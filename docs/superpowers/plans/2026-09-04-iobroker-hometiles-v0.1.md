@@ -131,10 +131,12 @@ Topic is built by lowercasing the entity id and replacing `.` with `/`.
 | `{base}/cmnd/display_brightness` | integer 1..100 |
 | `{base}/stat/display_brightness` | retained integer; a value above 100 means legacy 121..255 encoding |
 | `{base}/cmnd/screensaver_brightness`, `{base}/stat/screensaver_brightness` | as above |
-| `{base}/cmnd/display_rotate`, `{base}/stat/display_rotate` | integer |
-| `{base}/cmnd/display_sleep`, `{base}/stat/display_sleep` | enum string |
-| `{base}/cmnd/sleep_mains`, `{base}/stat/sleep_mains` | enum string |
-| `{base}/cmnd/sleep_battery`, `{base}/stat/sleep_battery` | enum string |
+| `{base}/cmnd/display_rotate` | **boolean** via `parseBoolPayload`: `1`/`on`/`true`/`yes` or `0`/`off`/`false`/`no`. Means rotated 180°, NOT an angle |
+| `{base}/stat/display_rotate` | retained `ON` / `OFF` |
+| `{base}/cmnd/display_sleep` | **boolean** via `parseBoolPayload`. Means sleep now / wake, NOT a timeout |
+| `{base}/stat/display_sleep` | retained `ON` / `OFF`, reflecting `powerManager.isInSleep()` |
+| `{base}/cmnd/sleep_mains`, `{base}/cmnd/sleep_battery` | **duration string** via `parseSleepPayload`: `nie`/`never`/`off`/`0` disables; otherwise one of the labels `5 s`, `15 s`, `30 s`, `60 s`, `5 min`, `15 min`, `30 min`, `60 min`, or a free-form form like `30s`, `15min`, or a bare number of seconds in 1..3600 |
+| `{base}/stat/sleep_mains`, `{base}/stat/sleep_battery` | retained label from `sleepLabelFromConfig` |
 | `{base}/cmnd/io/{channelId}` | `ON` / `OFF` |
 | `{base}/stat/io/{channelId}` | retained `ON` / `OFF` for a relay, a decimal string or `unavailable` for a temperature channel |
 
@@ -5233,6 +5235,16 @@ describe('runtime/panel-objects', () => {
     expect(temp.common.unit).to.equal('°C');
   });
 
+  it('types each control the way the firmware actually parses it', () => {
+    const defs = panelObjectDefs(harness().session);
+    const common = (id: string): Record<string, unknown> =>
+      (defs.find((d) => d.id === id)!.obj as { common: Record<string, unknown> }).common;
+    expect(common('panels.a1.control.display_brightness').type).to.equal('number');
+    expect(common('panels.a1.control.display_rotate').type).to.equal('boolean');
+    expect(common('panels.a1.control.display_sleep').type).to.equal('boolean');
+    expect(common('panels.a1.control.sleep_mains').type).to.equal('string');
+  });
+
   it('bounds the brightness controls to the visible 1..100 range', () => {
     const defs = panelObjectDefs(harness().session);
     const brightness = defs.find((d) => d.id === 'panels.a1.control.display_brightness')!;
@@ -5285,10 +5297,48 @@ describe('runtime/panel-objects', () => {
     expect(states).to.have.length(0);
   });
 
-  it('passes an enum stat through as a string', async () => {
+  it('treats display_sleep and display_rotate as booleans, not durations', async () => {
+    // The firmware parses both with parseBoolPayload and echoes ON / OFF.
+    // display_sleep means "asleep right now", not a timeout.
     const { session, panelObjects, states } = harness();
-    await panelObjects.applyPanelStat(session, 'display_sleep', '15 min');
-    expect(states).to.deep.equal([['panels.a1.control.display_sleep', '15 min', true]]);
+    await panelObjects.applyPanelStat(session, 'display_sleep', 'ON');
+    await panelObjects.applyPanelStat(session, 'display_rotate', 'OFF');
+    expect(states).to.deep.equal([
+      ['panels.a1.control.display_sleep', true, true],
+      ['panels.a1.control.display_rotate', false, true],
+    ]);
+  });
+
+  it('ignores a stat that is not a value the firmware would ever send', async () => {
+    const { session, panelObjects, states } = harness();
+    await panelObjects.applyPanelStat(session, 'display_rotate', '2');
+    expect(states).to.have.length(0);
+  });
+
+  it('passes a sleep timeout label through as a string', async () => {
+    const { session, panelObjects, states } = harness();
+    await panelObjects.applyPanelStat(session, 'sleep_mains', '15 min');
+    expect(states).to.deep.equal([['panels.a1.control.sleep_mains', '15 min', true]]);
+  });
+
+  it('publishes ON or OFF for a boolean control write', () => {
+    const { session, panelObjects, published } = harness();
+    panelObjects.handleControlWrite(session, 'control.display_rotate', true);
+    expect(published[0]).to.deep.equal({
+      topic: 'hometiles/cmnd/display_rotate',
+      payload: 'ON',
+      retain: false,
+    });
+  });
+
+  it('passes a duration control write through for the firmware to validate', () => {
+    // parseSleepPayload accepts labels, free-form durations and disable words;
+    // enumerating them here would only reject valid input.
+    const { session, panelObjects, published } = harness();
+    panelObjects.handleControlWrite(session, 'control.sleep_battery', '30s');
+    expect(published[0]!.payload).to.equal('30s');
+    panelObjects.handleControlWrite(session, 'control.sleep_mains', 'never');
+    expect(published[1]!.payload).to.equal('never');
   });
 
   it('maps a relay io stat onto a boolean and a temperature io stat onto a number', async () => {
@@ -5365,7 +5415,13 @@ export interface ObjectStore {
 
 export interface PanelSettingDef {
   leaf: string;
-  type: 'number' | 'string';
+  /**
+   * How the firmware parses this leaf, verified in mqtt_handlers.cpp:
+   *  - percent : integer, with a legacy 121..255 encoding on the stat topic
+   *  - bool    : parseBoolPayload, echoed as ON / OFF
+   *  - duration: parseSleepPayload, echoed as a label
+   */
+  kind: 'percent' | 'bool' | 'duration';
   role: string;
   name: string;
   min?: number;
@@ -5374,16 +5430,28 @@ export interface PanelSettingDef {
   states?: string[];
 }
 
-/** Matches the enum the firmware offers in its own settings dialog. */
-const SLEEP_OPTIONS = ['5 s', '15 s', '30 s', '60 s', '5 min', '15 min', '30 min', '60 min', 'Nie'];
+/**
+ * The labels `parseSleepPayload` matches exactly. It ALSO accepts free-form
+ * durations (`30s`, `15min`, a bare number of seconds in 1..3600) and the
+ * disable words below, so these are the convenient values rather than the only
+ * legal ones. `sleepLabelFromConfig` echoes one of these back on the stat topic.
+ */
+const SLEEP_LABELS = ['5 s', '15 s', '30 s', '60 s', '5 min', '15 min', '30 min', '60 min'];
+/** Any of these disables the timeout. The firmware lower-cases before matching. */
+const SLEEP_DISABLE = 'never';
 
 export const PANEL_SETTING_DEFS: readonly PanelSettingDef[] = [
-  { leaf: 'display_brightness', type: 'number', role: 'level.dimmer', name: 'Display brightness', min: 1, max: 100, unit: '%' },
-  { leaf: 'screensaver_brightness', type: 'number', role: 'level.dimmer', name: 'Screensaver brightness', min: 1, max: 100, unit: '%' },
-  { leaf: 'display_rotate', type: 'number', role: 'level', name: 'Display rotation', min: 0, max: 3 },
-  { leaf: 'display_sleep', type: 'string', role: 'text', name: 'Display sleep timeout', states: SLEEP_OPTIONS },
-  { leaf: 'sleep_mains', type: 'string', role: 'text', name: 'Sleep timeout on mains', states: SLEEP_OPTIONS },
-  { leaf: 'sleep_battery', type: 'string', role: 'text', name: 'Sleep timeout on battery', states: SLEEP_OPTIONS },
+  { leaf: 'display_brightness', kind: 'percent', role: 'level.dimmer', name: 'Display brightness', min: 1, max: 100, unit: '%' },
+  { leaf: 'screensaver_brightness', kind: 'percent', role: 'level.dimmer', name: 'Screensaver brightness', min: 1, max: 100, unit: '%' },
+  // Boolean, not an angle: parseBoolPayload feeds setRotationFlipped(). The
+  // panel echoes ON/OFF. Writing "2" here fails the parse and is silently
+  // ignored by the firmware.
+  { leaf: 'display_rotate', kind: 'bool', role: 'switch', name: 'Display rotated 180 degrees' },
+  // Boolean, and it is NOT a timeout: it puts the panel to sleep or wakes it.
+  // The stat topic reports powerManager.isInSleep().
+  { leaf: 'display_sleep', kind: 'bool', role: 'switch', name: 'Display asleep' },
+  { leaf: 'sleep_mains', kind: 'duration', role: 'text', name: 'Sleep timeout on mains', states: [...SLEEP_LABELS, SLEEP_DISABLE] },
+  { leaf: 'sleep_battery', kind: 'duration', role: 'text', name: 'Sleep timeout on battery', states: [...SLEEP_LABELS, SLEEP_DISABLE] },
 ];
 
 const LEGACY_BRIGHTNESS_MIN = 121;
@@ -5396,6 +5464,14 @@ const LEGACY_BRIGHTNESS_MAX = 255;
  * would write 0 % brightness, or 0 °C for a temperature channel that reported
  * nothing. Blank means unknown, so it yields undefined and the caller decides.
  */
+/** Mirrors the firmware's parseBoolPayload exactly, including its vocabulary. */
+function parseBoolPayload(raw: string): boolean | undefined {
+  const text = raw.trim().toLowerCase();
+  if (['1', 'on', 'true', 'yes'].includes(text)) return true;
+  if (['0', 'off', 'false', 'no'].includes(text)) return false;
+  return undefined;
+}
+
 function parseFiniteNumber(raw: string): number | undefined {
   const text = raw.trim();
   if (!text) return undefined;
@@ -5434,7 +5510,8 @@ export function panelObjectDefs(session: PanelSession): Array<{ id: string; obj:
   ];
 
   for (const def of PANEL_SETTING_DEFS) {
-    const common: Record<string, unknown> = { type: def.type, role: def.role, write: true };
+    const stateType = def.kind === 'percent' ? 'number' : def.kind === 'bool' ? 'boolean' : 'string';
+    const common: Record<string, unknown> = { type: stateType, role: def.role, write: true };
     if (def.min !== undefined) common.min = def.min;
     if (def.max !== undefined) common.max = def.max;
     if (def.unit) common.unit = def.unit;
@@ -5479,7 +5556,15 @@ export class PanelObjects {
     if (!def) return;
     const id = `panels.${session.deviceId}.control.${def.leaf}`;
 
-    if (def.type === 'string') {
+    if (def.kind === 'bool') {
+      // The panel echoes ON / OFF on these two.
+      const flag = parseBoolPayload(payload);
+      if (flag === undefined) return;
+      await this.store.setState(id, flag, true);
+      return;
+    }
+
+    if (def.kind === 'duration') {
       const text = payload.trim();
       if (!text) return;
       await this.store.setState(id, text, true);
@@ -5488,8 +5573,7 @@ export class PanelObjects {
 
     const numeric = parseFiniteNumber(payload);
     if (numeric === undefined) return;
-    const value = def.leaf.endsWith('brightness') ? decodeBrightness(numeric) : Math.round(numeric);
-    await this.store.setState(id, value, true);
+    await this.store.setState(id, decodeBrightness(numeric), true);
   }
 
   async applyIoStat(session: PanelSession, channelId: string, payload: string): Promise<void> {
@@ -5525,7 +5609,19 @@ export class PanelObjects {
     const def = PANEL_SETTING_DEFS.find((candidate) => candidate.leaf === leaf);
     if (!def) return;
 
-    if (def.type === 'string') {
+    if (def.kind === 'bool') {
+      // parseBoolPayload accepts ON / OFF among others; publish the form the
+      // panel itself echoes so a round trip is byte-identical.
+      const flag = typeof value === 'boolean' ? value : parseBoolPayload(String(value ?? ''));
+      if (flag === undefined) return;
+      session.publishPanelCommand(def.leaf, flag ? 'ON' : 'OFF');
+      return;
+    }
+
+    if (def.kind === 'duration') {
+      // parseSleepPayload takes a label, a free-form duration, or a disable
+      // word. Pass the text through and let the firmware do the validating —
+      // it accepts more forms than any list here could usefully enumerate.
       const text = String(value ?? '').trim();
       if (!text) return;
       session.publishPanelCommand(def.leaf, text);
@@ -5533,7 +5629,7 @@ export class PanelObjects {
     }
 
     const numeric = typeof value === 'number' ? value : parseFiniteNumber(String(value ?? ''));
-    if (numeric === undefined || !Number.isFinite(numeric)) return;
+    if (numeric === undefined) return;
     const min = def.min ?? Number.NEGATIVE_INFINITY;
     const max = def.max ?? Number.POSITIVE_INFINITY;
     session.publishPanelCommand(def.leaf, String(Math.round(Math.min(max, Math.max(min, numeric)))));
