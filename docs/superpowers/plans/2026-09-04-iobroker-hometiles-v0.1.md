@@ -5323,36 +5323,57 @@ git commit -m "feat(runtime): push broker credentials to an unconfigured panel a
 
 The persisted entity-id map lives in the adapter's own state `hometiles.0.info.entityIds` as JSON. This is the storage behind the Global Constraint that ids survive an ioBroker rename.
 
-- [ ] **Step 1: Write the failing startup test**
+- [ ] **Step 1: Write the failing package and startup tests**
 
-Create `test/main.startup.test.ts`. This uses `@iobroker/testing`'s unit harness, which starts the adapter against a mocked database and asserts it comes up and shuts down cleanly without a real broker.
+`@iobroker/testing` 5.3.0 marks `tests.unit` deprecated — "Adapter startup unit
+tests are no longer supported" — and its `defineAdditionalTests` takes no
+arguments. The `{ suite }` / `getHarness` API belongs to `tests.integration`,
+which downloads and runs a real js-controller. So the always-on gate here is
+`tests.packageFiles`, and the real adapter startup goes behind an opt-in
+integration suite. The wiring `main.ts` performs is already proven end to end
+by Task 19 against a real broker.
+
+Create `test/package.test.ts`:
+
+```ts
+import { tests } from '@iobroker/testing';
+import path from 'node:path';
+
+// Validates package.json against io-package.json: name, version, licence,
+// native/instanceObjects shape, and the adapter naming rules.
+tests.packageFiles(path.join(__dirname, '..'));
+```
+
+Create `test/main.integration.test.ts`:
 
 ```ts
 import { expect } from 'chai';
 import { tests } from '@iobroker/testing';
 import path from 'node:path';
 
-tests.unit(path.join(__dirname, '..'), {
-  // The adapter must start and stop cleanly even with no broker reachable:
-  // a panel install where the broker is briefly down must not crash ioBroker.
-  defineAdditionalTests({ suite }) {
-    suite('startup', (getHarness) => {
-      it('starts without a reachable broker and reports info.connection false', async function () {
-        this.timeout(20000);
-        const harness = getHarness();
-        await harness.startAdapterAndWait();
-        const state = await harness.states.getStateAsync('hometiles.0.info.connection');
-        expect(state?.val).to.equal(false);
+// Opt-in: this downloads and runs a real js-controller, so it stays out of the
+// default suite. Run it with HOMETILES_INTEGRATION=1 npm test.
+if (process.env.HOMETILES_INTEGRATION === '1') {
+  tests.integration(path.join(__dirname, '..'), {
+    defineAdditionalTests({ suite }) {
+      suite('startup', (getHarness) => {
+        it('starts with no reachable broker and reports info.connection false', async function () {
+          this.timeout(120000);
+          const harness = getHarness();
+          await harness.startAdapterAndWait();
+          const state = await harness.states.getStateAsync('hometiles.0.info.connection');
+          expect(state?.val).to.equal(false);
+        });
       });
-    });
-  },
-});
+    },
+  });
+}
 ```
 
-- [ ] **Step 2: Run the test to verify it fails**
+- [ ] **Step 2: Run the package test to verify it fails**
 
-Run: `npx mocha test/main.startup.test.ts`
-Expected: FAIL, the adapter entry point `build/main.js` does not exist yet.
+Run: `npx mocha test/package.test.ts`
+Expected: FAIL. `main` points at `build/main.js`, which does not exist yet.
 
 - [ ] **Step 3: Implement `src/main.ts`**
 
@@ -5763,10 +5784,15 @@ if (require.main !== module) {
 }
 ```
 
-- [ ] **Step 4: Build and run the startup test**
+- [ ] **Step 4: Build and run the package test**
 
-Run: `npm run build && npx mocha test/main.startup.test.ts`
-Expected: PASS. The adapter starts against the mocked database, reports `info.connection` false with no broker present, and shuts down without the harness reporting a hung unload.
+Run: `npm run build && npx mocha test/package.test.ts`
+Expected: PASS. `build/main.js` now exists and package metadata validates.
+
+The opt-in integration suite is not part of this gate. Note in the report
+whether `HOMETILES_INTEGRATION=1 npx mocha test/main.integration.test.ts` was
+attempted and what happened; a failure there caused by no network access is
+reported, not fixed.
 
 - [ ] **Step 5: Run the whole suite and lint**
 
@@ -5776,7 +5802,7 @@ Expected: all green.
 - [ ] **Step 6: Commit**
 
 ```bash
-git add src/main.ts test/main.startup.test.ts
+git add src/main.ts test/package.test.ts test/main.integration.test.ts
 git commit -m "feat: adapter main wiring, panel object sync and admin message handlers"
 ```
 
