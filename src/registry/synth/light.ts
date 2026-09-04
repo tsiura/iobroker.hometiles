@@ -43,8 +43,20 @@ export function synthLight(device: DeviceInput, entityId: string, values: Values
   if (!modes.length) modes.push(hasDimmer ? 'brightness' : 'onoff');
   attributes.supported_color_modes = modes;
 
-  const setRead = readChannel(device, 'set', values) ?? readChannel(device, 'actual', values);
-  const dimmerPercent = readNumber(device, 'dimmer', values);
+  // readChannel returns a non-null wrapper for any CONFIGURED channel even
+  // when its value is null, so `readChannel(set) ?? readChannel(actual)`
+  // never falls through: a device with both channels always keeps the SET
+  // wrapper, even when SET has never been confirmed. Matches the pattern
+  // switch.ts already gets right: prefer real feedback over an unconfirmed
+  // command, and only fall back when the preferred channel is not usable.
+  const actualRead = readChannel(device, 'actual', values);
+  const setChannelRead = readChannel(device, 'set', values);
+  const setRead = actualRead && isUsable(actualRead.value) ? actualRead : setChannelRead;
+  // rgb, rgbSingle, rgbwSingle, hue, ct and cie carry their level on DIMMER
+  // *or* BRIGHTNESS, depending on which detector pattern matched (see
+  // hasDimmer above, and dispatcher.ts's matching write-side fallback). Both
+  // are ioBroker 0..100 percent, so the same scaling applies to either.
+  const dimmerPercent = readNumber(device, 'dimmer', values) ?? readNumber(device, 'brightness', values);
   const anyUsable = Boolean(setRead && isUsable(setRead.value)) || dimmerPercent !== undefined;
 
   if (!anyUsable) {

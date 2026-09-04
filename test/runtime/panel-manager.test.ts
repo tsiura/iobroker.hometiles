@@ -35,6 +35,7 @@ function harness() {
   const unsubscribed: string[] = [];
   const warnings: string[] = [];
   const writes: Array<[string, unknown]> = [];
+  const removedPanels: string[] = [];
   let sessionsChanged = 0;
 
   const log = {
@@ -61,8 +62,21 @@ function harness() {
     onSessionsChanged: () => {
       sessionsChanged++;
     },
+    onPanelRemoved: (deviceId) => {
+      removedPanels.push(deviceId);
+    },
   });
-  return { manager, published, subscribed, unsubscribed, warnings, writes, log, sessions: () => sessionsChanged };
+  return {
+    manager,
+    published,
+    subscribed,
+    unsubscribed,
+    warnings,
+    writes,
+    log,
+    sessions: () => sessionsChanged,
+    removedPanels,
+  };
 }
 
 describe('runtime/panel-manager', () => {
@@ -88,6 +102,22 @@ describe('runtime/panel-manager', () => {
     await manager.handleAnnouncement('a1', '');
     expect(manager.get('a1')).to.equal(undefined);
     expect(unsubscribed.length).to.be.greaterThan(0);
+  });
+
+  it('calls onPanelRemoved with the device id after a panel withdraws', async () => {
+    // A withdrawn panel's `panels.<deviceId>.*` object tree must be cleaned
+    // up, or later writes to the orphaned control states vanish silently.
+    const { manager, removedPanels } = harness();
+    await manager.handleAnnouncement('a1', announcement('a1', 'panel-a'));
+    expect(removedPanels).to.deep.equal([]);
+    await manager.handleAnnouncement('a1', '');
+    expect(removedPanels).to.deep.equal(['a1']);
+  });
+
+  it('does not call onPanelRemoved for a device id that was never a session', async () => {
+    const { manager, removedPanels } = harness();
+    await manager.remove('ghost');
+    expect(removedPanels).to.deep.equal([]);
   });
 
   it('updates an existing panel rather than creating a duplicate', async () => {

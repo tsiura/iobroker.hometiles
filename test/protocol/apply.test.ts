@@ -16,7 +16,7 @@ function e(over: Partial<VirtualEntity>): VirtualEntity {
 }
 
 const ENTITIES: VirtualEntity[] = [
-  e({ entityId: 'sensor.temp', state: '21.5', attributes: { friendly_name: 'Wohnzimmer', unit_of_measurement: '°C', icon: 'mdi:thermometer' } }),
+  e({ entityId: 'sensor.temp', state: '21.5', attributes: { friendly_name: 'Wohnzimmer', unit_of_measurement: '°C', icon: 'mdi:thermometer', state_class: 'measurement' } }),
   e({ entityId: 'binary_sensor.tuer', domain: 'binary_sensor', state: 'on', attributes: { friendly_name: 'Haustuer', device_class: 'door', icon: 'mdi:door' } }),
   e({ entityId: 'switch.kaffee', domain: 'switch', state: 'off', attributes: { friendly_name: 'Kaffee' } }),
   e({ entityId: 'light.decke', domain: 'light', state: 'on', attributes: { friendly_name: 'Decke', brightness_pct: 60 } }),
@@ -26,7 +26,7 @@ const ENTITIES: VirtualEntity[] = [
 describe('protocol/apply', () => {
   it('emits every top-level key the firmware scanner looks for', () => {
     const parsed = JSON.parse(buildApplyPayload({ entities: ENTITIES, sceneMap: {} }));
-    for (const key of ['sensors', 'binary_sensors', 'lights', 'switches', 'media_players', 'climates', 'covers', 'cameras', 'weathers', 'scene_map']) {
+    for (const key of ['sensors', 'binary_sensors', 'lights', 'switches', 'media_players', 'climates', 'covers', 'cameras', 'weathers', 'energy', 'scene_map']) {
       expect(parsed, `missing key ${key}`).to.have.property(key);
     }
   });
@@ -48,6 +48,13 @@ describe('protocol/apply', () => {
     expect(parsed.weathers).to.deep.equal([]);
   });
 
+  it('emits an empty energy array so the firmware does not keep a stale migrated configuration', () => {
+    // ha_bridge_config.cpp scans for "energy" specifically and keeps whatever
+    // it last had when the key is absent, unlike the other domains above.
+    const parsed = JSON.parse(buildApplyPayload({ entities: ENTITIES, sceneMap: {} }));
+    expect(parsed.energy).to.deep.equal([]);
+  });
+
   it('builds sensor_meta with the exact keys the firmware parser reads', () => {
     const parsed = JSON.parse(buildApplyPayload({ entities: ENTITIES, sceneMap: {} }));
     expect(parsed.sensor_meta[0]).to.deep.equal({
@@ -65,6 +72,31 @@ describe('protocol/apply', () => {
   it('marks a textual sensor with state_kind state and number false', () => {
     const text = e({ entityId: 'sensor.mode', state: 'heating', attributes: { friendly_name: 'Modus' } });
     const parsed = JSON.parse(buildApplyPayload({ entities: [text], sceneMap: {} }));
+    expect(parsed.sensor_meta[0].state_kind).to.equal('state');
+    expect(parsed.sensor_meta[0].number).to.equal(false);
+  });
+
+  it('derives state_kind from the declared numeric type, not from the current state string', () => {
+    // bridge/apply is only re-pushed when registry membership changes, not on
+    // every state change, so classifying by the current value would let a
+    // transient "unavailable" at startup decide the panel's rendering mode
+    // permanently, even once the sensor starts reporting real numbers.
+    const startingUp = e({
+      entityId: 'sensor.temp',
+      state: 'unavailable',
+      available: false,
+      attributes: { friendly_name: 'Wohnzimmer', state_class: 'measurement' },
+    });
+    const parsed = JSON.parse(buildApplyPayload({ entities: [startingUp], sceneMap: {} }));
+    expect(parsed.sensor_meta[0].state_kind).to.equal('number');
+    expect(parsed.sensor_meta[0].number).to.equal(true);
+  });
+
+  it('does not read a numeric-looking transient string as state_kind number without a declared measurement type', () => {
+    // isNumericState(entity.state) used to accept anything Number() parsed,
+    // including "0x10". state_kind must come from the declared type only.
+    const notDeclared = e({ entityId: 'sensor.raw', state: '0x10', attributes: { friendly_name: 'Raw' } });
+    const parsed = JSON.parse(buildApplyPayload({ entities: [notDeclared], sceneMap: {} }));
     expect(parsed.sensor_meta[0].state_kind).to.equal('state');
     expect(parsed.sensor_meta[0].number).to.equal(false);
   });

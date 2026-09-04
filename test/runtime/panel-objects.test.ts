@@ -204,6 +204,21 @@ describe('runtime/panel-objects', () => {
     expect(states[0]).to.deep.equal(['panels.a1.io.temp_1', null, true]);
   });
 
+  it('skips a blank relay stat instead of writing it as OFF', async () => {
+    // text.toUpperCase() === 'ON' used to make an empty retained payload read
+    // as false, the same swallowed-blank defect class as the temperature
+    // branch just above already guards against.
+    const { session, panelObjects, states } = harness();
+    await panelObjects.applyIoStat(session, 'relay_1', '');
+    expect(states).to.have.length(0);
+  });
+
+  it('ignores a relay stat payload the firmware would never send instead of guessing OFF', async () => {
+    const { session, panelObjects, states } = harness();
+    await panelObjects.applyIoStat(session, 'relay_1', 'garbage');
+    expect(states).to.have.length(0);
+  });
+
   it('ignores an io stat for a channel the panel never announced', async () => {
     const { session, panelObjects, states } = harness();
     await panelObjects.applyIoStat(session, 'ghost', 'ON');

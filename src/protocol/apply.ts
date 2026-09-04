@@ -15,11 +15,6 @@ function idsFor(entities: VirtualEntity[], domain: Domain): string[] {
   return entities.filter((entity) => entity.domain === domain).map((entity) => entity.entityId);
 }
 
-function isNumericState(state: string): boolean {
-  if (!state.length) return false;
-  return Number.isFinite(Number(state));
-}
-
 /** The firmware stores last_changed as unix seconds. */
 function unixSeconds(msValue: number): number {
   return Math.floor(msValue / 1000);
@@ -29,7 +24,16 @@ function sensorMeta(entities: VirtualEntity[]): Record<string, unknown>[] {
   return entities
     .filter((entity) => entity.domain === 'sensor')
     .map((entity) => {
-      const numeric = isNumericState(entity.state);
+      // Derived from the declared type (synthSensor sets state_class exactly
+      // when the channel is numeric), never from entity.state itself: this
+      // section is only re-pushed when registry MEMBERSHIP changes, not on
+      // every state change (see EntityRegistry.onMembershipChanged), so a
+      // sensor that is "unavailable" at adapter startup would otherwise be
+      // published as state_kind "state" and stay a categorical timeline on
+      // the panel forever, even once it starts reporting real numbers. This
+      // also stops a numeric-looking transient string like "0x10" from being
+      // read as a number by coercion.
+      const numeric = entity.attributes.state_class === 'measurement';
       const meta: Record<string, unknown> = {
         entity_id: entity.entityId,
         name: text(entity.attributes, 'friendly_name') ?? entity.entityId,
@@ -120,6 +124,11 @@ export function buildApplyPayload(input: ApplyInput): string {
     covers: [] as string[],
     cameras: [] as string[],
     weathers: [] as string[],
+    // Unlike the other unimplemented domains above, the firmware keeps STALE
+    // energy configuration when this key is absent (ha_bridge_config.cpp
+    // scans for "energy" specifically), so a panel migrated from Home
+    // Assistant would otherwise keep old energy sources forever.
+    energy: [] as string[],
     scene_map: sceneMap,
     sensor_meta: sensorMeta(entities),
     binary_sensor_meta: binarySensorMeta(entities),

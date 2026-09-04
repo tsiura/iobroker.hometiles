@@ -12,6 +12,14 @@ export interface PanelManagerDeps {
   entities(): VirtualEntity[];
   /** Called after a session is created, updated or removed. */
   onSessionsChanged(): void | Promise<void>;
+  /**
+   * Called after a panel's session has been stopped and removed, so its
+   * `panels.<deviceId>.*` object tree can be cleaned up. Without this a
+   * withdrawn panel's objects stay behind forever, and later writes to the
+   * orphaned control.* states hit the `if (!session) return` guard in main
+   * and vanish silently.
+   */
+  onPanelRemoved(deviceId: string): void | Promise<void>;
 }
 
 export class PanelManager {
@@ -88,6 +96,7 @@ export class PanelManager {
     const session = this.panels.get(deviceId);
     if (!session) return;
     await session.stop();
+    await this.deps.onPanelRemoved(deviceId);
     this.panels.delete(deviceId);
     this.deps.log.info(`[Panel ${deviceId}] Session removed`);
     await this.deps.onSessionsChanged();

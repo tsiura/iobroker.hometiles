@@ -15,7 +15,13 @@ const DEVICE_CLASS_BY_DETECTOR: Record<string, string> = {
 
 export function synthBinarySensor(device: DeviceInput, entityId: string, values: Values): VirtualEntity {
   const { source, lastChanged, friendly } = baseEntity(device, entityId, values);
-  const read = readChannel(device, 'actual', values) ?? readChannel(device, 'set', values);
+  // readChannel returns a non-null wrapper for any CONFIGURED channel even
+  // when its value is null, so `readChannel(actual) ?? readChannel(set)`
+  // never falls through. Matches switch.ts's pattern: prefer ACTUAL only when
+  // it is actually usable, otherwise fall back to SET.
+  const actual = readChannel(device, 'actual', values);
+  const set = readChannel(device, 'set', values);
+  const read = actual && isUsable(actual.value) ? actual : set;
 
   const attributes: Record<string, unknown> = { ...friendly };
   const deviceClass = DEVICE_CLASS_BY_DETECTOR[device.detectorType];

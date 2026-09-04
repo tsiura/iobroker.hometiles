@@ -57,7 +57,15 @@ export class Dispatcher {
     }
 
     const writes = this.plan(call, entity);
-    if (!writes.length) return { ok: true, writes: 0 };
+    if (!writes.length) {
+      // A call that resolves to zero writes must not report success: it is
+      // indistinguishable from a command that did exactly what was asked. A
+      // scene wired to a read-only control, or a slider whose only channel
+      // the plan step could not find, would otherwise do nothing forever
+      // while every caller believes it worked.
+      this.log.warn(`[Command] Rejected ${call.kind} for ${entity.entityId}: no writable channel`);
+      return { ok: false, reason: 'no_writable_channel', applied: 0 };
+    }
 
     let applied = 0;
     for (const [channel, objectId, value] of writes) {
@@ -106,7 +114,13 @@ export class Dispatcher {
         break;
       case 'set_light': {
         if (call.state !== undefined) push('set', call.state === 'on');
-        if (call.brightnessPct !== undefined) push('dimmer', call.brightnessPct);
+        // A colour or CT bulb carries its level on DIMMER or BRIGHTNESS,
+        // never both (see registry/synth/light.ts). Writing unconditionally
+        // to 'dimmer' left a BRIGHTNESS-only bulb's slider with no channel to
+        // write to at all.
+        if (call.brightnessPct !== undefined) {
+          push(entity.source.dimmer ? 'dimmer' : 'brightness', call.brightnessPct);
+        }
         if (call.rgb) {
           push('red', call.rgb[0]);
           push('green', call.rgb[1]);

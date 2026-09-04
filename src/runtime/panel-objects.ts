@@ -179,7 +179,14 @@ export class PanelObjects {
     const text = payload.trim();
 
     if (channel.type === 'relay') {
-      await this.store.setState(id, text.toUpperCase() === 'ON', true);
+      // text.toUpperCase() === 'ON' made a blank or garbage retained payload
+      // read as false (OFF). parseBoolPayload mirrors the firmware exactly
+      // and returns undefined for anything it would not itself have sent, so
+      // an unrecognised payload is skipped rather than guessed at — the same
+      // rule the temperature branch below already follows for its own value.
+      const flag = parseBoolPayload(text);
+      if (flag === undefined) return;
+      await this.store.setState(id, flag, true);
       return;
     }
 

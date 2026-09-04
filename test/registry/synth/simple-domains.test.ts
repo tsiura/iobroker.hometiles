@@ -68,10 +68,51 @@ describe('registry/synth simple domains', () => {
     expect(e.available).to.equal(true);
   });
 
+  it('falls back to SET when ACTUAL is configured but has no usable value, instead of reporting unavailable', () => {
+    // readChannel returns a non-null wrapper for a CONFIGURED channel even
+    // when its value is null, so a naive `readChannel(actual) ?? readChannel(set)`
+    // never falls through.
+    const withSet: DeviceInput = {
+      ...tempDevice,
+      channels: {
+        actual: { objectId: 'zigbee.0.temp.value', unit: '°C', type: 'number' },
+        set: { objectId: 'zigbee.0.temp.set', type: 'number' },
+      },
+    };
+    const e = synthSensor(withSet, 'sensor.wohnzimmer', {
+      'zigbee.0.temp.value': value(null),
+      'zigbee.0.temp.set': value(19),
+    });
+    expect(e.available).to.equal(true);
+    expect(e.state).to.equal('19');
+  });
+
   it('marks a sensor unavailable when the backing state is entirely absent', () => {
     const e = synthSensor(tempDevice, 'sensor.wohnzimmer', {});
     expect(e.state).to.equal('unavailable');
     expect(e.available).to.equal(false);
+  });
+
+  it('marks state_class measurement from the declared channel type even while unavailable', () => {
+    // protocol/apply.ts reads state_class to decide state_kind, and that
+    // section is only re-pushed on registry membership changes, not on every
+    // state change. An unavailable sensor at adapter startup must still
+    // declare itself numeric or the panel is stuck on a categorical timeline
+    // forever, even once real numbers start arriving.
+    const e = synthSensor(tempDevice, 'sensor.wohnzimmer', {});
+    expect(e.available).to.equal(false);
+    expect(e.attributes.state_class).to.equal('measurement');
+  });
+
+  it('does not mark state_class measurement for an unavailable sensor with no declared numeric type', () => {
+    const textDevice: DeviceInput = {
+      ...tempDevice,
+      detectorType: 'info',
+      channels: { actual: { objectId: 'zigbee.0.temp.value', type: 'string', role: 'text' } },
+    };
+    const e = synthSensor(textDevice, 'sensor.status', {});
+    expect(e.available).to.equal(false);
+    expect(e.attributes.state_class).to.equal(undefined);
   });
 
   it('keeps a textual sensor state verbatim', () => {
@@ -97,6 +138,22 @@ describe('registry/synth simple domains', () => {
     const e = synthBinarySensor(doorDevice, 'binary_sensor.haustuer', {});
     expect(e.state).to.equal('unavailable');
     expect(e.state).to.not.equal('off');
+  });
+
+  it('falls back to SET when ACTUAL is configured but has no usable value, instead of reporting unavailable', () => {
+    const withSet: DeviceInput = {
+      ...doorDevice,
+      channels: {
+        actual: { objectId: 'zigbee.0.door.state', type: 'boolean', role: 'sensor.door' },
+        set: { objectId: 'zigbee.0.door.set', type: 'boolean' },
+      },
+    };
+    const e = synthBinarySensor(withSet, 'binary_sensor.haustuer', {
+      'zigbee.0.door.state': value(null),
+      'zigbee.0.door.set': value(true),
+    });
+    expect(e.available).to.equal(true);
+    expect(e.state).to.equal('on');
   });
 
   it('renders a switch from its SET channel and advertises it as writable', () => {

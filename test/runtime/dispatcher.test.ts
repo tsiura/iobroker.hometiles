@@ -82,6 +82,21 @@ describe('runtime/dispatcher', () => {
     expect(writes).to.deep.include(['hue.0.d.on', true]);
   });
 
+  it('writes brightness to the BRIGHTNESS channel when the device has no DIMMER channel', async () => {
+    // hue, ct, cie, rgb, rgbSingle and rgbwSingle carry their level on DIMMER
+    // *or* BRIGHTNESS. Writing unconditionally to 'dimmer' left such a bulb's
+    // slider publishing nothing at all.
+    const brightnessOnly = entity({
+      entityId: 'light.ct',
+      domain: 'light',
+      source: { set: 'zig.0.ct.on', brightness: 'zig.0.ct.level', temperature: 'zig.0.ct.ct' },
+    });
+    const d = new Dispatcher(lookup([brightnessOnly]), write, silentLog);
+    const result = await d.dispatch({ kind: 'set_light', entityId: 'light.ct', brightnessPct: 77 });
+    expect(result).to.deep.equal({ ok: true, writes: 1 });
+    expect(writes).to.deep.equal([['zig.0.ct.level', 77]]);
+  });
+
   it('splits rgb into the three component channels', async () => {
     const d = new Dispatcher(lookup([LIGHT]), write, silentLog);
     await d.dispatch({ kind: 'set_light', entityId: 'light.d', rgb: [255, 180, 90] });
@@ -161,6 +176,17 @@ describe('runtime/dispatcher', () => {
       reason: 'write_failed',
       applied: 0,
     });
+  });
+
+  it('rejects a call that resolves to zero writes instead of reporting success', async () => {
+    // Reproduces the buttonSensor-derived scene: its only channels are the
+    // read-only PRESS/PRESS_LONG, so nothing ever lands in source.set and the
+    // plan step produces no writes at all. That must not report ok:true.
+    const noWritableChannel = entity({ entityId: 'scene.silent', domain: 'scene', source: {} });
+    const d = new Dispatcher(lookup([noWritableChannel], { silent: 'scene.silent' }), write, silentLog);
+    const result = await d.dispatch({ kind: 'activate_scene', alias: 'silent' });
+    expect(result).to.deep.equal({ ok: false, reason: 'no_writable_channel', applied: 0 });
+    expect(writes).to.have.length(0);
   });
 
   it('reports how many writes landed before a mid-sequence failure', async () => {

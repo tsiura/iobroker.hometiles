@@ -60,8 +60,13 @@ export const DETECTOR_TYPE_TO_DOMAIN: Record<string, Domain> = {
   floodAlarm: 'binary_sensor',
   coAlarm: 'binary_sensor',
   warning: 'binary_sensor',
+  // buttonSensor is deliberately NOT mapped: its detector pattern is
+  // PRESS(r) PRESS_LONG(r) (see typePatterns.js) — both read-only, so it can
+  // never produce a writable `set` channel. Mapping it to scene would create
+  // a tile whose press resolves to zero writes; the dispatcher now rejects
+  // that outright rather than reporting success, but the tile should not
+  // exist in the first place. `button`, which has SET(w), stays.
   button: 'scene',
-  buttonSensor: 'scene',
 };
 
 /**

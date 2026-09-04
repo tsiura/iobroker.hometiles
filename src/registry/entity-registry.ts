@@ -119,6 +119,11 @@ export class EntityRegistry {
   dispose(): void {
     this.disposed = true;
     for (const entityId of [...this.timers.keys()]) this.cancelTimer(entityId);
+    // Cancelling timers alone left slots, watchers and values populated, so
+    // all() and byId() kept returning entities after disposal.
+    this.slots.clear();
+    this.watchers.clear();
+    this.values.clear();
   }
 
   private valuesFor(device: DeviceInput): Record<string, SourceValue | null> {

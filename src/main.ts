@@ -20,6 +20,7 @@ import { PanelManager } from './runtime/panel-manager';
 import { PanelObjects } from './runtime/panel-objects';
 import type { PanelSession } from './runtime/panel-session';
 import { credentialsFromOptions, pushCredentials } from './runtime/pairing';
+import { mergeSceneAliases } from './runtime/scene-aliases';
 
 const ENTITY_ID_STATE = 'info.entityIds';
 
@@ -102,6 +103,7 @@ class HomeTiles extends utils.Adapter {
       onSessionsChanged: async () => {
         await this.syncPanelObjects();
       },
+      onPanelRemoved: (deviceId) => this.panelObjects.remove(deviceId),
     });
 
     this.mqtt.onConnectionChange((connected) => {
@@ -309,11 +311,15 @@ class HomeTiles extends utils.Adapter {
   }
 
   private async syncPanelObjects(): Promise<void> {
-    for (const session of this.panels.sessions()) {
+    const sessions = this.panels.sessions();
+    for (const session of sessions) {
       await this.panelObjects.sync(session);
-      this.registry.setSceneAliases(session.sceneMap);
     }
-    await this.setState('info.panels', this.panels.sessions().length, true);
+    // setSceneAliases REPLACES the registry's map, so it must be called once
+    // with every panel's aliases merged in, not once per panel in the loop
+    // above — the latter left only the last panel's aliases reachable.
+    this.registry.setSceneAliases(mergeSceneAliases(sessions, this.log4));
+    await this.setState('info.panels', sessions.length, true);
   }
 
   private async loadPersistedIds(): Promise<Record<string, string>> {

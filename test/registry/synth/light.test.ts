@@ -90,6 +90,28 @@ describe('registry/synth light and scene', () => {
     expect(e.attributes.brightness).to.equal(77);
   });
 
+  it('reads the level from BRIGHTNESS when the device has no DIMMER channel', () => {
+    // hue, ct, cie, rgb, rgbSingle and rgbwSingle carry their level on DIMMER
+    // *or* BRIGHTNESS depending on which detector pattern matched.
+    const brightnessOnly: DeviceInput = {
+      objectId: 'zig.0.ct',
+      name: 'Decke CT',
+      detectorType: 'ct',
+      domain: 'light',
+      channels: {
+        set: { objectId: 'zig.0.ct.on', type: 'boolean', write: true },
+        brightness: { objectId: 'zig.0.ct.level', type: 'number', min: 0, max: 100, write: true },
+      },
+    };
+    const e = synthLight(brightnessOnly, 'light.ct', {
+      'zig.0.ct.on': value(true),
+      'zig.0.ct.level': value(60),
+    });
+    expect(e.attributes.brightness).to.equal(153);
+    expect(e.attributes.brightness_pct).to.equal(60);
+    expect(e.attributes.supported_color_modes).to.deep.equal(['brightness']);
+  });
+
   it('reports rgb and colour temperature modes when both channel groups exist', () => {
     const e = synthLight(rgbct, 'light.sofa', {
       'hue.0.rgb.on': value(true),
@@ -126,6 +148,25 @@ describe('registry/synth light and scene', () => {
     });
     expect(e.attributes.supported_color_modes).to.deep.equal(['brightness']);
     expect(e.attributes.rgb_color).to.equal(undefined);
+  });
+
+  it('prefers an ACTUAL power channel over an unconfirmed SET, matching the switch synthesiser', () => {
+    // readChannel returns a non-null wrapper for a CONFIGURED channel even
+    // when its value is null, so a naive `readChannel(set) ?? readChannel(actual)`
+    // never falls through and this would previously render unavailable.
+    const withActual: DeviceInput = {
+      ...onOff,
+      channels: {
+        set: { objectId: 'hue.0.decke.on', type: 'boolean', write: true },
+        actual: { objectId: 'hue.0.decke.on_actual', type: 'boolean' },
+      },
+    };
+    const e = synthLight(withActual, 'light.decke', {
+      'hue.0.decke.on': value(null),
+      'hue.0.decke.on_actual': value(true),
+    });
+    expect(e.available).to.equal(true);
+    expect(e.state).to.equal('on');
   });
 
   it('marks a light unavailable rather than off when every channel is missing', () => {

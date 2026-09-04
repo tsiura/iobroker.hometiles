@@ -150,4 +150,17 @@ describe('registry/entity-registry', () => {
     registry.flush();
     expect(changed).to.have.length(0);
   });
+
+  it('clears entities so all() and byId() stop returning stale data after dispose', () => {
+    const { registry } = harness();
+    registry.rebuild([TEMP, PLUG], {});
+    registry.applyStateChange('zigbee.0.temp.value', value(21.5));
+    expect(registry.all()).to.have.length(2);
+
+    registry.dispose();
+
+    expect(registry.all()).to.deep.equal([]);
+    expect(registry.byId('sensor.wohnzimmer')).to.equal(undefined);
+    expect(registry.byId('switch.kaffee')).to.equal(undefined);
+  });
 });

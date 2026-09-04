@@ -35,7 +35,6 @@ describe('registry/detector mapping', () => {
     expect(DETECTOR_TYPE_TO_DOMAIN.coAlarm).to.equal('binary_sensor');
     expect(DETECTOR_TYPE_TO_DOMAIN.warning).to.equal('binary_sensor');
     expect(DETECTOR_TYPE_TO_DOMAIN.button).to.equal('scene');
-    expect(DETECTOR_TYPE_TO_DOMAIN.buttonSensor).to.equal('scene');
   });
 
   it('does not map enum members that do not exist in type-detector 6.x', () => {
@@ -43,6 +42,17 @@ describe('registry/detector mapping', () => {
     expect(DETECTOR_TYPE_TO_DOMAIN.occupancy).to.equal(undefined);
     expect(DETECTOR_TYPE_TO_DOMAIN.switch).to.equal(undefined);
     expect(DETECTOR_TYPE_TO_DOMAIN.brightness).to.equal(undefined);
+  });
+
+  it('does not map buttonSensor to any domain: PRESS and PRESS_LONG are both read-only', () => {
+    // Verified against node_modules/@iobroker/type-detector/build/typePatterns.js:
+    // buttonSensor's states are PRESS (read:true, write:false) and the optional
+    // PRESS_LONG (read:true, write:false) — no writable channel exists. Mapping
+    // it to scene would create a tile whose press writes nothing while the
+    // dispatcher's own success/failure result cannot save it, because the
+    // device never had a `set` channel to begin with. `button`, whose SET is
+    // write:true, is the writable sibling and stays mapped.
+    expect(DETECTOR_TYPE_TO_DOMAIN.buttonSensor).to.equal(undefined);
   });
 
   it('returns null for a detector type outside v0.1 scope rather than guessing', () => {

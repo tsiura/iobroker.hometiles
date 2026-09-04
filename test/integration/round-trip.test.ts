@@ -114,6 +114,7 @@ describe('integration round trip', function () {
       log: silentLog,
       entities: () => registry.all(),
       onSessionsChanged: async () => undefined,
+      onPanelRemoved: async () => undefined,
     });
 
     adapterMqtt.onMessage((topic, payload) => {
