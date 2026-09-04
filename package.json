@@ -4,6 +4,9 @@
   "description": "Connects HomeTiles ESP32-P4/S3 touch panels to ioBroker over MQTT",
   "author": "Evgenij Cjura",
   "license": "MIT",
+  "repository": { "type": "git", "url": "git+https://github.com/GalusPeres/ioBroker.hometiles.git" },
+  "bugs": { "url": "https://github.com/GalusPeres/ioBroker.hometiles/issues" },
+  "homepage": "https://github.com/GalusPeres/ioBroker.hometiles#readme",
   "main": "build/main.js",
   "engines": { "node": ">=20" },
   "scripts": {

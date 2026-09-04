@@ -6,6 +6,8 @@
     "title": "HomeTiles",
     "titleLang": { "en": "HomeTiles", "de": "HomeTiles" },
     "desc": { "en": "Connects HomeTiles ESP32 touch panels to ioBroker over MQTT", "de": "Verbindet HomeTiles ESP32 Touch-Panels ueber MQTT mit ioBroker" },
+    "icon": "hometiles.png",
+    "extIcon": "https://raw.githubusercontent.com/GalusPeres/ioBroker.hometiles/main/admin/hometiles.png",
     "authors": ["Evgenij Cjura"],
     "keywords": ["hometiles", "esp32", "mqtt", "panel", "display"],
     "license": "MIT",
