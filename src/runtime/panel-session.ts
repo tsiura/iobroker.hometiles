@@ -7,6 +7,8 @@ import {
   bridgeRequestTopic,
   commandTopic,
   iconsTopic,
+  ioStateTopic,
+  PANEL_SETTING_LEAVES,
   stateTopic,
 } from '../protocol/topics';
 import type { VirtualEntity } from '../registry/types';
@@ -58,11 +60,25 @@ export class PanelSession {
     return this.announcement.sceneMap;
   }
 
+  get deviceName(): string {
+    return this.announcement.deviceName;
+  }
+
+  get model(): string {
+    return this.announcement.model;
+  }
+
+  publishRaw(topic: string, payload: string): void {
+    this.transport.publish({ topic, payload, retain: false });
+  }
+
   commandTopics(): string[] {
     const topics = COMMAND_LEAVES.map((leaf) => commandTopic(this.baseTopic, leaf));
     topics.push(stateTopic(this.baseTopic, 'connected'));
     topics.push(stateTopic(this.baseTopic, 'ip'));
     topics.push(bridgeRequestTopic(this.deviceId));
+    for (const leaf of PANEL_SETTING_LEAVES) topics.push(stateTopic(this.baseTopic, leaf));
+    for (const channel of this.announcement.localIo) topics.push(ioStateTopic(this.baseTopic, channel.id));
     return topics;
   }
 
