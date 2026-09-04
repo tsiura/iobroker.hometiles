@@ -146,7 +146,7 @@ Topic is built by lowercasing the entity id and replacing `.` with `/`.
 
 | File | Responsibility |
 | --- | --- |
-| `package.json`, `tsconfig.json`, `.mocharc.json`, `eslint.config.mjs`, `.gitignore` | build, test and lint harness |
+| `package.json`, `tsconfig.json`, `.mocharc.cjs`, `eslint.config.mjs`, `.gitignore` | build, test and lint harness |
 | `io-package.json` | ioBroker adapter manifest and native config defaults |
 | `src/config/options.ts` | typed native config, defaults, validation |
 | `src/protocol/topics.ts` | every topic string in the contract, in one place |
@@ -176,7 +176,7 @@ Topic is built by lowercasing the entity id and replacing `.` with `/`.
 ## Task 1: Project scaffold, build and test harness
 
 **Files:**
-- Create: `package.json`, `tsconfig.json`, `.mocharc.json`, `eslint.config.mjs`, `.gitignore`, `io-package.json`, `LICENSE`, `README.md`
+- Create: `package.json`, `tsconfig.json`, `.mocharc.cjs`, `eslint.config.mjs`, `.gitignore`, `io-package.json`, `LICENSE`, `README.md`
 - Create: `src/config/options.ts`
 - Test: `test/config/options.test.ts`
 
@@ -250,15 +250,31 @@ Topic is built by lowercasing the entity id and replacing `.` with `/`.
 }
 ```
 
-- [ ] **Step 3: Create `.mocharc.json`**
+- [ ] **Step 3: Create `.mocharc.cjs`**
 
-```json
-{
-  "require": ["ts-node/register"],
-  "spec": ["test/**/*.test.ts"],
-  "timeout": 10000,
-  "recursive": true
-}
+A `.cjs` config rather than JSON, because it needs one conditional. Node 22.6+
+recognises `.ts` natively and, with no `type` field in `package.json`, sniffs
+`import`/`export` syntax to decide a file is ESM. Mocha tries a dynamic
+`import()` before falling back to `require()`, so a CommonJS-authored `.ts`
+spec — one using `__dirname`, as the `@iobroker/testing` callers do — gets
+misloaded as ESM and crashes instead of taking the ts-node path. Disabling
+native type stripping restores the fallback. The guard reads Node's own flag
+registry rather than guessing a version, so it is a no-op on Node 20.
+
+```js
+'use strict';
+
+const nodeOption = process.allowedNodeEnvironmentFlags.has('--no-strip-types')
+  ? ['no-strip-types']
+  : [];
+
+module.exports = {
+  require: ['ts-node/register'],
+  spec: ['test/**/*.test.ts'],
+  timeout: 10000,
+  recursive: true,
+  ...(nodeOption.length ? { 'node-option': nodeOption } : {}),
+};
 ```
 
 - [ ] **Step 4: Create `eslint.config.mjs` with the purity rule**
@@ -6737,6 +6753,38 @@ if (require.main !== module) {
 }
 ```
 
+- [ ] **Step 3b: Add the metadata `tests.packageFiles` requires**
+
+The package test introduced in this task validates adapter metadata, so this
+task must supply it. Add to `package.json`:
+
+```json
+  "repository": { "type": "git", "url": "git+https://github.com/GalusPeres/ioBroker.hometiles.git" },
+  "bugs": { "url": "https://github.com/GalusPeres/ioBroker.hometiles/issues" },
+  "homepage": "https://github.com/GalusPeres/ioBroker.hometiles#readme",
+```
+
+Adjust the owner if this repository ends up elsewhere; the test checks shape,
+not reachability.
+
+Add to `io-package.json` under `common`:
+
+```json
+    "icon": "hometiles.png",
+    "extIcon": "https://raw.githubusercontent.com/GalusPeres/ioBroker.hometiles/main/admin/hometiles.png",
+```
+
+`common.icon` names a file that must exist under `admin/`. Create a placeholder
+so the gate is honest rather than pointing at nothing:
+
+```bash
+mkdir -p admin
+node -e "require('node:fs').writeFileSync('admin/hometiles.png', Buffer.from('iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNkYPhfDwAChwGA60e6kgAAAABJRU5ErkJggg==','base64'))"
+```
+
+That is a 1x1 transparent PNG standing in for real artwork. Replace it before
+publishing; it exists so the metadata does not reference a missing file.
+
 - [ ] **Step 4: Build and run the package test**
 
 Run: `npm run build && npx mocha test/package.test.ts`
@@ -7471,15 +7519,13 @@ jobs:
       - run: npm test
 ```
 
-- [ ] **Step 5: Add the repository field to `package.json`**
+- [ ] **Step 5: Confirm the package metadata is already present**
 
-```json
-  "repository": { "type": "git", "url": "git+https://github.com/GalusPeres/ioBroker.hometiles.git" },
-  "bugs": { "url": "https://github.com/GalusPeres/ioBroker.hometiles/issues" },
-  "homepage": "https://github.com/GalusPeres/ioBroker.hometiles#readme",
-```
-
-Adjust the owner if this repository lives elsewhere.
+`repository`, `bugs`, `homepage`, `common.icon` and `common.extIcon` were added
+in Task 17, because the `tests.packageFiles` gate introduced there requires
+them. Verify they are present and that `admin/hometiles.png` exists; replace
+that placeholder with real artwork if you have it. Nothing to add here
+otherwise.
 
 - [ ] **Step 6: Verify the whole project one last time**
 
