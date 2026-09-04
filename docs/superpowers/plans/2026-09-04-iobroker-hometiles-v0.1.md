@@ -609,8 +609,18 @@ export function ioStateTopic(baseTopic: string, channelId: string): string {
 }
 
 /**
- * The firmware lowercases the entity id and replaces the domain separator with
- * a slash. See buildHaStatestreamTopic in src/network/mqtt_handlers.cpp.
+ * Builds the retained entity-state topic.
+ *
+ * The firmware's `buildHaStatestreamTopic` (src/network/mqtt_handlers.cpp)
+ * trims the entity id and replaces EVERY '.' with '/', leaving case untouched.
+ * This function lowercases and replaces only the FIRST '.'. The two are
+ * equivalent for every id this adapter can produce: `entity-id.ts` emits
+ * `<domain>.<slug>` where the slug is already lowercase and cannot contain a
+ * dot, because slugify collapses every non-alphanumeric run to '_'. The
+ * lowercasing is defensive, for an id that reaches here from an admin override.
+ * Do not "align" this with the firmware by replacing every dot: a
+ * multi-dot id is a bug upstream, and one slash-joined topic segment per dot
+ * would silently address the wrong entity rather than fail loudly.
  */
 export function entityStateTopic(haPrefix: string, entityId: string): string {
   const dot = entityId.indexOf('.');
