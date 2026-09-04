@@ -3380,6 +3380,7 @@ describe('runtime/dispatcher', () => {
     expect(await d.dispatch({ kind: 'turn_on', entityId: 'switch.evil' })).to.deep.equal({
       ok: false,
       reason: 'unknown_entity',
+      applied: 0,
     });
     expect(writes).to.have.length(0);
   });
@@ -3389,6 +3390,7 @@ describe('runtime/dispatcher', () => {
     expect(await d.dispatch({ kind: 'turn_on', entityId: 'sensor.t' })).to.deep.equal({
       ok: false,
       reason: 'call_not_allowed_for_domain',
+      applied: 0,
     });
     expect(writes).to.have.length(0);
   });
@@ -3398,6 +3400,7 @@ describe('runtime/dispatcher', () => {
     expect(await d.dispatch({ kind: 'set_light', entityId: 'switch.k', brightnessPct: 50 })).to.deep.equal({
       ok: false,
       reason: 'call_not_allowed_for_domain',
+      applied: 0,
     });
   });
 
@@ -3413,6 +3416,7 @@ describe('runtime/dispatcher', () => {
     expect(await d.dispatch({ kind: 'activate_scene', alias: 'nope' })).to.deep.equal({
       ok: false,
       reason: 'unknown_scene',
+      applied: 0,
     });
   });
 
@@ -3424,7 +3428,23 @@ describe('runtime/dispatcher', () => {
     expect(await d.dispatch({ kind: 'turn_on', entityId: 'switch.k' })).to.deep.equal({
       ok: false,
       reason: 'write_failed',
+      applied: 0,
     });
+  });
+
+  it('reports how many writes landed before a mid-sequence failure', async () => {
+    // A light turned on but not dimmed is a different problem from one that
+    // was never touched, and the panel's own display cannot distinguish them.
+    let calls = 0;
+    const failSecond = async (objectId: string, value: unknown): Promise<void> => {
+      calls++;
+      if (calls === 2) throw new Error('not writable');
+      writes.push([objectId, value]);
+    };
+    const d = new Dispatcher(lookup([LIGHT]), failSecond, silentLog);
+    const result = await d.dispatch({ kind: 'set_light', entityId: 'light.d', state: 'on', brightnessPct: 42 });
+    expect(result).to.deep.equal({ ok: false, reason: 'write_failed', applied: 1 });
+    expect(writes).to.deep.equal([['hue.0.d.on', true]]);
   });
 });
 ```
@@ -3449,7 +3469,15 @@ export interface EntityLookup {
   bySceneAlias(alias: string): VirtualEntity | undefined;
 }
 
-export type DispatchResult = { ok: true; writes: number } | { ok: false; reason: string };
+export type DispatchResult =
+  | { ok: true; writes: number }
+  /**
+   * `applied` is how many writes already landed before the failure. A device
+   * left half-configured — turned on but not dimmed — must be distinguishable
+   * from one that was never touched, because those are different things to
+   * debug and the panel's own display cannot tell them apart either.
+   */
+  | { ok: false; reason: string; applied: number };
 
 type CallKind = ServiceCall['kind'];
 
@@ -3479,35 +3507,45 @@ export class Dispatcher {
     if (!entity) {
       const reason = call.kind === 'activate_scene' ? 'unknown_scene' : 'unknown_entity';
       this.log.warn(`[Command] Rejected ${call.kind}: ${reason}`);
-      return { ok: false, reason };
+      return { ok: false, reason, applied: 0 };
     }
 
     if (!ALLOWED_CALLS[entity.domain].has(call.kind)) {
       this.log.warn(`[Command] Rejected ${call.kind} for ${entity.entityId}: not allowed for ${entity.domain}`);
-      return { ok: false, reason: 'call_not_allowed_for_domain' };
+      return { ok: false, reason: 'call_not_allowed_for_domain', applied: 0 };
     }
 
     const writes = this.plan(call, entity);
     if (!writes.length) return { ok: true, writes: 0 };
 
-    try {
-      for (const [objectId, value] of writes) {
+    let applied = 0;
+    for (const [channel, objectId, value] of writes) {
+      try {
         await this.write(objectId, value);
+        applied++;
+      } catch (error) {
+        // Name the channel and the count: "failed on dimmer after 1 applied"
+        // tells an operator the lamp is on but not dimmed. "write_failed"
+        // alone sends them looking for a problem that never happened.
+        this.log.error(
+          `[Command] Write failed for ${entity.entityId} on channel ${channel} ` +
+            `after ${applied} of ${writes.length} writes: ${(error as Error).message}`,
+        );
+        return { ok: false, reason: 'write_failed', applied };
       }
-    } catch (error) {
-      this.log.error(`[Command] Write failed for ${entity.entityId}: ${(error as Error).message}`);
-      return { ok: false, reason: 'write_failed' };
     }
 
-    return { ok: true, writes: writes.length };
+    return { ok: true, writes: applied };
   }
 
   /** Resolves a call into concrete writes, skipping channels the device lacks. */
-  private plan(call: ServiceCall, entity: VirtualEntity): Array<[string, unknown]> {
-    const writes: Array<[string, unknown]> = [];
+  private plan(call: ServiceCall, entity: VirtualEntity): Array<[string, string, unknown]> {
+    // [channelName, objectId, value] — the channel name is carried so a failure
+    // can say which capability did not apply.
+    const writes: Array<[string, string, unknown]> = [];
     const push = (channel: string, value: unknown): void => {
       const objectId = entity.source[channel];
-      if (objectId) writes.push([objectId, value]);
+      if (objectId) writes.push([channel, objectId, value]);
     };
 
     switch (call.kind) {
@@ -3546,7 +3584,7 @@ export class Dispatcher {
 - [ ] **Step 4: Run the test to verify it passes**
 
 Run: `npx mocha test/runtime/dispatcher.test.ts`
-Expected: PASS, 13 passing
+Expected: PASS, 14 passing
 
 - [ ] **Step 5: Commit**
 
