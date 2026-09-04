@@ -1794,6 +1794,18 @@ describe('registry/synth light and scene', () => {
     expect(e.attributes.brightness).to.equal(undefined);
   });
 
+  it('omits brightness for a blank dimmer reading instead of reporting zero percent', () => {
+    // Number('') is 0, so a naive coercion would render a lamp at 0% rather
+    // than admitting the level is unknown.
+    const e = synthLight(dimmer, 'light.esstisch', {
+      'hue.0.dim.on': value(true),
+      'hue.0.dim.level': value('   '),
+    });
+    expect(e.state).to.equal('on');
+    expect(e.attributes.brightness).to.equal(undefined);
+    expect(e.attributes.brightness_pct).to.equal(undefined);
+  });
+
   it('renders a scene as a stateless entity that is always available', () => {
     const scene: DeviceInput = {
       objectId: 'scene.0.gute_nacht',
@@ -1836,7 +1848,14 @@ function percentToHaBrightness(percent: number): number {
 function readNumber(device: DeviceInput, name: string, values: Values): number | undefined {
   const read = readChannel(device, name, values);
   if (!read || !isUsable(read.value)) return undefined;
-  const numeric = typeof read.value.val === 'number' ? read.value.val : Number(String(read.value.val));
+  const raw = read.value.val;
+  if (typeof raw === 'number') return Number.isFinite(raw) ? raw : undefined;
+  // The same trap numberToState guards against: Number('') is 0, so a blank
+  // dimmer reading would become brightness 0 and render the lamp as off at 0%.
+  // Blank means the level is unknown, so the attribute is omitted entirely.
+  const text = String(raw).trim();
+  if (!text) return undefined;
+  const numeric = Number(text);
   return Number.isFinite(numeric) ? numeric : undefined;
 }
 
@@ -1956,7 +1975,7 @@ export function synthesise(device: DeviceInput, entityId: string, values: Values
 - [ ] **Step 6: Run the test to verify it passes**
 
 Run: `npx mocha test/registry/synth/light.test.ts`
-Expected: PASS, 10 passing
+Expected: PASS, 11 passing
 
 - [ ] **Step 7: Run the whole suite and lint**
 
