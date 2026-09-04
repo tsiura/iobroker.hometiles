@@ -5554,6 +5554,16 @@ describe('runtime/panel-objects', () => {
     expect(published[0]).to.deep.equal({ topic: 'hometiles/cmnd/display_brightness', payload: '42', retain: false });
   });
 
+  it('refuses a non-finite numeric write instead of publishing it', () => {
+    // NaN and Infinity are numbers, so the already-a-number branch needs its
+    // own finite check. NaN previously published the literal string "NaN" and
+    // Infinity silently clamped to the maximum.
+    const { session, panelObjects, published } = harness();
+    panelObjects.handleControlWrite(session, 'control.display_brightness', Number.NaN);
+    panelObjects.handleControlWrite(session, 'control.display_brightness', Number.POSITIVE_INFINITY);
+    expect(published).to.have.length(0);
+  });
+
   it('clamps a control write outside the allowed range', () => {
     const { session, panelObjects, published } = harness();
     panelObjects.handleControlWrite(session, 'control.display_brightness', 900);
@@ -5814,8 +5824,13 @@ export class PanelObjects {
       return;
     }
 
-    const numeric = typeof value === 'number' ? value : parseFiniteNumber(String(value ?? ''));
-    if (numeric === undefined) return;
+    // The already-a-number branch still needs the finite check: NaN and Infinity
+    // are numbers. Without it NaN publishes the literal string "NaN" and
+    // Infinity silently clamps to the maximum, both of which accept garbage as
+    // though it were a deliberate setting.
+    const raw = typeof value === 'number' ? value : parseFiniteNumber(String(value ?? ''));
+    if (raw === undefined || !Number.isFinite(raw)) return;
+    const numeric = raw;
     const min = def.min ?? Number.NEGATIVE_INFINITY;
     const max = def.max ?? Number.POSITIVE_INFINITY;
     session.publishPanelCommand(def.leaf, String(Math.round(Math.min(max, Math.max(min, numeric)))));
