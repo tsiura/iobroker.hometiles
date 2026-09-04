@@ -91,15 +91,27 @@ function channelName(controlType: string, detectorName: string): string | null {
   const upper = detectorName.toUpperCase();
   if (IGNORED_CHANNELS.has(upper)) return null;
 
-  const dimmerLike = controlType === 'dimmer' || controlType === 'ct' || controlType === 'hue';
-  if (dimmerLike) {
+  // The writable POWER channel, which every downstream module knows as `set`.
+  // The detector spells it three different ways depending on the pattern, and
+  // all three must land here. Verified against
+  // node_modules/@iobroker/type-detector/build/typePatterns.js:
+  //   light                              -> SET(w)
+  //   dimmer                             -> ON_SET(w)
+  //   hue, ct, cie, rgb, rgbSingle,
+  //   rgbwSingle                         -> ON(w)
+  // Missing the bare ON leaves those six types with no `set` channel at all.
+  // The dispatcher then plans a write to `set`, finds nothing in the entity's
+  // source map, writes nothing, and still reports success — so pressing a
+  // colour bulb does nothing and no error is raised anywhere.
+  if (upper === 'ON_SET' || upper === 'ON') return 'set';
+  if (upper === 'ON_ACTUAL') return 'actual';
+
+  // A dimmer's own SET is the brightness LEVEL, not power. Only `dimmer` has
+  // this shape; hue/ct/cie/rgb* carry their level on DIMMER and have no SET.
+  if (controlType === 'dimmer') {
     if (upper === 'SET') return 'dimmer';
     if (upper === 'ACTUAL') return 'dimmer_actual';
-    if (upper === 'ON_SET') return 'set';
-    if (upper === 'ON_ACTUAL') return 'actual';
   }
-  if (upper === 'ON_SET') return 'set';
-  if (upper === 'ON_ACTUAL') return 'actual';
 
   return upper.toLowerCase();
 }

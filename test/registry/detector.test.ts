@@ -80,6 +80,40 @@ describe('registry/detector mapping', () => {
     expect(Object.keys(device!.channels).sort()).to.deep.equal(['actual', 'dimmer']);
   });
 
+  it('maps the bare ON channel of a colour or CT bulb onto set', () => {
+    // hue, ct, cie, rgb, rgbSingle and rgbwSingle all carry power on ON(w),
+    // not ON_SET. Without this the device has no writable power channel and a
+    // tile press silently writes nothing while reporting success.
+    for (const type of ['hue', 'ct', 'cie', 'rgb', 'rgbSingle', 'rgbwSingle']) {
+      const control: DetectedControl = {
+        type,
+        states: [
+          { id: 'hue.0.decke.on', name: 'ON', write: true },
+          { id: 'hue.0.decke.on_actual', name: 'ON_ACTUAL' },
+          { id: 'hue.0.decke.level', name: 'DIMMER', write: true },
+        ],
+      };
+      const device = mapControlToDevice('hue.0.decke', control, META);
+      expect(device, `${type} must map`).to.not.equal(null);
+      expect(device!.channels.set?.objectId, `${type} needs a set channel`).to.equal('hue.0.decke.on');
+      expect(device!.channels.actual?.objectId, `${type} actual`).to.equal('hue.0.decke.on_actual');
+      expect(device!.channels.dimmer?.objectId, `${type} dimmer`).to.equal('hue.0.decke.level');
+    }
+  });
+
+  it('keeps a dimmer SET as the level while ON_SET remains power', () => {
+    const control: DetectedControl = {
+      type: 'dimmer',
+      states: [
+        { id: 'hue.0.decke.level', name: 'SET', write: true },
+        { id: 'hue.0.decke.on', name: 'ON_SET', write: true },
+      ],
+    };
+    const device = mapControlToDevice('hue.0.decke', control, META);
+    expect(device!.channels.dimmer!.objectId).to.equal('hue.0.decke.level');
+    expect(device!.channels.set!.objectId).to.equal('hue.0.decke.on');
+  });
+
   it('keeps a plain switch SET channel as set', () => {
     const control: DetectedControl = {
       type: 'socket',

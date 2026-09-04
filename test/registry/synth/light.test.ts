@@ -106,6 +106,28 @@ describe('registry/synth light and scene', () => {
     expect(e.attributes.max_color_temp_kelvin).to.equal(6500);
   });
 
+  it('does not advertise colour for a single-channel rgb device it cannot write', () => {
+    // rgbSingle/rgbwSingle/cie carry colour on one combined channel that the
+    // dispatcher has no encoder for. Offering the control would be a dead UI.
+    const single: DeviceInput = {
+      objectId: 'zigbee.0.strip',
+      name: 'Strip',
+      detectorType: 'rgbSingle',
+      domain: 'light',
+      channels: {
+        set: { objectId: 'zigbee.0.strip.on', type: 'boolean', write: true },
+        dimmer: { objectId: 'zigbee.0.strip.level', type: 'number', min: 0, max: 100, write: true },
+        rgb: { objectId: 'zigbee.0.strip.rgb', type: 'string', write: true },
+      },
+    };
+    const e = synthLight(single, 'light.strip', {
+      'zigbee.0.strip.on': value(true),
+      'zigbee.0.strip.level': value(40),
+    });
+    expect(e.attributes.supported_color_modes).to.deep.equal(['brightness']);
+    expect(e.attributes.rgb_color).to.equal(undefined);
+  });
+
   it('marks a light unavailable rather than off when every channel is missing', () => {
     const e = synthLight(dimmer, 'light.esstisch', {});
     expect(e.state).to.equal('unavailable');

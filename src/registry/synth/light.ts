@@ -28,7 +28,13 @@ export function synthLight(device: DeviceInput, entityId: string, values: Values
 
   // Colour modes come only from channels that exist. Never from a current value.
   const hasDimmer = Boolean(device.channels.dimmer || device.channels.brightness);
-  const hasRgb = Boolean(device.channels.red && device.channels.green && device.channels.blue) || Boolean(device.channels.rgb);
+  // Colour is advertised ONLY when the three component channels exist, because
+  // those are the only ones the dispatcher can write. rgbSingle, rgbwSingle and
+  // cie carry colour on a single combined channel (rgb / rgbw / cie) that the
+  // v0.1 command path has no encoder for; advertising them would put a colour
+  // picker on the panel whose writes silently do nothing. Such a bulb still
+  // works for on/off, brightness and colour temperature.
+  const hasRgb = Boolean(device.channels.red && device.channels.green && device.channels.blue);
   const hasCt = Boolean(device.channels.temperature);
 
   const modes: string[] = [];
