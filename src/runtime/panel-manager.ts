@@ -51,6 +51,17 @@ export class PanelManager {
       return;
     }
 
+    const clash = [...this.panels.values()].find((other) => other.baseTopic === announcement.baseTopic);
+    if (clash) {
+      // The firmware requires a unique device topic base per panel. Sharing one
+      // means these panels share command AND status topics, so presses and
+      // presence get attributed to whichever session matches first.
+      this.deps.log.warn(
+        `[Panel ${deviceId}] Base topic "${announcement.baseTopic}" is already used by panel ` +
+          `${clash.deviceId}. Give each panel its own device topic base.`,
+      );
+    }
+
     const session = new PanelSession(announcement, this.deps.transport, this.deps.dispatcher, this.deps.log);
     session.onRefreshRequested = (): void => {
       session.pushConfig(this.deps.entities(), true);
@@ -65,8 +76,11 @@ export class PanelManager {
   }
 
   async handleMessage(topic: string, payload: string): Promise<void> {
+    // First match wins. A command carries the entity and the desired state, so
+    // it does not matter which panel sent it — but executing it once per
+    // session would turn one tap into N writes.
     for (const session of this.panels.values()) {
-      await session.handleMessage(topic, payload);
+      if (await session.handleMessage(topic, payload)) return;
     }
   }
 

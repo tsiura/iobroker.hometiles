@@ -132,7 +132,14 @@ export class PanelSession {
     this.transport.publish({ topic: commandTopic(this.baseTopic, leaf), payload, retain: false });
   }
 
-  async handleMessage(topic: string, payload: string): Promise<void> {
+  /**
+   * Returns true when this session owns the topic. The manager uses that to
+   * stop after the first match: command topics are keyed by BASE TOPIC, not
+   * device id, so two panels sharing a base topic would otherwise both execute
+   * the same press — one physical tap becoming two writes, and a toggle
+   * netting to no visible change at all.
+   */
+  async handleMessage(topic: string, payload: string): Promise<boolean> {
     if (topic === bridgeRequestTopic(this.deviceId)) {
       // Signature reset makes the next pushConfig unconditional.
       this.lastSignature = null;
@@ -143,27 +150,28 @@ export class PanelSession {
         // config on the one path where freshness matters most. So an unwired
         // handler is a wiring bug, and it must be loud, not a silent no-op.
         this.log.warn(`[Panel ${this.deviceId}] Refresh requested but no handler is wired`);
-        return;
+        return true;
       }
       this.onRefreshRequested(payload.trim() === 'force');
-      return;
+      return true;
     }
 
     if (topic === stateTopic(this.baseTopic, 'connected')) {
       const text = payload.trim().toLowerCase();
       this.online = text === 'online' || text === 'true' || text === '1' || text === 'on';
-      return;
+      return true;
     }
 
     if (topic === stateTopic(this.baseTopic, 'ip')) {
       this.ip = payload.trim() || null;
-      return;
+      return true;
     }
 
     const leaf = COMMAND_LEAVES.find((candidate) => topic === commandTopic(this.baseTopic, candidate));
-    if (!leaf) return;
+    if (!leaf) return false;
 
     await this.executeCommand(leaf, payload);
+    return true;
   }
 
   /** Set by the manager so a forced refresh can reach the entity registry. */
