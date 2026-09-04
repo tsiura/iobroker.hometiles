@@ -2649,6 +2649,38 @@ describe('protocol/commands', () => {
     expect(() => parseSceneCommand('x'.repeat(300))).to.throw(CommandError);
   });
 
+  it('rejects an absurdly long entity id rather than passing it downstream', () => {
+    const huge = `switch.${'a'.repeat(300)}`;
+    expect(() => parseSwitchCommand(JSON.stringify({ entity_id: huge, state: 'on' }))).to.throw(
+      /entity_id_too_long/,
+    );
+  });
+
+  it('throws rather than returning undefined for an unknown topic leaf', () => {
+    // parseCommand is typed to return a ServiceCall. A caller reaching it with
+    // a wider string must fail loudly, not receive undefined.
+    expect(() => parseCommand('bogus' as 'light', '{}')).to.throw(CommandError);
+  });
+
+  it('preserves a legitimate zero on every numeric field', () => {
+    // Swallowed zeros have been a recurring defect class in this project.
+    expect(parseLightCommand('{"entity_id":"light.d","brightness_pct":0}')).to.deep.equal({
+      kind: 'set_light',
+      entityId: 'light.d',
+      brightnessPct: 0,
+    });
+    expect(parseLightCommand('{"entity_id":"light.d","rgb_color":[0,0,0]}')).to.deep.equal({
+      kind: 'set_light',
+      entityId: 'light.d',
+      rgb: [0, 0, 0],
+    });
+  });
+
+  it('clamps kelvin at both boundaries without rejecting them', () => {
+    expect((parseLightCommand('{"entity_id":"light.d","color_temp_kelvin":1000}') as { kelvin: number }).kelvin).to.equal(1000);
+    expect((parseLightCommand('{"entity_id":"light.d","color_temp_kelvin":15000}') as { kelvin: number }).kelvin).to.equal(15000);
+  });
+
   it('dispatches by topic leaf', () => {
     expect(parseCommand('scene', 'Nacht').kind).to.equal('activate_scene');
     expect(parseCommand('light', '{"entity_id":"light.d","state":"off"}').kind).to.equal('turn_off');
@@ -2687,6 +2719,12 @@ export class CommandError extends Error {
 }
 
 const MAX_SCENE_ALIAS_LENGTH = 128;
+/**
+ * Home Assistant entity ids are far shorter than this; the cap exists for the
+ * same reason the scene alias has one. Every field crossing this boundary is
+ * untrusted, so none of them may be unbounded.
+ */
+const MAX_ENTITY_ID_LENGTH = 255;
 const ENTITY_ID_RE = /^[a-z_]+\.[a-z0-9_]+$/;
 
 function clamp(value: number, min: number, max: number): number {
@@ -2710,6 +2748,7 @@ function requireEntityId(payload: Record<string, unknown>): string {
   const raw = payload.entity_id;
   if (typeof raw !== 'string') throw new CommandError('missing_entity_id');
   const entityId = raw.trim().toLowerCase();
+  if (entityId.length > MAX_ENTITY_ID_LENGTH) throw new CommandError('entity_id_too_long');
   if (!ENTITY_ID_RE.test(entityId)) throw new CommandError('invalid_entity_id');
   return entityId;
 }
@@ -2789,6 +2828,15 @@ export function parseCommand(leaf: 'light' | 'switch' | 'scene', raw: string): S
       return parseSwitchCommand(raw);
     case 'scene':
       return parseSceneCommand(raw);
+    default: {
+      // The union makes this unreachable at compile time, and the `never`
+      // binding keeps that guarantee if a leaf is added. The throw covers the
+      // runtime: this function is typed to return a ServiceCall, so a caller
+      // reaching it with a wider string must fail loudly rather than receive
+      // undefined from a non-optional return type.
+      const unreachable: never = leaf;
+      throw new CommandError(`unsupported_command_leaf_${String(unreachable)}`);
+    }
   }
 }
 ```
@@ -2796,7 +2844,7 @@ export function parseCommand(leaf: 'light' | 'switch' | 'scene', raw: string): S
 - [ ] **Step 4: Run the test to verify it passes**
 
 Run: `npx mocha test/protocol/commands.test.ts`
-Expected: PASS, 15 passing
+Expected: PASS, 19 passing
 
 - [ ] **Step 5: Run the whole suite and lint**
 
