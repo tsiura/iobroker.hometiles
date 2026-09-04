@@ -29,6 +29,18 @@ export class AnnounceError extends Error {
 }
 
 const MAX_LOCAL_IO_CHANNELS = 64;
+/**
+ * Every list in this payload is bounded. The announcement arrives as a retained
+ * MQTT message, so anything able to publish to the config topic can hand us this
+ * blob and we would hold whatever we parsed until the panel is removed. The
+ * caps below are far above what real firmware emits (a panel has tens of tiles,
+ * and HardwareIoManager tops out at 8 channels) and exist only to keep a
+ * malformed or hostile payload from turning into unbounded work and memory.
+ */
+const MAX_ENTITY_LIST = 512;
+const MAX_SCENE_ALIASES = 256;
+/** Parity with the Python bridge's MAX_LOCAL_IO_LEGACY_ENTITY_IDS. */
+const MAX_LEGACY_ENTITY_IDS = 8;
 const CHANNEL_ID_RE = /^[A-Za-z0-9][A-Za-z0-9_.-]{0,63}$/;
 const ENTITY_ID_RE = /^(sensor|switch)\.[a-z0-9][a-z0-9_]{0,254}$/;
 
@@ -40,15 +52,18 @@ const TYPE_ALIASES: Record<string, LocalIoType> = {
   temp: 'temperature',
 };
 
-function asStringArray(value: unknown): string[] {
+function asStringArray(value: unknown, cap: number, code: string): string[] {
   if (!Array.isArray(value)) return [];
+  if (value.length > cap) throw new AnnounceError(code);
   return value.filter((item): item is string => typeof item === 'string' && item.length > 0);
 }
 
-function asStringRecord(value: unknown): Record<string, string> {
+function asStringRecord(value: unknown, cap: number, code: string): Record<string, string> {
   if (!value || typeof value !== 'object' || Array.isArray(value)) return {};
+  const entries = Object.entries(value as Record<string, unknown>);
+  if (entries.length > cap) throw new AnnounceError(code);
   const out: Record<string, string> = {};
-  for (const [key, entry] of Object.entries(value as Record<string, unknown>)) {
+  for (const [key, entry] of entries) {
     if (typeof entry === 'string' && entry.length > 0) out[key] = entry;
   }
   return out;
@@ -78,10 +93,22 @@ export function normaliseLocalIo(raw: unknown): LocalIoChannel[] {
     if (seenIds.has(id)) throw new AnnounceError(`duplicate_local_io_id_${id}`);
     seenIds.add(id);
 
+    // Legacy aliases are best-effort migration aids, not load-bearing state, so
+    // an entry that is not a well-formed entity id is dropped rather than
+    // failing the whole announcement. The count is still capped: an absurd list
+    // is a malformed payload, not a migration.
+    const legacyEntityIds = asStringArray(
+      record.legacy_entity_ids,
+      MAX_LEGACY_ENTITY_IDS,
+      `too_many_legacy_entity_ids_${id}`,
+    )
+      .map((value) => value.trim().toLowerCase())
+      .filter((value) => ENTITY_ID_RE.test(value));
+
     result.push({
       id,
       entityId,
-      legacyEntityIds: asStringArray(record.legacy_entity_ids).map((value) => value.toLowerCase()),
+      legacyEntityIds,
       name: String(record.name ?? '').trim() || id,
       type,
     });
@@ -115,9 +142,9 @@ export function parseAnnouncement(deviceId: string, raw: string): Announcement {
     deviceName: text('device_name', ''),
     manufacturer: text('manufacturer', 'HomeTiles'),
     model: text('model', ''),
-    sensors: asStringArray(payload.sensors),
-    binarySensors: asStringArray(payload.binary_sensors),
-    sceneMap: asStringRecord(payload.scene_map),
+    sensors: asStringArray(payload.sensors, MAX_ENTITY_LIST, 'too_many_sensors'),
+    binarySensors: asStringArray(payload.binary_sensors, MAX_ENTITY_LIST, 'too_many_binary_sensors'),
+    sceneMap: asStringRecord(payload.scene_map, MAX_SCENE_ALIASES, 'too_many_scene_aliases'),
     localIo: normaliseLocalIo(payload.local_io),
   };
 }

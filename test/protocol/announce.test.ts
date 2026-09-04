@@ -87,4 +87,53 @@ describe('protocol/announce', () => {
     const raw = Array.from({ length: 65 }, (_, i) => ({ id: `c${i}`, entity_id: `switch.c${i}`, name: 'C', type: 'relay' }));
     expect(() => normaliseLocalIo(raw)).to.throw(/too_many_local_io_channels/);
   });
+
+  it('accepts exactly the maximum number of channels', () => {
+    const raw = Array.from({ length: 64 }, (_, i) => ({ id: `c${i}`, entity_id: `switch.c${i}`, name: 'C', type: 'relay' }));
+    expect(normaliseLocalIo(raw)).to.have.length(64);
+  });
+
+  it('bounds the sensor and binary sensor lists', () => {
+    const many = Array.from({ length: 513 }, (_, i) => `sensor.s${i}`);
+    expect(() => parseAnnouncement('a1', JSON.stringify({ sensors: many }))).to.throw(/too_many_sensors/);
+    expect(() => parseAnnouncement('a1', JSON.stringify({ binary_sensors: many }))).to.throw(
+      /too_many_binary_sensors/,
+    );
+  });
+
+  it('bounds the scene alias map', () => {
+    const aliases: Record<string, string> = {};
+    for (let i = 0; i < 257; i++) aliases[`alias ${i}`] = `scene.s${i}`;
+    expect(() => parseAnnouncement('a1', JSON.stringify({ scene_map: aliases }))).to.throw(
+      /too_many_scene_aliases/,
+    );
+  });
+
+  it('bounds legacy entity ids per channel', () => {
+    const raw = [
+      {
+        id: 'relay_1',
+        entity_id: 'switch.a',
+        name: 'A',
+        type: 'relay',
+        legacy_entity_ids: Array.from({ length: 9 }, (_, i) => `switch.old${i}`),
+      },
+    ];
+    expect(() => normaliseLocalIo(raw)).to.throw(/too_many_legacy_entity_ids_relay_1/);
+  });
+
+  it('drops a malformed legacy entity id instead of failing the announcement', () => {
+    const raw = [
+      {
+        id: 'relay_1',
+        entity_id: 'switch.a',
+        name: 'A',
+        type: 'relay',
+        legacy_entity_ids: ['switch.old_one', 'not an entity id', 'light.wrong_domain', 'SWITCH.OLD_TWO'],
+      },
+    ];
+    // A legacy alias is a migration aid, not load-bearing state: a bad one is
+    // dropped, and a differently-cased valid one is normalised and kept.
+    expect(normaliseLocalIo(raw)[0]!.legacyEntityIds).to.deep.equal(['switch.old_one', 'switch.old_two']);
+  });
 });
