@@ -1056,6 +1056,36 @@ describe('registry/entity-id', () => {
     expect(resolved['hue.0.a']).to.equal('light.decke');
     expect(resolved['zigbee.0.x']).to.equal('light.decke_2');
   });
+
+  it('reserves a persisted id whose device is currently absent, so it can be reclaimed', () => {
+    // This is the whole reason the reservation pass runs before assignment: an
+    // offline device must find its id waiting for it, not taken by a newcomer.
+    const persisted = { 'hue.0.gone': 'light.decke' };
+    const resolved = resolveEntityIds([{ ...device('zigbee.0.x', 'Decke'), domain: 'light' }], persisted);
+    expect(resolved['zigbee.0.x']).to.equal('light.decke_2');
+
+    // And when the absent device comes back, it reclaims its original id.
+    const afterReturn = resolveEntityIds(
+      [
+        { ...device('zigbee.0.x', 'Decke'), domain: 'light' },
+        { ...device('hue.0.gone', 'Decke'), domain: 'light' },
+      ],
+      { ...persisted, 'zigbee.0.x': 'light.decke_2' },
+    );
+    expect(afterReturn['hue.0.gone']).to.equal('light.decke');
+    expect(afterReturn['zigbee.0.x']).to.equal('light.decke_2');
+  });
+
+  it('slugifies a display name whole instead of splitting it on a dot', () => {
+    // "Sensor v1.2" must not become sensor.2.
+    const resolved = resolveEntityIds([{ ...device('zigbee.0.abc', 'Sensor v1.2'), domain: 'sensor' }], {});
+    expect(resolved['zigbee.0.abc']).to.equal('sensor.sensor_v1_2');
+  });
+
+  it('falls back to the object id tail when the device has no name', () => {
+    const resolved = resolveEntityIds([{ ...device('zigbee.0.kueche', '   '), domain: 'switch' }], {});
+    expect(resolved['zigbee.0.kueche']).to.equal('switch.kueche');
+  });
 });
 ```
 
@@ -1146,14 +1176,18 @@ function sourceSlug(source: string): string {
   return slugify(tail);
 }
 
-export function buildEntityId(domain: Domain, source: string, taken: ReadonlySet<string>): string {
-  const base = `${domain}.${sourceSlug(source)}`;
+function uniqueId(base: string, taken: ReadonlySet<string>): string {
   if (!taken.has(base)) return base;
   for (let suffix = 2; suffix < 10000; suffix++) {
     const candidate = `${base}_${suffix}`;
     if (!taken.has(candidate)) return candidate;
   }
-  throw new Error(`cannot allocate an entity id for ${source}`);
+  throw new Error(`cannot allocate an entity id for ${base}`);
+}
+
+/** Derives an id from an OBJECT ID, whose last dot-separated segment is the name. */
+export function buildEntityId(domain: Domain, source: string, taken: ReadonlySet<string>): string {
+  return uniqueId(`${domain}.${sourceSlug(source)}`, taken);
 }
 
 /**
@@ -1179,8 +1213,13 @@ export function resolveEntityIds(
 
   for (const device of devices) {
     if (resolved[device.objectId]) continue;
-    const nameSource = device.name || device.objectId;
-    const entityId = buildEntityId(device.domain, nameSource, taken);
+    // A display name is slugified WHOLE. Routing it through sourceSlug would
+    // split on the last dot and turn "Sensor v1.2" into the id "sensor.2".
+    // Only an object id has a meaningful dot-separated tail.
+    const name = device.name.trim();
+    const entityId = name
+      ? uniqueId(`${device.domain}.${slugify(name)}`, taken)
+      : buildEntityId(device.domain, device.objectId, taken);
     taken.add(entityId);
     resolved[device.objectId] = entityId;
   }
@@ -1192,7 +1231,7 @@ export function resolveEntityIds(
 - [ ] **Step 5: Run the test to verify it passes**
 
 Run: `npx mocha test/registry/entity-id.test.ts`
-Expected: PASS, 8 passing
+Expected: PASS, 11 passing
 
 - [ ] **Step 6: Commit**
 
