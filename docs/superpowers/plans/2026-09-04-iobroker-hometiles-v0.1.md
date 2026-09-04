@@ -2844,7 +2844,7 @@ export function parseCommand(leaf: 'light' | 'switch' | 'scene', raw: string): S
 - [ ] **Step 4: Run the test to verify it passes**
 
 Run: `npx mocha test/protocol/commands.test.ts`
-Expected: PASS, 19 passing
+Expected: PASS, 20 passing
 
 - [ ] **Step 5: Run the whole suite and lint**
 
