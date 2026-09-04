@@ -5017,6 +5017,28 @@ describe('runtime/panel-objects', () => {
     expect(states[0]![1]).to.equal(1);
   });
 
+  it('ignores a blank numeric stat rather than writing zero', async () => {
+    // Number('') is 0 and 0 is finite, so a bare isFinite guard would write a
+    // confident 0 % brightness for a panel that reported nothing.
+    const { session, panelObjects, states } = harness();
+    await panelObjects.applyPanelStat(session, 'display_brightness', '   ');
+    expect(states).to.have.length(0);
+  });
+
+  it('writes null, not zero, for a blank temperature io stat', async () => {
+    // 0 is a plausible temperature. A DS18B20 that reported nothing must not
+    // render as 0 degrees on a wall panel.
+    const { session, panelObjects, states } = harness();
+    await panelObjects.applyIoStat(session, 'temp_1', '  ');
+    expect(states[0]).to.deep.equal(['panels.a1.io.temp_1', null, true]);
+  });
+
+  it('ignores a blank control write rather than clamping it to the minimum', () => {
+    const { session, panelObjects, published } = harness();
+    panelObjects.handleControlWrite(session, 'control.display_brightness', '   ');
+    expect(published).to.have.length(0);
+  });
+
   it('ignores an unparseable numeric stat rather than writing zero', async () => {
     const { session, panelObjects, states } = harness();
     await panelObjects.applyPanelStat(session, 'display_brightness', 'nonsense');
