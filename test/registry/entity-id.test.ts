@@ -61,4 +61,34 @@ describe('registry/entity-id', () => {
     expect(resolved['hue.0.a']).to.equal('light.decke');
     expect(resolved['zigbee.0.x']).to.equal('light.decke_2');
   });
+
+  it('reserves a persisted id whose device is currently absent, so it can be reclaimed', () => {
+    // This is the whole reason the reservation pass runs before assignment: an
+    // offline device must find its id waiting for it, not taken by a newcomer.
+    const persisted = { 'hue.0.gone': 'light.decke' };
+    const resolved = resolveEntityIds([{ ...device('zigbee.0.x', 'Decke'), domain: 'light' }], persisted);
+    expect(resolved['zigbee.0.x']).to.equal('light.decke_2');
+
+    // And when the absent device comes back, it reclaims its original id.
+    const afterReturn = resolveEntityIds(
+      [
+        { ...device('zigbee.0.x', 'Decke'), domain: 'light' },
+        { ...device('hue.0.gone', 'Decke'), domain: 'light' },
+      ],
+      { ...persisted, 'zigbee.0.x': 'light.decke_2' },
+    );
+    expect(afterReturn['hue.0.gone']).to.equal('light.decke');
+    expect(afterReturn['zigbee.0.x']).to.equal('light.decke_2');
+  });
+
+  it('slugifies a display name whole instead of splitting it on a dot', () => {
+    // "Sensor v1.2" must not become sensor.2.
+    const resolved = resolveEntityIds([{ ...device('zigbee.0.abc', 'Sensor v1.2'), domain: 'sensor' }], {});
+    expect(resolved['zigbee.0.abc']).to.equal('sensor.sensor_v1_2');
+  });
+
+  it('falls back to the object id tail when the device has no name', () => {
+    const resolved = resolveEntityIds([{ ...device('zigbee.0.kueche', '   '), domain: 'switch' }], {});
+    expect(resolved['zigbee.0.kueche']).to.equal('switch.kueche');
+  });
 });
