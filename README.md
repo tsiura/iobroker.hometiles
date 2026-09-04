@@ -21,14 +21,14 @@ npm run check   # lint + build + test
 
 ## Configuration defaults
 
-| Option           | Default            |
+| Option            | Default           |
 | ----------------- | ------------------ |
-| `brokerHost`       | `127.0.0.1`         |
-| `brokerPort`       | `1883`               |
-| `baseTopic`        | `hometiles`          |
-| `haPrefix`          | `ha/statestream`      |
-| `coalesceMs`        | `200`                 |
-| `maxPublishQueue`   | `2000`                |
+| `brokerHost`      | `127.0.0.1`        |
+| `brokerPort`      | `1883`             |
+| `baseTopic`       | `hometiles`        |
+| `haPrefix`        | `ha/statestream`   |
+| `coalesceMs`      | `200`              |
+| `maxPublishQueue` | `2000`             |
 
 ## License
 
