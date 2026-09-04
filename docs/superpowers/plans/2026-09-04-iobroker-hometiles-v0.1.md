@@ -70,7 +70,7 @@ The firmware parses this with **substring scanning, not a JSON parser** (`HaBrid
 
 Metadata sections, scanned separately: `"sensor_meta"`, `"binary_sensor_meta"`, `"light_meta"`, `"switch_meta"`, `"media_player_meta"`, `"climate_meta"`, `"cover_meta"`, `"camera_meta"`, `"weather_meta"`, `"scene_meta"`.
 
-`sensor_meta` entry keys: `entity_id`, `name`, `unit`, `state`, `value`, `state_kind`, `number`, `icon`.
+`sensor_meta` entry keys: `entity_id`, `name`, `unit`, `state`, `value`, `state_kind`, `number`, `icon`. **`state_kind` accepts only `number` or `state`** — `parseSensorMetaSection` stores the key for no other value, and `src/types/sensor/renderer.cpp` branches on exactly those two to choose graph versus history mode. A textual sensor is `state`, not `text`.
 `binary_sensor_meta` entry keys: `entity_id`, `name`, `device_class`, `state`, `on`, `off`, `unknown`, `unavailable`, `icon`, `available`, `last_changed`.
 Every `*_meta` section is additionally scanned for `icon` by `parseIconMetaSections`.
 
@@ -2293,10 +2293,10 @@ describe('protocol/apply', () => {
     });
   });
 
-  it('marks a textual sensor with state_kind text and number false', () => {
+  it('marks a textual sensor with state_kind state and number false', () => {
     const text = e({ entityId: 'sensor.mode', state: 'heating', attributes: { friendly_name: 'Modus' } });
     const parsed = JSON.parse(buildApplyPayload({ entities: [text], sceneMap: {} }));
-    expect(parsed.sensor_meta[0].state_kind).to.equal('text');
+    expect(parsed.sensor_meta[0].state_kind).to.equal('state');
     expect(parsed.sensor_meta[0].number).to.equal(false);
   });
 
@@ -2406,7 +2406,13 @@ function sensorMeta(entities: VirtualEntity[]): Record<string, unknown>[] {
         unit: text(entity.attributes, 'unit_of_measurement') ?? '',
         state: entity.state,
         value: entity.state,
-        state_kind: numeric ? 'number' : 'text',
+        // Firmware accepts only "number" or "state" here: parseSensorMetaSection
+        // in ha_bridge_config.cpp stores the key only for those two values, and
+        // sensor/renderer.cpp branches on them to pick graph vs history mode.
+        // Any other value, including the intuitive "text", is silently dropped
+        // and the panel falls back to a unit-based heuristic that guesses wrong
+        // for a textual sensor that happens to carry a unit.
+        state_kind: numeric ? 'number' : 'state',
         number: numeric,
       };
       const icon = text(entity.attributes, 'icon');
