@@ -2903,9 +2903,26 @@ async function listen(server: Server, port: number): Promise<void> {
   await new Promise<void>((resolve) => server.listen(port, '127.0.0.1', resolve));
 }
 
+/**
+ * Polls until a condition holds, instead of sleeping a fixed interval. A fixed
+ * sleep encodes an assumption about how fast a loopback round trip is, which is
+ * exactly what degrades on a loaded CI runner — the classic source of a test
+ * that passes locally and fails intermittently in CI.
+ */
+async function waitUntil(predicate: () => boolean, timeoutMs = 3000): Promise<void> {
+  const deadline = Date.now() + timeoutMs;
+  for (;;) {
+    if (predicate()) return;
+    if (Date.now() > deadline) throw new Error('timed out waiting for the expected message');
+    await new Promise((resolve) => setTimeout(resolve, 10));
+  }
+}
+
 describe('runtime/mqtt-client', () => {
   const PORT = 18831;
-  let broker: ReturnType<typeof Aedes>;
+  // aedes 0.51.3 ships Aedes as a class, not a callable factory, so
+  // ReturnType<typeof Aedes> does not compile (TS2344). The class IS the type.
+  let broker: Aedes;
   let server: Server;
 
   beforeEach(async () => {
@@ -2929,7 +2946,7 @@ describe('runtime/mqtt-client', () => {
     await client.subscribe('test/topic');
 
     client.publish({ topic: 'test/topic', payload: 'hello', retain: false });
-    await new Promise((resolve) => setTimeout(resolve, 300));
+    await waitUntil(() => received.length > 0);
 
     expect(received).to.deep.equal([['test/topic', 'hello']]);
     await client.disconnect();
@@ -2957,7 +2974,7 @@ describe('runtime/mqtt-client', () => {
     await client.subscribe('early/topic');
     // Re-publish after subscribing so the assertion does not race the flush.
     client.publish({ topic: 'early/topic', payload: 'after', retain: false });
-    await new Promise((resolve) => setTimeout(resolve, 300));
+    await waitUntil(() => received.includes('after'));
 
     expect(received).to.include('after');
     await client.disconnect();
@@ -6551,7 +6568,9 @@ function waitFor<T>(predicate: () => T | undefined, timeoutMs = 3000): Promise<T
 describe('integration round trip', function () {
   this.timeout(20000);
 
-  let broker: ReturnType<typeof Aedes>;
+  // aedes 0.51.3 ships Aedes as a class, not a callable factory, so
+  // ReturnType<typeof Aedes> does not compile (TS2344). The class IS the type.
+  let broker: Aedes;
   let server: Server;
   let adapterMqtt: HomeTilesMqttClient;
   let panelMqtt: MqttClient;
