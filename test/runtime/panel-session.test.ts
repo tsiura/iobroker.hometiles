@@ -203,6 +203,19 @@ describe('runtime/panel-session', () => {
     expect(writes).to.have.length(0);
   });
 
+  it('ignores an implausible reported IP that could redirect pairing credentials', async () => {
+    // stat/ip feeds the pairing flow, which POSTs broker credentials to it.
+    // fetch would read panel.lan@attacker.example as attacker.example.
+    const { session, warnings } = harness();
+    await session.start();
+    await session.handleMessage('hometiles/stat/ip', '192.168.1.40');
+    expect(session.ip).to.equal('192.168.1.40');
+
+    await session.handleMessage('hometiles/stat/ip', 'panel.lan@attacker.example');
+    expect(session.ip, 'the previous good value must stand').to.equal('192.168.1.40');
+    expect(warnings.some((w) => w.includes('implausible reported IP'))).to.equal(true);
+  });
+
   it('tracks panel presence and IP from the retained stat topics', async () => {
     const { session } = harness();
     await session.start();

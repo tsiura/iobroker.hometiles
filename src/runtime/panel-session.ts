@@ -13,6 +13,7 @@ import {
 } from '../protocol/topics';
 import type { VirtualEntity } from '../registry/types';
 import type { Dispatcher } from './dispatcher';
+import { isPlausibleHost } from './pairing';
 import type { Logger, PublishRequest } from './mqtt-client';
 
 export interface PanelTransport {
@@ -179,7 +180,16 @@ export class PanelSession {
     }
 
     if (topic === stateTopic(this.baseTopic, 'ip')) {
-      this.ip = payload.trim() || null;
+      const reported = payload.trim();
+      // stat/ip feeds the pairing flow, which POSTs broker credentials to it.
+      // fetch would read panel.lan@attacker.example as attacker.example, so an
+      // implausible reported value could redirect credentials. This value arrives
+      // over MQTT — it is not a trusted string.
+      if (reported && !isPlausibleHost(reported)) {
+        this.log.warn(`[Panel ${this.deviceId}] implausible reported IP, keeping previous value`);
+        return true;
+      }
+      this.ip = reported || null;
       return true;
     }
 

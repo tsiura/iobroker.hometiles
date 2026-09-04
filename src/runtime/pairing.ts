@@ -26,6 +26,24 @@ export function credentialsFromOptions(options: AdapterOptions): PairingCredenti
   };
 }
 
+/**
+ * A bare host, optionally with a port. Deliberately strict.
+ *
+ * `fetch` follows URL rules, so `panel.lan@attacker.example` resolves to
+ * attacker.example with `panel.lan` discarded as userinfo — one stray character
+ * silently sends broker credentials to a different host. The panel's own
+ * reported IP reaches this function, and that arrives over MQTT, so it is not
+ * a trusted string. Anything carrying `@`, a path, a query, a fragment or
+ * whitespace is refused rather than normalised.
+ *
+ * IPv6 literals are not accepted; the firmware reports IPv4.
+ */
+const HOST_RE = /^[A-Za-z0-9](?:[A-Za-z0-9._-]*[A-Za-z0-9])?(?::\d{1,5})?$/;
+
+export function isPlausibleHost(raw: string): boolean {
+  return HOST_RE.test(raw.trim());
+}
+
 function normaliseHost(raw: string): string {
   return raw.trim().replace(/^https?:\/\//i, '').replace(/\/+$/, '');
 }
@@ -66,7 +84,10 @@ export async function pushCredentials(
   fetchImpl: typeof fetch = fetch,
 ): Promise<PairingResult> {
   const target = normaliseHost(host);
-  if (!target) return { ok: false, reason: 'invalid_host' };
+  if (!target || !isPlausibleHost(target)) {
+    log.warn(`[Pairing] Refused to send credentials to an implausible host`);
+    return { ok: false, reason: 'invalid_host' };
+  }
 
   const form = new URLSearchParams({
     mqtt_host: credentials.host,

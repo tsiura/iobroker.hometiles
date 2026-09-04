@@ -107,6 +107,42 @@ describe('runtime/pairing', () => {
     expect(await pushCredentials('   ', CREDS, silentLog)).to.deep.equal({ ok: false, reason: 'invalid_host' });
   });
 
+  it('refuses a host that would send credentials somewhere else', async () => {
+    // fetch follows URL rules: panel.lan@attacker.example resolves to
+    // attacker.example with panel.lan discarded as userinfo. The panel's own
+    // reported IP reaches this function and arrives over MQTT, so it is not a
+    // trusted string.
+    let called = false;
+    const spy: typeof fetch = async () => {
+      called = true;
+      return new Response('', { status: 200 });
+    };
+    for (const host of [
+      'trusted-panel.lan@attacker.example',
+      '10.0.0.5/../evil',
+      '10.0.0.5?x=1',
+      '10.0.0.5#frag',
+      'has space',
+      '@attacker.example',
+    ]) {
+      const result = await pushCredentials(host, CREDS, silentLog, spy);
+      expect(result, `${host} must be refused`).to.deep.equal({ ok: false, reason: 'invalid_host' });
+    }
+    expect(called, 'no request may be attempted for a refused host').to.equal(false);
+  });
+
+  it('still accepts an ordinary host, with or without a port or scheme', async () => {
+    const seen: string[] = [];
+    const spy: typeof fetch = async (url) => {
+      seen.push(String(url));
+      return new Response('', { status: 200 });
+    };
+    expect(await pushCredentials('10.0.0.5', CREDS, silentLog, spy)).to.deep.equal({ ok: true });
+    expect(await pushCredentials('http://panel-1.lan:8080/', CREDS, silentLog, spy)).to.deep.equal({ ok: true });
+    expect(seen[0]).to.equal('http://10.0.0.5/mqtt');
+    expect(seen[2]).to.equal('http://panel-1.lan:8080/mqtt');
+  });
+
   it('derives credentials from the adapter options', () => {
     const creds = credentialsFromOptions({
       ...DEFAULTS,
