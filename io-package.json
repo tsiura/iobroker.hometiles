@@ -1,0 +1,43 @@
+{
+  "common": {
+    "name": "hometiles",
+    "version": "0.1.0",
+    "news": { "0.1.0": { "en": "Initial release: sensor, binary sensor, switch, light and scene tiles, panel control, local Hardware I/O and pairing." } },
+    "title": "HomeTiles",
+    "titleLang": { "en": "HomeTiles", "de": "HomeTiles" },
+    "desc": { "en": "Connects HomeTiles ESP32 touch panels to ioBroker over MQTT", "de": "Verbindet HomeTiles ESP32 Touch-Panels ueber MQTT mit ioBroker" },
+    "authors": ["Evgenij Cjura"],
+    "keywords": ["hometiles", "esp32", "mqtt", "panel", "display"],
+    "license": "MIT",
+    "platform": "Javascript/Node.js",
+    "mode": "daemon",
+    "type": "visualization",
+    "compact": true,
+    "connectionType": "local",
+    "dataSource": "push",
+    "adminUI": { "config": "json" },
+    "dependencies": [{ "js-controller": ">=5.0.19" }],
+    "messagebox": true
+  },
+  "native": {
+    "brokerHost": "127.0.0.1",
+    "brokerPort": 1883,
+    "brokerTls": false,
+    "brokerUser": "",
+    "brokerPassword": "",
+    "clientId": "iobroker-hometiles",
+    "baseTopic": "hometiles",
+    "haPrefix": "ha/statestream",
+    "coalesceMs": 200,
+    "maxPublishQueue": 2000,
+    "protocolTrace": false,
+    "deviceOverrides": []
+  },
+  "objects": [],
+  "instanceObjects": [
+    { "_id": "info", "type": "channel", "common": { "name": "Information" }, "native": {} },
+    { "_id": "info.connection", "type": "state", "common": { "role": "indicator.connected", "name": "Broker connected", "type": "boolean", "read": true, "write": false, "def": false }, "native": {} },
+    { "_id": "info.panels", "type": "state", "common": { "role": "value", "name": "Announced panels", "type": "number", "read": true, "write": false, "def": 0 }, "native": {} },
+    { "_id": "info.entities", "type": "state", "common": { "role": "value", "name": "Published entities", "type": "number", "read": true, "write": false, "def": 0 }, "native": {} }
+  ]
+}
