@@ -1779,6 +1779,28 @@ describe('registry/synth light and scene', () => {
     expect(e.attributes.max_color_temp_kelvin).to.equal(6500);
   });
 
+  it('does not advertise colour for a single-channel rgb device it cannot write', () => {
+    // rgbSingle/rgbwSingle/cie carry colour on one combined channel that the
+    // dispatcher has no encoder for. Offering the control would be a dead UI.
+    const single: DeviceInput = {
+      objectId: 'zigbee.0.strip',
+      name: 'Strip',
+      detectorType: 'rgbSingle',
+      domain: 'light',
+      channels: {
+        set: { objectId: 'zigbee.0.strip.on', type: 'boolean', write: true },
+        dimmer: { objectId: 'zigbee.0.strip.level', type: 'number', min: 0, max: 100, write: true },
+        rgb: { objectId: 'zigbee.0.strip.rgb', type: 'string', write: true },
+      },
+    };
+    const e = synthLight(single, 'light.strip', {
+      'zigbee.0.strip.on': value(true),
+      'zigbee.0.strip.level': value(40),
+    });
+    expect(e.attributes.supported_color_modes).to.deep.equal(['brightness']);
+    expect(e.attributes.rgb_color).to.equal(undefined);
+  });
+
   it('marks a light unavailable rather than off when every channel is missing', () => {
     const e = synthLight(dimmer, 'light.esstisch', {});
     expect(e.state).to.equal('unavailable');
@@ -1865,7 +1887,13 @@ export function synthLight(device: DeviceInput, entityId: string, values: Values
 
   // Colour modes come only from channels that exist. Never from a current value.
   const hasDimmer = Boolean(device.channels.dimmer || device.channels.brightness);
-  const hasRgb = Boolean(device.channels.red && device.channels.green && device.channels.blue) || Boolean(device.channels.rgb);
+  // Colour is advertised ONLY when the three component channels exist, because
+  // those are the only ones the dispatcher can write. rgbSingle, rgbwSingle and
+  // cie carry colour on a single combined channel (rgb / rgbw / cie) that the
+  // v0.1 command path has no encoder for; advertising them would put a colour
+  // picker on the panel whose writes silently do nothing. Such a bulb still
+  // works for on/off, brightness and colour temperature.
+  const hasRgb = Boolean(device.channels.red && device.channels.green && device.channels.blue);
   const hasCt = Boolean(device.channels.temperature);
 
   const modes: string[] = [];
@@ -1975,7 +2003,7 @@ export function synthesise(device: DeviceInput, entityId: string, values: Values
 - [ ] **Step 6: Run the test to verify it passes**
 
 Run: `npx mocha test/registry/synth/light.test.ts`
-Expected: PASS, 11 passing
+Expected: PASS, 12 passing
 
 - [ ] **Step 7: Run the whole suite and lint**
 
@@ -3728,6 +3756,40 @@ describe('registry/detector mapping', () => {
     expect(Object.keys(device!.channels).sort()).to.deep.equal(['actual', 'dimmer']);
   });
 
+  it('maps the bare ON channel of a colour or CT bulb onto set', () => {
+    // hue, ct, cie, rgb, rgbSingle and rgbwSingle all carry power on ON(w),
+    // not ON_SET. Without this the device has no writable power channel and a
+    // tile press silently writes nothing while reporting success.
+    for (const type of ['hue', 'ct', 'cie', 'rgb', 'rgbSingle', 'rgbwSingle']) {
+      const control: DetectedControl = {
+        type,
+        states: [
+          { id: 'hue.0.decke.on', name: 'ON', write: true },
+          { id: 'hue.0.decke.on_actual', name: 'ON_ACTUAL' },
+          { id: 'hue.0.decke.level', name: 'DIMMER', write: true },
+        ],
+      };
+      const device = mapControlToDevice('hue.0.decke', control, META);
+      expect(device, `${type} must map`).to.not.equal(null);
+      expect(device!.channels.set?.objectId, `${type} needs a set channel`).to.equal('hue.0.decke.on');
+      expect(device!.channels.actual?.objectId, `${type} actual`).to.equal('hue.0.decke.on_actual');
+      expect(device!.channels.dimmer?.objectId, `${type} dimmer`).to.equal('hue.0.decke.level');
+    }
+  });
+
+  it('keeps a dimmer SET as the level while ON_SET remains power', () => {
+    const control: DetectedControl = {
+      type: 'dimmer',
+      states: [
+        { id: 'hue.0.decke.level', name: 'SET', write: true },
+        { id: 'hue.0.decke.on', name: 'ON_SET', write: true },
+      ],
+    };
+    const device = mapControlToDevice('hue.0.decke', control, META);
+    expect(device!.channels.dimmer!.objectId).to.equal('hue.0.decke.level');
+    expect(device!.channels.set!.objectId).to.equal('hue.0.decke.on');
+  });
+
   it('keeps a plain switch SET channel as set', () => {
     const control: DetectedControl = {
       type: 'socket',
@@ -3923,15 +3985,27 @@ function channelName(controlType: string, detectorName: string): string | null {
   const upper = detectorName.toUpperCase();
   if (IGNORED_CHANNELS.has(upper)) return null;
 
-  const dimmerLike = controlType === 'dimmer' || controlType === 'ct' || controlType === 'hue';
-  if (dimmerLike) {
+  // The writable POWER channel, which every downstream module knows as `set`.
+  // The detector spells it three different ways depending on the pattern, and
+  // all three must land here. Verified against
+  // node_modules/@iobroker/type-detector/build/typePatterns.js:
+  //   light                              -> SET(w)
+  //   dimmer                             -> ON_SET(w)
+  //   hue, ct, cie, rgb, rgbSingle,
+  //   rgbwSingle                         -> ON(w)
+  // Missing the bare ON leaves those six types with no `set` channel at all.
+  // The dispatcher then plans a write to `set`, finds nothing in the entity's
+  // source map, writes nothing, and still reports success — so pressing a
+  // colour bulb does nothing and no error is raised anywhere.
+  if (upper === 'ON_SET' || upper === 'ON') return 'set';
+  if (upper === 'ON_ACTUAL') return 'actual';
+
+  // A dimmer's own SET is the brightness LEVEL, not power. Only `dimmer` has
+  // this shape; hue/ct/cie/rgb* carry their level on DIMMER and have no SET.
+  if (controlType === 'dimmer') {
     if (upper === 'SET') return 'dimmer';
     if (upper === 'ACTUAL') return 'dimmer_actual';
-    if (upper === 'ON_SET') return 'set';
-    if (upper === 'ON_ACTUAL') return 'actual';
   }
-  if (upper === 'ON_SET') return 'set';
-  if (upper === 'ON_ACTUAL') return 'actual';
 
   return upper.toLowerCase();
 }
@@ -4077,7 +4151,7 @@ export function applyOverrides(devices: DeviceInput[], overrides: DeviceOverride
 - [ ] **Step 7: Run both tests to verify they pass**
 
 Run: `npx mocha test/registry/detector.test.ts test/registry/overrides.test.ts`
-Expected: PASS, 8 + 8 passing
+Expected: PASS, 11 + 8 passing
 
 - [ ] **Step 8: Commit**
 
