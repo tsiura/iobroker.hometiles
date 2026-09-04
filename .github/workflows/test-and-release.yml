@@ -1,4 +1,7 @@
-name: Test and release
+# Lint, build and test only. There is deliberately no publish step yet: v0.1
+# has never run on hardware, so nothing here should be able to push a release
+# without a human deciding to.
+name: Test
 
 on:
   push:

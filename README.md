@@ -37,6 +37,24 @@ works normally for on/off, brightness and colour temperature; only the
 colour picker is absent. This is intentional, not a bug — a future version
 can add the combined-channel encoder.
 
+## What "supported" means here
+
+Every row above is verified against the HomeTiles firmware's own parser rules —
+read out of its C++ source — and exercised end to end against an in-process MQTT
+broker. **No physical panel has ever run this adapter.**
+
+A green test suite is not evidence of behaviour on a device. These remain
+outstanding and need a real panel:
+
+1. Announcement and configuration push against real firmware, including the
+   panel's Web Admin entity dropdowns populating.
+2. Light popup slider interaction, including the final value on release.
+3. Retained state surviving a panel reboot with the adapter running.
+4. Pairing a factory-fresh panel by IP address.
+5. Local relay and DS18B20 channels on a panel that has them.
+
+Until those are done, treat v0.1 as ready to test, not ready to rely on.
+
 ## Requirements
 
 - ioBroker js-controller 5.0.19 or newer
