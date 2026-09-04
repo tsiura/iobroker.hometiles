@@ -66,6 +66,11 @@ describe('integration round trip', function () {
   let server: Server;
   let adapterMqtt: HomeTilesMqttClient;
   let panelMqtt: MqttClient;
+  // Tracked out here so afterEach can close it even when a test throws. Closing
+  // it only on the success path means a failing assertion leaves a connection
+  // open, and aedes' server.close() then waits for it forever — the suite hangs
+  // instead of reporting the very regression the test exists to catch.
+  let lateMqtt: MqttClient | null = null;
   let registry: EntityRegistry;
   let manager: PanelManager;
   let writes: Array<[string, unknown]>;
@@ -139,6 +144,11 @@ describe('integration round trip', function () {
     registry.dispose();
     await adapterMqtt.disconnect();
     await new Promise<void>((resolve) => panelMqtt.end(true, {}, () => resolve()));
+    if (lateMqtt) {
+      const late = lateMqtt;
+      lateMqtt = null;
+      await new Promise<void>((resolve) => late.end(true, {}, () => resolve()));
+    }
     await new Promise<void>((resolve) => server.close(() => resolve()));
     await new Promise<void>((resolve) => broker.close(() => resolve()));
   });
@@ -189,6 +199,7 @@ describe('integration round trip', function () {
     await waitFor(() => panelInbox.get('ha/e2e/switch/kaffee/state'));
 
     const late = mqtt.connect(`mqtt://127.0.0.1:${PORT}`, { clientId: 'late-panel' });
+    lateMqtt = late;
     await new Promise<void>((resolve) => late.once('connect', () => resolve()));
     const lateInbox = new Map<string, string>();
     late.on('message', (topic, payload) => lateInbox.set(topic, payload.toString('utf8')));
@@ -196,12 +207,20 @@ describe('integration round trip', function () {
 
     const retained = await waitFor(() => lateInbox.get('ha/e2e/switch/kaffee/state'));
     expect(retained).to.equal('off');
-    await new Promise<void>((resolve) => late.end(true, {}, () => resolve()));
+    // No close here on purpose — afterEach owns it, so a failing assertion
+    // above still releases the connection instead of wedging the broker.
   });
 
   it('ignores a malformed announcement without creating a session', async () => {
+    // Waiting for something NOT to happen cannot be polled, so instead publish
+    // a valid announcement afterwards and wait for THAT session to appear. MQTT
+    // delivers in order on one connection, so once the good one has been
+    // handled the bad one certainly has been too — deterministic, and no fixed
+    // sleep to tune.
     panelMqtt.publish('tab5_lvgl/config/bad1/bridge', '{"local_io":[{"id":""}]}', { retain: false });
-    await new Promise((resolve) => setTimeout(resolve, 400));
-    expect(manager.get('bad1')).to.equal(undefined);
+    panelMqtt.publish('tab5_lvgl/config/good1/bridge', ANNOUNCE.replace('e2e1', 'good1'), { retain: false });
+
+    await waitFor(() => manager.get('good1'));
+    expect(manager.get('bad1'), 'a malformed announcement must not create a session').to.equal(undefined);
   });
 });
