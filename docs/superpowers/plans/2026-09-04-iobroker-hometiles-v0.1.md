@@ -4870,7 +4870,6 @@ describe('runtime/panel-session', () => {
 
 ```ts
 import { expect } from 'chai';
-import { parseAnnouncement } from '../../src/protocol/announce';
 import { Dispatcher } from '../../src/runtime/dispatcher';
 import type { PublishRequest } from '../../src/runtime/mqtt-client';
 import { PanelManager } from '../../src/runtime/panel-manager';
