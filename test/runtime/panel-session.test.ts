@@ -54,8 +54,10 @@ function harness() {
     },
     silentLog,
   );
-  const session = new PanelSession(parseAnnouncement('a1', ANNOUNCE), transport, dispatcher, silentLog);
-  return { session, published, subscribed, writes, registryEntities };
+  const warnings: string[] = [];
+  const capturingLog = { ...silentLog, warn: (message: string): void => void warnings.push(message) };
+  const session = new PanelSession(parseAnnouncement('a1', ANNOUNCE), transport, dispatcher, capturingLog);
+  return { session, published, subscribed, writes, registryEntities, warnings };
 }
 
 describe('runtime/panel-session', () => {
@@ -114,13 +116,36 @@ describe('runtime/panel-session', () => {
     expect(published).to.have.length(1);
   });
 
-  it('honours a forced bridge/request from the panel', async () => {
+  it('honours a forced bridge/request through the wired refresh handler', async () => {
+    // The manager owns the live registry, so the session delegates rather than
+    // replaying a cached list — a forced refresh must carry CURRENT state.
     const { session, published } = harness();
     await session.start();
     session.pushConfig([entity({})]);
     published.length = 0;
+
+    let forcedWith: boolean | null = null;
+    session.onRefreshRequested = (forced): void => {
+      forcedWith = forced;
+      session.pushConfig([entity({}), entity({ entityId: 'sensor.fresh' })], true);
+    };
+
     await session.handleMessage('tab5_lvgl/config/a1/bridge/request', 'force');
-    expect(published.some((p) => p.topic === 'tab5_lvgl/config/a1/bridge/apply')).to.equal(true);
+    expect(forcedWith).to.equal(true);
+    const apply = published.find((p) => p.topic === 'tab5_lvgl/config/a1/bridge/apply');
+    expect(apply).to.not.equal(undefined);
+    // The republished config is the handler's current list, not a cached one.
+    expect(JSON.parse(apply!.payload).sensors).to.deep.equal(['sensor.fresh', 'sensor.t']);
+  });
+
+  it('warns instead of silently doing nothing when no refresh handler is wired', async () => {
+    const { session, published, warnings } = harness();
+    await session.start();
+    session.pushConfig([entity({})]);
+    published.length = 0;
+    await session.handleMessage('tab5_lvgl/config/a1/bridge/request', 'force');
+    expect(published).to.have.length(0);
+    expect(warnings.some((w) => w.includes('no handler is wired'))).to.equal(true);
   });
 
   it('publishes a sensor state retained as a bare string', () => {

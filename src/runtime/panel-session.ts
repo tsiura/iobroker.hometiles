@@ -26,8 +26,6 @@ type CommandLeaf = (typeof COMMAND_LEAVES)[number];
 export class PanelSession {
   private lastSignature: string | null = null;
   private lastIconsPayload: string | null = null;
-  /** Entities the last pushConfig call was given, replayed for a self-contained forced refresh. */
-  private lastEntities: VirtualEntity[] | null = null;
   private started = false;
 
   online = false;
@@ -103,7 +101,6 @@ export class PanelSession {
   }
 
   pushConfig(entities: VirtualEntity[], force = false): boolean {
-    this.lastEntities = entities;
     const payload = buildApplyPayload({ entities, sceneMap: this.sceneMap });
     const signature = configSignature(payload);
     if (!force && signature === this.lastSignature) return false;
@@ -140,16 +137,15 @@ export class PanelSession {
       // Signature reset makes the next pushConfig unconditional.
       this.lastSignature = null;
       this.lastIconsPayload = null;
-      const forced = payload.trim() === 'force';
-      if (this.onRefreshRequested) {
-        // The manager owns the live registry: prefer it so the refresh also
-        // republishes current entity state, not just the config blob.
-        this.onRefreshRequested(forced);
-      } else if (this.lastEntities) {
-        // No manager attached (e.g. a bare session): replay the last known
-        // configuration so an explicit request from the panel is still honoured.
-        this.pushConfig(this.lastEntities, true);
+      if (!this.onRefreshRequested) {
+        // The session does not own the entity list — the manager does. Caching
+        // the last pushed list here to republish it would risk replaying STALE
+        // config on the one path where freshness matters most. So an unwired
+        // handler is a wiring bug, and it must be loud, not a silent no-op.
+        this.log.warn(`[Panel ${this.deviceId}] Refresh requested but no handler is wired`);
+        return;
       }
+      this.onRefreshRequested(payload.trim() === 'force');
       return;
     }
 
