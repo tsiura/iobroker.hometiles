@@ -10,7 +10,15 @@ export interface EntityLookup {
   bySceneAlias(alias: string): VirtualEntity | undefined;
 }
 
-export type DispatchResult = { ok: true; writes: number } | { ok: false; reason: string };
+export type DispatchResult =
+  | { ok: true; writes: number }
+  /**
+   * `applied` is how many writes already landed before the failure. A device
+   * left half-configured — turned on but not dimmed — must be distinguishable
+   * from one that was never touched, because those are different things to
+   * debug and the panel's own display cannot tell them apart either.
+   */
+  | { ok: false; reason: string; applied: number };
 
 type CallKind = ServiceCall['kind'];
 
@@ -40,35 +48,45 @@ export class Dispatcher {
     if (!entity) {
       const reason = call.kind === 'activate_scene' ? 'unknown_scene' : 'unknown_entity';
       this.log.warn(`[Command] Rejected ${call.kind}: ${reason}`);
-      return { ok: false, reason };
+      return { ok: false, reason, applied: 0 };
     }
 
     if (!ALLOWED_CALLS[entity.domain].has(call.kind)) {
       this.log.warn(`[Command] Rejected ${call.kind} for ${entity.entityId}: not allowed for ${entity.domain}`);
-      return { ok: false, reason: 'call_not_allowed_for_domain' };
+      return { ok: false, reason: 'call_not_allowed_for_domain', applied: 0 };
     }
 
     const writes = this.plan(call, entity);
     if (!writes.length) return { ok: true, writes: 0 };
 
-    try {
-      for (const [objectId, value] of writes) {
+    let applied = 0;
+    for (const [channel, objectId, value] of writes) {
+      try {
         await this.write(objectId, value);
+        applied++;
+      } catch (error) {
+        // Name the channel and the count: "failed on dimmer after 1 applied"
+        // tells an operator the lamp is on but not dimmed. "write_failed"
+        // alone sends them looking for a problem that never happened.
+        this.log.error(
+          `[Command] Write failed for ${entity.entityId} on channel ${channel} ` +
+            `after ${applied} of ${writes.length} writes: ${(error as Error).message}`,
+        );
+        return { ok: false, reason: 'write_failed', applied };
       }
-    } catch (error) {
-      this.log.error(`[Command] Write failed for ${entity.entityId}: ${(error as Error).message}`);
-      return { ok: false, reason: 'write_failed' };
     }
 
-    return { ok: true, writes: writes.length };
+    return { ok: true, writes: applied };
   }
 
   /** Resolves a call into concrete writes, skipping channels the device lacks. */
-  private plan(call: ServiceCall, entity: VirtualEntity): Array<[string, unknown]> {
-    const writes: Array<[string, unknown]> = [];
+  private plan(call: ServiceCall, entity: VirtualEntity): Array<[string, string, unknown]> {
+    // [channelName, objectId, value] — the channel name is carried so a failure
+    // can say which capability did not apply.
+    const writes: Array<[string, string, unknown]> = [];
     const push = (channel: string, value: unknown): void => {
       const objectId = entity.source[channel];
-      if (objectId) writes.push([objectId, value]);
+      if (objectId) writes.push([channel, objectId, value]);
     };
 
     switch (call.kind) {

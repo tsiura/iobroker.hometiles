@@ -111,6 +111,7 @@ describe('runtime/dispatcher', () => {
     expect(await d.dispatch({ kind: 'turn_on', entityId: 'switch.evil' })).to.deep.equal({
       ok: false,
       reason: 'unknown_entity',
+      applied: 0,
     });
     expect(writes).to.have.length(0);
   });
@@ -120,6 +121,7 @@ describe('runtime/dispatcher', () => {
     expect(await d.dispatch({ kind: 'turn_on', entityId: 'sensor.t' })).to.deep.equal({
       ok: false,
       reason: 'call_not_allowed_for_domain',
+      applied: 0,
     });
     expect(writes).to.have.length(0);
   });
@@ -129,6 +131,7 @@ describe('runtime/dispatcher', () => {
     expect(await d.dispatch({ kind: 'set_light', entityId: 'switch.k', brightnessPct: 50 })).to.deep.equal({
       ok: false,
       reason: 'call_not_allowed_for_domain',
+      applied: 0,
     });
   });
 
@@ -144,6 +147,7 @@ describe('runtime/dispatcher', () => {
     expect(await d.dispatch({ kind: 'activate_scene', alias: 'nope' })).to.deep.equal({
       ok: false,
       reason: 'unknown_scene',
+      applied: 0,
     });
   });
 
@@ -155,6 +159,22 @@ describe('runtime/dispatcher', () => {
     expect(await d.dispatch({ kind: 'turn_on', entityId: 'switch.k' })).to.deep.equal({
       ok: false,
       reason: 'write_failed',
+      applied: 0,
     });
+  });
+
+  it('reports how many writes landed before a mid-sequence failure', async () => {
+    // A light turned on but not dimmed is a different problem from one that
+    // was never touched, and the panel's own display cannot distinguish them.
+    let calls = 0;
+    const failSecond = async (objectId: string, value: unknown): Promise<void> => {
+      calls++;
+      if (calls === 2) throw new Error('not writable');
+      writes.push([objectId, value]);
+    };
+    const d = new Dispatcher(lookup([LIGHT]), failSecond, silentLog);
+    const result = await d.dispatch({ kind: 'set_light', entityId: 'light.d', state: 'on', brightnessPct: 42 });
+    expect(result).to.deep.equal({ ok: false, reason: 'write_failed', applied: 1 });
+    expect(writes).to.deep.equal([['hue.0.d.on', true]]);
   });
 });
