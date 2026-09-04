@@ -750,6 +750,55 @@ describe('protocol/announce', () => {
     const raw = Array.from({ length: 65 }, (_, i) => ({ id: `c${i}`, entity_id: `switch.c${i}`, name: 'C', type: 'relay' }));
     expect(() => normaliseLocalIo(raw)).to.throw(/too_many_local_io_channels/);
   });
+
+  it('accepts exactly the maximum number of channels', () => {
+    const raw = Array.from({ length: 64 }, (_, i) => ({ id: `c${i}`, entity_id: `switch.c${i}`, name: 'C', type: 'relay' }));
+    expect(normaliseLocalIo(raw)).to.have.length(64);
+  });
+
+  it('bounds the sensor and binary sensor lists', () => {
+    const many = Array.from({ length: 513 }, (_, i) => `sensor.s${i}`);
+    expect(() => parseAnnouncement('a1', JSON.stringify({ sensors: many }))).to.throw(/too_many_sensors/);
+    expect(() => parseAnnouncement('a1', JSON.stringify({ binary_sensors: many }))).to.throw(
+      /too_many_binary_sensors/,
+    );
+  });
+
+  it('bounds the scene alias map', () => {
+    const aliases: Record<string, string> = {};
+    for (let i = 0; i < 257; i++) aliases[`alias ${i}`] = `scene.s${i}`;
+    expect(() => parseAnnouncement('a1', JSON.stringify({ scene_map: aliases }))).to.throw(
+      /too_many_scene_aliases/,
+    );
+  });
+
+  it('bounds legacy entity ids per channel', () => {
+    const raw = [
+      {
+        id: 'relay_1',
+        entity_id: 'switch.a',
+        name: 'A',
+        type: 'relay',
+        legacy_entity_ids: Array.from({ length: 9 }, (_, i) => `switch.old${i}`),
+      },
+    ];
+    expect(() => normaliseLocalIo(raw)).to.throw(/too_many_legacy_entity_ids_relay_1/);
+  });
+
+  it('drops a malformed legacy entity id instead of failing the announcement', () => {
+    const raw = [
+      {
+        id: 'relay_1',
+        entity_id: 'switch.a',
+        name: 'A',
+        type: 'relay',
+        legacy_entity_ids: ['switch.old_one', 'not an entity id', 'light.wrong_domain', 'SWITCH.OLD_TWO'],
+      },
+    ];
+    // A legacy alias is a migration aid, not load-bearing state: a bad one is
+    // dropped, and a differently-cased valid one is normalised and kept.
+    expect(normaliseLocalIo(raw)[0]!.legacyEntityIds).to.deep.equal(['switch.old_one', 'switch.old_two']);
+  });
 });
 ```
 
@@ -792,6 +841,18 @@ export class AnnounceError extends Error {
 }
 
 const MAX_LOCAL_IO_CHANNELS = 64;
+/**
+ * Every list in this payload is bounded. The announcement arrives as a retained
+ * MQTT message, so anything able to publish to the config topic can hand us this
+ * blob and we would hold whatever we parsed until the panel is removed. The
+ * caps below are far above what real firmware emits (a panel has tens of tiles,
+ * and HardwareIoManager tops out at 8 channels) and exist only to keep a
+ * malformed or hostile payload from turning into unbounded work and memory.
+ */
+const MAX_ENTITY_LIST = 512;
+const MAX_SCENE_ALIASES = 256;
+/** Parity with the Python bridge's MAX_LOCAL_IO_LEGACY_ENTITY_IDS. */
+const MAX_LEGACY_ENTITY_IDS = 8;
 const CHANNEL_ID_RE = /^[A-Za-z0-9][A-Za-z0-9_.-]{0,63}$/;
 const ENTITY_ID_RE = /^(sensor|switch)\.[a-z0-9][a-z0-9_]{0,254}$/;
 
@@ -803,15 +864,18 @@ const TYPE_ALIASES: Record<string, LocalIoType> = {
   temp: 'temperature',
 };
 
-function asStringArray(value: unknown): string[] {
+function asStringArray(value: unknown, cap: number, code: string): string[] {
   if (!Array.isArray(value)) return [];
+  if (value.length > cap) throw new AnnounceError(code);
   return value.filter((item): item is string => typeof item === 'string' && item.length > 0);
 }
 
-function asStringRecord(value: unknown): Record<string, string> {
+function asStringRecord(value: unknown, cap: number, code: string): Record<string, string> {
   if (!value || typeof value !== 'object' || Array.isArray(value)) return {};
+  const entries = Object.entries(value as Record<string, unknown>);
+  if (entries.length > cap) throw new AnnounceError(code);
   const out: Record<string, string> = {};
-  for (const [key, entry] of Object.entries(value as Record<string, unknown>)) {
+  for (const [key, entry] of entries) {
     if (typeof entry === 'string' && entry.length > 0) out[key] = entry;
   }
   return out;
@@ -841,10 +905,22 @@ export function normaliseLocalIo(raw: unknown): LocalIoChannel[] {
     if (seenIds.has(id)) throw new AnnounceError(`duplicate_local_io_id_${id}`);
     seenIds.add(id);
 
+    // Legacy aliases are best-effort migration aids, not load-bearing state, so
+    // an entry that is not a well-formed entity id is dropped rather than
+    // failing the whole announcement. The count is still capped: an absurd list
+    // is a malformed payload, not a migration.
+    const legacyEntityIds = asStringArray(
+      record.legacy_entity_ids,
+      MAX_LEGACY_ENTITY_IDS,
+      `too_many_legacy_entity_ids_${id}`,
+    )
+      .map((value) => value.trim().toLowerCase())
+      .filter((value) => ENTITY_ID_RE.test(value));
+
     result.push({
       id,
       entityId,
-      legacyEntityIds: asStringArray(record.legacy_entity_ids).map((value) => value.toLowerCase()),
+      legacyEntityIds,
       name: String(record.name ?? '').trim() || id,
       type,
     });
@@ -878,9 +954,9 @@ export function parseAnnouncement(deviceId: string, raw: string): Announcement {
     deviceName: text('device_name', ''),
     manufacturer: text('manufacturer', 'HomeTiles'),
     model: text('model', ''),
-    sensors: asStringArray(payload.sensors),
-    binarySensors: asStringArray(payload.binary_sensors),
-    sceneMap: asStringRecord(payload.scene_map),
+    sensors: asStringArray(payload.sensors, MAX_ENTITY_LIST, 'too_many_sensors'),
+    binarySensors: asStringArray(payload.binary_sensors, MAX_ENTITY_LIST, 'too_many_binary_sensors'),
+    sceneMap: asStringRecord(payload.scene_map, MAX_SCENE_ALIASES, 'too_many_scene_aliases'),
     localIo: normaliseLocalIo(payload.local_io),
   };
 }
@@ -889,7 +965,7 @@ export function parseAnnouncement(deviceId: string, raw: string): Announcement {
 - [ ] **Step 4: Run the test to verify it passes**
 
 Run: `npx mocha test/protocol/announce.test.ts`
-Expected: PASS, 9 passing
+Expected: PASS, 14 passing
 
 - [ ] **Step 5: Commit**
 
