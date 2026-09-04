@@ -5127,6 +5127,20 @@ export const PANEL_SETTING_DEFS: readonly PanelSettingDef[] = [
 const LEGACY_BRIGHTNESS_MIN = 121;
 const LEGACY_BRIGHTNESS_MAX = 255;
 
+/**
+ * Number('') and Number('   ') are both 0, and 0 is finite, so a bare
+ * Number()+isFinite guard silently turns a blank payload into a confident zero.
+ * That is the same defect class already fixed in the synthesis helpers: here it
+ * would write 0 % brightness, or 0 °C for a temperature channel that reported
+ * nothing. Blank means unknown, so it yields undefined and the caller decides.
+ */
+function parseFiniteNumber(raw: string): number | undefined {
+  const text = raw.trim();
+  if (!text) return undefined;
+  const numeric = Number(text);
+  return Number.isFinite(numeric) ? numeric : undefined;
+}
+
 /** The firmware's older protocol encoded 1..100 percent as 121..255. */
 function decodeBrightness(raw: number): number {
   if (raw <= 100) return Math.round(raw);
@@ -5210,8 +5224,8 @@ export class PanelObjects {
       return;
     }
 
-    const numeric = Number(payload.trim());
-    if (!Number.isFinite(numeric)) return;
+    const numeric = parseFiniteNumber(payload);
+    if (numeric === undefined) return;
     const value = def.leaf.endsWith('brightness') ? decodeBrightness(numeric) : Math.round(numeric);
     await this.store.setState(id, value, true);
   }
@@ -5227,9 +5241,10 @@ export class PanelObjects {
       return;
     }
 
-    // An unavailable sensor must stay null. Zero would be a plausible temperature.
-    const numeric = Number(text);
-    await this.store.setState(id, Number.isFinite(numeric) ? numeric : null, true);
+    // An unavailable sensor must stay null. Zero is a plausible temperature, so
+    // a blank or non-numeric payload must never be coerced into one.
+    const numeric = parseFiniteNumber(text);
+    await this.store.setState(id, numeric ?? null, true);
   }
 
   handleControlWrite(session: PanelSession, path: string, value: unknown): void {
@@ -5255,8 +5270,8 @@ export class PanelObjects {
       return;
     }
 
-    const numeric = Number(value);
-    if (!Number.isFinite(numeric)) return;
+    const numeric = typeof value === 'number' ? value : parseFiniteNumber(String(value ?? ''));
+    if (numeric === undefined || !Number.isFinite(numeric)) return;
     const min = def.min ?? Number.NEGATIVE_INFINITY;
     const max = def.max ?? Number.POSITIVE_INFINITY;
     session.publishPanelCommand(def.leaf, String(Math.round(Math.min(max, Math.max(min, numeric)))));
