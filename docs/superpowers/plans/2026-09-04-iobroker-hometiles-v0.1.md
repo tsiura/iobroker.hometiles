@@ -4845,6 +4845,19 @@ describe('runtime/panel-session', () => {
     expect(writes).to.have.length(0);
   });
 
+  it('ignores an implausible reported IP that could redirect pairing credentials', async () => {
+    // stat/ip feeds the pairing flow, which POSTs broker credentials to it.
+    // fetch would read panel.lan@attacker.example as attacker.example.
+    const { session, warnings } = harness();
+    await session.start();
+    await session.handleMessage('hometiles/stat/ip', '192.168.1.40');
+    expect(session.ip).to.equal('192.168.1.40');
+
+    await session.handleMessage('hometiles/stat/ip', 'panel.lan@attacker.example');
+    expect(session.ip, 'the previous good value must stand').to.equal('192.168.1.40');
+    expect(warnings.some((w) => w.includes('implausible reported IP'))).to.equal(true);
+  });
+
   it('tracks panel presence and IP from the retained stat topics', async () => {
     const { session } = harness();
     await session.start();
@@ -5016,6 +5029,7 @@ import {
 import type { VirtualEntity } from '../registry/types';
 import type { Dispatcher } from './dispatcher';
 import type { Logger, PublishRequest } from './mqtt-client';
+import { isPlausibleHost } from './pairing';
 
 export interface PanelTransport {
   publish(request: PublishRequest): void;
@@ -5167,7 +5181,15 @@ export class PanelSession {
     }
 
     if (topic === stateTopic(this.baseTopic, 'ip')) {
-      this.ip = payload.trim() || null;
+      // This value reaches the pairing flow, which POSTs broker credentials to
+      // it. It arrives over MQTT, so anything able to publish here could
+      // otherwise redirect those credentials to a host of its choosing.
+      const reported = payload.trim();
+      if (reported && !isPlausibleHost(reported)) {
+        this.log.warn(`[Panel ${this.deviceId}] Ignored an implausible reported IP address`);
+        return true;
+      }
+      this.ip = reported || null;
       return true;
     }
 
@@ -6033,6 +6055,42 @@ describe('runtime/pairing', () => {
     expect(await pushCredentials('   ', CREDS, silentLog)).to.deep.equal({ ok: false, reason: 'invalid_host' });
   });
 
+  it('refuses a host that would send credentials somewhere else', async () => {
+    // fetch follows URL rules: panel.lan@attacker.example resolves to
+    // attacker.example with panel.lan discarded as userinfo. The panel's own
+    // reported IP reaches this function and arrives over MQTT, so it is not a
+    // trusted string.
+    let called = false;
+    const spy: typeof fetch = async () => {
+      called = true;
+      return new Response('', { status: 200 });
+    };
+    for (const host of [
+      'trusted-panel.lan@attacker.example',
+      '10.0.0.5/../evil',
+      '10.0.0.5?x=1',
+      '10.0.0.5#frag',
+      'has space',
+      '@attacker.example',
+    ]) {
+      const result = await pushCredentials(host, CREDS, silentLog, spy);
+      expect(result, `${host} must be refused`).to.deep.equal({ ok: false, reason: 'invalid_host' });
+    }
+    expect(called, 'no request may be attempted for a refused host').to.equal(false);
+  });
+
+  it('still accepts an ordinary host, with or without a port or scheme', async () => {
+    const seen: string[] = [];
+    const spy: typeof fetch = async (url) => {
+      seen.push(String(url));
+      return new Response('', { status: 200 });
+    };
+    expect(await pushCredentials('10.0.0.5', CREDS, silentLog, spy)).to.deep.equal({ ok: true });
+    expect(await pushCredentials('http://panel-1.lan:8080/', CREDS, silentLog, spy)).to.deep.equal({ ok: true });
+    expect(seen[0]).to.equal('http://10.0.0.5/mqtt');
+    expect(seen[2]).to.equal('http://panel-1.lan:8080/mqtt');
+  });
+
   it('derives credentials from the adapter options', () => {
     const creds = credentialsFromOptions({
       ...DEFAULTS,
@@ -6089,6 +6147,24 @@ export function credentialsFromOptions(options: AdapterOptions): PairingCredenti
   };
 }
 
+/**
+ * A bare host, optionally with a port. Deliberately strict.
+ *
+ * `fetch` follows URL rules, so `panel.lan@attacker.example` resolves to
+ * attacker.example with `panel.lan` discarded as userinfo — one stray character
+ * silently sends broker credentials to a different host. The panel's own
+ * reported IP reaches this function, and that arrives over MQTT, so it is not
+ * a trusted string. Anything carrying `@`, a path, a query, a fragment or
+ * whitespace is refused rather than normalised.
+ *
+ * IPv6 literals are not accepted; the firmware reports IPv4.
+ */
+const HOST_RE = /^[A-Za-z0-9](?:[A-Za-z0-9._-]*[A-Za-z0-9])?(?::\d{1,5})?$/;
+
+export function isPlausibleHost(raw: string): boolean {
+  return HOST_RE.test(raw.trim());
+}
+
 function normaliseHost(raw: string): string {
   return raw.trim().replace(/^https?:\/\//i, '').replace(/\/+$/, '');
 }
@@ -6129,7 +6205,10 @@ export async function pushCredentials(
   fetchImpl: typeof fetch = fetch,
 ): Promise<PairingResult> {
   const target = normaliseHost(host);
-  if (!target) return { ok: false, reason: 'invalid_host' };
+  if (!target || !isPlausibleHost(target)) {
+    log.warn(`[Pairing] Refused to send credentials to an implausible host`);
+    return { ok: false, reason: 'invalid_host' };
+  }
 
   const form = new URLSearchParams({
     mqtt_host: credentials.host,
