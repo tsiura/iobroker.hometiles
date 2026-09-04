@@ -1251,7 +1251,7 @@ git commit -m "feat(registry): virtual entity types and rename-stable entity ids
 **Interfaces:**
 - Consumes: `DeviceInput`, `SourceValue`, `VirtualEntity`, `STATE_*` from `src/registry/types`.
 - Produces: `synthSensor(device, entityId, values): VirtualEntity`, `synthBinarySensor(device, entityId, values): VirtualEntity`, `synthSwitch(device, entityId, values): VirtualEntity`. All three take `values: Readonly<Record<string, SourceValue | null | undefined>>` keyed by ioBroker state id.
-- Also produces the shared helper module `src/registry/synth/common.ts` exporting `readValue(device, channel, values): SourceValue | null`, `isUsable(value: SourceValue | null | undefined): boolean`, `toBoolState(raw: unknown): string`.
+- Also produces the shared helper module `src/registry/synth/common.ts` exporting `readChannel(device, name, values): ChannelRead | null`, `isUsable(value: SourceValue | null | undefined): boolean`, `toBoolState(raw: unknown): string`.
 
 - [ ] **Step 1: Write the failing test**
 
@@ -1381,6 +1381,29 @@ describe('registry/synth simple domains', () => {
     expect(e.state).to.equal('off');
   });
 
+  it('treats an empty or blank numeric value as unknown, never as zero', () => {
+    // Number('') and Number('   ') are both 0 in JavaScript. A blank reading
+    // must not render as a confident 0 on a panel.
+    for (const blank of ['', '   ', '\t']) {
+      const e = synthSensor(tempDevice, 'sensor.wohnzimmer', { 'zigbee.0.temp.value': value(blank) });
+      expect(e.state, `blank ${JSON.stringify(blank)} must be unknown`).to.equal('unknown');
+      expect(e.available).to.equal(true);
+    }
+  });
+
+  it('leaves lastChanged at zero when no source value has ever been seen', () => {
+    // Substituting Date.now() here would make a permanently dead entity look
+    // freshly changed on every synthesis pass.
+    const e = synthSensor(tempDevice, 'sensor.wohnzimmer', {});
+    expect(e.lastChanged).to.equal(0);
+  });
+
+  it('carries the source timestamp into lastChanged', () => {
+    // The value() helper stamps ts = NOW; its second argument is quality.
+    const e = synthSensor(tempDevice, 'sensor.wohnzimmer', { 'zigbee.0.temp.value': value(21.5) });
+    expect(e.lastChanged).to.equal(NOW);
+  });
+
   it('reports assumed_state when the device offers no feedback channel', () => {
     const setOnly: DeviceInput = {
       ...socketDevice,
@@ -1443,7 +1466,15 @@ export function toBoolState(raw: unknown): string {
 }
 
 export function numberToState(raw: unknown): string {
-  const numeric = typeof raw === 'number' ? raw : Number(String(raw).trim());
+  if (typeof raw === 'number') {
+    return Number.isFinite(raw) ? String(raw) : STATE_UNKNOWN;
+  }
+  // Number('') and Number('   ') are both 0. Coercing here would turn a present
+  // but empty value into a confident "0" on a wall panel, which is exactly the
+  // swallowed zero this module exists to prevent. Blank is unknown, not zero.
+  const text = String(raw).trim();
+  if (!text) return STATE_UNKNOWN;
+  const numeric = Number(text);
   if (!Number.isFinite(numeric)) return STATE_UNKNOWN;
   return String(numeric);
 }
@@ -1462,7 +1493,12 @@ export function baseEntity(
   }
   const friendly: Record<string, unknown> = { friendly_name: device.name || entityId };
   if (device.icon) friendly.icon = device.icon;
-  return { source, lastChanged: lastChanged || Date.now(), friendly };
+  // 0 means "never observed" and is deliberately NOT replaced with Date.now():
+  // that would re-evaluate on every synthesis, so an entity whose source has
+  // never produced a value would look freshly changed on every pass. Consumers
+  // must treat 0 as unknown — see buildApplyPayload, which omits last_changed
+  // rather than publishing a fabricated timestamp.
+  return { source, lastChanged, friendly };
 }
 
 export const UNAVAILABLE = STATE_UNAVAILABLE;
@@ -1605,7 +1641,7 @@ export function synthSwitch(device: DeviceInput, entityId: string, values: Value
 - [ ] **Step 7: Run the test to verify it passes**
 
 Run: `npx mocha test/registry/synth/simple-domains.test.ts`
-Expected: PASS, 13 passing
+Expected: PASS, 15 passing
 
 - [ ] **Step 8: Commit**
 
@@ -2220,6 +2256,15 @@ describe('protocol/apply', () => {
     expect(meta.icon).to.equal('mdi:door');
   });
 
+  it('omits last_changed entirely when the source has never produced a value', () => {
+    // lastChanged 0 means never observed. Publishing unixSeconds(0) would claim
+    // the entity last changed in 1970; fabricating a current timestamp would
+    // make a dead entity look fresh on every push.
+    const never = e({ entityId: 'binary_sensor.n', domain: 'binary_sensor', state: 'unavailable', available: false, lastChanged: 0, attributes: { friendly_name: 'N' } });
+    const parsed = JSON.parse(buildApplyPayload({ entities: [never], sceneMap: {} }));
+    expect(parsed.binary_sensor_meta[0]).to.not.have.property('last_changed');
+  });
+
   it('reports an unavailable entity as available false in its metadata', () => {
     const gone = e({ entityId: 'binary_sensor.g', domain: 'binary_sensor', state: 'unavailable', available: false, attributes: { friendly_name: 'G' } });
     const parsed = JSON.parse(buildApplyPayload({ entities: [gone], sceneMap: {} }));
@@ -2329,8 +2374,12 @@ function binarySensorMeta(entities: VirtualEntity[]): Record<string, unknown>[] 
         unknown: 'unknown',
         unavailable: 'unavailable',
         available: entity.available,
-        last_changed: unixSeconds(entity.lastChanged),
       };
+      // lastChanged 0 means the source has never produced a value. Publishing
+      // unixSeconds(0) would tell the panel this entity last changed in 1970,
+      // and fabricating Date.now() would make a dead entity look fresh on every
+      // push. Omitting the key lets the firmware's scanner simply not find it.
+      if (entity.lastChanged > 0) meta.last_changed = unixSeconds(entity.lastChanged);
       const icon = text(entity.attributes, 'icon');
       if (icon) meta.icon = icon;
       return meta;
@@ -2416,7 +2465,7 @@ export { buildIconsPayload } from './apply';
 - [ ] **Step 5: Run the test to verify it passes**
 
 Run: `npx mocha test/protocol/apply.test.ts`
-Expected: PASS, 11 passing
+Expected: PASS, 12 passing
 
 - [ ] **Step 6: Commit**
 
