@@ -71,8 +71,20 @@ export const DETECTOR_TYPE_TO_DOMAIN: Record<string, Domain> = {
  */
 const LIGHTING_TYPES = ['light', 'dimmer', 'ct', 'hue', 'cie', 'rgb', 'rgbSingle', 'rgbwSingle'];
 
-/** Channels that carry diagnostics rather than anything a tile renders. */
+/**
+ * Channels no v0.1 tile renders. Dropping them is not cosmetic: every channel
+ * that survives becomes a foreign-state subscription and an entity recompute
+ * on each change. A power-metering bulb reports ELECTRIC_POWER every few
+ * seconds, so keeping it would wake the registry constantly to recompute an
+ * entity whose rendered state cannot have changed.
+ *
+ * Two groups:
+ *  - diagnostics and telemetry the panel never shows
+ *  - writable capabilities v0.1 exposes no control for
+ * Add a name back here the day a tile actually renders it.
+ */
 const IGNORED_CHANNELS = new Set([
+  // diagnostics
   'UNREACH',
   'LOWBAT',
   'MAINTAIN',
@@ -80,6 +92,18 @@ const IGNORED_CHANNELS = new Set([
   'WORKING',
   'DIRECTION',
   'CONNECTED',
+  'RSSI',
+  'BATTERY',
+  // energy telemetry, and the noisiest of the lot
+  'ELECTRIC_POWER',
+  'CURRENT',
+  'VOLTAGE',
+  'CONSUMPTION',
+  'FREQUENCY',
+  // writable, but no v0.1 control drives them
+  'EFFECT',
+  'TRANSITION_TIME',
+  'ON_TIME',
 ]);
 
 /**

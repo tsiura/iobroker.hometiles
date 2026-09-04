@@ -138,6 +138,30 @@ describe('registry/detector mapping', () => {
     expect(Object.keys(device!.channels)).to.deep.equal(['set']);
   });
 
+  it('drops telemetry and effect channels from a power-metering bulb', () => {
+    const control: DetectedControl = {
+      type: 'ct',
+      states: [
+        { id: 'zig.0.b.on', name: 'ON', write: true },
+        { id: 'zig.0.b.on_actual', name: 'ON_ACTUAL' },
+        { id: 'zig.0.b.level', name: 'DIMMER', write: true },
+        { id: 'zig.0.b.ct', name: 'TEMPERATURE', write: true },
+        { id: 'zig.0.b.power', name: 'ELECTRIC_POWER' },
+        { id: 'zig.0.b.voltage', name: 'VOLTAGE' },
+        { id: 'zig.0.b.rssi', name: 'RSSI' },
+        { id: 'zig.0.b.battery', name: 'BATTERY' },
+        { id: 'zig.0.b.effect', name: 'EFFECT', write: true },
+      ],
+    };
+    const device = mapControlToDevice('zig.0.b', control, {});
+    expect(Object.keys(device!.channels).sort()).to.deep.equal([
+      'actual',
+      'dimmer',
+      'set',
+      'temperature',
+    ]);
+  });
+
   it('returns null when the control has no usable channel left after filtering', () => {
     const control: DetectedControl = { type: 'socket', states: [{ id: 'shelly.0.plug.unreach', name: 'UNREACH' }] };
     expect(mapControlToDevice('shelly.0.plug', control, META)).to.equal(null);
