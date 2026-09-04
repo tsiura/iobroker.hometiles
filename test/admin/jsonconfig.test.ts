@@ -40,6 +40,7 @@ describe('admin/jsonConfig', () => {
 
   it('covers every native key with a field so nothing is silently unconfigurable', () => {
     const keys = new Set(boundNativeKeys());
+    expect(Object.keys(ioPackage.native).length, 'native must not be empty').to.be.greaterThan(5);
     for (const key of Object.keys(ioPackage.native)) {
       expect(keys, `no UI field binds native.${key}`).to.include(key);
     }
@@ -81,5 +82,31 @@ describe('admin/jsonConfig', () => {
     const en = JSON.parse(readFileSync(path.join(__dirname, '../../admin/i18n/en.json'), 'utf8'));
     const de = JSON.parse(readFileSync(path.join(__dirname, '../../admin/i18n/de.json'), 'utf8'));
     expect(Object.keys(de).sort()).to.deep.equal(Object.keys(en).sort());
+  });
+
+  it('defines every identifier the UI actually references', () => {
+    // Matching en against de is not enough: a label added to jsonConfig.json
+    // and omitted from BOTH files leaves the two in agreement while the UI
+    // renders the raw key id. This checks the referenced-vs-defined direction.
+    const referenced = new Set<string>();
+    const walk = (node: unknown): void => {
+      if (!node || typeof node !== 'object') return;
+      const record = node as Record<string, unknown>;
+      for (const prop of ['label', 'title', 'text', 'help']) {
+        const value = record[prop];
+        if (typeof value === 'string' && value) referenced.add(value);
+      }
+      for (const value of Object.values(record)) walk(value);
+    };
+    walk(config.items);
+
+    const en = JSON.parse(readFileSync(path.join(__dirname, '../../admin/i18n/en.json'), 'utf8'));
+    const de = JSON.parse(readFileSync(path.join(__dirname, '../../admin/i18n/de.json'), 'utf8'));
+
+    expect(referenced.size, 'the walk must actually find identifiers').to.be.greaterThan(20);
+    for (const key of referenced) {
+      expect(en, `en.json is missing "${key}"`).to.have.property(key);
+      expect(de, `de.json is missing "${key}"`).to.have.property(key);
+    }
   });
 });
