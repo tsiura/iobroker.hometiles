@@ -3814,6 +3814,32 @@ describe('registry/detector mapping', () => {
     expect(Object.keys(device!.channels)).to.deep.equal(['set']);
   });
 
+  it('keeps a real bulb down to the channels a tile actually uses', () => {
+    // Every surviving channel becomes a foreign-state subscription and a
+    // recompute trigger. A metering bulb reports power every few seconds.
+    const control: DetectedControl = {
+      type: 'ct',
+      states: [
+        { id: 'zig.0.b.on', name: 'ON', write: true },
+        { id: 'zig.0.b.on_actual', name: 'ON_ACTUAL' },
+        { id: 'zig.0.b.level', name: 'DIMMER', write: true },
+        { id: 'zig.0.b.ct', name: 'TEMPERATURE', write: true },
+        { id: 'zig.0.b.power', name: 'ELECTRIC_POWER' },
+        { id: 'zig.0.b.voltage', name: 'VOLTAGE' },
+        { id: 'zig.0.b.rssi', name: 'RSSI' },
+        { id: 'zig.0.b.battery', name: 'BATTERY' },
+        { id: 'zig.0.b.effect', name: 'EFFECT', write: true },
+      ],
+    };
+    const device = mapControlToDevice('zig.0.b', control, {});
+    expect(Object.keys(device!.channels).sort()).to.deep.equal([
+      'actual',
+      'dimmer',
+      'set',
+      'temperature',
+    ]);
+  });
+
   it('returns null when the control has no usable channel left after filtering', () => {
     const control: DetectedControl = { type: 'socket', states: [{ id: 'shelly.0.plug.unreach', name: 'UNREACH' }] };
     expect(mapControlToDevice('shelly.0.plug', control, META)).to.equal(null);
@@ -3965,8 +3991,20 @@ export const DETECTOR_TYPE_TO_DOMAIN: Record<string, Domain> = {
  */
 const LIGHTING_TYPES = ['light', 'dimmer', 'ct', 'hue', 'cie', 'rgb', 'rgbSingle', 'rgbwSingle'];
 
-/** Channels that carry diagnostics rather than anything a tile renders. */
+/**
+ * Channels no v0.1 tile renders. Dropping them is not cosmetic: every channel
+ * that survives becomes a foreign-state subscription and an entity recompute
+ * on each change. A power-metering bulb reports ELECTRIC_POWER every few
+ * seconds, so keeping it would wake the registry constantly to recompute an
+ * entity whose rendered state cannot have changed.
+ *
+ * Two groups:
+ *  - diagnostics and telemetry the panel never shows
+ *  - writable capabilities v0.1 exposes no control for
+ * Add a name back here the day a tile actually renders it.
+ */
 const IGNORED_CHANNELS = new Set([
+  // diagnostics
   'UNREACH',
   'LOWBAT',
   'MAINTAIN',
@@ -3974,6 +4012,18 @@ const IGNORED_CHANNELS = new Set([
   'WORKING',
   'DIRECTION',
   'CONNECTED',
+  'RSSI',
+  'BATTERY',
+  // energy telemetry, and the noisiest of the lot
+  'ELECTRIC_POWER',
+  'CURRENT',
+  'VOLTAGE',
+  'CONSUMPTION',
+  'FREQUENCY',
+  // writable, but no v0.1 control drives them
+  'EFFECT',
+  'TRANSITION_TIME',
+  'ON_TIME',
 ]);
 
 /**
@@ -4151,7 +4201,7 @@ export function applyOverrides(devices: DeviceInput[], overrides: DeviceOverride
 - [ ] **Step 7: Run both tests to verify they pass**
 
 Run: `npx mocha test/registry/detector.test.ts test/registry/overrides.test.ts`
-Expected: PASS, 11 + 8 passing
+Expected: PASS, 12 + 8 passing
 
 - [ ] **Step 8: Commit**
 
