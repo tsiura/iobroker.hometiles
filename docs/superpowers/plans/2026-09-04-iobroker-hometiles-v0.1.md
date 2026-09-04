@@ -5118,7 +5118,7 @@ export class PanelManager {
 - [ ] **Step 5: Run the test to verify it passes**
 
 Run: `npx mocha test/runtime/panel-session.test.ts`
-Expected: PASS, 15 passing
+Expected: PASS, 16 passing
 
 - [ ] **Step 6: Commit**
 
