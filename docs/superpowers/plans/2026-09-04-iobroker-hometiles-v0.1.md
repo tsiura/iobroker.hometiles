@@ -10,6 +10,24 @@
 
 **Spec:** `docs/superpowers/specs/2026-09-04-hometiles-iobroker-adapter-design.md`
 
+## Running the tests
+
+`.mocharc.json` sets `spec` to the whole `test/` tree, and mocha MERGES a file
+argument with that rather than replacing it. So `npx mocha test/foo.test.ts`
+runs the entire suite and prints the full-suite total, and so does
+`--spec`. That is harmless — a stricter run — but it means the
+"Expected: PASS, N passing" figure in each task is the count for **that task's
+own `describe` block**, not the number mocha prints at the end.
+
+To actually isolate one suite, grep its describe name:
+
+```bash
+npx mocha --grep 'registry/entity-registry'
+```
+
+Report both when a task asks for a count: the suite's own figure and the
+full-suite total.
+
 ## Global Constraints
 
 Every task's requirements implicitly include this section.
@@ -4235,7 +4253,6 @@ git commit -m "feat(registry): type-detector mapping to v0.1 domains with object
 
 Coalescing rule from the Global Constraints: a chatty source cannot flood a panel, and the trailing edge is always delivered so the final value is never lost. The registry schedules one timer per entity; the timer fires with whatever the newest value is at that moment.
 
-`now` is injectable so the tests do not depend on wall-clock timing.
 
 - [ ] **Step 1: Write the failing test**
 
