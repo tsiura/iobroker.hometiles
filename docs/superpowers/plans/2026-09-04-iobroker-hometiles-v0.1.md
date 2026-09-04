@@ -3249,6 +3249,11 @@ Expected, and confirmed against **@iobroker/type-detector 6.0.1** while this pla
 - `DetectOptions` carries `objects`, `id`, `ignoreIndicators?`, `allowedTypes?`, `limitTypesToOneOf?`, `_keysOptional?`, `_keysOptionalSorted?`, `_usedIdsOptional?`
 - `PatternControl` is `{ type: Types; states: DetectorState[] }`; each `DetectorState` carries `id`, `name` (the upper-case TAG), `write?` and `defaultRole?`
 - `Types` is a string enum. The members this adapter maps are exactly: `socket`, `light`, `dimmer`, `rgb`, `rgbSingle`, `rgbwSingle`, `hue`, `ct`, `cie`, `temperature`, `humidity`, `illuminance`, `pressure`, `weatherCurrent`, `info`, `window`, `windowTilt`, `door`, `contact`, `motion`, `fireAlarm`, `floodAlarm`, `coAlarm`, `warning`, `button`, `buttonSensor`
+- **`ChannelDetector` is the DEFAULT export, not a named one.** `require('@iobroker/type-detector').ChannelDetector` is `undefined`; the constructor is `.default`. The module's own keys are `roleOrEnumLight`, `roleOrEnumBlind`, `roleOrEnumWindow`, `roleOrEnumDoor`, `roleOrEnumGate`, `Types`, `StateType`, `default`. Confirm with:
+
+```bash
+node -e "const m=require('@iobroker/type-detector'); console.log(Object.keys(m), typeof m.default, m.default && m.default.name)"
+```
 
 There is **no** `flood`, `occupancy`, `switch` or `brightness` member. Do not invent one; an unlisted type is simply left unmapped and its device is skipped.
 
@@ -3598,22 +3603,34 @@ export function mapControlToDevice(
  * Thin wrapper around @iobroker/type-detector. Kept deliberately small: all
  * behaviour lives in mapControlToDevice, which needs no library and no adapter.
  */
+interface DetectRequest {
+  id: string;
+  objects: Record<string, unknown>;
+  _keysOptional?: string[];
+  _keysOptionalSorted?: boolean;
+  _usedIdsOptional?: string[];
+  ignoreIndicators?: string[];
+  limitTypesToOneOf?: string[][];
+}
+
+type DetectorCtor = new () => { detect(options: DetectRequest): DetectedControl[] | null };
+
 export function createIoBrokerDetector(objects: Record<string, unknown>): DetectorPort {
-  // Imported lazily so the pure mapping stays usable in tests without the dep.
+  // Required lazily so the pure mapping stays usable in tests without the dep.
+  //
+  // In 6.x ChannelDetector is the DEFAULT export, not a named one: destructuring
+  // `{ ChannelDetector }` yields undefined and throws at `new`. Verified against
+  // the installed 6.0.1, whose module keys are roleOrEnum*, Types, StateType and
+  // default. The named fallback keeps this working if a version re-adds it.
   // eslint-disable-next-line @typescript-eslint/no-var-requires
-  const { ChannelDetector } = require('@iobroker/type-detector') as {
-    ChannelDetector: new () => {
-      detect(options: {
-        id: string;
-        objects: Record<string, unknown>;
-        _keysOptional?: string[];
-        _keysOptionalSorted?: boolean;
-        _usedIdsOptional?: string[];
-        ignoreIndicators?: string[];
-        limitTypesToOneOf?: string[][];
-      }): DetectedControl[] | null;
-    };
+  const detectorModule = require('@iobroker/type-detector') as {
+    default?: DetectorCtor;
+    ChannelDetector?: DetectorCtor;
   };
+  const ChannelDetector = detectorModule.default ?? detectorModule.ChannelDetector;
+  if (typeof ChannelDetector !== 'function') {
+    throw new Error('@iobroker/type-detector: ChannelDetector constructor not found');
+  }
 
   const detector = new ChannelDetector();
   const keys = Object.keys(objects).sort();
