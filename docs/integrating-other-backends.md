@@ -75,13 +75,17 @@ of that is the thing to measure, not assume.
 
 Worth it if panels must work off-LAN. Otherwise Option 1 dominates.
 
-## Option 3 — replace the transport entirely (not recommended)
+## Option 3 — replace the transport entirely (not recommended *for this goal*)
 
 Rewriting the panel to use WebSocket or HTTP long-polling means rewriting
 `mqtt_handlers.cpp` (~2,755 lines) plus the dynamic routing, retained-state
 handling and last-will semantics that MQTT provides for free. MQTT is already
 the right protocol for this problem: pub/sub, retained state, LWT presence.
 Replacing it buys nothing and discards a working contract.
+
+This verdict is scoped to the goal above — reaching a cloud from panels that
+still live on a LAN. If the product itself is cloud-native, the calculus
+changes and the appendix at the end of this document works through it.
 
 ## Option 4 — the HTTP admin API (LAN-only, not a state channel)
 
