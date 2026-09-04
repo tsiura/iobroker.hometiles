@@ -2993,6 +2993,32 @@ describe('runtime/mqtt-client', () => {
     expect(logger.warnings.length).to.be.lessThan(10, 'drop warnings must be rate-limited');
   });
 
+  it('survives a throwing message handler instead of crashing the process', async () => {
+    // mqtt.js emits synchronously, so an unguarded throw here escapes into the
+    // library and kills the adapter. The protocol parsers these handlers feed
+    // throw by design on malformed input arriving from the network.
+    const logger = silentLogger();
+    const client = new HomeTilesMqttClient({ ...DEFAULTS, brokerPort: PORT }, logger);
+    const seen: string[] = [];
+    client.onMessage((_topic, payload) => {
+      seen.push(payload);
+      throw new Error('handler exploded');
+    });
+
+    await client.connect();
+    await client.subscribe('boom/topic');
+    client.publish({ topic: 'boom/topic', payload: 'first', retain: false });
+    await waitUntil(() => seen.length > 0);
+
+    // Still alive and still delivering after the throw.
+    client.publish({ topic: 'boom/topic', payload: 'second', retain: false });
+    await waitUntil(() => seen.length > 1);
+    expect(seen).to.deep.equal(['first', 'second']);
+    expect(client.connected).to.equal(true);
+
+    await client.disconnect();
+  });
+
   it('is idempotent on repeated disconnect', async () => {
     const client = new HomeTilesMqttClient({ ...DEFAULTS, brokerPort: PORT }, silentLogger());
     await client.connect();
@@ -3083,14 +3109,23 @@ export class HomeTilesMqttClient {
     });
     this.client = client;
 
+    // Every dispatch into caller code is isolated. mqtt.js emits synchronously,
+    // so a throw from a handler escapes into the library's emit and takes down
+    // the adapter process. The protocol parsers these handlers feed THROW by
+    // design on malformed input, and that input arrives from the network, so
+    // this is the difference between one rejected payload and a crash loop.
     client.on('message', (topic, payload) => {
-      this.messageHandler?.(topic, payload.toString('utf8'));
+      try {
+        this.messageHandler?.(topic, payload.toString('utf8'));
+      } catch (error) {
+        this.log.error(`[MQTT] Message handler failed for ${topic}: ${(error as Error).message}`);
+      }
     });
 
     client.on('connect', () => {
       this.isConnected = true;
       this.log.info('[MQTT] Connected to broker');
-      this.connectionHandler?.(true);
+      this.notifyConnection(true);
       this.flush();
     });
 
@@ -3100,7 +3135,7 @@ export class HomeTilesMqttClient {
       if (!this.isConnected) return;
       this.isConnected = false;
       this.log.warn('[MQTT] Connection closed');
-      this.connectionHandler?.(false);
+      this.notifyConnection(false);
     });
 
     client.on('error', (error) => this.log.error(`[MQTT] ${error.message}`));
@@ -3125,7 +3160,16 @@ export class HomeTilesMqttClient {
     await new Promise<void>((resolve) => client.end(true, {}, () => resolve()));
     if (this.isConnected) {
       this.isConnected = false;
-      this.connectionHandler?.(false);
+      this.notifyConnection(false);
+    }
+  }
+
+  /** Same isolation as the message path: a throwing consumer must not crash us. */
+  private notifyConnection(connected: boolean): void {
+    try {
+      this.connectionHandler?.(connected);
+    } catch (error) {
+      this.log.error(`[MQTT] Connection handler failed: ${(error as Error).message}`);
     }
   }
 
@@ -3184,7 +3228,7 @@ export class HomeTilesMqttClient {
 - [ ] **Step 4: Run the test to verify it passes**
 
 Run: `npx mocha test/runtime/mqtt-client.test.ts`
-Expected: PASS, 5 passing
+Expected: PASS, 6 passing
 
 - [ ] **Step 5: Commit**
 
