@@ -122,3 +122,109 @@ The parts worth copying rather than rediscovering:
   spelling and present-but-empty sections matter
 - `cmnd/scene` carries plain text; every other command topic carries JSON
 - `state_kind` accepts only `number` or `state`
+
+---
+
+# Appendix: forking the firmware for a cloud-native transport
+
+Question considered: change the firmware so the user enters a cloud URL and a
+token, connects over some purpose-built protocol instead of MQTT, and reuses
+all the HomeTiles graphics.
+
+## Feasibility: high, and the seam is unusually clean
+
+Measured against v0.6.9:
+
+| Area | Lines | Transport-coupled? |
+| --- | --- | --- |
+| `src/ui` + `src/tiles` + `src/types` | 59,097 | no, except 14 files' includes |
+| `src/devices` + `src/core` | 64,017 | no — display, touch, HAL, i18n, power |
+| `src/web` | 33,542 | mostly no — admin UI and its assets |
+| `src/network` | 9,403 | **yes, this is the part you replace** |
+
+The UI talks to the transport through exactly **21 outbound functions**, all
+named `mqttPublish*` / `mqttRequest*`:
+
+```
+mqttPublishLightCommand        mqttPublishSwitchCommand      mqttPublishCoverCommand
+mqttPublishClimateTemperature  mqttPublishClimateHumidity    mqttPublishClimateHvacMode
+mqttPublishClimateFanMode      mqttPublishClimatePresetMode  mqttPublishClimateSwingMode
+mqttPublishClimateHorizontalSwingMode
+mqttPublishMediaCommand        mqttPublishMediaVolume        mqttPublishMediaSeek
+mqttPublishCameraCommand       mqttPublishDeviceSettings     mqttRequestDynamicSlotsReload
+mqttPublishHistoryRequest      mqttPublishStateHistoryRequest
+mqttPublishBinaryHistoryRequest mqttPublishWeatherRequest    mqttPublishEnergyRequest
+```
+
+and the transport reaches back into the UI through roughly **three** entry
+points: `tiles_update_sensor_by_entity`, `tiles_update_weather_by_entity`, and
+`queue_sensor_popup_history`.
+
+That is a genuine interface hiding behind a naming convention. Introducing an
+abstract `PanelTransport` with those ~24 operations, and pointing the 14
+coupled files at it instead of `mqtt_handlers.h`, is mechanical work. The
+plumbing is days, not months.
+
+## What is actually hard
+
+None of the hard parts are the graphics. They are the semantics MQTT was
+providing for free:
+
+**Retained state.** A panel that boots must immediately render current values.
+MQTT retained messages give this at no cost. A raw WebSocket does not — you
+need an explicit `hello` → `full snapshot` handshake, and the server must hold
+per-entity current state. This is the single biggest thing you would be
+rebuilding.
+
+**Presence.** MQTT's last will announces a panel dropping off. Over WebSocket
+you need heartbeats and server-side timeout, and you must decide what a missed
+heartbeat means while someone is standing in front of the panel.
+
+**Offline behaviour.** A LAN broker keeps working during an internet outage. A
+cloud-only panel is a dark rectangle on the wall when the WAN drops. This is a
+product decision, not a technical one: decide now whether the panel caches last
+known state and renders it greyed, or shows a connection error.
+
+**Token entry.** Typing a long token on a touchscreen keyboard is miserable.
+Use the device-code flow televisions use: panel shows a short code, user
+approves on a phone, panel polls for its real credential. The firmware already
+has an on-device keyboard and an HTTPS client, so this is achievable.
+
+**TLS memory.** The MQTT receive path already reaches a 32 KB buffer
+(`kMqttBufferLarge`), and media states approach 24 KB. TLS record buffers and
+handshake state land on top of that. Measure on the tightest target (ESP32-S3)
+before committing; P4 with PSRAM is likely comfortable.
+
+**The entity model.** Decide whether to keep the Home Assistant shaped contract
+or define your own. Keeping it means the existing renderers, popups and
+`state_kind` logic work untouched. Replacing it means touching the 59k lines
+you were trying to reuse. Strong recommendation: keep the shape, change only
+the pipe.
+
+## Protocol suggestion
+
+**WebSocket over TLS carrying the existing JSON payloads.** One outbound
+connection traverses NAT, TLS is standard, tokens fit naturally in the upgrade
+request, and it is bidirectional so commands and state share a socket. Keep the
+payload shapes already documented in `docs/protocol.md` and add a framing
+envelope with a type discriminator and the snapshot handshake.
+
+**MQTT over WSS** is worth considering as the lazier option: it keeps retained
+state, LWT, and every existing payload semantic, and only changes the socket
+underneath. If a cloud broker is acceptable, this is dramatically less work
+than a bespoke protocol and loses almost nothing.
+
+## The cheap option that gets most of the UX
+
+If the goal is really "enter a URL and a token" rather than "own the
+protocol", the smallest viable change is:
+
+1. Swap `NetworkClient` for `NetworkClientSecure` on the MQTT path.
+2. Add CA certificate configuration.
+3. Use the token as the MQTT password.
+4. Point the panel at a managed cloud broker.
+
+That is roughly one file, keeps every semantic the firmware already depends on,
+and gives the user exactly the URL-plus-token experience. Reach for a bespoke
+protocol only when something concrete requires it — per-panel authorisation
+policy, non-MQTT cloud infrastructure, or payloads MQTT genuinely cannot carry.
