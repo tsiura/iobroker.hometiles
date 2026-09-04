@@ -38,7 +38,15 @@ export function toBoolState(raw: unknown): string {
 }
 
 export function numberToState(raw: unknown): string {
-  const numeric = typeof raw === 'number' ? raw : Number(String(raw).trim());
+  if (typeof raw === 'number') {
+    return Number.isFinite(raw) ? String(raw) : STATE_UNKNOWN;
+  }
+  // Number('') and Number('   ') are both 0. Coercing here would turn a present
+  // but empty value into a confident "0" on a wall panel, which is exactly the
+  // swallowed zero this module exists to prevent. Blank is unknown, not zero.
+  const text = String(raw).trim();
+  if (!text) return STATE_UNKNOWN;
+  const numeric = Number(text);
   if (!Number.isFinite(numeric)) return STATE_UNKNOWN;
   return String(numeric);
 }
@@ -57,7 +65,12 @@ export function baseEntity(
   }
   const friendly: Record<string, unknown> = { friendly_name: device.name || entityId };
   if (device.icon) friendly.icon = device.icon;
-  return { source, lastChanged: lastChanged || Date.now(), friendly };
+  // 0 means "never observed" and is deliberately NOT replaced with Date.now():
+  // that would re-evaluate on every synthesis, so an entity whose source has
+  // never produced a value would look freshly changed on every pass. Consumers
+  // must treat 0 as unknown — see buildApplyPayload, which omits last_changed
+  // rather than publishing a fabricated timestamp.
+  return { source, lastChanged, friendly };
 }
 
 export const UNAVAILABLE = STATE_UNAVAILABLE;

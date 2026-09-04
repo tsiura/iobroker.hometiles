@@ -121,6 +121,29 @@ describe('registry/synth simple domains', () => {
     expect(e.state).to.equal('off');
   });
 
+  it('treats an empty or blank numeric value as unknown, never as zero', () => {
+    // Number('') and Number('   ') are both 0 in JavaScript. A blank reading
+    // must not render as a confident 0 on a panel.
+    for (const blank of ['', '   ', '\t']) {
+      const e = synthSensor(tempDevice, 'sensor.wohnzimmer', { 'zigbee.0.temp.value': value(blank) });
+      expect(e.state, `blank ${JSON.stringify(blank)} must be unknown`).to.equal('unknown');
+      expect(e.available).to.equal(true);
+    }
+  });
+
+  it('leaves lastChanged at zero when no source value has ever been seen', () => {
+    // Substituting Date.now() here would make a permanently dead entity look
+    // freshly changed on every synthesis pass.
+    const e = synthSensor(tempDevice, 'sensor.wohnzimmer', {});
+    expect(e.lastChanged).to.equal(0);
+  });
+
+  it('carries the source timestamp into lastChanged', () => {
+    // The value() helper stamps ts = NOW; its second argument is quality.
+    const e = synthSensor(tempDevice, 'sensor.wohnzimmer', { 'zigbee.0.temp.value': value(21.5) });
+    expect(e.lastChanged).to.equal(NOW);
+  });
+
   it('reports assumed_state when the device offers no feedback channel', () => {
     const setOnly: DeviceInput = {
       ...socketDevice,
