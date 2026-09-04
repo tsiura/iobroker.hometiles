@@ -7,23 +7,41 @@ export interface StatePublish {
   retain: true;
 }
 
-/**
- * Domains the firmware consumes as a bare string. See sync_external_temp_entity
- * and the TILE_SENSOR / TILE_SWITCH branches of tiles_update_sensor_by_entity.
- * Everything else that has state is published as a JSON object, matching
- * sync_local_device_entities, which publishes {"state":"on","brightness_pct":N}.
- */
-const BARE_STRING_DOMAINS: ReadonlySet<Domain> = new Set<Domain>(['sensor', 'binary_sensor', 'switch']);
+type PayloadShape = 'bare' | 'json' | 'none';
 
-/** A scene has no state to publish; the panel only ever fires it. */
-const STATELESS_DOMAINS: ReadonlySet<Domain> = new Set<Domain>(['scene']);
+/**
+ * The wire format is domain-dependent, and getting it wrong is visible on a
+ * wall panel as literal JSON text. This is an exhaustive switch with no
+ * `default` on purpose: adding a domain to the `Domain` union without deciding
+ * its payload shape must fail to COMPILE, not silently fall into the JSON
+ * branch. Do not rewrite it as a set membership test with a fallthrough.
+ *
+ * - bare: sync_external_temp_entity publishes a bare dtostrf result or the
+ *   literal "unavailable", and tiles_update_sensor_by_entity consumes the raw
+ *   payload for TILE_SENSOR, TILE_SWITCH and TILE_BINARY_SENSOR.
+ * - json: sync_local_device_entities publishes {"state":"on","brightness_pct":N}.
+ * - none: a scene has no state; the panel only ever fires it.
+ */
+function payloadShape(domain: Domain): PayloadShape {
+  switch (domain) {
+    case 'sensor':
+    case 'binary_sensor':
+    case 'switch':
+      return 'bare';
+    case 'light':
+      return 'json';
+    case 'scene':
+      return 'none';
+  }
+}
 
 export function buildStatePublish(haPrefix: string, entity: VirtualEntity): StatePublish | null {
-  if (STATELESS_DOMAINS.has(entity.domain)) return null;
+  const shape = payloadShape(entity.domain);
+  if (shape === 'none') return null;
 
   const topic = entityStateTopic(haPrefix, entity.entityId);
 
-  if (BARE_STRING_DOMAINS.has(entity.domain)) {
+  if (shape === 'bare') {
     return { topic, payload: entity.state, retain: true };
   }
 

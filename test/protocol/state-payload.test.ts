@@ -1,6 +1,6 @@
 import { expect } from 'chai';
 import { buildStateClear, buildStatePublish } from '../../src/protocol/state-payload';
-import type { VirtualEntity } from '../../src/registry/types';
+import { DOMAINS, type VirtualEntity } from '../../src/registry/types';
 
 function entity(over: Partial<VirtualEntity>): VirtualEntity {
   return {
@@ -93,5 +93,23 @@ describe('protocol/state-payload', () => {
     expect(p.topic).to.equal('ha/statestream/sensor/gone/state');
     expect(p.payload).to.equal('');
     expect(p.retain).to.equal(true);
+  });
+
+  it('assigns every v0.1 domain an explicit payload shape', () => {
+    // Guards the exhaustive switch: a domain added to the union without a
+    // decided payload shape must fail to compile, never default into JSON.
+    // This test pins the runtime half of that contract.
+    const shapes = DOMAINS.map((domain) => {
+      const publish = buildStatePublish('ha/statestream', entity({ entityId: `${domain}.t`, domain, state: 'on' }));
+      if (!publish) return [domain, 'none'] as const;
+      return [domain, publish.payload.startsWith('{') ? 'json' : 'bare'] as const;
+    });
+    expect(Object.fromEntries(shapes)).to.deep.equal({
+      sensor: 'bare',
+      binary_sensor: 'bare',
+      switch: 'bare',
+      light: 'json',
+      scene: 'none',
+    });
   });
 });
