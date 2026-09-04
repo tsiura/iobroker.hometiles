@@ -4863,9 +4863,141 @@ describe('runtime/panel-session', () => {
 });
 ```
 
-- [ ] **Step 2: Run the test to verify it fails**
+- [ ] **Step 1b: Write the failing manager test**
 
-Run: `npx mocha test/runtime/panel-session.test.ts`
+`PanelManager` owns lifecycle the session tests cannot reach. Create
+`test/runtime/panel-manager.test.ts`:
+
+```ts
+import { expect } from 'chai';
+import { parseAnnouncement } from '../../src/protocol/announce';
+import { Dispatcher } from '../../src/runtime/dispatcher';
+import type { PublishRequest } from '../../src/runtime/mqtt-client';
+import { PanelManager } from '../../src/runtime/panel-manager';
+import type { PanelTransport } from '../../src/runtime/panel-session';
+import type { VirtualEntity } from '../../src/registry/types';
+
+function announcement(deviceId: string, baseTopic: string): string {
+  return JSON.stringify({
+    device_id: deviceId,
+    base_topic: baseTopic,
+    ha_prefix: 'ha/statestream',
+    device_name: `Panel ${deviceId}`,
+    model: 'waveshare_touch_lcd_8',
+    sensors: [],
+    binary_sensors: [],
+    scene_map: {},
+    local_io: [],
+  });
+}
+
+const ENTITY: VirtualEntity = {
+  entityId: 'switch.k',
+  domain: 'switch',
+  source: { set: 'shelly.0.on' },
+  state: 'off',
+  attributes: { friendly_name: 'K' },
+  available: true,
+  lastChanged: 1_757_000_000_000,
+};
+
+function harness() {
+  const published: PublishRequest[] = [];
+  const subscribed: string[] = [];
+  const unsubscribed: string[] = [];
+  const warnings: string[] = [];
+  const writes: Array<[string, unknown]> = [];
+  let sessionsChanged = 0;
+
+  const log = {
+    info: (): void => undefined,
+    debug: (): void => undefined,
+    error: (): void => undefined,
+    warn: (message: string): void => void warnings.push(message),
+  };
+  const transport: PanelTransport = {
+    publish: (request) => published.push(request),
+    subscribe: async (topic) => void subscribed.push(topic),
+    unsubscribe: async (topic) => void unsubscribed.push(topic),
+  };
+  const dispatcher = new Dispatcher(
+    { byId: (id) => (id === ENTITY.entityId ? ENTITY : undefined), bySceneAlias: () => undefined },
+    async (objectId, value) => void writes.push([objectId, value]),
+    log,
+  );
+  const manager = new PanelManager({
+    transport,
+    dispatcher,
+    log,
+    entities: () => [ENTITY],
+    onSessionsChanged: () => {
+      sessionsChanged++;
+    },
+  });
+  return { manager, published, subscribed, unsubscribed, warnings, writes, log, sessions: () => sessionsChanged };
+}
+
+describe('runtime/panel-manager', () => {
+  it('creates a session and pushes config plus current state on announcement', async () => {
+    const { manager, published } = harness();
+    await manager.handleAnnouncement('a1', announcement('a1', 'panel-a'));
+    expect(manager.get('a1')).to.not.equal(undefined);
+    expect(published.some((p) => p.topic === 'tab5_lvgl/config/a1/bridge/apply')).to.equal(true);
+    expect(published.some((p) => p.topic === 'ha/statestream/switch/k/state')).to.equal(true);
+  });
+
+  it('rejects a malformed announcement without creating a session', async () => {
+    const { manager, warnings } = harness();
+    await manager.handleAnnouncement('bad', '{"local_io":[{"id":""}]}');
+    expect(manager.get('bad')).to.equal(undefined);
+    expect(warnings.some((w) => w.includes('Rejected announcement'))).to.equal(true);
+  });
+
+  it('treats an empty retained announcement as the panel withdrawing itself', async () => {
+    const { manager, unsubscribed } = harness();
+    await manager.handleAnnouncement('a1', announcement('a1', 'panel-a'));
+    unsubscribed.length = 0;
+    await manager.handleAnnouncement('a1', '');
+    expect(manager.get('a1')).to.equal(undefined);
+    expect(unsubscribed.length).to.be.greaterThan(0);
+  });
+
+  it('updates an existing panel rather than creating a duplicate', async () => {
+    const { manager } = harness();
+    await manager.handleAnnouncement('a1', announcement('a1', 'panel-a'));
+    await manager.handleAnnouncement('a1', announcement('a1', 'panel-a-renamed'));
+    expect(manager.sessions()).to.have.length(1);
+    expect(manager.get('a1')!.baseTopic).to.equal('panel-a-renamed');
+  });
+
+  it('executes a shared-base-topic command exactly once, not once per panel', async () => {
+    // base_topic defaults to "hometiles" when omitted, so two panels can end up
+    // sharing one command channel. Executing per session would turn one tap
+    // into two writes, and a toggle into no visible change.
+    const { manager, writes, warnings } = harness();
+    await manager.handleAnnouncement('a1', announcement('a1', 'shared'));
+    await manager.handleAnnouncement('a2', announcement('a2', 'shared'));
+    expect(warnings.some((w) => w.includes('already used by panel'))).to.equal(true);
+
+    await manager.handleMessage('shared/cmnd/switch', '{"entity_id":"switch.k","state":"on"}');
+    expect(writes).to.deep.equal([['shelly.0.on', true]]);
+  });
+
+  it('releases subscriptions for every panel on stopAll', async () => {
+    const { manager, unsubscribed } = harness();
+    await manager.handleAnnouncement('a1', announcement('a1', 'panel-a'));
+    await manager.handleAnnouncement('a2', announcement('a2', 'panel-b'));
+    unsubscribed.length = 0;
+    await manager.stopAll();
+    expect(manager.sessions()).to.have.length(0);
+    expect(unsubscribed.length).to.be.greaterThan(0);
+  });
+});
+```
+
+- [ ] **Step 2: Run the tests to verify they fail**
+
+Run: `npx mocha --grep 'runtime/panel-'`
 Expected: FAIL, `Cannot find module '../../src/runtime/panel-session'`
 
 - [ ] **Step 3: Implement `src/runtime/panel-session.ts`**
@@ -5005,7 +5137,14 @@ export class PanelSession {
     this.transport.publish({ topic: commandTopic(this.baseTopic, leaf), payload, retain: false });
   }
 
-  async handleMessage(topic: string, payload: string): Promise<void> {
+  /**
+   * Returns true when this session owns the topic. The manager uses that to
+   * stop after the first match: command topics are keyed by BASE TOPIC, not
+   * device id, so two panels sharing a base topic would otherwise both execute
+   * the same press — one physical tap becoming two writes, and a toggle
+   * netting to no visible change at all.
+   */
+  async handleMessage(topic: string, payload: string): Promise<boolean> {
     if (topic === bridgeRequestTopic(this.deviceId)) {
       // Signature reset makes the next pushConfig unconditional.
       this.lastSignature = null;
@@ -5016,27 +5155,28 @@ export class PanelSession {
         // config on the one path where freshness matters most. So an unwired
         // handler is a wiring bug, and it must be loud, not a silent no-op.
         this.log.warn(`[Panel ${this.deviceId}] Refresh requested but no handler is wired`);
-        return;
+        return true;
       }
       this.onRefreshRequested(payload.trim() === 'force');
-      return;
+      return true;
     }
 
     if (topic === stateTopic(this.baseTopic, 'connected')) {
       const text = payload.trim().toLowerCase();
       this.online = text === 'online' || text === 'true' || text === '1' || text === 'on';
-      return;
+      return true;
     }
 
     if (topic === stateTopic(this.baseTopic, 'ip')) {
       this.ip = payload.trim() || null;
-      return;
+      return true;
     }
 
     const leaf = COMMAND_LEAVES.find((candidate) => topic === commandTopic(this.baseTopic, candidate));
-    if (!leaf) return;
+    if (!leaf) return false;
 
     await this.executeCommand(leaf, payload);
+    return true;
   }
 
   /** Set by the manager so a forced refresh can reach the entity registry. */
@@ -5113,6 +5253,17 @@ export class PanelManager {
       return;
     }
 
+    const clash = [...this.panels.values()].find((other) => other.baseTopic === announcement.baseTopic);
+    if (clash) {
+      // The firmware requires a unique device topic base per panel. Sharing one
+      // means these panels share command AND status topics, so presses and
+      // presence get attributed to whichever session matches first.
+      this.deps.log.warn(
+        `[Panel ${deviceId}] Base topic "${announcement.baseTopic}" is already used by panel ` +
+          `${clash.deviceId}. Give each panel its own device topic base.`,
+      );
+    }
+
     const session = new PanelSession(announcement, this.deps.transport, this.deps.dispatcher, this.deps.log);
     session.onRefreshRequested = (): void => {
       session.pushConfig(this.deps.entities(), true);
@@ -5127,8 +5278,11 @@ export class PanelManager {
   }
 
   async handleMessage(topic: string, payload: string): Promise<void> {
+    // First match wins. A command carries the entity and the desired state, so
+    // it does not matter which panel sent it — but executing it once per
+    // session would turn one tap into N writes.
     for (const session of this.panels.values()) {
-      await session.handleMessage(topic, payload);
+      if (await session.handleMessage(topic, payload)) return;
     }
   }
 
