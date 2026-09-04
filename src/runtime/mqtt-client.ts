@@ -70,14 +70,23 @@ export class HomeTilesMqttClient {
     });
     this.client = client;
 
+    // Every dispatch into caller code is isolated. mqtt.js emits synchronously,
+    // so a throw from a handler escapes into the library's emit and takes down
+    // the adapter process. The protocol parsers these handlers feed THROW by
+    // design on malformed input, and that input arrives from the network, so
+    // this is the difference between one rejected payload and a crash loop.
     client.on('message', (topic, payload) => {
-      this.messageHandler?.(topic, payload.toString('utf8'));
+      try {
+        this.messageHandler?.(topic, payload.toString('utf8'));
+      } catch (error) {
+        this.log.error(`[MQTT] Message handler failed for ${topic}: ${(error as Error).message}`);
+      }
     });
 
     client.on('connect', () => {
       this.isConnected = true;
       this.log.info('[MQTT] Connected to broker');
-      this.connectionHandler?.(true);
+      this.notifyConnection(true);
       this.flush();
     });
 
@@ -87,7 +96,7 @@ export class HomeTilesMqttClient {
       if (!this.isConnected) return;
       this.isConnected = false;
       this.log.warn('[MQTT] Connection closed');
-      this.connectionHandler?.(false);
+      this.notifyConnection(false);
     });
 
     client.on('error', (error) => this.log.error(`[MQTT] ${error.message}`));
@@ -112,7 +121,16 @@ export class HomeTilesMqttClient {
     await new Promise<void>((resolve) => client.end(true, {}, () => resolve()));
     if (this.isConnected) {
       this.isConnected = false;
-      this.connectionHandler?.(false);
+      this.notifyConnection(false);
+    }
+  }
+
+  /** Same isolation as the message path: a throwing consumer must not crash us. */
+  private notifyConnection(connected: boolean): void {
+    try {
+      this.connectionHandler?.(connected);
+    } catch (error) {
+      this.log.error(`[MQTT] Connection handler failed: ${(error as Error).message}`);
     }
   }
 

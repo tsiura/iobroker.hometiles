@@ -109,6 +109,32 @@ describe('runtime/mqtt-client', () => {
     expect(logger.warnings.length).to.be.lessThan(10, 'drop warnings must be rate-limited');
   });
 
+  it('survives a throwing message handler instead of crashing the process', async () => {
+    // mqtt.js emits synchronously, so an unguarded throw here escapes into the
+    // library and kills the adapter. The protocol parsers these handlers feed
+    // throw by design on malformed input arriving from the network.
+    const logger = silentLogger();
+    const client = new HomeTilesMqttClient({ ...DEFAULTS, brokerPort: PORT }, logger);
+    const seen: string[] = [];
+    client.onMessage((_topic, payload) => {
+      seen.push(payload);
+      throw new Error('handler exploded');
+    });
+
+    await client.connect();
+    await client.subscribe('boom/topic');
+    client.publish({ topic: 'boom/topic', payload: 'first', retain: false });
+    await waitUntil(() => seen.length > 0);
+
+    // Still alive and still delivering after the throw.
+    client.publish({ topic: 'boom/topic', payload: 'second', retain: false });
+    await waitUntil(() => seen.length > 1);
+    expect(seen).to.deep.equal(['first', 'second']);
+    expect(client.connected).to.equal(true);
+
+    await client.disconnect();
+  });
+
   it('is idempotent on repeated disconnect', async () => {
     const client = new HomeTilesMqttClient({ ...DEFAULTS, brokerPort: PORT }, silentLogger());
     await client.connect();
