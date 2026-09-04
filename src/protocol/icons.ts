@@ -1,0 +1,1 @@
+export { buildIconsPayload } from './apply';
