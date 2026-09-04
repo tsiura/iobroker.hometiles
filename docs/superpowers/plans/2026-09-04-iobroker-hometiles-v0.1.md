@@ -7532,6 +7532,38 @@ The wire contract this adapter implements is documented in
 MIT
 ```
 
+- [ ] **Step 2b: State plainly that nothing has been tested on hardware**
+
+The scope table says "supported" for eight rows. Every one of them is verified
+against the firmware's parser rules and an in-process MQTT broker — and against
+nothing else. No physical panel has ever run this adapter. A reader who sees
+that table and a Release-blockers section naming only an icon and some URLs will
+reasonably conclude otherwise, and a compile plus a green suite is not evidence
+of runtime behaviour on a device.
+
+Add this to `README.md`, immediately after the scope table so it cannot be
+missed:
+
+```markdown
+## What "supported" means here
+
+Every row above is verified against the HomeTiles firmware's own parser rules —
+read out of its C++ source — and exercised end to end against an in-process MQTT
+broker. **No physical panel has ever run this adapter.**
+
+A green test suite is not evidence of behaviour on a device. These remain
+outstanding and need a real panel:
+
+1. Announcement and configuration push against real firmware, including the
+   panel's Web Admin entity dropdowns populating.
+2. Light popup slider interaction, including the final value on release.
+3. Retained state surviving a panel reboot with the adapter running.
+4. Pairing a factory-fresh panel by IP address.
+5. Local relay and DS18B20 channels on a panel that has them.
+
+Until those are done, treat v0.1 as ready to test, not ready to rely on.
+```
+
 - [ ] **Step 3: Add the MIT `LICENSE` file**
 
 Use the standard MIT text with `Copyright (c) 2026 Evgenij Cjura`.
@@ -7539,7 +7571,10 @@ Use the standard MIT text with `Copyright (c) 2026 Evgenij Cjura`.
 - [ ] **Step 4: Add `.github/workflows/test-and-release.yml`**
 
 ```yaml
-name: Test and release
+# Lint, build and test only. There is deliberately no publish step yet: v0.1
+# has never run on hardware, so nothing here should be able to push a release
+# without a human deciding to.
+name: Test
 
 on:
   push:
