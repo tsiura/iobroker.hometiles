@@ -62,10 +62,10 @@ describe('protocol/apply', () => {
     });
   });
 
-  it('marks a textual sensor with state_kind text and number false', () => {
+  it('marks a textual sensor with state_kind state and number false', () => {
     const text = e({ entityId: 'sensor.mode', state: 'heating', attributes: { friendly_name: 'Modus' } });
     const parsed = JSON.parse(buildApplyPayload({ entities: [text], sceneMap: {} }));
-    expect(parsed.sensor_meta[0].state_kind).to.equal('text');
+    expect(parsed.sensor_meta[0].state_kind).to.equal('state');
     expect(parsed.sensor_meta[0].number).to.equal(false);
   });
 

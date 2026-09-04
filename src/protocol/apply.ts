@@ -36,7 +36,13 @@ function sensorMeta(entities: VirtualEntity[]): Record<string, unknown>[] {
         unit: text(entity.attributes, 'unit_of_measurement') ?? '',
         state: entity.state,
         value: entity.state,
-        state_kind: numeric ? 'number' : 'text',
+        // Firmware accepts only "number" or "state" here: parseSensorMetaSection
+        // in ha_bridge_config.cpp stores the key only for those two values, and
+        // sensor/renderer.cpp branches on them to pick graph vs history mode.
+        // Any other value, including the intuitive "text", is silently dropped
+        // and the panel falls back to a unit-based heuristic that guesses wrong
+        // for a textual sensor that happens to carry a unit.
+        state_kind: numeric ? 'number' : 'state',
         number: numeric,
       };
       const icon = text(entity.attributes, 'icon');
