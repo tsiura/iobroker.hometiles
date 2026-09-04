@@ -1,0 +1,113 @@
+{
+  "i18n": true,
+  "type": "tabs",
+  "items": {
+    "connection": {
+      "type": "panel",
+      "label": "tab_connection",
+      "items": {
+        "brokerHost": { "type": "text", "label": "broker_host", "newLine": true, "sm": 12, "md": 6, "lg": 4 },
+        "brokerPort": { "type": "number", "label": "broker_port", "min": 1, "max": 65535, "sm": 12, "md": 3, "lg": 2 },
+        "brokerTls": { "type": "checkbox", "label": "broker_tls", "sm": 12, "md": 3, "lg": 2 },
+        "brokerUser": { "type": "text", "label": "broker_user", "newLine": true, "sm": 12, "md": 6, "lg": 4 },
+        "brokerPassword": { "type": "password", "label": "broker_password", "visible": true, "sm": 12, "md": 6, "lg": 4 },
+        "clientId": { "type": "text", "label": "client_id", "newLine": true, "sm": 12, "md": 6, "lg": 4 },
+        "baseTopic": { "type": "text", "label": "base_topic", "newLine": true, "sm": 12, "md": 6, "lg": 4, "help": "base_topic_help" },
+        "haPrefix": { "type": "text", "label": "ha_prefix", "sm": 12, "md": 6, "lg": 4, "help": "ha_prefix_help" },
+        "_testBroker": {
+          "type": "sendTo",
+          "label": "test_broker",
+          "command": "testBroker",
+          "newLine": true,
+          "variant": "contained",
+          "useNative": true,
+          "sm": 12,
+          "md": 4,
+          "lg": 3
+        }
+      }
+    },
+    "devices": {
+      "type": "panel",
+      "label": "tab_devices",
+      "items": {
+        "_detected": {
+          "type": "sendTo",
+          "label": "list_detected",
+          "command": "listDetected",
+          "variant": "contained",
+          "useNative": true,
+          "sm": 12,
+          "md": 4,
+          "lg": 3
+        },
+        "deviceOverrides": {
+          "type": "table",
+          "label": "device_overrides",
+          "newLine": true,
+          "sm": 12,
+          "md": 12,
+          "lg": 12,
+          "items": [
+            { "type": "text", "attr": "objectId", "title": "column_object_id", "width": "40%", "filter": true, "sort": true },
+            { "type": "checkbox", "attr": "include", "title": "column_include", "width": "10%", "default": true },
+            { "type": "text", "attr": "name", "title": "column_name", "width": "25%" },
+            {
+              "type": "select",
+              "attr": "forcedDomain",
+              "title": "column_forced_domain",
+              "width": "25%",
+              "options": [
+                { "label": "domain_auto", "value": "" },
+                { "label": "domain_sensor", "value": "sensor" },
+                { "label": "domain_binary_sensor", "value": "binary_sensor" },
+                { "label": "domain_switch", "value": "switch" },
+                { "label": "domain_light", "value": "light" },
+                { "label": "domain_scene", "value": "scene" }
+              ]
+            }
+          ]
+        },
+        "_preview": {
+          "type": "sendTo",
+          "label": "preview_entity",
+          "command": "previewEntity",
+          "newLine": true,
+          "variant": "outlined",
+          "useNative": true,
+          "sm": 12,
+          "md": 4,
+          "lg": 3,
+          "help": "preview_entity_help"
+        }
+      }
+    },
+    "panels": {
+      "type": "panel",
+      "label": "tab_panels",
+      "items": {
+        "_pairInfo": { "type": "staticText", "text": "pair_info", "sm": 12, "md": 12, "lg": 12 },
+        "_pairPanel": {
+          "type": "sendTo",
+          "label": "pair_panel",
+          "command": "pairPanel",
+          "newLine": true,
+          "variant": "contained",
+          "useNative": true,
+          "sm": 12,
+          "md": 4,
+          "lg": 3
+        }
+      }
+    },
+    "advanced": {
+      "type": "panel",
+      "label": "tab_advanced",
+      "items": {
+        "coalesceMs": { "type": "number", "label": "coalesce_ms", "min": 0, "max": 5000, "sm": 12, "md": 4, "lg": 3, "help": "coalesce_ms_help" },
+        "maxPublishQueue": { "type": "number", "label": "max_publish_queue", "min": 100, "max": 100000, "sm": 12, "md": 4, "lg": 3, "help": "max_publish_queue_help" },
+        "protocolTrace": { "type": "checkbox", "label": "protocol_trace", "newLine": true, "sm": 12, "md": 4, "lg": 3, "help": "protocol_trace_help" }
+      }
+    }
+  }
+}
