@@ -200,17 +200,25 @@ and must not be conflated:
 
 ### 5.2 Type mapping (v0.1)
 
+Type names below are members of the `Types` string enum in
+`@iobroker/type-detector` 6.x, verified against the installed package. There is
+no `flood`, `occupancy`, `switch` or `brightness` member.
+
 | type-detector type | HA domain | Notes |
 | --- | --- | --- |
-| `socket`, `switch` | `switch` | boolean `SET` channel |
-| `light` (on/off only) | `light` | `supported_color_modes: ["onoff"]` |
+| `socket` | `switch` | boolean `SET` channel |
+| `light` | `light` | `supported_color_modes: ["onoff"]` |
 | `dimmer` | `light` | ioBroker `0..100` scaled to HA `0..255` |
-| `rgb`, `rgbSingle`, `hue`, `ct` | `light` | color modes derived from present channels only |
-| `temperature`, `humidity`, other numeric `value.*` | `sensor` | `unit_of_measurement` from `common.unit`, `device_class` from role |
-| `window`, `door`, `motion`, `fireAlarm`, `flood` | `binary_sensor` | `device_class` mapped from detector type |
-| enum or free-text states | `sensor` | textual state, drives the categorical popup path |
-| ioBroker scene objects and button states | `scene` | fire-and-forget activation |
+| `rgb`, `rgbSingle`, `rgbwSingle`, `hue`, `ct`, `cie` | `light` | colour modes derived from present channels only |
+| `temperature`, `humidity`, `illuminance`, `pressure`, `weatherCurrent` | `sensor` | `unit_of_measurement` from `common.unit`, `device_class` from role |
+| `info` | `sensor` | textual state, drives the categorical popup path |
+| `window`, `windowTilt`, `door`, `contact`, `motion`, `fireAlarm`, `floodAlarm`, `coAlarm`, `warning` | `binary_sensor` | `device_class` mapped from detector type |
+| `button`, `buttonSensor` | `scene` | fire-and-forget activation |
 | anything else | excluded | the admin can force a domain per object |
+
+A lamp can satisfy several lighting patterns at once, so the detector is called
+with `limitTypesToOneOf` over the lighting group. Without it one bulb produces
+three tiles.
 
 ### 5.3 Feature synthesis
 
@@ -354,16 +362,28 @@ Generate the project with `@iobroker/create-adapter` using the TypeScript
 template, then replace the generated `src/` with the layout in section 4.2.
 This keeps the standard ioBroker build, lint, release and CI tooling.
 
-## 13. Open items for the implementation plan
+## 13. Protocol extraction: resolved
 
-These are known work items, not unresolved design questions:
+The four extraction items this section originally listed have all been carried
+out against the firmware source. The results live in the **Verified Firmware
+Contract** section of
+`docs/superpowers/plans/2026-09-04-iobroker-hometiles-v0.1.md`, which is the
+authoritative record for implementation, and are mirrored into
+`docs/protocol.md` as part of Task 20.
 
-1. Extract the exact `bridge/apply` and `bridge/icons` payload schemas from the
-   firmware parser and record them as versioned fixtures.
-2. Extract the exact per-domain statestream payload shapes the firmware
-   accepts, including which suffixes beyond `state` are read.
-3. Enumerate the `cmnd/light`, `cmnd/switch` and `cmnd/scene` payload variants
-   the firmware emits, including the slider throttling and final-release
-   behaviour.
-4. Confirm the DS18B20 and relay announcement descriptor fields against
-   `src/io/hardware_io.cpp`.
+The findings that changed the design:
+
+- The `bridge/apply` payload is parsed by **substring scanning, not a JSON
+  parser** (`HaBridgeConfig::applyJson`). Exact key spelling and well-formed
+  empty sections matter; a missing section falls back to a stale stored value.
+- The entity state payload is **domain-dependent**. `sensor`, `binary_sensor`
+  and `switch` receive a bare string; `light` receives a JSON object carrying
+  `state` plus its attributes. Publishing JSON to a sensor makes the tile render
+  the literal JSON text.
+- `cmnd/scene` carries **plain text**, not JSON, unlike every other command
+  topic.
+- `cmnd/switch` sends `toggle` whenever the tile had no explicit target state,
+  and an `entity_id` beginning with `light.` is routed to `cmnd/light` instead.
+- Pairing is HTTP, not MQTT: `POST /mqtt` with a form body, then a mandatory
+  `POST /restart`, because the firmware latches `mqtt_enabled` at boot.
+- A `stat` brightness value above 100 is the legacy 121..255 encoding.
