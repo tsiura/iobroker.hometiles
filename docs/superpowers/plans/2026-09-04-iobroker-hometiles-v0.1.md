@@ -183,7 +183,7 @@ Topic is built by lowercasing the entity id and replacing `.` with `/`.
   },
   "dependencies": {
     "@iobroker/adapter-core": "^3.2.3",
-    "@iobroker/type-detector": "^4.1.1",
+    "@iobroker/type-detector": "^6.0.1",
     "mqtt": "^5.10.1"
   },
   "devDependencies": {
@@ -216,7 +216,7 @@ Topic is built by lowercasing the entity id and replacing `.` with `/`.
     "moduleResolution": "node",
     "lib": ["ES2022"],
     "outDir": "build",
-    "rootDir": ".",
+    "rootDir": "src",
     "strict": true,
     "noUncheckedIndexedAccess": true,
     "exactOptionalPropertyTypes": false,
