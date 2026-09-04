@@ -87,6 +87,38 @@ describe('protocol/commands', () => {
     expect(() => parseSceneCommand('x'.repeat(300))).to.throw(CommandError);
   });
 
+  it('rejects an absurdly long entity id rather than passing it downstream', () => {
+    const huge = `switch.${'a'.repeat(300)}`;
+    expect(() => parseSwitchCommand(JSON.stringify({ entity_id: huge, state: 'on' }))).to.throw(
+      /entity_id_too_long/,
+    );
+  });
+
+  it('throws rather than returning undefined for an unknown topic leaf', () => {
+    // parseCommand is typed to return a ServiceCall. A caller reaching it with
+    // a wider string must fail loudly, not receive undefined.
+    expect(() => parseCommand('bogus' as 'light', '{}')).to.throw(CommandError);
+  });
+
+  it('preserves a legitimate zero on every numeric field', () => {
+    // Swallowed zeros have been a recurring defect class in this project.
+    expect(parseLightCommand('{"entity_id":"light.d","brightness_pct":0}')).to.deep.equal({
+      kind: 'set_light',
+      entityId: 'light.d',
+      brightnessPct: 0,
+    });
+    expect(parseLightCommand('{"entity_id":"light.d","rgb_color":[0,0,0]}')).to.deep.equal({
+      kind: 'set_light',
+      entityId: 'light.d',
+      rgb: [0, 0, 0],
+    });
+  });
+
+  it('clamps kelvin at both boundaries without rejecting them', () => {
+    expect((parseLightCommand('{"entity_id":"light.d","color_temp_kelvin":1000}') as { kelvin: number }).kelvin).to.equal(1000);
+    expect((parseLightCommand('{"entity_id":"light.d","color_temp_kelvin":15000}') as { kelvin: number }).kelvin).to.equal(15000);
+  });
+
   it('dispatches by topic leaf', () => {
     expect(parseCommand('scene', 'Nacht').kind).to.equal('activate_scene');
     expect(parseCommand('light', '{"entity_id":"light.d","state":"off"}').kind).to.equal('turn_off');

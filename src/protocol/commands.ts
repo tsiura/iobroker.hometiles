@@ -20,6 +20,12 @@ export class CommandError extends Error {
 }
 
 const MAX_SCENE_ALIAS_LENGTH = 128;
+/**
+ * Home Assistant entity ids are far shorter than this; the cap exists for the
+ * same reason the scene alias has one. Every field crossing this boundary is
+ * untrusted, so none of them may be unbounded.
+ */
+const MAX_ENTITY_ID_LENGTH = 255;
 const ENTITY_ID_RE = /^[a-z_]+\.[a-z0-9_]+$/;
 
 function clamp(value: number, min: number, max: number): number {
@@ -43,6 +49,7 @@ function requireEntityId(payload: Record<string, unknown>): string {
   const raw = payload.entity_id;
   if (typeof raw !== 'string') throw new CommandError('missing_entity_id');
   const entityId = raw.trim().toLowerCase();
+  if (entityId.length > MAX_ENTITY_ID_LENGTH) throw new CommandError('entity_id_too_long');
   if (!ENTITY_ID_RE.test(entityId)) throw new CommandError('invalid_entity_id');
   return entityId;
 }
@@ -122,5 +129,14 @@ export function parseCommand(leaf: 'light' | 'switch' | 'scene', raw: string): S
       return parseSwitchCommand(raw);
     case 'scene':
       return parseSceneCommand(raw);
+    default: {
+      // The union makes this unreachable at compile time, and the `never`
+      // binding keeps that guarantee if a leaf is added. The throw covers the
+      // runtime: this function is typed to return a ServiceCall, so a caller
+      // reaching it with a wider string must fail loudly rather than receive
+      // undefined from a non-optional return type.
+      const unreachable: never = leaf;
+      throw new CommandError(`unsupported_command_leaf_${String(unreachable)}`);
+    }
   }
 }
