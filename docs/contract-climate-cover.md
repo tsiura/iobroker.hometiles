@@ -14,6 +14,7 @@ documentation unless explicitly marked. Files read:
 - `src/types/tile_type_policy.h`
 - `src/ui/popups/cover/cover_popup.cpp` (to confirm which allow-listed cover commands the shipped UI actually sends)
 - `src/core/json_scan.h` (the shared scanner climate's own local helpers build on)
+- `src/types/climate/renderer.cpp`, `src/ui/popups/climate/climate_popup.h`, `src/ui/popups/climate/climate_popup.cpp` (added in Task 5b, same commit: the climate feature-bit gating in §5)
 
 **The two most dangerous things in this document, read this before writing any publisher code:**
 
@@ -73,7 +74,7 @@ Expected shape (mirrors a Home Assistant `state_changed` event):
 | `swing_horizontal_mode` | — | string, trim+lowercase | `swing_horizontal_mode[16]` | `""` | `2171-2176` |
 | `temperature_unit` | `unit_of_measurement` | string | `temperature_unit[8]` | if **both** absent, defaulted at end-of-parse to `"°C"` (UTF-8 `C2 B0` + `C`) | `2177-2181`, default at `2287-2290` |
 | `available` | — | bool | `ClimateState.available` | stays `true` (struct default, state.h:11) unless the `hvac_mode`-unavailable rule below fires | `2183-2187` |
-| `hvac_modes` | — | JSON array → CSV → bitmask (off/heat/cool/heat_cool/auto/dry/fan_only) | `hvac_modes_mask` (uint8) | `0` (no mode buttons shown) | `2191-2194`, mask table state.h:45-53 |
+| `hvac_modes` | — | JSON array → CSV → bitmask (off/heat/cool/heat_cool/auto/dry/fan_only) | `hvac_modes_mask` (uint8) | `0`: no option list, yet the popup still offers the current `hvac_mode` as one option (§5) | `2191-2194`, mask table state.h:45-53 |
 | `preset_modes` | — | array → bitmask, same 8 names as `preset_mode` | `preset_modes_mask` (uint8) | `0` | `2195-2198` |
 | `fan_modes` | — | array → bitmask (10 names: auto/low/medium/high/on/off/top/middle/focus/diffuse) | `fan_modes_mask` (uint16) | `0` | `2199-2202`, state.h:99-110 |
 | `swing_modes` | — | array → bitmask (5 names) | `swing_modes_mask` (uint8) | `0` | `2203-2206`, state.h:125-131 |
@@ -111,7 +112,7 @@ if (!state.valid) return;
 ...
 states[grid_index] = state;   // full replace, no field-level merge
 ```
-There is no merge with the previously cached state. Combined with the defaults table above: omit `"temperature"` from one update and the cached target snaps to `20.0`; omit `"hvac_modes"` and the mode-button bitmask clears to `0` (hiding every mode button); omit `"supported_features"` and `has_supported_features` drops to `false`. **Publish the full current attribute set every time**, not just the changed fields.
+There is no merge with the previously cached state. Combined with the defaults table above: omit `"temperature"` from one update and the cached target snaps to `20.0`; omit `"hvac_modes"` and the mode bitmask clears to `0` (leaving at most the current mode as a lone option, §5); omit `"supported_features"` and `has_supported_features` drops to `false` (every control is then assumed supported, §5). **Publish the full current attribute set every time**, not just the changed fields.
 
 #### `null` on a string field is actively dangerous
 
@@ -149,11 +150,33 @@ Every one of these functions returns without publishing (only logs) if `entity_i
 
 ### 5. Feature/capability gating
 
-`supported_features` (uint16) is stored verbatim (clamped, `has_supported_features` flag) at `state.h:12,30` / parser `tile_renderer.cpp:2211-2219`, and is passed through to the popup init struct (`build_climate_popup_init`, `tile_renderer.cpp:2213 area`). **HomeTiles does not define its own bit-name enum for this mask** — unlike cover, there is no `ClimateEntityFeature`-style constant list anywhere in `state.h`, `renderer.cpp`, or `control_contract.h`.
+`supported_features` (uint16) is stored with a `has_supported_features` flag (`state.h:12,30`; parser `tile_renderer.cpp:2213-2220`: finite, `>=0`, clamped to 65535) and carried into the popup (`renderer.cpp:924-925`, `tile_renderer.cpp:2371-2372`). Its bit enum is `ClimateSupportedFeature`, defined in `src/ui/popups/climate/climate_popup.h:6-16` — not in `state.h`, which is why an earlier pass reported none (corrected in Task 5b):
 
-The actual per-control gating instead comes from the explicit `*_modes` **arrays** (`hvac_modes`, `preset_modes`, `fan_modes`, `swing_modes`, `swing_horizontal_modes`), each converted to its own bitmask against a fixed, hardcoded name table (`state.h:45-165`). A control is only populated from names present in its mask; an unrecognized name in the array is silently dropped, not an error.
+| Bit | Name | Value |
+|---|---|---|
+| 0 | `CLIMATE_FEATURE_TARGET_TEMPERATURE` | 1 |
+| 1 | `CLIMATE_FEATURE_TARGET_TEMPERATURE_RANGE` | 2 |
+| 2 | `CLIMATE_FEATURE_TARGET_HUMIDITY` | 4 |
+| 3 | `CLIMATE_FEATURE_FAN_MODE` | 8 |
+| 4 | `CLIMATE_FEATURE_PRESET_MODE` | 16 |
+| 5 | `CLIMATE_FEATURE_SWING_MODE` | 32 |
+| 7 | `CLIMATE_FEATURE_TURN_OFF` | 128 |
+| 8 | `CLIMATE_FEATURE_TURN_ON` | 256 |
+| 9 | `CLIMATE_FEATURE_SWING_HORIZONTAL_MODE` | 512 |
 
-UNVERIFIED: whether/how individual `supported_features` bits gate any specific climate widget beyond being carried through to the popup. Confirming that would require reading `src/ui/popups/climate/climate_popup.cpp`, which is outside the primary sources for this task and was not opened in this pass.
+Bit 6 (64) is undefined. TURN_OFF and TURN_ON are declared but read nowhere in the firmware.
+
+**No key means every feature.** `climate_state_feature_supported` (`renderer.cpp:74-78`) and the popup's `climate_feature_supported` (`climate_popup.cpp:280-286`) return `legacy_supported` when `has_supported_features` is false, and every call site passes `true`; the web admin preview does the same (`src/types/climate/admin-content.js:266-269`). So a read-only setpoint looks adjustable unless a mask says otherwise.
+
+**With the key present, a clear bit disables its control:**
+- Tile target slots and their +/- publishes: TARGET_TEMPERATURE for the single target, TARGET_TEMPERATURE_RANGE for low/high, TARGET_HUMIDITY — each also needs its `has_*` flag (`slot_is_interactive`, `renderer.cpp:80-97`; `mini_target_command_supported`, `:146-162`).
+- Popup arc and +/-: `temperature_control_available` (`climate_popup.cpp:288-296`: range mode needs bit 2, single needs `has_target` and bit 1) and `humidity_control_available` (`:298-301`, bit 4), applied in `refresh_interactive_state` (`:579-597`).
+- Popup dropdowns: `climate_control_available` (`:303-324`) needs at least one option, then PRESET bit 16, FAN bit 8, SWING bit 32, SWING_HORIZONTAL bit 512. **HVAC has no bit** (`:310-311`).
+- A bit that disappears while the popup is open discards its pending commands (`update_climate_popup`, `:2819-2830`).
+
+**The `*_modes` arrays give the options.** Each is converted to a bitmask against a fixed name table (`tile_renderer.cpp:2029-2136`, names in `state.h:45-165`) after brackets, quotes and all spaces are stripped and the rest lowercased (`:2019-2027`); an unrecognized name is silently dropped. An absent or wholly unrecognized array leaves the mask at `0`, but that is **not** "no buttons": `parse_options` (`climate_popup.cpp:436-461`) falls back to ONE option — the current value (`hvac_mode`, `fan_mode`, …, lowercased at `:1148-1159`) — whenever that value is non-empty (`:458-460`). For HVAC nothing can hide that option; for the other four only their bit can. A chosen option is sent back verbatim (`apply_control_selection`, `:1781-1818`).
+
+Consequence for a publisher: always send `supported_features`, computed from what can actually be commanded, and expect any value you publish as a current mode to come back as a command, lowercased.
 
 ### 6. Special / sentinel values
 
@@ -270,6 +293,6 @@ UNVERIFIED: the exact per-entry sub-keys inside `"climate_meta"`/`"cover_meta"` 
 
 ## Consolidated UNVERIFIED list
 
-1. Whether/how individual `supported_features` bits gate specific climate popup controls beyond being stored and forwarded — would require reading `src/ui/popups/climate/climate_popup.cpp` (not a listed primary source, not opened in this task).
+1. RESOLVED (Task 5b): how climate `supported_features` bits gate the tile and popup controls, and what happens without the key — see §5, read from `src/ui/popups/climate/climate_popup.h`/`.cpp` and `src/types/climate/renderer.cpp`.
 2. Whether HomeTiles' `CoverFeature` bit values are intentionally aligned with Home Assistant core's `CoverEntityFeature` enum — the bit pattern looks identical from general knowledge of HA, but this was not checked against Home Assistant source in this task; the firmware source has no comment confirming the alignment.
 3. The exact sub-key schema of `"climate_meta"`/`"cover_meta"` entries in the `bridge/apply` payload (section names and their two consumers are confirmed; per-entry field names are not).

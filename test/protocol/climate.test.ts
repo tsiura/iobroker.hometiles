@@ -238,7 +238,7 @@ describe('protocol/climate', () => {
   describe('*_modes lists (Task 5b)', () => {
     const LIST_KEYS = ['hvac_modes', 'fan_modes', 'swing_modes', 'swing_horizontal_modes'] as const;
 
-    it('forwards every non-empty list synthClimate built', () => {
+    it('forwards each non-empty list it is given, verbatim', () => {
       const lists = {
         hvac_modes: ['off', 'heat', 'cool'],
         fan_modes: ['auto', 'low'],
@@ -305,9 +305,38 @@ describe('protocol/climate', () => {
       expect(writable.supported_features & TARGET_TEMPERATURE).to.equal(TARGET_TEMPERATURE);
     });
 
-    it('sets each remaining bit from its writable role, the range only when both bounds are writable', () => {
+    it('maps each writable role, alone, to exactly its own bit', () => {
+      // One role at a time, so swapping any two bits in the table is caught;
+      // an OR over every role cannot tell FAN from PRESET.
+      const cases: Array<[Record<string, boolean>, number]> = [
+        [{ setpoint: true }, TARGET_TEMPERATURE],
+        [{ target_temp_low: true, target_temp_high: true }, TARGET_TEMPERATURE_RANGE],
+        [{ target_humidity: true }, TARGET_HUMIDITY],
+        [{ fan_mode: true }, FAN_MODE],
+        [{ preset_mode: true }, PRESET_MODE],
+        [{ swing_mode: true }, SWING_MODE],
+        [{ swing_horizontal_mode: true }, SWING_HORIZONTAL_MODE],
+        // The range needs both bounds: the firmware sends both in one command.
+        [{ target_temp_low: true }, 0],
+        [{ target_temp_high: true }, 0],
+        [{ target_temp_low: true, target_temp_high: false }, 0],
+        // No firmware bit exists for these (climate_popup.cpp:310-311 never
+        // gates HVAC; power/boost are not climate controls at all).
+        [{ hvac_mode: true }, 0],
+        [{ power: true }, 0],
+        [{ boost: true }, 0],
+        // A role present but not writable sets nothing.
+        [{ setpoint: false, fan_mode: false }, 0],
+      ];
+      for (const [writable, bit] of cases) {
+        expect(JSON.parse(buildClimatePayload(entity({ writable }))).supported_features, JSON.stringify(writable)).to.equal(bit);
+      }
+    });
+
+    it('combines the bits of every writable role', () => {
       const all = entity({
         writable: {
+          setpoint: true,
           target_temp_low: true,
           target_temp_high: true,
           target_humidity: true,
@@ -315,19 +344,20 @@ describe('protocol/climate', () => {
           preset_mode: true,
           swing_mode: true,
           swing_horizontal_mode: true,
-          // No firmware bit exists for these (climate_popup.cpp:310-311 never
-          // gates HVAC; power/boost are not climate controls at all).
           hvac_mode: true,
           power: true,
           boost: true,
         },
       });
       expect(JSON.parse(buildClimatePayload(all)).supported_features).to.equal(
-        TARGET_TEMPERATURE_RANGE | TARGET_HUMIDITY | FAN_MODE | PRESET_MODE | SWING_MODE | SWING_HORIZONTAL_MODE,
+        TARGET_TEMPERATURE |
+          TARGET_TEMPERATURE_RANGE |
+          TARGET_HUMIDITY |
+          FAN_MODE |
+          PRESET_MODE |
+          SWING_MODE |
+          SWING_HORIZONTAL_MODE,
       );
-
-      const halfRange = entity({ writable: { target_temp_low: true, target_temp_high: false } });
-      expect(JSON.parse(buildClimatePayload(halfRange)).supported_features).to.equal(0);
     });
   });
 

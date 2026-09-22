@@ -199,6 +199,9 @@ describe('runtime/panel-session', () => {
         state: 'heat',
         source: { mode: 'zig.0.hall.mode' },
         writable: { hvac_mode: true },
+        // A states map says what "cool" means; an untyped MODE without one is
+        // refused since Ruling 33, so this routing test must carry one.
+        channelMeta: { mode: { type: 'string', states: { cool: 'Cool', heat: 'Heat' } } },
       }),
     );
     await session.start();

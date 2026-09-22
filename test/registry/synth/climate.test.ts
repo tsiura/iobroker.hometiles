@@ -1,7 +1,7 @@
 import { expect } from 'chai';
 import { synthClimate } from '../../../src/registry/synth/climate';
 import { synthesise } from '../../../src/registry/synth/index';
-import type { DeviceInput, SourceValue } from '../../../src/registry/types';
+import type { ChannelInput, DeviceInput, SourceValue } from '../../../src/registry/types';
 
 const NOW = 1_757_000_000_000;
 
@@ -340,6 +340,53 @@ describe('registry/synth/climate', () => {
       });
       expect(e?.available).to.equal(false);
       expect(e?.state).to.equal('unavailable');
+    });
+
+    // Ruling 36: supported_features is derived from `writable`, so a label
+    // role may be writable only when a label can actually land in its
+    // channel -- judged on the same codec the dispatcher encodes with.
+    it('marks a label role writable only when its channel is writable AND can take a label (Ruling 36)', () => {
+      const mode = (channel: Partial<ChannelInput>) =>
+        withChannels({ mode: { objectId: 'ac.0.mode', write: true, ...channel } })?.writable?.hvac_mode;
+      const withMode = (name: string, channel: Partial<ChannelInput>) =>
+        withChannels({
+          mode: { objectId: 'ac.0.mode', type: 'number', write: true, states: { '0': 'OFF' } },
+          [name]: { objectId: `ac.0.${name}`, write: true, ...channel },
+        })?.writable;
+
+      // (a) untyped MODE, no states: its raw 1 would come back as the string "1".
+      expect(mode({}), 'untyped MODE').to.equal(false);
+      expect(mode({ type: 'string' }), 'string MODE').to.equal(false);
+      expect(mode({ type: 'number' }), 'number MODE: "1" carries back as 1').to.equal(true);
+      expect(mode({ type: 'string', states: { AUTO: 'Auto' } }), 'string MODE with states').to.equal(true);
+      // (b) string SPEED, no states: raw "HIGH" would come back as "high".
+      expect(withMode('speed', { type: 'string' })?.fan_mode, 'string SPEED').to.equal(false);
+      // The dispatcher encodes an untyped SPEED/SWING as a number, so it can land.
+      expect(withMode('speed', {})?.fan_mode, 'untyped SPEED').to.equal(true);
+      expect(withMode('swing', { type: 'string' })?.swing_mode, 'string SWING').to.equal(false);
+      expect(withMode('swing', { type: 'number' })?.swing_mode, 'number SWING').to.equal(true);
+    });
+
+    it('gives the swing toggle its bit and its on/off list under one condition: writable and boolean', () => {
+      const toggle = (channel: Partial<ChannelInput>) =>
+        withChannels({
+          mode: { objectId: 'ac.0.mode', type: 'number', write: true, states: { '0': 'OFF' } },
+          swing_toggle: { objectId: 'ac.0.swing_toggle', ...channel },
+        });
+      const cases: Array<[string, Partial<ChannelInput>, boolean]> = [
+        ['writable boolean', { type: 'boolean', write: true }, true],
+        ['untyped, which the dispatcher encodes as boolean', { write: true }, true],
+        ['read-only boolean', { type: 'boolean', write: false }, false],
+        // (c) raw "true" would come back as "on".
+        ['writable string', { type: 'string', write: true }, false],
+        ['writable number', { type: 'number', write: true }, false],
+      ];
+      for (const [label, channel, commandable] of cases) {
+        const e = toggle(channel);
+        expect(e?.writable?.swing_horizontal_mode, `${label}: writable`).to.equal(commandable);
+        if (commandable) expect(e?.attributes.swing_horizontal_modes, label).to.deep.equal(['off', 'on']);
+        else expect(e?.attributes, label).to.not.have.property('swing_horizontal_modes');
+      }
     });
   });
 });

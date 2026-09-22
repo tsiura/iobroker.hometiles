@@ -81,6 +81,37 @@ export function baseEntity(
 }
 
 /**
+ * The type a label role's channel is encoded as when the registry captured
+ * none: type-detector declares SPEED, SPEED_LEVEL and the numeric SWING as
+ * Number and the swing toggle as Boolean, with no alternative (typePatterns.js
+ * FanPatterns, Ruling 24(a)). MODE is Number-or-String per device, so
+ * hvac_mode and preset_mode have none. The dispatcher encodes with this and
+ * synthClimate advertises with it, so the two cannot disagree (Ruling 36).
+ */
+const ROLE_FALLBACK_TYPE: Readonly<Record<string, ChannelCodec['type']>> = {
+  fan_mode: 'number',
+  swing_mode: 'number',
+  swing_horizontal_mode: 'boolean',
+};
+
+export function roleCodec(role: string, codec: ChannelCodec | undefined): ChannelCodec | undefined {
+  const fallback = ROLE_FALLBACK_TYPE[role];
+  return codec?.type === undefined && fallback ? { type: fallback, states: codec?.states } : codec;
+}
+
+/**
+ * Ruling 33 (supersedes Ruling 24(a)'s passthrough): a label means something
+ * to a channel only if it is number- or boolean-typed or has a non-empty
+ * states map. Anything else would write back verbatim whatever the panel
+ * sent, and when a modes list is empty the firmware still offers the CURRENT
+ * value, lowercased, as a lone option (climate_popup.cpp:458-460): "auto" for
+ * "AUTO", the string "1" for 1, "on" for "true" -- each with ok:true.
+ */
+export function acceptsLabels(codec: ChannelCodec | undefined): boolean {
+  return codec?.type === 'number' || codec?.type === 'boolean' || Object.keys(codec?.states ?? {}).length > 0;
+}
+
+/**
  * The exact inverse of readEnum (synth/climate.ts) and toBoolState (above):
  * those decode a raw ioBroker value into an HA-style display label; this
  * turns a label back into the raw value a write actually needs. Writing a
@@ -119,6 +150,8 @@ export function encodeChannelValue(codec: ChannelCodec | undefined, label: strin
     return undefined;
   }
 
+  if (!acceptsLabels(codec)) return undefined;
+
   let raw = label;
   const entries = codec?.states ? Object.entries(codec.states) : [];
   if (entries.length > 0) {
@@ -143,9 +176,15 @@ export function encodeChannelValue(codec: ChannelCodec | undefined, label: strin
     const matches = entries.filter(
       ([, candidate]) => typeof candidate === 'string' && candidate.trim().toLowerCase() === wanted,
     );
-    const onlyMatch = matches.length === 1 ? matches[0] : undefined;
-    if (!onlyMatch) return undefined;
-    raw = onlyMatch[0];
+    if (matches.length > 1) return undefined;
+    const [onlyMatch] = matches;
+    if (onlyMatch) raw = onlyMatch[0];
+    // Ruling 36: a label outside the map is refused, except on a number
+    // channel. There readEnum emits an out-of-map raw value as its own
+    // number-string, which the panel's lone fallback option sends back, so
+    // coercing it below completes the inverse (a no-op write of the current
+    // value, not a dead button). Blank and non-finite still refuse.
+    else if (codec?.type !== 'number') return undefined;
   }
 
   switch (codec?.type) {
@@ -160,9 +199,9 @@ export function encodeChannelValue(codec: ChannelCodec | undefined, label: strin
       return Number.isFinite(numeric) ? numeric : undefined;
     }
     default:
-      // 'string', 'mixed', and no captured type at all: the safe default is
-      // to write back exactly what arrived (or what the states map
-      // reversed it to, for an untyped enum channel).
+      // 'string', 'mixed' or no captured type: reachable only through a
+      // states map (Ruling 33), so `raw` is the key the label reversed to --
+      // the channel's own internal value.
       return raw;
   }
 }

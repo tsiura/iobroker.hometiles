@@ -1,6 +1,6 @@
 import { expect } from 'chai';
 import { buildClimatePayload } from '../../src/protocol/climate';
-import { parseClimateCommand } from '../../src/protocol/commands';
+import { parseClimateCommand, type ServiceCall } from '../../src/protocol/commands';
 import { synthClimate } from '../../src/registry/synth/climate';
 import { Dispatcher, type EntityLookup } from '../../src/runtime/dispatcher';
 import type { DeviceInput, SourceValue, VirtualEntity } from '../../src/registry/types';
@@ -361,17 +361,31 @@ describe('runtime/dispatcher', () => {
       expect(result).to.deep.equal({ ok: false, reason: 'no_writable_channel', applied: 0 });
     });
 
-    it('writes hvac_mode through the MODE channel', async () => {
+    it('refuses a label for a channel with no number/boolean type and no states map, even marked writable (Ruling 33)', async () => {
+      // Supersedes the old passthrough ("cool" written verbatim into an
+      // untyped MODE). The reviewer's three shapes, each the panel's lone
+      // fallback option echoing the current value back lowercased: an
+      // untyped MODE at raw 1 ("1" -- the string), a string SPEED with no
+      // states at "HIGH" ("high"), a string swing toggle at "true" ("on").
+      // writable is forced true to prove the ENCODER refuses; synthClimate
+      // no longer marks such a role writable at all (Ruling 36).
       const ac = entity({
         entityId: 'climate.ac',
         domain: 'climate',
-        source: { mode: 'zig.0.ac.mode' },
-        writable: { hvac_mode: true },
+        source: { mode: 'zig.0.ac.mode', speed: 'zig.0.ac.speed', swing_toggle: 'zig.0.ac.swing_h' },
+        writable: { hvac_mode: true, fan_mode: true, swing_horizontal_mode: true },
+        channelMeta: { speed: { type: 'string' }, swing_toggle: { type: 'string' } },
       });
       const d = new Dispatcher(lookup([ac]), write, silentLog);
-      const result = await d.dispatch({ kind: 'set_hvac_mode', entityId: 'climate.ac', mode: 'cool' });
-      expect(result).to.deep.equal({ ok: true, writes: 1 });
-      expect(writes).to.deep.equal([['zig.0.ac.mode', 'cool']]);
+      const calls: ServiceCall[] = [
+        { kind: 'set_hvac_mode', entityId: 'climate.ac', mode: '1' },
+        { kind: 'set_fan_mode', entityId: 'climate.ac', mode: 'high' },
+        { kind: 'set_swing_horizontal_mode', entityId: 'climate.ac', on: true },
+      ];
+      for (const call of calls) {
+        expect(await d.dispatch(call), call.kind).to.deep.equal({ ok: false, reason: 'cannot_encode_value', applied: 0 });
+      }
+      expect(writes).to.have.length(0);
     });
 
     it('encodes hvac_mode through a numeric states map instead of writing the label verbatim (fix-round 2 CRITICAL)', async () => {
@@ -614,6 +628,89 @@ describe('runtime/dispatcher', () => {
         };
         expectNativeValues(await roundTrip(device, { 'ac.0.mode': state('HEAT') }), {
           hvac_modes: { heat: ['ac.0.mode', 'HEAT'], cool: ['ac.0.mode', 'COOL'], auto: ['ac.0.mode', 'AUTO'] },
+        });
+      });
+
+      // Ruling 36: with an empty list the popup still offers ONE option, the
+      // current value lowercased (climate_popup.cpp:458-460), and the HVAC
+      // dropdown has no bit to hide it (:310-311). So what a payload lets the
+      // panel show must land exactly, and what cannot land must not be shown.
+      describe('the lone fallback option (Ruling 36)', () => {
+        const FIELD = {
+          set_hvac_mode: 'hvac_mode',
+          set_fan_mode: 'fan_mode',
+          set_swing_horizontal_mode: 'swing_horizontal_mode',
+        } as const;
+        const MODE = { objectId: 'ac.0.mode', type: 'number' as const, write: true, states: { '0': 'OFF' } };
+        const airCondition = (channels: DeviceInput['channels']): DeviceInput => ({
+          objectId: 'ac.0',
+          name: 'AC',
+          detectorType: 'airCondition',
+          domain: 'climate',
+          channels,
+        });
+
+        /** Real synth -> real payload -> the panel taps its one option -> real parser -> dispatcher. */
+        async function tapFallback(device: DeviceInput, values: Record<string, SourceValue>, command: keyof typeof FIELD) {
+          const synthesised = synthClimate(device, 'climate.ac', values)!;
+          const published = JSON.parse(buildClimatePayload(synthesised)) as Record<string, unknown>;
+          const field = FIELD[command];
+          const option = String(published[field]).trim().toLowerCase();
+          writes = [];
+          const d = new Dispatcher(lookup([synthesised]), write, silentLog);
+          const result = await d.dispatch(parseClimateCommand(JSON.stringify({ entity_id: 'climate.ac', command, [field]: option })));
+          return { published, features: published.supported_features as number, result, landed: writes };
+        }
+
+        it('(a) an untyped MODE: the HVAC option nothing can hide is refused, never written as the string "1"', async () => {
+          const tap = await tapFallback(airCondition({ mode: { objectId: 'ac.0.mode', write: true } }), { 'ac.0.mode': state(1) }, 'set_hvac_mode');
+          expect(tap.published.hvac_mode).to.equal('1');
+          expect(tap.published).to.not.have.property('hvac_modes');
+          expect(tap.result.ok).to.equal(false);
+          expect(tap.landed).to.deep.equal([]);
+        });
+
+        it('(b) a string SPEED with no states map: no FAN bit, and its "high" is refused', async () => {
+          const tap = await tapFallback(
+            airCondition({ mode: MODE, speed: { objectId: 'ac.0.speed', type: 'string', write: true } }),
+            { 'ac.0.speed': state('HIGH') },
+            'set_fan_mode',
+          );
+          expect(tap.published.fan_mode).to.equal('HIGH');
+          expect(tap.published).to.not.have.property('fan_modes');
+          expect(tap.features & 8, 'FAN_MODE').to.equal(0);
+          expect(tap.result.ok).to.equal(false);
+          expect(tap.landed).to.deep.equal([]);
+        });
+
+        it('(c) a writable string swing toggle: no SWING_HORIZONTAL bit, and its "on" is refused', async () => {
+          const tap = await tapFallback(
+            airCondition({ mode: MODE, swing_toggle: { objectId: 'ac.0.swing_toggle', type: 'string', write: true } }),
+            { 'ac.0.swing_toggle': state('true') },
+            'set_swing_horizontal_mode',
+          );
+          expect(tap.published.swing_horizontal_mode).to.equal('on');
+          expect(tap.published).to.not.have.property('swing_horizontal_modes');
+          expect(tap.features & 512, 'SWING_HORIZONTAL_MODE').to.equal(0);
+          expect(tap.result.ok).to.equal(false);
+          expect(tap.landed).to.deep.equal([]);
+        });
+
+        it('a SPEED_LEVEL value outside its states map: the FAN bit stays, and "50" lands as the number 50', async () => {
+          const tap = await tapFallback(
+            airCondition({
+              mode: MODE,
+              speed_level: { objectId: 'ac.0.speed_level', type: 'number', write: true, states: { '0': 'AUS', '100': 'MAX' } },
+            }),
+            { 'ac.0.speed_level': state(50) },
+            'set_fan_mode',
+          );
+          expect(tap.published.fan_mode).to.equal('50');
+          expect(tap.published).to.not.have.property('fan_modes');
+          expect(tap.features & 8, 'FAN_MODE').to.equal(8);
+          expect(tap.result).to.deep.equal({ ok: true, writes: 1 });
+          expect(tap.landed).to.deep.equal([['ac.0.speed_level', 50]]);
+          expect(typeof tap.landed[0]?.[1]).to.equal('number');
         });
       });
     });

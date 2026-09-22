@@ -1,6 +1,15 @@
 import type { ChannelInput, DeviceInput, VirtualEntity } from '../types';
 import { STATE_UNAVAILABLE, STATE_UNKNOWN } from '../types';
-import { baseEntity, encodeChannelValue, isUsable, readChannel, toBoolState, type Values } from './common';
+import {
+  acceptsLabels,
+  baseEntity,
+  encodeChannelValue,
+  isUsable,
+  readChannel,
+  roleCodec,
+  toBoolState,
+  type Values,
+} from './common';
 
 /**
  * Channels that can make the firmware's own payload-acceptance check pass.
@@ -79,6 +88,17 @@ function setWritable(writable: Record<string, boolean>, role: string, channel: C
 }
 
 /**
+ * Ruling 36: a label role (hvac_mode, fan_mode, swing_mode) is writable only
+ * when a label command can land -- the channel is writable AND takes labels
+ * at all (acceptsLabels, Ruling 33), judged on the codec the dispatcher
+ * encodes with (roleCodec). protocol/climate.ts derives supported_features
+ * from `writable`, so a control is advertised exactly when it is commandable.
+ */
+function setLabelWritable(writable: Record<string, boolean>, role: string, channel: ChannelInput | undefined): void {
+  if (channel) writable[role] = channel.write === true && acceptsLabels(roleCodec(role, channel));
+}
+
+/**
  * The firmware's fixed control-name tables, read from HomeTiles (read-only
  * repo) src/tiles/runtime/tile_renderer.cpp, the code that turns a published
  * array into a button mask: climate_modes_mask :2029-2047,
@@ -99,27 +119,26 @@ const FAN_MODE_NAMES = ['auto', 'low', 'medium', 'high', 'on', 'off', 'top', 'mi
 const SWING_MODE_NAMES = ['off', 'on', 'vertical', 'horizontal', 'both'] as const;
 
 /**
- * The firmware names a panel can send back for a readEnum-decoded channel
- * (MODE, SPEED/SPEED_LEVEL, the numeric SWING) and have land as that
- * channel's exact native value (Task 5b):
+ * The firmware names a panel can send back for a readEnum-decoded role
+ * (hvac_mode from MODE, fan_mode from SPEED/SPEED_LEVEL, swing_mode from the
+ * numeric SWING) and have land as that channel's exact native value:
  *
  * - read-only or absent: none. Every button would send a command the
- *   dispatcher refuses (writable[role] is exactly channel.write === true).
- * - not number/string: none. Untyped, the dispatcher may apply a role
- *   fallback type never visible here; mixed has no single native type;
- *   boolean decodes through toBoolState, not labels. Natural detection always
- *   carries number or string here (type-detector matches on common.type).
- * - no states map: none (Ruling 30). The valid values are unknown, and the
- *   panel lowercases every command, so a raw "AUTO" sent back as "auto"
- *   would be written verbatim, wrong, with ok:true.
+ *   dispatcher refuses.
+ * - codec not number/string: none. The codec is roleCodec's, the one the
+ *   dispatcher encodes with. An untyped MODE has no fixed pattern type, so
+ *   the type it would be written as is a guess; mixed has no single native
+ *   type; boolean decodes through toBoolState, not labels.
  * - otherwise: exactly the names encodeChannelValue, the function the
- *   dispatcher itself calls, can reverse. That excludes by construction a
- *   label two states share case-insensitively and a key the type cannot hold.
+ *   dispatcher itself calls, can reverse. By construction that excludes a
+ *   channel with no states map (Rulings 30/33: no firmware name is a number,
+ *   and a string channel refuses every label), a label two states share
+ *   case-insensitively, and a key the type cannot hold.
  */
-function enumModes(channel: ChannelInput | undefined, names: readonly string[]): string[] {
-  if (channel?.write !== true || (channel.type !== 'number' && channel.type !== 'string')) return [];
-  if (!channel.states || !Object.keys(channel.states).length) return [];
-  return names.filter((name) => encodeChannelValue(channel, name) !== undefined);
+function enumModes(role: string, channel: ChannelInput | undefined, names: readonly string[]): string[] {
+  const codec = roleCodec(role, channel);
+  if (channel?.write !== true || (codec?.type !== 'number' && codec?.type !== 'string')) return [];
+  return names.filter((name) => encodeChannelValue(codec, name) !== undefined);
 }
 
 export function synthClimate(device: DeviceInput, entityId: string, values: Values): VirtualEntity | null {
@@ -183,7 +202,16 @@ export function synthClimate(device: DeviceInput, entityId: string, values: Valu
   // ACTUAL and HUMIDITY are read-only telemetry in both thermostat and
   // airCondition patterns (write:false) — there is no writable channel to
   // back a target_humidity, so only the current reading is ever populated.
-  const currentTemperature = readNumber(device, 'actual', values);
+  //
+  // With no separate temperature object, type-detector binds ACTUAL to a
+  // read-only or write-silent setpoint's OWN object: ACTUAL's pattern
+  // (write:false, role /temperature(\..*)?$/) matches it too (Task 5c finding
+  // (e)). That object is the target, not a reading, so it is never published
+  // as the current temperature.
+  const actual = device.channels.actual;
+  const actualIsSetpoint =
+    actual !== undefined && ['set', 'set_heating', 'set_cooling'].some((name) => device.channels[name]?.objectId === actual.objectId);
+  const currentTemperature = actualIsSetpoint ? undefined : readNumber(device, 'actual', values);
   if (currentTemperature !== undefined) attributes.current_temperature = currentTemperature;
 
   const currentHumidity = readNumber(device, 'humidity', values);
@@ -194,7 +222,7 @@ export function synthClimate(device: DeviceInput, entityId: string, values: Valu
   // analogue to WORKING_MODE is hvac_action, not hvac_mode.
   const hvacMode = readEnum(device, 'mode', values);
   if (hvacMode !== undefined) attributes.hvac_mode = hvacMode;
-  setWritable(writable, 'hvac_mode', device.channels.mode);
+  setLabelWritable(writable, 'hvac_mode', device.channels.mode);
 
   const hvacAction = readEnum(device, 'working_mode', values);
   if (hvacAction !== undefined) attributes.hvac_action = hvacAction;
@@ -223,7 +251,7 @@ export function synthClimate(device: DeviceInput, entityId: string, values: Valu
   }
   if (fanMode !== undefined) attributes.fan_mode = fanMode;
   const fanChannel = device.channels.speed ?? device.channels.speed_level;
-  setWritable(writable, 'fan_mode', fanChannel);
+  setLabelWritable(writable, 'fan_mode', fanChannel);
 
   // The two SWING channels are resolved by role at the detector layer
   // (detector.ts's channelName): 'swing' is the numeric multi-position
@@ -231,11 +259,18 @@ export function synthClimate(device: DeviceInput, entityId: string, values: Valu
   // as two independent attributes, never merged.
   const swingMode = readEnum(device, 'swing', values);
   if (swingMode !== undefined) attributes.swing_mode = swingMode;
-  setWritable(writable, 'swing_mode', device.channels.swing);
+  setLabelWritable(writable, 'swing_mode', device.channels.swing);
 
   const swingHorizontal = readBoolAttr(device, 'swing_toggle', values);
   if (swingHorizontal !== undefined) attributes.swing_horizontal_mode = swingHorizontal;
-  setWritable(writable, 'swing_horizontal_mode', device.channels.swing_toggle);
+  // toBoolState never reads a states map, so only a boolean codec is its
+  // exact inverse (encodeChannelValue maps exactly on/off to true/false).
+  // The bit (via writable) and the on/off list below share this one
+  // condition, so they can never disagree (Ruling 36).
+  const swingToggle = device.channels.swing_toggle;
+  const swingToggleCommandable =
+    swingToggle?.write === true && roleCodec('swing_horizontal_mode', swingToggle)?.type === 'boolean';
+  if (swingToggle) writable.swing_horizontal_mode = swingToggleCommandable;
 
   const power = readBoolAttr(device, 'power', values);
   if (power !== undefined) attributes.power = power;
@@ -260,18 +295,15 @@ export function synthClimate(device: DeviceInput, entityId: string, values: Valu
   // metadata, not a reading, and must never make a valueless device look
   // available. Each comes from the one channel its role reads and writes
   // (fanChannel above, Ruling 25), and each is omitted when empty.
-  for (const [key, channel, names] of [
-    ['hvac_modes', device.channels.mode, HVAC_MODE_NAMES],
-    ['fan_modes', fanChannel, FAN_MODE_NAMES],
-    ['swing_modes', device.channels.swing, SWING_MODE_NAMES],
+  for (const [role, channel, names] of [
+    ['hvac_mode', device.channels.mode, HVAC_MODE_NAMES],
+    ['fan_mode', fanChannel, FAN_MODE_NAMES],
+    ['swing_mode', device.channels.swing, SWING_MODE_NAMES],
   ] as const) {
-    const modes = enumModes(channel, names);
-    if (modes.length) attributes[key] = modes;
+    const modes = enumModes(role, channel, names);
+    if (modes.length) attributes[`${role}s`] = modes;
   }
-  // toBoolState never reads a states map, and encodeChannelValue maps exactly
-  // on/off to true/false on a boolean channel -- nothing else round-trips.
-  const swingToggle = device.channels.swing_toggle;
-  if (swingToggle?.write === true && swingToggle.type === 'boolean') attributes.swing_horizontal_modes = ['off', 'on'];
+  if (swingToggleCommandable) attributes.swing_horizontal_modes = ['off', 'on'];
 
   return { entityId, domain: 'climate', source, state, attributes, available, lastChanged, writable, channelMeta };
 }

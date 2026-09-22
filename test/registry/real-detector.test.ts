@@ -291,6 +291,13 @@ describe('real type-detector end to end (Task 5c)', () => {
     // matches a read-only level.temperature against ACTUAL's pattern too.
     expectRealChannels(PROBE, ac!.device, { set: 'dev.0.ac.SET', mode: 'dev.0.ac.MODE', actual: 'dev.0.ac.SET' });
     expect(ac!.device.channels.set!.write).to.equal(false);
+    // That binding is the setpoint, not a reading: it is the target, and it
+    // must never be published as the current temperature too (Task 5b round
+    // 1, Task 5c finding (e)). The binding above stays -- it is what the
+    // detector does -- and synthClimate is what refuses to read it.
+    const payload = json(runFor(run(PROBE, { 'dev.0.ac.SET': value(21) }), 'dev.0.ac'));
+    expect(payload.temperature).to.equal(21);
+    expect(payload).to.not.have.property('current_temperature');
   });
 
   describe('sensor', () => {
@@ -491,6 +498,37 @@ describe('real type-detector end to end (Task 5c)', () => {
       const result = runFor(run(set, { [`${CIRCUIT}.DesiredRoomTemp`]: value(21) }), CIRCUIT);
       expectRealChannels(set, result.device, { set: `${CIRCUIT}.DesiredRoomTemp`, actual: `${CIRCUIT}.RoomTemp` });
       expect(json(result).supported_features).to.equal(1);
+    });
+
+    it('Task 5b round 1: a setpoint the detector also binds to ACTUAL is never published as the current temperature', () => {
+      // With no separate temperature object, ACTUAL's pattern (write:false,
+      // role /temperature(\..*)?$/, searchInParent) also matches a setpoint
+      // object that is read-only or declares no write flag, so the detector
+      // binds ACTUAL to that setpoint's own object.
+      const setpointOnly = (root: string, role: string, write?: boolean): IoObjects =>
+        objects(
+          channel(root, 'Heizung'),
+          state(`${root}.SP`, { role, type: 'number', unit: '°C', ...(write === undefined ? {} : { write }) }),
+        );
+      const cases: Array<[string, IoObjects, string]> = [
+        ['read-only SET_HEATING', setpointOnly('alias.0.h', 'level.temperature.heating', false), 'alias.0.h'],
+        ['read-only SET_COOLING', setpointOnly('alias.0.c', 'level.temperature.cooling', false), 'alias.0.c'],
+        ['SET with no write flag', setpointOnly('alias.0.n', 'level.temperature'), 'alias.0.n'],
+      ];
+      for (const [label, set, root] of cases) {
+        const result = runFor(run(set, { [`${root}.SP`]: value(21) }), root);
+        expect(result.device.channels.actual?.objectId, `${label}: the detector's own binding`).to.equal(`${root}.SP`);
+        const payload = json(result);
+        expect(payload.temperature, label).to.equal(21);
+        expect(payload, label).to.not.have.property('current_temperature');
+      }
+
+      // A real temperature object next to a read-only setpoint is still the reading.
+      const withReading = runFor(
+        run(circuitSet(false), { [`${CIRCUIT}.DesiredRoomTemp`]: value(21), [`${CIRCUIT}.RoomTemp`]: value(20) }),
+        CIRCUIT,
+      );
+      expect(json(withReading).current_temperature).to.equal(20);
     });
   });
 

@@ -29,12 +29,47 @@ describe('registry/synth/common: encodeChannelValue', () => {
     expect(typeof encoded).to.equal('number');
   });
 
-  it('passes a string-typed MODE label straight through', () => {
-    // readEnum: raw="cool" (string, no states) -> trimmed -> decodes "cool".
-    const codec: ChannelCodec = { type: 'string' };
-    const encoded = encodeChannelValue(codec, 'cool');
-    expect(encoded).to.equal('cool');
+  // Ruling 33 (supersedes Ruling 24(a)'s passthrough): with no non-empty
+  // states map, only a number- or boolean-typed channel says what a label
+  // means. When a modes list is empty the firmware still offers the CURRENT
+  // value as a lone option (climate_popup.cpp:458-460), lowercased, so a
+  // passthrough wrote "auto" for "AUTO", the string "1" for 1 and "on" for
+  // "true" -- with ok:true. Refusing loses nothing: that lone option is a
+  // re-select of the current value.
+  it('refuses a label for a channel that is not number- or boolean-typed and has no non-empty states map (Ruling 33)', () => {
+    const codecs: Array<ChannelCodec | undefined> = [
+      undefined,
+      {},
+      { type: 'string' },
+      { type: 'mixed' },
+      { type: 'string', states: {} },
+    ];
+    for (const codec of codecs) {
+      for (const label of ['auto', '1', 'on']) {
+        expect(encodeChannelValue(codec, label), `${JSON.stringify(codec)} "${label}"`).to.equal(undefined);
+      }
+    }
+  });
+
+  it('still reverses a string channel label through its states map, restoring the exact case', () => {
+    const encoded = encodeChannelValue({ type: 'string', states: { AUTO: 'Auto', HEAT: 'Heat' } }, 'auto');
+    expect(encoded).to.equal('AUTO');
     expect(typeof encoded).to.equal('string');
+  });
+
+  // Ruling 36: readEnum emits a raw number OUTSIDE its states map as its own
+  // number-string ("50"), and that is exactly what the lone fallback option
+  // sends back. Refusing it left a dead button; carrying it back is a no-op
+  // write of the current value.
+  it('carries a label outside the states map back as its own number, on a number channel only', () => {
+    const codec: ChannelCodec = { type: 'number', states: { '0': 'AUS', '100': 'MAX' } };
+    const encoded = encodeChannelValue(codec, '50');
+    expect(encoded).to.equal(50);
+    expect(typeof encoded).to.equal('number');
+    for (const label of ['', '   ', 'NaN', 'Infinity', 'turbo']) {
+      expect(encodeChannelValue(codec, label), label).to.equal(undefined);
+    }
+    expect(encodeChannelValue({ type: 'string', states: { AUTO: 'Auto' } }, 'eco')).to.equal(undefined);
   });
 
   it('round-trips the boolean swing toggle (true/false <-> the decoder\'s own "on"/"off")', () => {
@@ -106,18 +141,6 @@ describe('registry/synth/common: encodeChannelValue', () => {
     expect(encodeChannelValue(codec, 'auto')).to.equal(undefined);
   });
 
-  it('passes a label through unchanged when the channel carries no type/states metadata at all', () => {
-    // The safe default for a channel the registry never captured metadata
-    // for: write back exactly what arrived, same as every climate command
-    // already did before this field existed.
-    expect(encodeChannelValue(undefined, 'cool')).to.equal('cool');
-  });
-
-  it('treats a mixed-type channel the same as a plain string: pass through', () => {
-    const codec: ChannelCodec = { type: 'mixed' };
-    expect(encodeChannelValue(codec, 'cool')).to.equal('cool');
-  });
-
   // Fix-round 3, IMPORTANT A: ambiguous states-map matches must refuse, not
   // silently pick one.
   it('refuses a label that matches two different keys case-insensitively, rather than picking the first', () => {
@@ -161,9 +184,11 @@ describe('registry/synth/common: encodeChannelValue', () => {
     const codec: ChannelCodec = { type: 'number', states: malformed };
     expect(() => encodeChannelValue(codec, 'heat')).to.not.throw();
     expect(encodeChannelValue(codec, 'heat')).to.equal(1);
-    // The non-string entry can never match anything, string or not.
+    // The non-string entry can never match anything, string or not: "5"
+    // never resolves to its key 2. On a number channel it is simply a label
+    // outside the map, carried back as its own number (Ruling 36).
     expect(() => encodeChannelValue(codec, '5')).to.not.throw();
-    expect(encodeChannelValue(codec, '5')).to.equal(undefined);
+    expect(encodeChannelValue(codec, '5')).to.equal(5);
   });
 
   // Fix-round 3, finding 6: feed REAL decoder output into the encoder,
@@ -190,6 +215,26 @@ describe('registry/synth/common: encodeChannelValue', () => {
 
       const encoded = encodeChannelValue(e?.channelMeta?.mode, decoded as string);
       expect(encoded).to.equal(1);
+      expect(typeof encoded).to.equal('number');
+    });
+
+    it('via synthClimate: a numeric SPEED whose raw value is outside its states map (Ruling 36)', () => {
+      const device: DeviceInput = {
+        objectId: 'rt.0',
+        name: 'RT',
+        detectorType: 'airCondition',
+        domain: 'climate',
+        channels: {
+          mode: { objectId: 'rt.0.mode', write: true, type: 'number' },
+          speed: { objectId: 'rt.0.speed', write: true, type: 'number', states: { '0': 'AUTO', '1': 'HIGH' } },
+        },
+      };
+      const e = synthClimate(device, 'climate.rt', { 'rt.0.speed': numState(4) });
+      const decoded = e?.attributes.fan_mode;
+      expect(decoded, 'readEnum emits the out-of-map raw value as its own number-string').to.equal('4');
+
+      const encoded = encodeChannelValue(e?.channelMeta?.speed, decoded as string);
+      expect(encoded).to.equal(4);
       expect(typeof encoded).to.equal('number');
     });
 

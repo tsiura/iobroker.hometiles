@@ -1,7 +1,7 @@
 import type { ServiceCall } from '../protocol/commands';
-import type { ChannelCodec, Domain, VirtualEntity } from '../registry/types';
+import type { Domain, VirtualEntity } from '../registry/types';
 import { STATE_OFF, STATE_ON } from '../registry/types';
-import { encodeChannelValue } from '../registry/synth/common';
+import { encodeChannelValue, roleCodec } from '../registry/synth/common';
 import type { Logger } from './mqtt-client';
 
 export type StateWriter = (objectId: string, value: unknown) => Promise<void>;
@@ -162,29 +162,15 @@ export class Dispatcher {
      * defining bug class: success reported for a write that lands on
      * nothing, or on the wrong thing.
      *
-     * `fallbackType` supplies a default when the registry captured no
-     * type/states for this channel at all: fan_mode's SPEED/SPEED_LEVEL and
-     * swing_mode's SWING are always Number-typed by construction
-     * (@iobroker/type-detector's FanPatterns.speed/speedLevel/swing, fixed
-     * pattern declarations, not per-device data -- verified fix-round 1/2),
-     * so an untyped fixture or device still gets safe numeric coercion
-     * instead of a bare string passthrough. hvac_mode and preset_mode have
-     * no such structural guarantee (MODE is genuinely Number-or-String
-     * depending on the device) and take no fallback, defaulting to
-     * passthrough -- exactly what every climate command already did before
-     * this field existed, so an untyped channel never regresses.
+     * roleCodec (common.ts) supplies the role's fixed pattern type when the
+     * registry captured none -- the same function synthClimate advertises
+     * with, so what the panel is offered and what lands here cannot differ
+     * (Ruling 36).
      */
-    const pushEncoded = (
-      role: string,
-      channels: readonly string[],
-      label: string,
-      fallbackType?: ChannelCodec['type'],
-    ): void => {
+    const pushEncoded = (role: string, channels: readonly string[], label: string): void => {
       const channel = resolveChannel(role, channels);
       if (!channel) return;
-      const codec = entity.channelMeta?.[channel];
-      const effective = codec?.type === undefined && fallbackType ? { type: fallbackType, states: codec?.states } : codec;
-      const value = encodeChannelValue(effective, label);
+      const value = encodeChannelValue(roleCodec(role, entity.channelMeta?.[channel]), label);
       if (value === undefined) {
         this.log.warn(`[Command] Cannot encode "${label}" for ${entity.entityId} on channel ${channel}`);
         failureReason = 'cannot_encode_value';
@@ -237,29 +223,27 @@ export class Dispatcher {
         break;
       case 'set_hvac_mode':
         // No structural type guarantee (MODE can be Number- or String-typed
-        // depending on the device) -- passthrough default when untyped.
+        // depending on the device), so no fallback type: an untyped MODE
+        // takes a label only through its states map (Ruling 33).
         pushEncoded('hvac_mode', ['mode'], call.mode);
         break;
       case 'set_fan_mode':
         // SPEED (named steps) and SPEED_LEVEL (a percentage) are alternates
         // for the same role, same as light's dimmer/brightness pair.
-        pushEncoded('fan_mode', ['speed', 'speed_level'], call.mode, 'number');
+        pushEncoded('fan_mode', ['speed', 'speed_level'], call.mode);
         break;
       case 'set_preset_mode':
         pushEncoded('preset_mode', ['preset'], call.mode);
         break;
       case 'set_swing_mode':
-        pushEncoded('swing_mode', ['swing'], call.mode, 'number');
+        pushEncoded('swing_mode', ['swing'], call.mode);
         break;
       case 'set_swing_horizontal_mode':
         // requireOnOff (commands.ts) already proved this is a strict on/off
         // choice; convert to the exact label toBoolState emits for a boolean
-        // channel before encoding, defaulting to boolean when untyped
-        // (SWING_TOGGLE's fixed Boolean declaration) instead of the generic
-        // string passthrough every other label command falls back to -- that
-        // passthrough would regress a boolean write that already worked
-        // before this fix into a wrongly-typed string write.
-        pushEncoded('swing_horizontal_mode', ['swing_toggle'], call.on ? STATE_ON : STATE_OFF, 'boolean');
+        // channel before encoding (an untyped toggle encodes as boolean, its
+        // fixed pattern type -- roleCodec).
+        pushEncoded('swing_horizontal_mode', ['swing_toggle'], call.on ? STATE_ON : STATE_OFF);
         break;
     }
 
