@@ -84,6 +84,19 @@ describe('protocol/state-payload', () => {
     expect(JSON.parse(p!.payload).state).to.equal('unavailable');
   });
 
+  it('routes climate through buildClimatePayload instead of the generic JSON body', () => {
+    // Full rule coverage (overwrite semantics, null-string hazard, paired
+    // setpoint, preset allow-list) lives in protocol/climate.test.ts; this
+    // just pins that buildStatePublish actually delegates to it rather than
+    // falling into the generic attribute loop, which would diff instead of
+    // always publishing the complete attribute set.
+    const p = buildStatePublish('ha/statestream', entity({ entityId: 'climate.living_room', domain: 'climate', attributes: { current_temperature: 21 } }));
+    expect(p!.topic).to.equal('ha/statestream/climate/living_room/state');
+    const parsed = JSON.parse(p!.payload) as Record<string, unknown>;
+    expect(parsed).to.include.keys('temperature', 'min_temp', 'max_temp', 'available');
+    expect(parsed).to.not.have.property('state');
+  });
+
   it('publishes nothing for a scene', () => {
     expect(buildStatePublish('ha/statestream', entity({ entityId: 'scene.n', domain: 'scene' }))).to.equal(null);
   });

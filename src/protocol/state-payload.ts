@@ -1,4 +1,5 @@
 import type { Domain, VirtualEntity } from '../registry/types';
+import { buildClimatePayload } from './climate';
 import { entityStateTopic } from './topics';
 
 export interface StatePublish {
@@ -54,6 +55,16 @@ export function buildStatePublish(haPrefix: string, entity: VirtualEntity): Stat
 
   if (shape === 'bare') {
     return { topic, payload: entity.state, retain: true };
+  }
+
+  // Climate publishes a different shape than every other JSON domain here:
+  // the firmware caches it by full overwrite (never merge), so the payload
+  // must always carry the complete attribute set, and its hand-rolled string
+  // parser makes a bare `null` dangerous. See src/protocol/climate.ts and
+  // docs/contract-climate-cover.md for the full rules; do not fold this back
+  // into the generic loop below.
+  if (entity.domain === 'climate') {
+    return { topic, payload: buildClimatePayload(entity), retain: true };
   }
 
   const body: Record<string, unknown> = {};
