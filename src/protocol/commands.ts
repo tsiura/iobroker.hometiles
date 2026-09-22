@@ -10,7 +10,14 @@ export type ServiceCall =
       rgb?: [number, number, number];
       kelvin?: number;
     }
-  | { kind: 'activate_scene'; alias: string };
+  | { kind: 'activate_scene'; alias: string }
+  | { kind: 'set_temperature'; entityId: string; value?: number; low?: number; high?: number }
+  | { kind: 'set_humidity'; entityId: string; value: number }
+  | { kind: 'set_hvac_mode'; entityId: string; mode: string }
+  | { kind: 'set_fan_mode'; entityId: string; mode: string }
+  | { kind: 'set_preset_mode'; entityId: string; mode: string }
+  | { kind: 'set_swing_mode'; entityId: string; mode: string }
+  | { kind: 'set_swing_horizontal_mode'; entityId: string; on: boolean };
 
 export class CommandError extends Error {
   constructor(public readonly code: string) {
@@ -58,6 +65,29 @@ function requireNumber(value: unknown, code: string): number {
   const numeric = typeof value === 'number' ? value : Number.NaN;
   if (!Number.isFinite(numeric)) throw new CommandError(code);
   return numeric;
+}
+
+/**
+ * The firmware's preset name table (tile_renderer.cpp's climate_preset_id,
+ * docs/contract-climate-cover.md "preset_mode name table is closed") only
+ * recognises these 8 HA-core names; anything else is silently discarded on
+ * the firmware side. Duplicated from protocol/climate.ts rather than
+ * imported: that module belongs to a different in-flight change and must not
+ * be touched here.
+ */
+const ALLOWED_PRESET_MODES = new Set(['none', 'eco', 'away', 'boost', 'comfort', 'home', 'sleep', 'activity']);
+
+function requireMode(value: unknown, code: string): string {
+  const text = typeof value === 'string' ? value.trim().toLowerCase() : '';
+  if (!text) throw new CommandError(code);
+  return text;
+}
+
+function requireOnOff(value: unknown, code: string): boolean {
+  const text = typeof value === 'string' ? value.trim().toLowerCase() : '';
+  if (text === 'on') return true;
+  if (text === 'off') return false;
+  throw new CommandError(code);
 }
 
 function onOffCall(entityId: string, state: unknown): ServiceCall {
@@ -121,7 +151,69 @@ export function parseSceneCommand(raw: string): ServiceCall {
   return { kind: 'activate_scene', alias };
 }
 
-export function parseCommand(leaf: 'light' | 'switch' | 'scene', raw: string): ServiceCall {
+/**
+ * All seven climate commands share one MQTT topic and are discriminated by a
+ * "command" field inside the JSON payload itself (docs/contract-climate-cover.md
+ * "Outbound commands and service names") -- unlike light/switch/scene, where
+ * the topic leaf alone says what the payload means.
+ */
+export function parseClimateCommand(raw: string): ServiceCall {
+  const payload = parseObject(raw);
+  const entityId = requireEntityId(payload);
+  const command = typeof payload.command === 'string' ? payload.command : '';
+
+  switch (command) {
+    case 'set_temperature': {
+      const hasValue = payload.temperature !== undefined;
+      const hasLow = payload.target_temp_low !== undefined;
+      const hasHigh = payload.target_temp_high !== undefined;
+      // The firmware only ever sends the single "temperature" key or the
+      // complete "target_temp_low"+"target_temp_high" pair together
+      // (mqttPublishClimateTemperature's two branches), never one bound
+      // alone. Guessing the missing bound would silently move a setpoint the
+      // user never touched.
+      if (hasLow !== hasHigh) throw new CommandError('incomplete_temperature_range');
+      if (!hasValue && !hasLow) throw new CommandError('missing_temperature');
+
+      const call: Extract<ServiceCall, { kind: 'set_temperature' }> = { kind: 'set_temperature', entityId };
+      if (hasValue) call.value = requireNumber(payload.temperature, 'invalid_temperature');
+      if (hasLow) {
+        call.low = requireNumber(payload.target_temp_low, 'invalid_temperature_range');
+        call.high = requireNumber(payload.target_temp_high, 'invalid_temperature_range');
+      }
+      return call;
+    }
+    case 'set_humidity':
+      return { kind: 'set_humidity', entityId, value: requireNumber(payload.humidity, 'invalid_humidity') };
+    case 'set_hvac_mode':
+      return { kind: 'set_hvac_mode', entityId, mode: requireMode(payload.hvac_mode, 'invalid_hvac_mode') };
+    case 'set_fan_mode':
+      return { kind: 'set_fan_mode', entityId, mode: requireMode(payload.fan_mode, 'invalid_fan_mode') };
+    case 'set_preset_mode': {
+      const mode = requireMode(payload.preset_mode, 'invalid_preset_mode');
+      // Only the firmware's fixed 8 survive; anything else is silently
+      // discarded on the other end (climate_preset_id), so forwarding it
+      // would report success for a command that does nothing.
+      if (!ALLOWED_PRESET_MODES.has(mode)) throw new CommandError('invalid_preset_mode');
+      return { kind: 'set_preset_mode', entityId, mode };
+    }
+    case 'set_swing_mode':
+      return { kind: 'set_swing_mode', entityId, mode: requireMode(payload.swing_mode, 'invalid_swing_mode') };
+    case 'set_swing_horizontal_mode':
+      return {
+        kind: 'set_swing_horizontal_mode',
+        entityId,
+        // The only ioBroker channel this role ever maps to (synth/climate.ts's
+        // SWING_TOGGLE) is a boolean, so "on"/"off" are the only values with
+        // anywhere real to go.
+        on: requireOnOff(payload.swing_horizontal_mode, 'invalid_swing_horizontal_mode'),
+      };
+    default:
+      throw new CommandError('unsupported_climate_command');
+  }
+}
+
+export function parseCommand(leaf: 'light' | 'switch' | 'scene' | 'climate', raw: string): ServiceCall {
   switch (leaf) {
     case 'light':
       return parseLightCommand(raw);
@@ -129,6 +221,8 @@ export function parseCommand(leaf: 'light' | 'switch' | 'scene', raw: string): S
       return parseSwitchCommand(raw);
     case 'scene':
       return parseSceneCommand(raw);
+    case 'climate':
+      return parseClimateCommand(raw);
     default: {
       // The union makes this unreachable at compile time, and the `never`
       // binding keeps that guarantee if a leaf is added. The throw covers the

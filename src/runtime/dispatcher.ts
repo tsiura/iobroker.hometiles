@@ -38,7 +38,15 @@ const ALLOWED_CALLS: Record<Domain, ReadonlySet<CallKind>> = {
   // "call_not_allowed_for_domain" rejection below rather than throwing out of
   // a static table — loud and explicit, not a silent fallthrough. Later tasks
   // add each domain's ServiceCall kind here as it gains real commands.
-  climate: new Set<CallKind>(),
+  climate: new Set<CallKind>([
+    'set_temperature',
+    'set_humidity',
+    'set_hvac_mode',
+    'set_fan_mode',
+    'set_preset_mode',
+    'set_swing_mode',
+    'set_swing_horizontal_mode',
+  ]),
   cover: new Set<CallKind>(),
   media_player: new Set<CallKind>(),
   weather: new Set<CallKind>(),
@@ -110,6 +118,19 @@ export class Dispatcher {
       if (objectId) writes.push([channel, objectId, value]);
     };
 
+    // Climate-only: a role (e.g. "setpoint") is writable per entity.writable
+    // — set by the registry, never re-derived here — but is not pinned to one
+    // fixed channel name. A single setpoint is ordinarily SET, but a
+    // dual-setpoint device exposing only one side of SET_HEATING/SET_COOLING
+    // can also be "the" setpoint writer for that role (see synth/climate.ts).
+    // Candidates are tried in order; the first one the entity actually has
+    // wins. Same mechanism also covers fan_mode's SPEED/SPEED_LEVEL fallback.
+    const pushRole = (role: string, channels: readonly string[], value: unknown): void => {
+      if (entity.writable?.[role] !== true) return;
+      const channel = channels.find((name) => entity.source[name]);
+      if (channel) push(channel, value);
+    };
+
     switch (call.kind) {
       case 'turn_on':
         push('set', true);
@@ -142,6 +163,33 @@ export class Dispatcher {
         if (call.kelvin !== undefined) push('temperature', call.kelvin);
         break;
       }
+      case 'set_temperature':
+        // Do not hardcode 'set': whatever channel the registry recorded as
+        // the setpoint writer is the one to write (see pushRole above).
+        if (call.value !== undefined) pushRole('setpoint', ['set', 'set_heating', 'set_cooling'], call.value);
+        if (call.low !== undefined) pushRole('target_temp_low', ['set_heating'], call.low);
+        if (call.high !== undefined) pushRole('target_temp_high', ['set_cooling'], call.high);
+        break;
+      case 'set_humidity':
+        pushRole('target_humidity', ['humidity'], call.value);
+        break;
+      case 'set_hvac_mode':
+        pushRole('hvac_mode', ['mode'], call.mode);
+        break;
+      case 'set_fan_mode':
+        // SPEED (named steps) and SPEED_LEVEL (a percentage) are alternates
+        // for the same role, same as light's dimmer/brightness pair.
+        pushRole('fan_mode', ['speed', 'speed_level'], call.mode);
+        break;
+      case 'set_preset_mode':
+        pushRole('preset_mode', ['preset'], call.mode);
+        break;
+      case 'set_swing_mode':
+        pushRole('swing_mode', ['swing'], call.mode);
+        break;
+      case 'set_swing_horizontal_mode':
+        pushRole('swing_horizontal_mode', ['swing_toggle'], call.on);
+        break;
     }
 
     return writes;

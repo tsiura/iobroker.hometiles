@@ -203,4 +203,202 @@ describe('runtime/dispatcher', () => {
     expect(result).to.deep.equal({ ok: false, reason: 'write_failed', applied: 1 });
     expect(writes).to.deep.equal([['hue.0.d.on', true]]);
   });
+
+  describe('climate', () => {
+    it('rejects a setpoint command when the thermostat has no writable SET', async () => {
+      // The v0.1 rule, applied to a new domain: writing nothing is not success.
+      const readOnlyThermostat = entity({
+        entityId: 'climate.hall',
+        domain: 'climate',
+        source: { set: 'zig.0.hall.set' },
+        writable: { setpoint: false },
+      });
+      const d = new Dispatcher(lookup([readOnlyThermostat]), write, silentLog);
+      const result = await d.dispatch({ kind: 'set_temperature', entityId: 'climate.hall', value: 21 });
+      expect(result).to.deep.equal({ ok: false, reason: 'no_writable_channel', applied: 0 });
+      expect(writes).to.have.length(0);
+    });
+
+    it('writes a single setpoint through its SET channel when writable', async () => {
+      const thermostat = entity({
+        entityId: 'climate.hall',
+        domain: 'climate',
+        source: { set: 'zig.0.hall.set' },
+        writable: { setpoint: true },
+      });
+      const d = new Dispatcher(lookup([thermostat]), write, silentLog);
+      const result = await d.dispatch({ kind: 'set_temperature', entityId: 'climate.hall', value: 21.5 });
+      expect(result).to.deep.equal({ ok: true, writes: 1 });
+      expect(writes).to.deep.equal([['zig.0.hall.set', 21.5]]);
+    });
+
+    it('routes a single setpoint to whichever channel writable.setpoint points at, not hardcoded to SET', async () => {
+      // Forward-looking: a synth change lets a lone SET_HEATING (no plain SET,
+      // no SET_COOLING) become the single-setpoint writer. The dispatcher must
+      // not assume the channel is literally named 'set'.
+      const singleViaHeating = entity({
+        entityId: 'climate.single',
+        domain: 'climate',
+        source: { set_heating: 'zig.0.single.heat' },
+        writable: { setpoint: true },
+      });
+      const d = new Dispatcher(lookup([singleViaHeating]), write, silentLog);
+      const result = await d.dispatch({ kind: 'set_temperature', entityId: 'climate.single', value: 19 });
+      expect(result).to.deep.equal({ ok: true, writes: 1 });
+      expect(writes).to.deep.equal([['zig.0.single.heat', 19]]);
+    });
+
+    it('writes both bounds of a dual-setpoint range when both channels are writable', async () => {
+      const dual = entity({
+        entityId: 'climate.dual',
+        domain: 'climate',
+        source: { set_heating: 'zig.0.dual.heat', set_cooling: 'zig.0.dual.cool' },
+        writable: { target_temp_low: true, target_temp_high: true },
+      });
+      const d = new Dispatcher(lookup([dual]), write, silentLog);
+      const result = await d.dispatch({ kind: 'set_temperature', entityId: 'climate.dual', low: 18, high: 24 });
+      expect(result).to.deep.equal({ ok: true, writes: 2 });
+      expect(writes).to.deep.equal([
+        ['zig.0.dual.heat', 18],
+        ['zig.0.dual.cool', 24],
+      ]);
+    });
+
+    it('succeeds for the one bound it can write when only one side of a dual setpoint is writable', async () => {
+      // Same exception v0.1 established for set_light: a command carrying
+      // several values succeeds for what it could write, and only fails
+      // outright when NOTHING could be written.
+      const heatOnly = entity({
+        entityId: 'climate.dual',
+        domain: 'climate',
+        source: { set_heating: 'zig.0.dual.heat', set_cooling: 'zig.0.dual.cool' },
+        writable: { target_temp_low: true, target_temp_high: false },
+      });
+      const d = new Dispatcher(lookup([heatOnly]), write, silentLog);
+      const result = await d.dispatch({ kind: 'set_temperature', entityId: 'climate.dual', low: 18, high: 24 });
+      expect(result).to.deep.equal({ ok: true, writes: 1 });
+      expect(writes).to.deep.equal([['zig.0.dual.heat', 18]]);
+    });
+
+    it('rejects a dual-setpoint command when neither bound is writable', async () => {
+      const neither = entity({
+        entityId: 'climate.dual',
+        domain: 'climate',
+        source: { set_heating: 'zig.0.dual.heat', set_cooling: 'zig.0.dual.cool' },
+        writable: { target_temp_low: false, target_temp_high: false },
+      });
+      const d = new Dispatcher(lookup([neither]), write, silentLog);
+      const result = await d.dispatch({ kind: 'set_temperature', entityId: 'climate.dual', low: 18, high: 24 });
+      expect(result).to.deep.equal({ ok: false, reason: 'no_writable_channel', applied: 0 });
+      expect(writes).to.have.length(0);
+    });
+
+    it('routes swing and horizontal swing to different, independent channels', async () => {
+      // brief's literal assertion is r.writes[0].channel, but DispatchResult's
+      // ok:true shape carries only a count (writes: number), unchanged since
+      // v0.1 -- every existing dispatcher test relies on that. This pins the
+      // same fact (the two commands land on different channels) through the
+      // write-log the rest of this file already uses.
+      const acWithBothSwings = entity({
+        entityId: 'climate.ac',
+        domain: 'climate',
+        source: { swing: 'zig.0.ac.swing', swing_toggle: 'zig.0.ac.swing_h' },
+        writable: { swing_mode: true, swing_horizontal_mode: true },
+      });
+      const d = new Dispatcher(lookup([acWithBothSwings]), write, silentLog);
+
+      await d.dispatch({ kind: 'set_swing_mode', entityId: 'climate.ac', mode: 'vertical' });
+      expect(writes).to.deep.equal([['zig.0.ac.swing', 'vertical']]);
+
+      writes = [];
+      await d.dispatch({ kind: 'set_swing_horizontal_mode', entityId: 'climate.ac', on: true });
+      expect(writes).to.deep.equal([['zig.0.ac.swing_h', true]]);
+    });
+
+    it('rejects horizontal swing when only the vertical swing channel is writable', async () => {
+      const verticalOnly = entity({
+        entityId: 'climate.ac',
+        domain: 'climate',
+        source: { swing: 'zig.0.ac.swing', swing_toggle: 'zig.0.ac.swing_h' },
+        writable: { swing_mode: true, swing_horizontal_mode: false },
+      });
+      const d = new Dispatcher(lookup([verticalOnly]), write, silentLog);
+      const result = await d.dispatch({ kind: 'set_swing_horizontal_mode', entityId: 'climate.ac', on: true });
+      expect(result).to.deep.equal({ ok: false, reason: 'no_writable_channel', applied: 0 });
+    });
+
+    it('writes hvac_mode through the MODE channel', async () => {
+      const ac = entity({
+        entityId: 'climate.ac',
+        domain: 'climate',
+        source: { mode: 'zig.0.ac.mode' },
+        writable: { hvac_mode: true },
+      });
+      const d = new Dispatcher(lookup([ac]), write, silentLog);
+      const result = await d.dispatch({ kind: 'set_hvac_mode', entityId: 'climate.ac', mode: 'cool' });
+      expect(result).to.deep.equal({ ok: true, writes: 1 });
+      expect(writes).to.deep.equal([['zig.0.ac.mode', 'cool']]);
+    });
+
+    it('writes fan_mode to the named SPEED channel when present', async () => {
+      const ac = entity({
+        entityId: 'climate.ac',
+        domain: 'climate',
+        source: { speed: 'zig.0.ac.speed', speed_level: 'zig.0.ac.speed_pct' },
+        writable: { fan_mode: true },
+      });
+      const d = new Dispatcher(lookup([ac]), write, silentLog);
+      await d.dispatch({ kind: 'set_fan_mode', entityId: 'climate.ac', mode: 'high' });
+      expect(writes).to.deep.equal([['zig.0.ac.speed', 'high']]);
+    });
+
+    it('falls back to SPEED_LEVEL when the device has no named SPEED channel', async () => {
+      const ac = entity({
+        entityId: 'climate.ac',
+        domain: 'climate',
+        source: { speed_level: 'zig.0.ac.speed_pct' },
+        writable: { fan_mode: true },
+      });
+      const d = new Dispatcher(lookup([ac]), write, silentLog);
+      await d.dispatch({ kind: 'set_fan_mode', entityId: 'climate.ac', mode: '42' });
+      expect(writes).to.deep.equal([['zig.0.ac.speed_pct', '42']]);
+    });
+
+    it('rejects set_humidity when the device has no writable humidity channel', async () => {
+      // No ioBroker type-detector pattern this adapter recognises exposes a
+      // settable target humidity (synth/climate.ts: HUMIDITY is read-only
+      // telemetry) -- this must always fail, never silently succeed.
+      const ac = entity({
+        entityId: 'climate.ac',
+        domain: 'climate',
+        source: { humidity: 'zig.0.ac.humidity' },
+        writable: {},
+      });
+      const d = new Dispatcher(lookup([ac]), write, silentLog);
+      const result = await d.dispatch({ kind: 'set_humidity', entityId: 'climate.ac', value: 55 });
+      expect(result).to.deep.equal({ ok: false, reason: 'no_writable_channel', applied: 0 });
+    });
+
+    it('rejects set_preset_mode when the device has no writable preset channel', async () => {
+      const ac = entity({ entityId: 'climate.ac', domain: 'climate', source: {}, writable: {} });
+      const d = new Dispatcher(lookup([ac]), write, silentLog);
+      const result = await d.dispatch({ kind: 'set_preset_mode', entityId: 'climate.ac', mode: 'eco' });
+      expect(result).to.deep.equal({ ok: false, reason: 'no_writable_channel', applied: 0 });
+    });
+
+    it('refuses a light-only call aimed at a climate entity', async () => {
+      const ac = entity({
+        entityId: 'climate.ac',
+        domain: 'climate',
+        source: { mode: 'zig.0.ac.mode' },
+        writable: { hvac_mode: true },
+      });
+      const d = new Dispatcher(lookup([ac]), write, silentLog);
+      expect(await d.dispatch({ kind: 'set_light', entityId: 'climate.ac', brightnessPct: 50 })).to.deep.equal({
+        ok: false,
+        reason: 'call_not_allowed_for_domain',
+        applied: 0,
+      });
+    });
+  });
 });

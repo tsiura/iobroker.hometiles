@@ -1,5 +1,12 @@
 import { expect } from 'chai';
-import { CommandError, parseCommand, parseLightCommand, parseSceneCommand, parseSwitchCommand } from '../../src/protocol/commands';
+import {
+  CommandError,
+  parseClimateCommand,
+  parseCommand,
+  parseLightCommand,
+  parseSceneCommand,
+  parseSwitchCommand,
+} from '../../src/protocol/commands';
 
 describe('protocol/commands', () => {
   it('parses a plain on command from the switch topic', () => {
@@ -123,5 +130,142 @@ describe('protocol/commands', () => {
     expect(parseCommand('scene', 'Nacht').kind).to.equal('activate_scene');
     expect(parseCommand('light', '{"entity_id":"light.d","state":"off"}').kind).to.equal('turn_off');
     expect(parseCommand('switch', '{"entity_id":"switch.d","state":"on"}').kind).to.equal('turn_on');
+  });
+
+  // Climate: all seven commands share one topic and are discriminated by a
+  // "command" field inside the payload (docs/contract-climate-cover.md).
+  it('parses a single-value set_temperature command', () => {
+    expect(
+      parseClimateCommand('{"entity_id":"climate.hall","command":"set_temperature","temperature":21.5}'),
+    ).to.deep.equal({ kind: 'set_temperature', entityId: 'climate.hall', value: 21.5 });
+  });
+
+  it('parses a dual-setpoint set_temperature range', () => {
+    expect(
+      parseClimateCommand(
+        '{"entity_id":"climate.hall","command":"set_temperature","target_temp_low":18,"target_temp_high":24}',
+      ),
+    ).to.deep.equal({ kind: 'set_temperature', entityId: 'climate.hall', low: 18, high: 24 });
+  });
+
+  it('rejects a temperature range missing one bound rather than guessing the other', () => {
+    expect(() =>
+      parseClimateCommand('{"entity_id":"climate.hall","command":"set_temperature","target_temp_low":18}'),
+    ).to.throw(CommandError);
+  });
+
+  it('rejects a set_temperature command with no temperature field at all', () => {
+    expect(() => parseClimateCommand('{"entity_id":"climate.hall","command":"set_temperature"}')).to.throw(
+      CommandError,
+    );
+  });
+
+  it('rejects a blank temperature rather than coercing it to zero', () => {
+    // Number('') is 0 and finite -- exactly how this class of bug got in before.
+    expect(() =>
+      parseClimateCommand('{"entity_id":"climate.hall","command":"set_temperature","temperature":""}'),
+    ).to.throw(CommandError);
+  });
+
+  it('preserves a legitimate zero target temperature', () => {
+    expect(
+      (
+        parseClimateCommand('{"entity_id":"climate.hall","command":"set_temperature","temperature":0}') as {
+          value: number;
+        }
+      ).value,
+    ).to.equal(0);
+  });
+
+  it('parses set_humidity', () => {
+    expect(
+      parseClimateCommand('{"entity_id":"climate.hall","command":"set_humidity","humidity":55.5}'),
+    ).to.deep.equal({ kind: 'set_humidity', entityId: 'climate.hall', value: 55.5 });
+  });
+
+  it('rejects a blank humidity rather than coercing it to zero', () => {
+    expect(() =>
+      parseClimateCommand('{"entity_id":"climate.hall","command":"set_humidity","humidity":""}'),
+    ).to.throw(CommandError);
+  });
+
+  it('parses set_hvac_mode, trimmed and lowercased', () => {
+    expect(
+      parseClimateCommand('{"entity_id":"climate.hall","command":"set_hvac_mode","hvac_mode":" Heat "}'),
+    ).to.deep.equal({ kind: 'set_hvac_mode', entityId: 'climate.hall', mode: 'heat' });
+  });
+
+  it('rejects an empty hvac_mode', () => {
+    expect(() =>
+      parseClimateCommand('{"entity_id":"climate.hall","command":"set_hvac_mode","hvac_mode":""}'),
+    ).to.throw(CommandError);
+  });
+
+  it('parses set_fan_mode', () => {
+    expect(parseClimateCommand('{"entity_id":"climate.ac","command":"set_fan_mode","fan_mode":"High"}')).to.deep.equal(
+      { kind: 'set_fan_mode', entityId: 'climate.ac', mode: 'high' },
+    );
+  });
+
+  it('parses set_preset_mode when the name is one of the firmware-recognised eight', () => {
+    expect(
+      parseClimateCommand('{"entity_id":"climate.hall","command":"set_preset_mode","preset_mode":"Eco"}'),
+    ).to.deep.equal({ kind: 'set_preset_mode', entityId: 'climate.hall', mode: 'eco' });
+  });
+
+  it('rejects a preset_mode outside the firmware-recognised eight names', () => {
+    // climate_preset_id (tile_renderer.cpp) only recognises 8 HA-core names;
+    // anything else is silently discarded on the firmware side, so it must
+    // never be forwarded as if it were accepted.
+    expect(() =>
+      parseClimateCommand('{"entity_id":"climate.hall","command":"set_preset_mode","preset_mode":"custom_mode"}'),
+    ).to.throw(CommandError);
+  });
+
+  it('parses set_swing_mode', () => {
+    expect(
+      parseClimateCommand('{"entity_id":"climate.ac","command":"set_swing_mode","swing_mode":"vertical"}'),
+    ).to.deep.equal({ kind: 'set_swing_mode', entityId: 'climate.ac', mode: 'vertical' });
+  });
+
+  it('parses set_swing_horizontal_mode as a boolean toggle', () => {
+    expect(
+      parseClimateCommand(
+        '{"entity_id":"climate.ac","command":"set_swing_horizontal_mode","swing_horizontal_mode":"on"}',
+      ),
+    ).to.deep.equal({ kind: 'set_swing_horizontal_mode', entityId: 'climate.ac', on: true });
+    expect(
+      parseClimateCommand(
+        '{"entity_id":"climate.ac","command":"set_swing_horizontal_mode","swing_horizontal_mode":"Off"}',
+      ),
+    ).to.deep.equal({ kind: 'set_swing_horizontal_mode', entityId: 'climate.ac', on: false });
+  });
+
+  it('rejects a swing_horizontal_mode value that is not on or off', () => {
+    // The only ioBroker channel this role ever maps to (synth/climate.ts's
+    // SWING_TOGGLE) is a boolean, so a value like "auto" has nowhere real to go.
+    expect(() =>
+      parseClimateCommand(
+        '{"entity_id":"climate.ac","command":"set_swing_horizontal_mode","swing_horizontal_mode":"auto"}',
+      ),
+    ).to.throw(CommandError);
+  });
+
+  it('rejects a climate payload whose command field is not one of the seven known kinds', () => {
+    expect(() => parseClimateCommand('{"entity_id":"climate.hall","command":"bogus"}')).to.throw(CommandError);
+  });
+
+  it('rejects a climate payload with no recognisable command', () => {
+    // Brief's literal example is parseCommand('cmnd/climate', '{"bogus":1}'):
+    // 'cmnd/climate' is not a real leaf value (the leaf param takes bare
+    // domain words, see 'dispatches by topic leaf' above) -- this exercises
+    // the same intent through the real parseCommand('climate', ...) API.
+    expect(() => parseCommand('climate', '{"bogus":1}')).to.throw(CommandError);
+  });
+
+  it('dispatches the climate leaf through parseCommand', () => {
+    expect(
+      parseCommand('climate', '{"entity_id":"climate.hall","command":"set_hvac_mode","hvac_mode":"cool"}').kind,
+    ).to.equal('set_hvac_mode');
   });
 });
