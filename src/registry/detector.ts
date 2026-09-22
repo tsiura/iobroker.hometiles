@@ -116,6 +116,15 @@ const IGNORED_CHANNELS = new Set([
   'EFFECT',
   'TRANSITION_TIME',
   'ON_TIME',
+  // thermostat's notable-optional channels (docs/contract-iobroker-types.md):
+  // none of the three is in synthClimate's mapped-role table, and VALVE in
+  // particular is a live analog percentage on a real device — exactly the
+  // ELECTRIC_POWER-style churn this set exists to stop. Each name is unique
+  // to the thermostat pattern (verified against typePatterns.js), so this
+  // cannot shadow an unrelated channel on another device type.
+  'VALVE',
+  'WINDOW',
+  'PARTY',
 ]);
 
 /**

@@ -208,6 +208,44 @@ describe('registry/detector mapping', () => {
     expect(device!.channels.swing_toggle?.objectId).to.equal('ac.0.swing_switch');
   });
 
+  it('resolves the duplicate SWING channels by role regardless of which one arrives first', () => {
+    // The test above happens to use the same ordering typePatterns.js does
+    // (numeric level.mode.swing, then boolean switch.mode.swing). That alone
+    // cannot catch a regression to position-based dispatch (first SWING wins
+    // `swing`, second wins `swing_toggle`, defaultRole ignored) — a fixture
+    // with the order reversed is required to prove it is genuinely
+    // role-keyed, not order-keyed.
+    const control: DetectedControl = {
+      type: 'airCondition',
+      states: [
+        { id: 'ac.0.mode', name: 'MODE', write: true },
+        { id: 'ac.0.swing_switch', name: 'SWING', write: true, defaultRole: 'switch.mode.swing' },
+        { id: 'ac.0.swing_level', name: 'SWING', write: true, defaultRole: 'level.mode.swing' },
+      ],
+    };
+    const device = mapControlToDevice('ac.0', control, {});
+    expect(device).to.not.equal(null);
+    expect(device!.channels.swing?.objectId).to.equal('ac.0.swing_level');
+    expect(device!.channels.swing_toggle?.objectId).to.equal('ac.0.swing_switch');
+  });
+
+  it("drops a thermostat's VALVE, WINDOW and PARTY channels: no v0.2 role reads them", () => {
+    // VALVE is a live analog percentage on a real device — exactly the
+    // ELECTRIC_POWER-style recompute churn IGNORED_CHANNELS exists to stop
+    // (see the mechanism-level regression test in entity-registry.test.ts).
+    const control: DetectedControl = {
+      type: 'thermostat',
+      states: [
+        { id: 'thermo.0.actual', name: 'ACTUAL' },
+        { id: 'thermo.0.valve', name: 'VALVE' },
+        { id: 'thermo.0.window', name: 'WINDOW' },
+        { id: 'thermo.0.party', name: 'PARTY', write: true },
+      ],
+    };
+    const device = mapControlToDevice('thermo.0', control, {});
+    expect(Object.keys(device!.channels)).to.deep.equal(['actual']);
+  });
+
   it('falls back to the last object id segment when no name is known', () => {
     const control: DetectedControl = { type: 'temperature', states: [{ id: 'zigbee.0.unknown.value', name: 'ACTUAL' }] };
     const device = mapControlToDevice('zigbee.0.unknown', control, {});

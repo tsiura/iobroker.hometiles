@@ -1,4 +1,5 @@
 import { expect } from 'chai';
+import { mapControlToDevice, type DetectedControl } from '../../src/registry/detector';
 import { EntityRegistry } from '../../src/registry/entity-registry';
 import type { DeviceInput, SourceValue, VirtualEntity } from '../../src/registry/types';
 
@@ -75,6 +76,35 @@ describe('registry/entity-registry', () => {
     changed.length = 0;
     registry.applyStateChange('some.other.state', value(1));
     expect(changed).to.have.length(0);
+  });
+
+  it('never schedules a recompute for a channel the detector drops as noise', () => {
+    // Proves the mechanism, not just IGNORED_CHANNELS's contents: rebuild()
+    // watches every key in device.channels (see the loop below `synthesise`
+    // in rebuild), so a channel that never becomes a key — because
+    // mapControlToDevice's channelName dropped it — can never be watched,
+    // and applyStateChange on its object id must be a complete no-op. VALVE
+    // is a live analog percentage on a real thermostat; without this, every
+    // tick would force a full synthClimate recompute and JSON.stringify diff.
+    const control: DetectedControl = {
+      type: 'thermostat',
+      states: [
+        { id: 'thermo.0.actual', name: 'ACTUAL' },
+        { id: 'thermo.0.valve', name: 'VALVE' },
+      ],
+    };
+    const device = mapControlToDevice('thermo.0', control, {});
+    expect(device!.channels.valve, 'sanity check: not just the set contents').to.equal(undefined);
+
+    const { registry, changed, membership } = harness();
+    registry.rebuild([device!], {});
+    changed.length = 0;
+    const membershipBefore = membership();
+
+    registry.applyStateChange('thermo.0.valve', value(42));
+
+    expect(changed, 'a change on a dropped channel must not trigger a recompute').to.have.length(0);
+    expect(membership()).to.equal(membershipBefore);
   });
 
   it('coalesces a burst into a single emission carrying the newest value', () => {

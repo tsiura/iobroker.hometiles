@@ -84,9 +84,14 @@ describe('registry/synth/climate', () => {
     expect(e?.writable?.target_temp_high).to.equal(true);
   });
 
-  it('resolves the two SWING channels deterministically', () => {
-    // airCondition lists SWING twice; pin which is vertical (numeric,
-    // level.mode.swing) and which is the horizontal toggle (switch.mode.swing).
+  it('reads the two independently-resolved SWING channels into separate attributes', () => {
+    // This fixture starts from channels already resolved to swing/swing_toggle
+    // - it verifies synthClimate decodes each into its own attribute, not the
+    // name-collision fix itself. That fix (two raw SWING states -> two
+    // distinct channel keys, order-independent) is pinned at the detector
+    // layer: test/registry/detector.test.ts, "resolves airCondition's
+    // duplicate SWING channels by role, not by name" and its reversed-order
+    // companion.
     const { device, values } = airConditionWithBothSwings();
     const e = synthClimate(device, 'climate.ac', values);
     expect(e?.attributes.swing_mode).to.equal('vertical');
@@ -128,6 +133,12 @@ describe('registry/synth/climate', () => {
     expect(e?.attributes.hvac_action).to.equal('heating');
     expect(e?.attributes.fan_mode).to.equal('high');
     expect(e?.writable?.hvac_mode).to.equal(true);
+    expect(e?.writable?.fan_mode).to.equal(true);
+  });
+
+  it('falls back to SPEED_LEVEL for fan_mode when SPEED is not configured', () => {
+    const e = synth({ SPEED_LEVEL: numState(45) });
+    expect(e?.attributes.fan_mode).to.equal('45');
     expect(e?.writable?.fan_mode).to.equal(true);
   });
 
