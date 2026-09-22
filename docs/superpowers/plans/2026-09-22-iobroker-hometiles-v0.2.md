@@ -487,6 +487,18 @@ git add -A && git commit -m "feat(runtime): dispatch climate commands"
 
 ---
 
+## Task 5b: Make climate controls reachable (added in execution, Ruling 26)
+
+Full brief: `.superpowers/sdd/2026-09-22-iobroker-hometiles-v0.2/task-5b-brief.md`.
+The adapter publishes none of the `*_modes` arrays, and the firmware renders
+a climate control's buttons only from them, so every climate control is
+unreachable on real hardware. Derive each list from the channel's states
+map, keep only labels in the firmware's fixed name tables, emit only when
+non-empty, and resolve the `supported_features` bits that gate setpoint
+interactivity.
+
+---
+
 ## Task 6: Cover registry — detection and synthesis
 
 **Read first:** `docs/contract-iobroker-types.md` (blinds, blindButtons, gate).
