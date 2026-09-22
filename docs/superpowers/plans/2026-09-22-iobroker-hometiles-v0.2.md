@@ -511,6 +511,17 @@ drives the REAL detector end to end for every implemented domain.
 
 ---
 
+## Task 5d: Detection orchestration — one entity per physical control (added in execution, Ruling 39)
+
+Full brief: `.superpowers/sdd/2026-09-22-iobroker-hometiles-v0.2/task-5d-brief.md`.
+Discovery produced duplicate entities for every device->channel->state tree,
+kept only the first control per root, let an unmapped control fall through
+to the catch-all `info`, and never passed enums to the detector. Extract the
+pure detection loop so the real-detector suite tests production code, then
+fix all four.
+
+---
+
 ## Task 6: Cover registry — detection and synthesis
 
 **Read first:** `docs/contract-iobroker-types.md` (blinds, blindButtons, gate).
