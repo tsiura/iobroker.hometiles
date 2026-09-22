@@ -48,6 +48,14 @@ export interface ChannelInput {
   write?: boolean;
 }
 
+/**
+ * The subset of a channel's metadata an encoder needs to reverse a decoded
+ * display label back into the raw value a write actually needs -- see
+ * synth/common.ts's encodeChannelValue, the exact inverse of readEnum/
+ * toBoolState.
+ */
+export type ChannelCodec = Pick<ChannelInput, 'type' | 'states'>;
+
 /** A device as classified by the detector plus the admin's overrides. */
 export interface DeviceInput {
   objectId: string;
@@ -83,6 +91,18 @@ export interface VirtualEntity {
    * reporting success.
    */
   writable?: Record<string, boolean>;
+  /**
+   * Per-channel type/states metadata, keyed by the same channel names as
+   * `source` (NOT by role, unlike `writable`). Lets a command dispatcher
+   * reverse a decoded display label back into the raw value a write needs
+   * (synth/common.ts's encodeChannelValue) instead of writing the label
+   * string verbatim -- e.g. "heat" into a MODE state that expects 1.
+   * Optional and additive, like `writable`: no existing synth has to
+   * populate it, and a channel without an entry here falls back to writing
+   * the label unchanged, exactly as every climate command did before this
+   * field existed.
+   */
+  channelMeta?: Record<string, ChannelCodec>;
 }
 
 export const STATE_UNAVAILABLE = 'unavailable';

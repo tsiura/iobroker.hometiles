@@ -204,6 +204,14 @@ describe('registry/synth/climate', () => {
     expect(e?.writable?.boost).to.equal(true);
   });
 
+  it('carries channel type/states metadata for the dispatcher to encode commands with (fix-round 2)', () => {
+    const { device, values } = deviceWith({});
+    device.channels.mode = { objectId: 'climate.0.mode', write: true, type: 'number', states: { '1': 'heat' } };
+    values['climate.0.mode'] = numState(1);
+    const e = synthClimate(device, 'climate.test', values);
+    expect(e?.channelMeta?.mode).to.deep.equal({ type: 'number', states: { '1': 'heat' } });
+  });
+
   it('dispatches to synthClimate through synthesise, including its null result', () => {
     const { device, values } = deviceWith({ ACTUAL: numState(21.5) });
     expect(synthesise(device, 'climate.x', values)?.domain).to.equal('climate');

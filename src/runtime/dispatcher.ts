@@ -1,6 +1,7 @@
 import type { ServiceCall } from '../protocol/commands';
-import type { Domain, VirtualEntity } from '../registry/types';
-import { STATE_ON } from '../registry/types';
+import type { ChannelCodec, Domain, VirtualEntity } from '../registry/types';
+import { STATE_OFF, STATE_ON } from '../registry/types';
+import { encodeChannelValue } from '../registry/synth/common';
 import type { Logger } from './mqtt-client';
 
 export type StateWriter = (objectId: string, value: unknown) => Promise<void>;
@@ -21,23 +22,6 @@ export type DispatchResult =
   | { ok: false; reason: string; applied: number };
 
 type CallKind = ServiceCall['kind'];
-
-/**
- * SPEED and SPEED_LEVEL (climate's fan_mode channels) are both Number-typed
- * ioBroker states, verified against @iobroker/type-detector's
- * typePatterns.js FanPatterns.speed/speedLevel — SPEED is usually decoded
- * through a states label map (e.g. AUTO/HIGH/LOW/MEDIUM/QUIET/TURBO,
- * synth/climate.ts's readEnum) but is not itself a string channel. Writing
- * ServiceCall's string mode verbatim was writing a string into a numeric
- * state. Number('') is 0 and finite, so a blank must be rejected, not
- * coerced to zero — the same trap this project has hit before.
- */
-function numericModeValue(mode: string): number | undefined {
-  const text = mode.trim();
-  if (!text) return undefined;
-  const numeric = Number(text);
-  return Number.isFinite(numeric) ? numeric : undefined;
-}
 
 /**
  * The security boundary. A command may only reach a channel listed here, on an
@@ -151,6 +135,47 @@ export class Dispatcher {
       if (channel) push(channel, value);
     };
 
+    /**
+     * For the five climate commands that carry a decoded display LABEL
+     * (hvac_mode, fan_mode, swing_mode, swing_horizontal_mode, preset_mode):
+     * reverses that label back into the raw value the channel actually needs
+     * via encodeChannelValue (registry/synth/common.ts), the exact inverse of
+     * the decoder that produced it (readEnum/toBoolState). Writing the label
+     * verbatim -- e.g. "heat" into a MODE state that expects 1, or "on" into
+     * a boolean SWING_TOGGLE that expects `true` -- is this project's
+     * defining bug class: success reported for a write that lands on
+     * nothing, or on the wrong thing.
+     *
+     * `fallbackType` supplies a default when the registry captured no
+     * type/states for this channel at all: fan_mode's SPEED/SPEED_LEVEL and
+     * swing_mode's SWING are always Number-typed by construction
+     * (@iobroker/type-detector's FanPatterns.speed/speedLevel/swing, fixed
+     * pattern declarations, not per-device data -- verified fix-round 1/2),
+     * so an untyped fixture or device still gets safe numeric coercion
+     * instead of a bare string passthrough. hvac_mode and preset_mode have
+     * no such structural guarantee (MODE is genuinely Number-or-String
+     * depending on the device) and take no fallback, defaulting to
+     * passthrough -- exactly what every climate command already did before
+     * this field existed, so an untyped channel never regresses.
+     */
+    const pushEncoded = (
+      role: string,
+      channels: readonly string[],
+      label: string,
+      fallbackType?: ChannelCodec['type'],
+    ): void => {
+      const channel = resolveChannel(role, channels);
+      if (!channel) return;
+      const codec = entity.channelMeta?.[channel];
+      const effective = codec?.type === undefined && fallbackType ? { type: fallbackType, states: codec?.states } : codec;
+      const value = encodeChannelValue(effective, label);
+      if (value === undefined) {
+        this.log.warn(`[Command] Cannot encode "${label}" for ${entity.entityId} on channel ${channel}`);
+        return;
+      }
+      push(channel, value);
+    };
+
     switch (call.kind) {
       case 'turn_on':
         push('set', true);
@@ -194,32 +219,30 @@ export class Dispatcher {
         pushRole('target_humidity', ['humidity'], call.value);
         break;
       case 'set_hvac_mode':
-        pushRole('hvac_mode', ['mode'], call.mode);
+        // No structural type guarantee (MODE can be Number- or String-typed
+        // depending on the device) -- passthrough default when untyped.
+        pushEncoded('hvac_mode', ['mode'], call.mode);
         break;
-      case 'set_fan_mode': {
+      case 'set_fan_mode':
         // SPEED (named steps) and SPEED_LEVEL (a percentage) are alternates
-        // for the same role, same as light's dimmer/brightness pair — but
-        // unlike dimmer/brightness, both are Number-typed states here, so
-        // call.mode (always a string, see commands.ts's requireMode) must be
-        // converted, never written verbatim. A label SPEED decodes through a
-        // states map (e.g. "high") has no code to reverse it back to without
-        // that map, which VirtualEntity does not carry — refused rather than
-        // written as the wrong type, same as a blank or non-numeric value.
-        const channel = resolveChannel('fan_mode', ['speed', 'speed_level']);
-        if (channel) {
-          const numeric = numericModeValue(call.mode);
-          if (numeric !== undefined) push(channel, numeric);
-        }
+        // for the same role, same as light's dimmer/brightness pair.
+        pushEncoded('fan_mode', ['speed', 'speed_level'], call.mode, 'number');
         break;
-      }
       case 'set_preset_mode':
-        pushRole('preset_mode', ['preset'], call.mode);
+        pushEncoded('preset_mode', ['preset'], call.mode);
         break;
       case 'set_swing_mode':
-        pushRole('swing_mode', ['swing'], call.mode);
+        pushEncoded('swing_mode', ['swing'], call.mode, 'number');
         break;
       case 'set_swing_horizontal_mode':
-        pushRole('swing_horizontal_mode', ['swing_toggle'], call.on);
+        // requireOnOff (commands.ts) already proved this is a strict on/off
+        // choice; convert to the exact label toBoolState emits for a boolean
+        // channel before encoding, defaulting to boolean when untyped
+        // (SWING_TOGGLE's fixed Boolean declaration) instead of the generic
+        // string passthrough every other label command falls back to -- that
+        // passthrough would regress a boolean write that already worked
+        // before this fix into a wrongly-typed string write.
+        pushEncoded('swing_horizontal_mode', ['swing_toggle'], call.on ? STATE_ON : STATE_OFF, 'boolean');
         break;
     }
 

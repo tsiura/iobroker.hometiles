@@ -1,4 +1,4 @@
-import type { ChannelInput, DeviceInput, SourceValue } from '../types';
+import type { ChannelCodec, ChannelInput, DeviceInput, SourceValue } from '../types';
 import { STATE_OFF, STATE_ON, STATE_UNAVAILABLE, STATE_UNKNOWN } from '../types';
 
 export type Values = Readonly<Record<string, SourceValue | null | undefined>>;
@@ -55,11 +55,18 @@ export function baseEntity(
   device: DeviceInput,
   entityId: string,
   values: Values,
-): { source: Record<string, string>; lastChanged: number; friendly: Record<string, unknown> } {
+): {
+  source: Record<string, string>;
+  channelMeta: Record<string, ChannelCodec>;
+  lastChanged: number;
+  friendly: Record<string, unknown>;
+} {
   const source: Record<string, string> = {};
+  const channelMeta: Record<string, ChannelCodec> = {};
   let lastChanged = 0;
   for (const [name, channel] of Object.entries(device.channels)) {
     source[name] = channel.objectId;
+    channelMeta[name] = { type: channel.type, states: channel.states };
     const value = values[channel.objectId];
     if (value && value.ts > lastChanged) lastChanged = value.ts;
   }
@@ -70,7 +77,60 @@ export function baseEntity(
   // never produced a value would look freshly changed on every pass. Consumers
   // must treat 0 as unknown — see buildApplyPayload, which omits last_changed
   // rather than publishing a fabricated timestamp.
-  return { source, lastChanged, friendly };
+  return { source, channelMeta, lastChanged, friendly };
+}
+
+/**
+ * The exact inverse of readEnum (synth/climate.ts) and toBoolState (above):
+ * those decode a raw ioBroker value into an HA-style display label; this
+ * turns a label back into the raw value a write actually needs. Writing a
+ * decoded label back to ioBroker verbatim -- e.g. the string "heat" into a
+ * MODE state that expects the number 1 -- is this project's defining bug
+ * class: success reported for a write that lands on nothing, or on the wrong
+ * thing. A label this function cannot faithfully re-encode returns
+ * `undefined`, never a guessed value.
+ *
+ * The states-map reversal is case-insensitive:
+ * docs/contract-climate-cover.md confirms the firmware trims+lowercases
+ * hvac_mode/fan_mode/swing_mode on its own ingest, so a label built from a
+ * states map in any other case (e.g. @iobroker/type-detector's own
+ * upper-case defaultStates, "HIGH") comes back from a real panel already
+ * lower-cased. An exact-case-only reversal would refuse the type-detector's
+ * own default labels on every real round trip.
+ */
+export function encodeChannelValue(codec: ChannelCodec | undefined, label: string): number | boolean | string | undefined {
+  let raw = label;
+  if (codec?.states) {
+    const match = Object.entries(codec.states).find(([, candidate]) => candidate.toLowerCase() === label.toLowerCase());
+    if (!match) return undefined;
+    raw = match[0];
+  }
+
+  switch (codec?.type) {
+    case 'number': {
+      // Number('') and Number('NaN') are both non-encodable for different
+      // reasons ('' is 0 and finite -- the exact trap this project has hit
+      // before; 'NaN' parses to a real NaN) -- both must refuse, neither may
+      // fall through as 0.
+      const text = raw.trim();
+      if (!text) return undefined;
+      const numeric = Number(text);
+      return Number.isFinite(numeric) ? numeric : undefined;
+    }
+    case 'boolean':
+      // toBoolState only ever EMITS 'on' or 'off' for a genuine boolean
+      // channel ('unknown' means nothing boolean was recoverable at all), so
+      // those are the only two labels with a faithful raw value to
+      // reconstruct -- accepting more (e.g. toBoolState's lenient INPUT
+      // vocabulary like "1"/"yes") would accept values decode never emits.
+      if (raw === STATE_ON) return true;
+      if (raw === STATE_OFF) return false;
+      return undefined;
+    default:
+      // 'string', 'mixed', and no captured type at all: the safe default is
+      // to write back exactly what arrived.
+      return raw;
+  }
 }
 
 export const UNAVAILABLE = STATE_UNAVAILABLE;

@@ -315,26 +315,32 @@ describe('runtime/dispatcher', () => {
       expect(writes).to.have.length(0);
     });
 
-    it('routes swing and horizontal swing to different, independent channels', async () => {
+    it('routes swing and horizontal swing to different, independent channels, each correctly typed', async () => {
       // brief's literal assertion is r.writes[0].channel, but DispatchResult's
       // ok:true shape carries only a count (writes: number), unchanged since
       // v0.1 -- every existing dispatcher test relies on that. This pins the
       // same fact (the two commands land on different channels) through the
-      // write-log the rest of this file already uses.
+      // write-log the rest of this file already uses. Fix-round 2: 'vertical'
+      // is only reachable through a states map (mirrors
+      // test/registry/synth/climate.test.ts's airConditionWithBothSwings
+      // fixture), so the numeric swing channel now needs one to stay
+      // encodable; swing_toggle stays untyped to prove the boolean fallback.
       const acWithBothSwings = entity({
         entityId: 'climate.ac',
         domain: 'climate',
         source: { swing: 'zig.0.ac.swing', swing_toggle: 'zig.0.ac.swing_h' },
         writable: { swing_mode: true, swing_horizontal_mode: true },
+        channelMeta: { swing: { type: 'number', states: { '3': 'vertical' } } },
       });
       const d = new Dispatcher(lookup([acWithBothSwings]), write, silentLog);
 
       await d.dispatch({ kind: 'set_swing_mode', entityId: 'climate.ac', mode: 'vertical' });
-      expect(writes).to.deep.equal([['zig.0.ac.swing', 'vertical']]);
+      expect(writes).to.deep.equal([['zig.0.ac.swing', 3]]);
 
       writes = [];
       await d.dispatch({ kind: 'set_swing_horizontal_mode', entityId: 'climate.ac', on: true });
       expect(writes).to.deep.equal([['zig.0.ac.swing_h', true]]);
+      expect(typeof writes[0]?.[1]).to.equal('boolean');
     });
 
     it('rejects horizontal swing when only the vertical swing channel is writable', async () => {
@@ -360,6 +366,40 @@ describe('runtime/dispatcher', () => {
       const result = await d.dispatch({ kind: 'set_hvac_mode', entityId: 'climate.ac', mode: 'cool' });
       expect(result).to.deep.equal({ ok: true, writes: 1 });
       expect(writes).to.deep.equal([['zig.0.ac.mode', 'cool']]);
+    });
+
+    it('encodes hvac_mode through a numeric states map instead of writing the label verbatim (fix-round 2 CRITICAL)', async () => {
+      // The bug: a thermostat with numeric modes (Homematic and most
+      // ioBroker thermostats) has MODE decoded through states (raw 1 ->
+      // "heat", synth/climate.ts's readEnum) but the dispatcher wrote the
+      // label "heat" straight back, into a channel that expects the number
+      // 1 -- and reported ok:true for a write that landed on nothing.
+      const ac = entity({
+        entityId: 'climate.ac',
+        domain: 'climate',
+        source: { mode: 'zig.0.ac.mode' },
+        writable: { hvac_mode: true },
+        channelMeta: { mode: { type: 'number', states: { '1': 'heat', '3': 'cool' } } },
+      });
+      const d = new Dispatcher(lookup([ac]), write, silentLog);
+      const result = await d.dispatch({ kind: 'set_hvac_mode', entityId: 'climate.ac', mode: 'heat' });
+      expect(result).to.deep.equal({ ok: true, writes: 1 });
+      expect(writes).to.deep.equal([['zig.0.ac.mode', 1]]);
+      expect(typeof writes[0]?.[1]).to.equal('number');
+    });
+
+    it('rejects an hvac_mode label absent from the states map rather than writing nothing while reporting success', async () => {
+      const ac = entity({
+        entityId: 'climate.ac',
+        domain: 'climate',
+        source: { mode: 'zig.0.ac.mode' },
+        writable: { hvac_mode: true },
+        channelMeta: { mode: { type: 'number', states: { '1': 'heat', '3': 'cool' } } },
+      });
+      const d = new Dispatcher(lookup([ac]), write, silentLog);
+      const result = await d.dispatch({ kind: 'set_hvac_mode', entityId: 'climate.ac', mode: 'auto' });
+      expect(result).to.deep.equal({ ok: false, reason: 'no_writable_channel', applied: 0 });
+      expect(writes).to.have.length(0);
     });
 
     it('writes fan_mode to the named SPEED channel when present, coerced to a number', async () => {
@@ -391,6 +431,24 @@ describe('runtime/dispatcher', () => {
       const result = await d.dispatch({ kind: 'set_fan_mode', entityId: 'climate.ac', mode: '42' });
       expect(result).to.deep.equal({ ok: true, writes: 1 });
       expect(writes).to.deep.equal([['zig.0.ac.speed_pct', 42]]);
+    });
+
+    it('reverses a labelled SPEED through its states map -- the case fix-round 1 made refuse, which now works', async () => {
+      // Round 1 made ANY non-numeric fan_mode fail outright, since it had no
+      // way to reverse a label back to a raw code. With channelMeta this now
+      // succeeds instead of refusing a value the device genuinely supports.
+      const ac = entity({
+        entityId: 'climate.ac',
+        domain: 'climate',
+        source: { speed: 'zig.0.ac.speed' },
+        writable: { fan_mode: true },
+        channelMeta: { speed: { type: 'number', states: { '0': 'auto', '1': 'high', '2': 'low' } } },
+      });
+      const d = new Dispatcher(lookup([ac]), write, silentLog);
+      const result = await d.dispatch({ kind: 'set_fan_mode', entityId: 'climate.ac', mode: 'high' });
+      expect(result).to.deep.equal({ ok: true, writes: 1 });
+      expect(writes).to.deep.equal([['zig.0.ac.speed', 1]]);
+      expect(typeof writes[0]?.[1]).to.equal('number');
     });
 
     it('rejects a blank, non-numeric or "NaN" fan_mode rather than writing 0 or a string into a numeric state', async () => {

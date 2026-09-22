@@ -88,7 +88,12 @@ export function synthClimate(device: DeviceInput, entityId: string, values: Valu
   // published a payload the firmware always rejects as invalid.
   if (!VALIDITY_CHANNELS.some((name) => device.channels[name])) return null;
 
-  const { source, lastChanged, friendly } = baseEntity(device, entityId, values);
+  // channelMeta is passed through unchanged from baseEntity, not computed
+  // here -- this is plumbing, not a decode-logic change. Without it, a real
+  // climate VirtualEntity would never carry the type/states metadata
+  // dispatcher.ts's encodeChannelValue needs, and fix-round 2 would only work
+  // against hand-built test fixtures, never a real detected device.
+  const { source, channelMeta, lastChanged, friendly } = baseEntity(device, entityId, values);
   const attributes: Record<string, unknown> = { ...friendly };
   const baselineKeys = Object.keys(attributes).length;
   const writable: Record<string, boolean> = {};
@@ -185,5 +190,5 @@ export function synthClimate(device: DeviceInput, entityId: string, values: Valu
   const available = Object.keys(attributes).length > baselineKeys;
   const state = hvacMode ?? (available ? STATE_UNKNOWN : STATE_UNAVAILABLE);
 
-  return { entityId, domain: 'climate', source, state, attributes, available, lastChanged, writable };
+  return { entityId, domain: 'climate', source, state, attributes, available, lastChanged, writable, channelMeta };
 }
