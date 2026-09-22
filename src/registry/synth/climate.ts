@@ -200,10 +200,13 @@ export function synthClimate(device: DeviceInput, entityId: string, values: Valu
   if (boost !== undefined) attributes.boost = boost;
   setWritable(writable, 'boost', device.channels.boost);
 
-  // available reflects whether any configured channel currently holds a
-  // usable value, not just whether one is structurally configured (that
-  // distinction is already handled by the null-return above): every usable
-  // read above added a key beyond the friendly_name/icon baseline.
+  // available: at least one read above added an attribute beyond the
+  // friendly_name/icon baseline, i.e. a channel this synth actually reads
+  // holds a usable, decodable value -- not merely a configured one (that
+  // case is the null-return above). A configured channel shadowed by a
+  // preferred alternate is never read, so its value cannot make the entity
+  // available on its own: SET_HEATING/SET_COOLING when a plain SET exists,
+  // and SPEED_LEVEL when SPEED is configured (Ruling 25).
   const available = Object.keys(attributes).length > baselineKeys;
   const state = hvacMode ?? (available ? STATE_UNKNOWN : STATE_UNAVAILABLE);
 

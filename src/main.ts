@@ -280,7 +280,7 @@ class HomeTiles extends utils.Adapter {
         type: typeof common.type === 'string' ? common.type : undefined,
         min: typeof common.min === 'number' ? common.min : undefined,
         max: typeof common.max === 'number' ? common.max : undefined,
-        states: validStates(common.states),
+        states: validStates(common.states, common.type),
         write: typeof common.write === 'boolean' ? common.write : undefined,
         icon: typeof common.icon === 'string' ? common.icon : undefined,
       };

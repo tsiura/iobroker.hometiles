@@ -6,6 +6,8 @@ import {
   type DetectedControl,
   type ObjectMeta,
 } from '../../src/registry/detector';
+import { synthClimate } from '../../src/registry/synth/climate';
+import { encodeChannelValue } from '../../src/registry/synth/common';
 
 const META: Record<string, ObjectMeta> = {
   'hue.0.decke.on': { name: 'On', role: 'switch', type: 'boolean', write: true },
@@ -330,15 +332,112 @@ describe('registry/detector: validStates', () => {
     expect(validStates({ '1': 5, '2': true })).to.equal(undefined);
   });
 
-  it('returns undefined for undefined, null, an array, or a primitive', () => {
+  it('returns undefined for undefined, null, or a non-string primitive', () => {
     expect(validStates(undefined)).to.equal(undefined);
     expect(validStates(null)).to.equal(undefined);
-    expect(validStates(['heat', 'cool'])).to.equal(undefined);
-    expect(validStates('heat')).to.equal(undefined);
     expect(validStates(42)).to.equal(undefined);
   });
 
   it('returns undefined for an empty object, matching "no states configured"', () => {
     expect(validStates({})).to.equal(undefined);
+  });
+
+  // Fix-round 4 (Ruling 30): ioBroker documents THREE forms of common.states
+  // (@iobroker/types objects.d.ts) -- an object, an array and a deprecated
+  // "val1:text1;val2:text2" string. Round 3 accepted only the object, so an
+  // array-form device silently lost its mode labels and its control.
+  describe('the array form', () => {
+    it('reads the index as the internal value on a number state', () => {
+      expect(validStates(['OFF', 'HEAT', 'COOL'], 'number')).to.deep.equal({ '0': 'OFF', '1': 'HEAT', '2': 'COOL' });
+    });
+
+    it('drops a non-string element individually, without shifting the indexes after it', () => {
+      expect(validStates(['OFF', 5, 'COOL', null], 'number')).to.deep.equal({ '0': 'OFF', '2': 'COOL' });
+    });
+
+    // ioBroker's objects schema: a string state's array lists the allowed
+    // VALUES, ['Start', 'Flight'] "is the same as {'Start': 'Start',
+    // 'Flight': 'Flight'}". Read by index, "heat" would reverse to "1".
+    it('reads each element as its own internal value on a string state', () => {
+      expect(validStates(['auto', 7, 'heat'], 'string')).to.deep.equal({ auto: 'auto', heat: 'heat' });
+    });
+
+    it('reads [false label, true label] on a boolean state', () => {
+      expect(validStates(['Closed', 'Open'], 'boolean')).to.deep.equal({ false: 'Closed', true: 'Open' });
+    });
+
+    it('returns undefined when the state type defines no reading, rather than guessing one', () => {
+      expect(validStates(['OFF', 'ON'])).to.equal(undefined);
+      expect(validStates(['OFF', 'ON'], 'mixed')).to.equal(undefined);
+    });
+  });
+
+  describe('the deprecated "val1:text1;val2:text2" string form', () => {
+    it('parses every part into a map', () => {
+      expect(validStates('0:OFF;1:HEAT;2:COOL')).to.deep.equal({ '0': 'OFF', '1': 'HEAT', '2': 'COOL' });
+    });
+
+    it('splits each part on its FIRST colon only, so a colon inside a label survives', () => {
+      expect(validStates('1:Heat: Eco;2:Cool')).to.deep.equal({ '1': 'Heat: Eco', '2': 'Cool' });
+    });
+
+    it('drops a malformed part individually without losing the good ones', () => {
+      expect(validStates('0:OFF;garbage;;2:COOL;')).to.deep.equal({ '0': 'OFF', '2': 'COOL' });
+    });
+
+    it('trims the whitespace around each value and label', () => {
+      expect(validStates(' 0 : Off; 1:On ')).to.deep.equal({ '0': 'Off', '1': 'On' });
+    });
+
+    it('returns undefined when no part is well-formed', () => {
+      expect(validStates('heat')).to.equal(undefined);
+      expect(validStates('')).to.equal(undefined);
+    });
+
+    it('does not split a JSON-encoded string into a garbage value and label', () => {
+      expect(validStates('{"0":"Off","1":"On"}')).to.equal(undefined);
+    });
+  });
+
+  // The exact chain main.ts's detectDevices feeds: validStates builds
+  // ObjectMeta.states from common.states/common.type, mapControlToDevice
+  // copies it into ChannelInput.states, synthClimate decodes MODE through it
+  // (the real readEnum), and the decoded label goes back through
+  // encodeChannelValue. No step is hand-built.
+  describe('round-trips through the real detector, synth and encoder', () => {
+    function decodeMode(states: unknown, type: 'number' | 'string', raw: number | string) {
+      const control: DetectedControl = { type: 'airCondition', states: [{ id: 'ac.0.mode', name: 'MODE', write: true }] };
+      const meta: Record<string, ObjectMeta> = {
+        'ac.0.mode': { name: 'Mode', type, write: true, states: validStates(states, type) },
+      };
+      const device = mapControlToDevice('ac.0', control, meta);
+      const entity = synthClimate(device!, 'climate.ac', { 'ac.0.mode': { val: raw, ack: true, q: 0, ts: 1 } });
+      return { decoded: entity?.attributes.hvac_mode, codec: entity?.channelMeta?.mode };
+    }
+
+    it('array form on a Number MODE: raw 1 decodes to "HEAT" and encodes back to the number 1', () => {
+      const { decoded, codec } = decodeMode(['OFF', 'HEAT', 'COOL'], 'number', 1);
+      expect(decoded).to.equal('HEAT');
+      const encoded = encodeChannelValue(codec, decoded as string);
+      expect(encoded).to.equal(1);
+      expect(typeof encoded).to.equal('number');
+    });
+
+    it('legacy form on a Number MODE: raw 1 decodes to "Heat: Eco" and encodes back to the number 1', () => {
+      const { decoded, codec } = decodeMode('0:Off;1:Heat: Eco;2:Cool', 'number', 1);
+      expect(decoded).to.equal('Heat: Eco');
+      const encoded = encodeChannelValue(codec, decoded as string);
+      expect(encoded).to.equal(1);
+      expect(typeof encoded).to.equal('number');
+    });
+
+    it('array form on a String MODE: "HEAT" encodes back to "HEAT", never to its index "1"', () => {
+      const { decoded, codec } = decodeMode(['AUTO', 'HEAT', 'COOL'], 'string', 'HEAT');
+      expect(decoded).to.equal('HEAT');
+      expect(encodeChannelValue(codec, decoded as string)).to.equal('HEAT');
+      // The firmware trims and lowercases hvac_mode on ingest, so "heat" is
+      // what a real panel sends back; the states map restores the exact case.
+      expect(encodeChannelValue(codec, 'heat')).to.equal('HEAT');
+    });
   });
 });

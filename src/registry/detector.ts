@@ -30,22 +30,55 @@ export interface ObjectMeta {
 }
 
 /**
- * `common.states` is untrusted ioBroker object configuration, not a value
- * this adapter's own code ever produces -- a non-object, or an object with a
- * non-string label, must never reach ChannelInput.states, where
- * encodeChannelValue's states-map reversal calls .toLowerCase() on every
- * label (fix-round 3, finding 3: an unvalidated cast here threw a TypeError
- * only caught several layers away, in panel-session's generic command
- * handler, and logged as an opaque "candidate.toLowerCase is not a
- * function"). A malformed entry is dropped individually rather than
- * discarding the whole map, so one bad label does not cost every good one.
+ * `common.states` (with its state's `common.type`) is untrusted ioBroker
+ * object configuration, not a value this adapter's own code ever produces.
+ * ioBroker documents three forms of it (@iobroker/types objects.d.ts), and
+ * all three are normalised here into the one `{ "internal value": "label" }`
+ * map that ChannelInput.states, readEnum and encodeChannelValue work on
+ * (fix-round 4, Ruling 30):
+ *
+ * - an object: already that map.
+ * - an array, read the way ioBroker's own UI reads it (adapter-react-v5's
+ *   Utils.getStates), because its meaning depends on `common.type`: on a
+ *   number state the INDEX is the internal value, on a string state each
+ *   element IS its own internal value (the objects schema: ['Start',
+ *   'Flight'] "is the same as {'Start': 'Start', 'Flight': 'Flight'}"), on a
+ *   boolean state it is [false label, true label]. Reading a string state's
+ *   array by index would reverse "heat" to "1" and write "1" into a string
+ *   MODE, so any other type, which defines no reading, drops the array
+ *   rather than guessing one.
+ * - the deprecated string "val1:text1;val2:text2": split on ";", then each
+ *   part on its FIRST ":" only, so a colon inside a label survives. A
+ *   JSON-looking string is not that format and is dropped, not split into a
+ *   garbage value and label.
+ *
+ * A malformed entry -- a non-string label, a part with no ":" -- is dropped
+ * individually, so one bad label does not cost every good one; nothing valid
+ * left means undefined, the same as no states configured. A non-string label
+ * must never reach encodeChannelValue, which calls .toLowerCase() on every
+ * label (fix-round 3, finding 3: that threw a TypeError only caught several
+ * layers away, in panel-session's generic command handler).
  */
-export function validStates(value: unknown): Record<string, string> | undefined {
-  if (!value || typeof value !== 'object' || Array.isArray(value)) return undefined;
-  const entries = Object.entries(value as Record<string, unknown>).filter(
-    (entry): entry is [string, string] => typeof entry[1] === 'string',
-  );
-  return entries.length ? Object.fromEntries(entries) : undefined;
+export function validStates(value: unknown, type?: unknown): Record<string, string> | undefined {
+  let entries: [string, unknown][];
+  if (typeof value === 'string') {
+    if (value.trim().startsWith('{')) return undefined;
+    entries = value.split(';').flatMap((part): [string, string][] => {
+      const colon = part.indexOf(':');
+      return colon < 0 ? [] : [[part.slice(0, colon).trim(), part.slice(colon + 1).trim()]];
+    });
+  } else if (Array.isArray(value)) {
+    if (type === 'number') entries = Object.entries(value);
+    else if (type === 'string') entries = value.map((label): [string, unknown] => [String(label), label]);
+    else if (type === 'boolean') entries = [['false', value[0]], ['true', value[1]]];
+    else return undefined;
+  } else if (value && typeof value === 'object') {
+    entries = Object.entries(value);
+  } else {
+    return undefined;
+  }
+  const valid = entries.filter((entry): entry is [string, string] => typeof entry[1] === 'string');
+  return valid.length ? Object.fromEntries(valid) : undefined;
 }
 
 /**
