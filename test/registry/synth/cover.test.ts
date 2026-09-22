@@ -237,4 +237,102 @@ describe('registry/synth/cover', () => {
     const { device, values } = deviceWith({ SET: numState(40) });
     expect(synthesise(device, 'cover.x', values)?.domain).to.equal('cover');
   });
+
+  // --- Fix round 1 -----------------------------------------------------
+
+  it('keeps a numeric ACTUAL as current_position for a gate too, while its toggle SET grants no position write (Ruling 27)', () => {
+    // Home Assistant reports current_position independently of whether
+    // SET_POSITION is offered -- a gate can have real position telemetry
+    // (its optional ACTUAL, verified Number-typed against typePatterns.js)
+    // even though its required SET can only open/close, not set an exact
+    // percentage. Dropping ACTUAL here would discard real, non-fabricated
+    // data; task 7 is what prevents the position slider from appearing,
+    // by deriving supported_features from `writable` rather than from
+    // current_position's mere presence.
+    const device: DeviceInput = {
+      objectId: 'gate.0',
+      name: 'Gate',
+      detectorType: 'gate',
+      domain: 'cover',
+      channels: {
+        set: { objectId: 'gate.0.set', write: true },
+        actual: { objectId: 'gate.0.actual' },
+      },
+    };
+    const values = { 'gate.0.actual': numState(62) };
+    const e = synthCover(device, 'gate.test', values);
+    expect(e.attributes.current_position).to.equal(62);
+    // No position WRITE path exists: writable.position must stay unset.
+    expect(e.writable?.position).to.equal(undefined);
+    // Its boolean SET still backs open/close.
+    expect(e.writable?.open).to.equal(true);
+    expect(e.writable?.close).to.equal(true);
+  });
+
+  it('treats a boolean SET as a toggle even when forced into cover from a non-gate detectorType (Ruling 28)', () => {
+    // overrides.ts forces `domain` without touching channels or
+    // detectorType (overrides.ts:25-30 spreads ...device unchanged) -- a
+    // socket's SET is boolean in practice, so the type-based decision must
+    // resolve 'toggle' here from that recorded type alone, with a
+    // detectorType that is neither 'gate' nor 'blind'.
+    const device: DeviceInput = {
+      objectId: 'socket.0',
+      name: 'Forced socket',
+      detectorType: 'socket',
+      domain: 'cover',
+      channels: { set: { objectId: 'socket.0.set', write: true, type: 'boolean' } },
+    };
+    const e = synthCover(device, 'cover.forced', {});
+    expect(e.writable?.position).to.equal(undefined);
+    expect(e.writable?.open).to.equal(true);
+    expect(e.writable?.close).to.equal(true);
+  });
+
+  it('does not fabricate a state from a numeric SET holding NaN (Ruling 28)', () => {
+    // toBoolState treats a NaN number as truthy (NaN !== 0), which
+    // previously let a numeric SET's garbage value fall into the
+    // boolean-toggle state path and report a spurious 'open'. A
+    // numeric-kind SET must never reach that path at all.
+    const e = synth({ SET: numState(NaN) });
+    expect(e.attributes.current_position).to.equal(undefined);
+    expect(e.state).to.equal('unavailable');
+  });
+
+  it('never treats an explicitly numeric SET as a toggle, even under a gate detectorType', () => {
+    // Isolates the type-based rule from the detectorType fallback: real
+    // metadata (type: 'number') must win even where the pattern-shape
+    // fallback would otherwise say 'toggle' for detectorType 'gate'.
+    const device: DeviceInput = {
+      objectId: 'weird.0',
+      name: 'Weird',
+      detectorType: 'gate',
+      domain: 'cover',
+      channels: { set: { objectId: 'weird.0.set', write: true, type: 'number' } },
+    };
+    const e = synthCover(device, 'cover.weird', { 'weird.0.set': numState(NaN) });
+    expect(e.attributes.current_position).to.equal(undefined);
+    expect(e.writable?.position).to.equal(true);
+    expect(e.state).to.equal('unavailable');
+  });
+
+  it("uses gate's OPENED contact alone when CLOSED does not resolve the state", () => {
+    // The existing "dedicated OPENED/CLOSED contacts" test only ever
+    // exercises the closed === true branch; a swapped or dead
+    // `opened === true` branch would not be caught without this one, since
+    // CLOSED here resolves to a definite `false`, not merely absent.
+    const device: DeviceInput = {
+      objectId: 'gate.0',
+      name: 'Gate',
+      detectorType: 'gate',
+      domain: 'cover',
+      channels: {
+        set: { objectId: 'gate.0.set', write: true },
+        opened: { objectId: 'gate.0.opened' },
+        closed: { objectId: 'gate.0.closed' },
+      },
+    };
+    const values = { 'gate.0.opened': numState(true), 'gate.0.closed': numState(false) };
+    const e = synthCover(device, 'gate.test', values);
+    expect(e.state).to.equal('open');
+  });
 });
