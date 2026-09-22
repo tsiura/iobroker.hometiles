@@ -44,9 +44,26 @@ a silent bug.
 | **history, energy responses** | preserves the cached value | **explicitly clears** the cached value |
 | **editable `/control`** | a missing `state` key **rejects the whole message** | `state: null` is valid and renders `--` |
 
-Concretely, for climate and cover you must publish the **complete** attribute
-set on every publish, never a diff. Omitting `target_temperature` sets it to
-20.0. Omitting cover `current_position` sets it to 0.
+Concretely, for climate and cover you must publish the **complete set of
+KNOWN attributes** on every publish, never a diff — a known value you leave
+out gets reset.
+
+**CORRECTED during execution (Ruling 13) — the original wording here was
+wrong and produced a real defect.** An omitted key resets BOTH the stored
+value AND a separate presence flag. The value snaps to a default (20.0 for
+the target temperature), but the flag — e.g. `has_target_temperature`,
+`climate/state.h:15` — goes FALSE, and the renderer checks the flag before
+showing anything (`climate/renderer.cpp:85,151,993`,
+`climate_popup.cpp:1166-1176`). So omission is the CORRECT way to say "this
+device has no such value". Never fill an unknown with the firmware's default:
+that sets the presence flag and fabricates a value the device does not have.
+Concretely, always emitting `temperature` breaks dual-setpoint mode, which
+activates only when `has_target_range && !has_target_temperature`
+(`climate_popup.cpp:1169`).
+
+Note the wire key: the firmware reads the target setpoint from the key
+`temperature` (`tile_renderer.cpp:2234`), NOT `target_temperature`, which is
+only the firmware's internal field name.
 
 Never send `null` for a climate string field. The firmware's hand-rolled
 string scanner can misparse it and take the next quoted token in the payload
@@ -359,11 +376,17 @@ semantics and the null-parsing hazard.
 
 **Two rules that make this task different from every v0.1 domain:**
 
-1. The firmware **overwrites its whole cache** on each message. An omitted
-   key does not mean unchanged — it snaps to a hardcoded default
-   (`target_temperature` 20.0, `min_temp` 7.0, `max_temp` 35.0,
-   `target_temp_low` 18.0, `target_temp_high` 24.0). So publish every
-   attribute every time, including ones that did not change.
+1. The firmware **overwrites its whole cache** on each message, so every
+   KNOWN attribute goes out on every publish, including ones that did not
+   change. **An UNKNOWN attribute is omitted — never filled with the
+   firmware's default.** (CORRECTED in execution, Rulings 13-14: the original
+   text said to publish every attribute "every time", which produced a real
+   defect.) An omitted key resets a separate presence flag such as
+   `has_target_temperature`, and the climate UI gates on that flag; filling
+   20.0 fabricates an interactive setpoint on a read-only thermostat and
+   permanently disables dual-setpoint range mode
+   (`climate_popup.cpp:1169`). The wire key for the target is `temperature`
+   (`tile_renderer.cpp:2234`), not `target_temperature`.
 2. **Never emit `null` for a string field.** The firmware's hand-rolled
    scanner can misparse it and take the next quoted token in the payload as
    the value. Omit the key instead.
@@ -371,10 +394,17 @@ semantics and the null-parsing hazard.
 - [ ] **Step 1: Write the failing tests**
 
 ```ts
-it('emits every attribute on every publish, not a diff', () => {
+it('omits the target temperature when it is unknown, never filling 20.0', () => {
+  // CORRECTED (Ruling 13): presence of `temperature` sets has_target_temperature,
+  // which fabricates a setpoint and disables dual-setpoint mode
   const p = JSON.parse(buildClimatePayload(entityWithOnly({ current_temperature: 21 })));
-  // omitting these would snap the panel to 20.0/7.0/35.0
-  expect(p).to.include.keys('target_temperature', 'min_temp', 'max_temp');
+  expect(p).to.not.have.property('temperature');
+});
+
+it('emits the target under the wire key temperature when it is known', () => {
+  const p = JSON.parse(buildClimatePayload(entityWithOnly({ target_temperature: 21.5 })));
+  expect(p.temperature).to.equal(21.5);
+  expect(p).to.not.have.property('target_temperature');
 });
 
 it('never emits null for a string field', () => {
@@ -383,13 +413,14 @@ it('never emits null for a string field', () => {
   expect(JSON.parse(raw)).to.not.have.property('hvac_mode');
 });
 
-it('emits both ends of the dual setpoint or neither', () => {
-  // target_temp_low and target_temp_high share ONE presence flag: sending
-  // only one makes the firmware treat both as fresh and silently revert the
-  // other to its default
+it('emits the dual setpoint pair only when BOTH ends are known', () => {
+  // target_temp_low and target_temp_high share ONE presence flag. Filling the
+  // unknown end with 18.0/24.0 fabricates a displayed, interactive value.
+  // (CORRECTED, Ruling 14: a lone end is collapsed to a single setpoint in the
+  // synth layer, so it never reaches here as half a pair.)
   const p = JSON.parse(buildClimatePayload(entityWithOnly({ target_temp_low: 18 })));
-  const has = ('target_temp_low' in p) === ('target_temp_high' in p);
-  expect(has).to.equal(true);
+  expect(p).to.not.have.property('target_temp_low');
+  expect(p).to.not.have.property('target_temp_high');
 });
 
 it('drops a custom preset rather than sending a name the firmware discards', () => {
@@ -560,7 +591,7 @@ git add -A && git commit -m "feat(protocol): build cover payload with explicit s
 **Read first:** the cover command allow-list in `docs/contract-climate-cover.md`.
 
 **Files:**
-- Modify: `src/protocol/commands.ts`, `src/runtime/dispatcher.ts`
+- Modify: `src/protocol/commands.ts`, `src/runtime/dispatcher.ts`, `src/runtime/panel-session.ts`
 - Test: `test/runtime/dispatcher.test.ts`
 
 Ten commands are allow-listed by the firmware. Two of them — `toggle` and
@@ -568,6 +599,14 @@ Ten commands are allow-listed by the firmware. Two of them — `toggle` and
 all ten anyway: they are part of the accepted contract, they cost a line
 each, and a future firmware release may wire them up. Note the two dead ones
 in a comment so a later reader does not go hunting for the UI that sends them.
+
+**Command subscription (added in execution, Ruling 16).** Parsing and
+dispatching a command is useless unless the panel session subscribes to its
+topic. Add `'cover'` to `COMMAND_LEAVES` in `src/runtime/panel-session.ts`
+so `<baseTopic>/cmnd/cover` is actually received, and add a test that the
+session's subscription list includes it. The leaf is `cover` — taken from
+the contract document, and NOT necessarily the same string as the
+`cover` domain name.
 
 - [ ] **Step 1: Write the failing tests**
 
@@ -643,13 +682,21 @@ git add -A && git commit -m "feat: media player detection, synthesis and payload
 **Read first:** the media command section of `docs/contract-media-weather.md`.
 
 **Files:**
-- Modify: `src/protocol/commands.ts`, `src/runtime/dispatcher.ts`
+- Modify: `src/protocol/commands.ts`, `src/runtime/dispatcher.ts`, `src/runtime/panel-session.ts`
 - Test: `test/runtime/dispatcher.test.ts`
 
 **Only three transport commands exist in this firmware:** `previous`,
 `play_pause`, `next`. There is **no media stop command from any UI control**,
 despite `STOP` existing as a type-detector channel. Do not invent one. Volume,
 mute and seek are separate commands with their own payloads.
+
+**Command subscription (added in execution, Ruling 16).** Parsing and
+dispatching a command is useless unless the panel session subscribes to its
+topic. Add `'media'` to `COMMAND_LEAVES` in `src/runtime/panel-session.ts`
+so `<baseTopic>/cmnd/media` is actually received, and add a test that the
+session's subscription list includes it. The leaf is `media` — taken from
+the contract document, and NOT necessarily the same string as the
+`media_player` domain name.
 
 - [ ] **Step 1: Write the failing tests**
 
@@ -889,7 +936,7 @@ git add -A && git commit -m "feat(protocol): build and validate the editable con
 
 **Files:**
 - Create: `src/runtime/value-ack.ts`
-- Modify: `src/protocol/commands.ts`, `src/runtime/dispatcher.ts`
+- Modify: `src/protocol/commands.ts`, `src/runtime/dispatcher.ts`, `src/runtime/panel-session.ts`
 - Test: `test/runtime/value-ack.test.ts`
 
 **Interfaces:**
@@ -904,6 +951,14 @@ is read as a rejection.
 The device echoes `session`, `revision` and its own `deadline` in the
 command. The adapter treats all three as **opaque** — echo them back, never
 parse or validate them.
+
+**Command subscription (added in execution, Ruling 16).** Parsing and
+dispatching a command is useless unless the panel session subscribes to its
+topic. Add `'value'` to `COMMAND_LEAVES` in `src/runtime/panel-session.ts`
+so `<baseTopic>/cmnd/value` is actually received, and add a test that the
+session's subscription list includes it. The leaf is `value` — taken from
+the contract document, and NOT necessarily the same string as the
+`number/select/datetime` domain name.
 
 - [ ] **Step 1: Write the failing tests**
 
