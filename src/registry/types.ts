@@ -1,6 +1,31 @@
-export type Domain = 'sensor' | 'binary_sensor' | 'switch' | 'light' | 'scene';
+export type Domain =
+  | 'sensor'
+  | 'binary_sensor'
+  | 'switch'
+  | 'light'
+  | 'scene'
+  | 'climate'
+  | 'cover'
+  | 'media_player'
+  | 'weather'
+  | 'number'
+  | 'select'
+  | 'datetime';
 
-export const DOMAINS: readonly Domain[] = ['sensor', 'binary_sensor', 'switch', 'light', 'scene'];
+export const DOMAINS: readonly Domain[] = [
+  'sensor',
+  'binary_sensor',
+  'switch',
+  'light',
+  'scene',
+  'climate',
+  'cover',
+  'media_player',
+  'weather',
+  'number',
+  'select',
+  'datetime',
+];
 
 /** The subset of an ioBroker state this adapter cares about. */
 export interface SourceValue {

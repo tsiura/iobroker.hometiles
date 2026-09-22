@@ -20,5 +20,16 @@ export function synthesise(device: DeviceInput, entityId: string, values: Values
       return synthLight(device, entityId, values);
     case 'scene':
       return synthScene(device, entityId, values);
+    case 'climate':
+    case 'cover':
+    case 'media_player':
+    case 'weather':
+    case 'number':
+    case 'select':
+    case 'datetime':
+      // Later v0.2 tasks add the synth module for each of these. Throwing
+      // here is deliberate: a device the detector classified into one of
+      // these domains must not silently fall through to a wrong renderer.
+      throw new Error(`not implemented: ${device.domain}`);
   }
 }

@@ -32,6 +32,19 @@ const ALLOWED_CALLS: Record<Domain, ReadonlySet<CallKind>> = {
   scene: new Set<CallKind>(['activate_scene']),
   sensor: new Set<CallKind>(),
   binary_sensor: new Set<CallKind>(),
+  // v0.2 domains: no ServiceCall variant exists for any of these yet (see
+  // protocol/commands.ts), so nothing can be allowed through. An empty set
+  // routes a call for one of these domains into the existing, already-logged
+  // "call_not_allowed_for_domain" rejection below rather than throwing out of
+  // a static table — loud and explicit, not a silent fallthrough. Later tasks
+  // add each domain's ServiceCall kind here as it gains real commands.
+  climate: new Set<CallKind>(),
+  cover: new Set<CallKind>(),
+  media_player: new Set<CallKind>(),
+  weather: new Set<CallKind>(),
+  number: new Set<CallKind>(),
+  select: new Set<CallKind>(),
+  datetime: new Set<CallKind>(),
 };
 
 export class Dispatcher {

@@ -95,10 +95,11 @@ describe('protocol/state-payload', () => {
     expect(p.retain).to.equal(true);
   });
 
-  it('assigns every v0.1 domain an explicit payload shape', () => {
+  it('assigns every domain an explicit payload shape', () => {
     // Guards the exhaustive switch: a domain added to the union without a
     // decided payload shape must fail to compile, never default into JSON.
-    // This test pins the runtime half of that contract.
+    // This test pins the runtime half of that contract for every domain,
+    // v0.1 and v0.2 alike.
     const shapes = DOMAINS.map((domain) => {
       const publish = buildStatePublish('ha/statestream', entity({ entityId: `${domain}.t`, domain, state: 'on' }));
       if (!publish) return [domain, 'none'] as const;
@@ -110,6 +111,13 @@ describe('protocol/state-payload', () => {
       switch: 'bare',
       light: 'json',
       scene: 'none',
+      climate: 'json',
+      cover: 'json',
+      media_player: 'json',
+      weather: 'json',
+      number: 'json',
+      select: 'json',
+      datetime: 'json',
     });
   });
 });

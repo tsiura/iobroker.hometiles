@@ -21,6 +21,10 @@ type PayloadShape = 'bare' | 'json' | 'none';
  *   payload for TILE_SENSOR, TILE_SWITCH and TILE_BINARY_SENSOR.
  * - json: sync_local_device_entities publishes {"state":"on","brightness_pct":N}.
  * - none: a scene has no state; the panel only ever fires it.
+ *
+ * climate, cover, media_player, weather, number, select and datetime all
+ * publish JSON: docs/contract-climate-cover.md, docs/contract-media-weather.md
+ * and docs/contract-editable.md (the `/control` payload).
  */
 function payloadShape(domain: Domain): PayloadShape {
   switch (domain) {
@@ -29,6 +33,13 @@ function payloadShape(domain: Domain): PayloadShape {
     case 'switch':
       return 'bare';
     case 'light':
+    case 'climate':
+    case 'cover':
+    case 'media_player':
+    case 'weather':
+    case 'number':
+    case 'select':
+    case 'datetime':
       return 'json';
     case 'scene':
       return 'none';

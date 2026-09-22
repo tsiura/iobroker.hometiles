@@ -27,8 +27,11 @@ describe('registry/overrides', () => {
     expect(result.find((d) => d.objectId === 'b')!.domain).to.equal('binary_sensor');
   });
 
-  it('ignores a forced domain that is not a v0.1 domain', () => {
-    const result = applyOverrides(DEVICES, [{ objectId: 'b', include: true, forcedDomain: 'climate' }]);
+  it('ignores a forced domain that is not a recognised domain', () => {
+    // 'camera' is deliberately never a Domain member (out of scope by explicit
+    // product decision), so it stays a valid negative case across releases
+    // unlike a domain such as 'climate' that later became real in v0.2.
+    const result = applyOverrides(DEVICES, [{ objectId: 'b', include: true, forcedDomain: 'camera' }]);
     expect(result.find((d) => d.objectId === 'b')!.domain).to.equal('sensor');
   });
 
