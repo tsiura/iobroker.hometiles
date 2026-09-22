@@ -9,7 +9,7 @@ import {
   PANEL_SETTING_LEAVES,
   stateTopic,
 } from './protocol/topics';
-import { createIoBrokerDetector, mapControlToDevice, type ObjectMeta } from './registry/detector';
+import { createIoBrokerDetector, mapControlToDevice, validStates, type ObjectMeta } from './registry/detector';
 import { EntityRegistry } from './registry/entity-registry';
 import { applyOverrides } from './registry/overrides';
 import { synthesise } from './registry/synth/index';
@@ -280,7 +280,7 @@ class HomeTiles extends utils.Adapter {
         type: typeof common.type === 'string' ? common.type : undefined,
         min: typeof common.min === 'number' ? common.min : undefined,
         max: typeof common.max === 'number' ? common.max : undefined,
-        states: (common.states as Record<string, string>) ?? undefined,
+        states: validStates(common.states),
         write: typeof common.write === 'boolean' ? common.write : undefined,
         icon: typeof common.icon === 'string' ? common.icon : undefined,
       };

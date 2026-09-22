@@ -192,6 +192,25 @@ describe('registry/synth/climate', () => {
     expect(e?.writable?.fan_mode).to.equal(true);
   });
 
+  it('never borrows SPEED_LEVEL for fan_mode when SPEED is configured but has no usable value (Ruling 25, fix-round 3)', () => {
+    // Before this fix: display fell back to SPEED_LEVEL's value here while
+    // the dispatcher (which only checks whether the SPEED channel OBJECT
+    // exists, not whether it currently has a value) still routed writes to
+    // SPEED -- fan_mode would display "42" and a command would write the
+    // number 42, a SPEED_LEVEL percentage, into the SPEED enum, with
+    // ok:true. Display and write must use the SAME channel: SPEED exists,
+    // so fan_mode is unknown here, never "42".
+    const { device, values } = deviceWith({ MODE: numState('cool') });
+    device.channels.speed = { objectId: 'climate.0.speed', write: true, states: { '2': 'high' } };
+    device.channels.speed_level = { objectId: 'climate.0.speed_level', write: true };
+    values['climate.0.speed_level'] = numState(42);
+    // Deliberately no value at all for climate.0.speed.
+    const e = synthClimate(device, 'climate.test', values);
+    expect(e?.attributes.fan_mode).to.equal(undefined);
+    expect(e?.writable?.fan_mode).to.equal(true);
+    expect(e?.source.speed).to.equal('climate.0.speed');
+  });
+
   it('reads POWER and BOOST as on/off and records them writable', () => {
     // ACTUAL keeps this device valid under the firmware's acceptance rule
     // (M6 above); a POWER/BOOST-only device is covered by its own

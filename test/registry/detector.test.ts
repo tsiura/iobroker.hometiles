@@ -1,5 +1,11 @@
 import { expect } from 'chai';
-import { DETECTOR_TYPE_TO_DOMAIN, mapControlToDevice, type DetectedControl, type ObjectMeta } from '../../src/registry/detector';
+import {
+  DETECTOR_TYPE_TO_DOMAIN,
+  mapControlToDevice,
+  validStates,
+  type DetectedControl,
+  type ObjectMeta,
+} from '../../src/registry/detector';
 
 const META: Record<string, ObjectMeta> = {
   'hue.0.decke.on': { name: 'On', role: 'switch', type: 'boolean', write: true },
@@ -301,5 +307,38 @@ describe('registry/detector mapping', () => {
     const control: DetectedControl = { type: 'temperature', states: [{ id: 'zigbee.0.unknown.value', name: 'ACTUAL' }] };
     const device = mapControlToDevice('zigbee.0.unknown', control, {});
     expect(device!.name).to.equal('unknown');
+  });
+});
+
+describe('registry/detector: validStates', () => {
+  // Fix-round 3, finding 3: main.ts's detectDevices used to cast
+  // common.states without validation. A non-object, or an object with a
+  // non-string label, must never reach ChannelInput.states, where
+  // encodeChannelValue's states-map reversal calls .toLowerCase() on every
+  // label -- an unvalidated bad shape threw a TypeError several layers away,
+  // in panel-session's generic command catch, logged as an opaque
+  // "candidate.toLowerCase is not a function".
+  it('passes a well-formed states map through unchanged', () => {
+    expect(validStates({ '1': 'heat', '3': 'cool' })).to.deep.equal({ '1': 'heat', '3': 'cool' });
+  });
+
+  it('drops a non-string label instead of letting it through', () => {
+    expect(validStates({ '1': 'heat', '2': 5 })).to.deep.equal({ '1': 'heat' });
+  });
+
+  it('returns undefined for a states map that is entirely non-string labels', () => {
+    expect(validStates({ '1': 5, '2': true })).to.equal(undefined);
+  });
+
+  it('returns undefined for undefined, null, an array, or a primitive', () => {
+    expect(validStates(undefined)).to.equal(undefined);
+    expect(validStates(null)).to.equal(undefined);
+    expect(validStates(['heat', 'cool'])).to.equal(undefined);
+    expect(validStates('heat')).to.equal(undefined);
+    expect(validStates(42)).to.equal(undefined);
+  });
+
+  it('returns undefined for an empty object, matching "no states configured"', () => {
+    expect(validStates({})).to.equal(undefined);
   });
 });

@@ -30,6 +30,25 @@ export interface ObjectMeta {
 }
 
 /**
+ * `common.states` is untrusted ioBroker object configuration, not a value
+ * this adapter's own code ever produces -- a non-object, or an object with a
+ * non-string label, must never reach ChannelInput.states, where
+ * encodeChannelValue's states-map reversal calls .toLowerCase() on every
+ * label (fix-round 3, finding 3: an unvalidated cast here threw a TypeError
+ * only caught several layers away, in panel-session's generic command
+ * handler, and logged as an opaque "candidate.toLowerCase is not a
+ * function"). A malformed entry is dropped individually rather than
+ * discarding the whole map, so one bad label does not cost every good one.
+ */
+export function validStates(value: unknown): Record<string, string> | undefined {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return undefined;
+  const entries = Object.entries(value as Record<string, unknown>).filter(
+    (entry): entry is [string, string] => typeof entry[1] === 'string',
+  );
+  return entries.length ? Object.fromEntries(entries) : undefined;
+}
+
+/**
  * Detector types v0.1 understands. A type that is absent here is skipped
  * entirely rather than guessed at, so an unsupported device never turns into a
  * half-working tile.

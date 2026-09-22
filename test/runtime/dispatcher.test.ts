@@ -256,13 +256,16 @@ describe('runtime/dispatcher', () => {
       // fall through to set_heating/set_cooling as if it were the lone-side
       // case. The synth decides WHETHER a setpoint role exists; the
       // dispatcher's candidate order only decides WHICH channel backs one
-      // that does. Real synth output omits the key entirely rather than
-      // setting it false; both read the same way through `!== true`.
+      // that does. Fix-round 3: the fixture OMITS the key, matching real
+      // synth output exactly -- a previous draft set `setpoint: false`
+      // explicitly, which reads identically today (`!== true`) but would
+      // stay green even if that check ever tightened to `=== false`, while a
+      // real device (key simply absent) would still write 21 to set_heating.
       const trueDual = entity({
         entityId: 'climate.dual',
         domain: 'climate',
         source: { set_heating: 'zig.0.dual.heat', set_cooling: 'zig.0.dual.cool' },
-        writable: { setpoint: false, target_temp_low: true, target_temp_high: true },
+        writable: { target_temp_low: true, target_temp_high: true },
       });
       const d = new Dispatcher(lookup([trueDual]), write, silentLog);
       const result = await d.dispatch({ kind: 'set_temperature', entityId: 'climate.dual', value: 21 });
@@ -398,7 +401,9 @@ describe('runtime/dispatcher', () => {
       });
       const d = new Dispatcher(lookup([ac]), write, silentLog);
       const result = await d.dispatch({ kind: 'set_hvac_mode', entityId: 'climate.ac', mode: 'auto' });
-      expect(result).to.deep.equal({ ok: false, reason: 'no_writable_channel', applied: 0 });
+      // Fix-round 3, fold-in 2: a value that can't be encoded is a different
+      // problem from no writable channel -- the channel IS writable here.
+      expect(result).to.deep.equal({ ok: false, reason: 'cannot_encode_value', applied: 0 });
       expect(writes).to.have.length(0);
     });
 
@@ -466,7 +471,9 @@ describe('runtime/dispatcher', () => {
       for (const mode of ['', 'abc', 'NaN']) {
         writes = [];
         const result = await d.dispatch({ kind: 'set_fan_mode', entityId: 'climate.ac', mode });
-        expect(result, mode).to.deep.equal({ ok: false, reason: 'no_writable_channel', applied: 0 });
+        // Fix-round 3, fold-in 2: distinct from no_writable_channel -- the
+        // channel is writable, the value just can't be encoded for it.
+        expect(result, mode).to.deep.equal({ ok: false, reason: 'cannot_encode_value', applied: 0 });
         expect(writes, mode).to.have.length(0);
       }
     });

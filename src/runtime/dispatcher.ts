@@ -78,15 +78,23 @@ export class Dispatcher {
       return { ok: false, reason: 'call_not_allowed_for_domain', applied: 0 };
     }
 
-    const writes = this.plan(call, entity);
+    const { writes, failureReason } = this.plan(call, entity);
     if (!writes.length) {
       // A call that resolves to zero writes must not report success: it is
       // indistinguishable from a command that did exactly what was asked. A
       // scene wired to a read-only control, or a slider whose only channel
       // the plan step could not find, would otherwise do nothing forever
       // while every caller believes it worked.
-      this.log.warn(`[Command] Rejected ${call.kind} for ${entity.entityId}: no writable channel`);
-      return { ok: false, reason: 'no_writable_channel', applied: 0 };
+      //
+      // failureReason distinguishes "no channel to write to" from "a channel
+      // exists and is writable, but the value could not be encoded for it"
+      // (fix-round 3, fold-in 2) -- the two are different problems to debug,
+      // and collapsing them into one reason claimed a channel was missing
+      // when it was really the value that didn't fit it.
+      const reason = failureReason ?? 'no_writable_channel';
+      const detail = failureReason ? 'could not encode the value for any channel' : 'no writable channel';
+      this.log.warn(`[Command] Rejected ${call.kind} for ${entity.entityId}: ${detail}`);
+      return { ok: false, reason, applied: 0 };
     }
 
     let applied = 0;
@@ -110,10 +118,18 @@ export class Dispatcher {
   }
 
   /** Resolves a call into concrete writes, skipping channels the device lacks. */
-  private plan(call: ServiceCall, entity: VirtualEntity): Array<[string, string, unknown]> {
+  private plan(
+    call: ServiceCall,
+    entity: VirtualEntity,
+  ): { writes: Array<[string, string, unknown]>; failureReason?: string } {
     // [channelName, objectId, value] — the channel name is carried so a failure
     // can say which capability did not apply.
     const writes: Array<[string, string, unknown]> = [];
+    // Set only by pushEncoded, and only consulted by dispatch() when `writes`
+    // ends up empty — every climate command below calls pushEncoded at most
+    // once per plan(), so there is no ordering ambiguity between an earlier
+    // success and a later encode failure to worry about.
+    let failureReason: string | undefined;
     const push = (channel: string, value: unknown): void => {
       const objectId = entity.source[channel];
       if (objectId) writes.push([channel, objectId, value]);
@@ -171,6 +187,7 @@ export class Dispatcher {
       const value = encodeChannelValue(effective, label);
       if (value === undefined) {
         this.log.warn(`[Command] Cannot encode "${label}" for ${entity.entityId} on channel ${channel}`);
+        failureReason = 'cannot_encode_value';
         return;
       }
       push(channel, value);
@@ -246,6 +263,6 @@ export class Dispatcher {
         break;
     }
 
-    return writes;
+    return { writes, failureReason };
   }
 }

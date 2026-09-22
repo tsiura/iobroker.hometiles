@@ -1,6 +1,7 @@
 import { expect } from 'chai';
-import { encodeChannelValue } from '../../../src/registry/synth/common';
-import type { ChannelCodec } from '../../../src/registry/types';
+import { encodeChannelValue, toBoolState } from '../../../src/registry/synth/common';
+import { synthClimate } from '../../../src/registry/synth/climate';
+import type { ChannelCodec, DeviceInput, SourceValue } from '../../../src/registry/types';
 
 /**
  * encodeChannelValue is the exact inverse of readEnum (synth/climate.ts) and
@@ -115,5 +116,91 @@ describe('registry/synth/common: encodeChannelValue', () => {
   it('treats a mixed-type channel the same as a plain string: pass through', () => {
     const codec: ChannelCodec = { type: 'mixed' };
     expect(encodeChannelValue(codec, 'cool')).to.equal('cool');
+  });
+
+  // Fix-round 3, IMPORTANT A: ambiguous states-map matches must refuse, not
+  // silently pick one.
+  it('refuses a label that matches two different keys case-insensitively, rather than picking the first', () => {
+    // {"1":"High","2":"HIGH"} with label "high": a device currently at raw 2
+    // (decoded "HIGH") whose user re-selects their OWN current mode must not
+    // get raw 1 written instead -- `.find` returning the first match did
+    // exactly that, with ok:true.
+    const codec: ChannelCodec = { type: 'number', states: { '1': 'High', '2': 'HIGH' } };
+    expect(encodeChannelValue(codec, 'high')).to.equal(undefined);
+  });
+
+  it('refuses a label that matches two keys under exact-case duplicates too', () => {
+    const codec: ChannelCodec = { type: 'number', states: { '1': 'heat', '5': 'heat' } };
+    expect(encodeChannelValue(codec, 'heat')).to.equal(undefined);
+  });
+
+  // Fix-round 3, IMPORTANT B (REGRESSION): the decoder toBoolState never
+  // reads a states map -- it always emits STATE_ON/STATE_OFF -- so the
+  // encoder must not apply one either for a boolean-typed channel.
+  it('ignores a states map entirely for a boolean-typed channel, matching toBoolState exactly', () => {
+    for (const states of [{ true: 'ON', false: 'OFF' }, { true: 'An', false: 'Aus' }, { true: 'on', false: 'off' }]) {
+      const codec: ChannelCodec = { type: 'boolean', states };
+      expect(encodeChannelValue(codec, 'on'), JSON.stringify(states)).to.equal(true);
+      expect(encodeChannelValue(codec, 'off'), JSON.stringify(states)).to.equal(false);
+    }
+  });
+
+  // Fix-round 3, fold-in 1: readEnum treats {} exactly like no map at all
+  // (no key of an empty object can ever match), so the encoder must too.
+  it('treats an empty states map as no map at all', () => {
+    const codec: ChannelCodec = { type: 'number', states: {} };
+    expect(encodeChannelValue(codec, '3')).to.equal(3);
+  });
+
+  // Fix-round 3, fold-in 3: a non-string label must be skipped, not thrown
+  // on. main.ts's detectDevices now validates common.states so a real
+  // device should never produce one, but the encoder must not crash if a
+  // states map built any other way ever does.
+  it('skips a non-string label in a states map instead of throwing', () => {
+    const malformed = { '1': 'heat', '2': 5 } as unknown as Record<string, string>;
+    const codec: ChannelCodec = { type: 'number', states: malformed };
+    expect(() => encodeChannelValue(codec, 'heat')).to.not.throw();
+    expect(encodeChannelValue(codec, 'heat')).to.equal(1);
+    // The non-string entry can never match anything, string or not.
+    expect(() => encodeChannelValue(codec, '5')).to.not.throw();
+    expect(encodeChannelValue(codec, '5')).to.equal(undefined);
+  });
+
+  // Fix-round 3, finding 6: feed REAL decoder output into the encoder,
+  // rather than a hand-written label, so the round trip is checked against
+  // the actual decode path, not a re-description of it.
+  describe('round-trips real decoder output, not hand-written labels', () => {
+    const NOW = 1_757_000_000_000;
+    function numState(val: unknown): SourceValue {
+      return { val, ack: true, q: 0, ts: NOW };
+    }
+
+    it('via synthClimate: a real numeric MODE with a states map', () => {
+      const device: DeviceInput = {
+        objectId: 'rt.0',
+        name: 'RT',
+        detectorType: 'airCondition',
+        domain: 'climate',
+        channels: { mode: { objectId: 'rt.0.mode', write: true, type: 'number', states: { '1': 'heat', '3': 'cool' } } },
+      };
+      const values = { 'rt.0.mode': numState(1) };
+      const e = synthClimate(device, 'climate.rt', values);
+      const decoded = e?.attributes.hvac_mode;
+      expect(decoded, 'synthClimate must actually decode MODE via the real readEnum path').to.equal('heat');
+
+      const encoded = encodeChannelValue(e?.channelMeta?.mode, decoded as string);
+      expect(encoded).to.equal(1);
+      expect(typeof encoded).to.equal('number');
+    });
+
+    it('via the real toBoolState: the boolean swing toggle', () => {
+      const decodedOn = toBoolState(true);
+      const decodedOff = toBoolState(false);
+      expect(decodedOn).to.equal('on');
+      expect(decodedOff).to.equal('off');
+
+      expect(encodeChannelValue({ type: 'boolean' }, decodedOn)).to.equal(true);
+      expect(encodeChannelValue({ type: 'boolean' }, decodedOff)).to.equal(false);
+    });
   });
 });

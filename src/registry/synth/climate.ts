@@ -158,8 +158,25 @@ export function synthClimate(device: DeviceInput, entityId: string, values: Valu
   // Fan speed: airCondition only. SPEED (named steps) and SPEED_LEVEL (a
   // percentage) are alternates for the same role, same as light.ts treats
   // DIMMER/BRIGHTNESS — prefer the named one, fall back to the percentage.
-  const speedLevel = readNumber(device, 'speed_level', values);
-  const fanMode = readEnum(device, 'speed', values) ?? (speedLevel !== undefined ? String(speedLevel) : undefined);
+  //
+  // Ruling 25 (fix-round 3): the channel choice must be the SAME for display
+  // and for write, decided once by which channel is CONFIGURED, never by
+  // which one currently has a usable VALUE. The previous version read
+  // `readEnum(speed) ?? String(speedLevel)`: when SPEED was configured but
+  // valueless, display silently borrowed SPEED_LEVEL's percentage while
+  // setWritable (below) still pointed writes at SPEED (the channel object
+  // exists regardless of its value) -- so fan_mode could display "42" and a
+  // command would write the number 42 into an enum channel that has no code
+  // 42, landing wrong with ok:true. If SPEED is configured, fan_mode comes
+  // from SPEED alone, usable value or not; SPEED_LEVEL backs it only when
+  // SPEED is not configured at all.
+  let fanMode: string | undefined;
+  if (device.channels.speed) {
+    fanMode = readEnum(device, 'speed', values);
+  } else {
+    const speedLevel = readNumber(device, 'speed_level', values);
+    fanMode = speedLevel !== undefined ? String(speedLevel) : undefined;
+  }
   if (fanMode !== undefined) attributes.fan_mode = fanMode;
   setWritable(writable, 'fan_mode', device.channels.speed ?? device.channels.speed_level);
 

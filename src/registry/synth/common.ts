@@ -90,7 +90,7 @@ export function baseEntity(
  * thing. A label this function cannot faithfully re-encode returns
  * `undefined`, never a guessed value.
  *
- * The states-map reversal is case-insensitive:
+ * The states-map reversal is case-insensitive (trimmed too):
  * docs/contract-climate-cover.md confirms the firmware trims+lowercases
  * hvac_mode/fan_mode/swing_mode on its own ingest, so a label built from a
  * states map in any other case (e.g. @iobroker/type-detector's own
@@ -99,11 +99,53 @@ export function baseEntity(
  * own default labels on every real round trip.
  */
 export function encodeChannelValue(codec: ChannelCodec | undefined, label: string): number | boolean | string | undefined {
+  // Boolean is checked FIRST and never consults a states map at all, because
+  // the decoder it must invert -- toBoolState -- never reads one either: it
+  // always emits exactly STATE_ON/STATE_OFF regardless of what states the
+  // channel carries (fix-round 3, IMPORTANT B). Applying the states-map
+  // reversal before this check made every boolean channel with ANY states
+  // map -- even the literal {"true":"on","false":"off"} -- refuse both "on"
+  // and "off", a real regression from the plain `true`/`false` write that
+  // worked before fix-round 2. The general rule this restores: the encoder
+  // consults a states map only where the decoder does.
+  if (codec?.type === 'boolean') {
+    if (label === STATE_ON) return true;
+    if (label === STATE_OFF) return false;
+    // toBoolState only ever EMITS 'on' or 'off' for a genuine boolean
+    // channel ('unknown' means nothing boolean was recoverable at all), so
+    // those are the only two labels with a faithful raw value to
+    // reconstruct -- accepting more (e.g. toBoolState's lenient INPUT
+    // vocabulary like "1"/"yes") would accept values decode never emits.
+    return undefined;
+  }
+
   let raw = label;
-  if (codec?.states) {
-    const match = Object.entries(codec.states).find(([, candidate]) => candidate.toLowerCase() === label.toLowerCase());
-    if (!match) return undefined;
-    raw = match[0];
+  const entries = codec?.states ? Object.entries(codec.states) : [];
+  if (entries.length > 0) {
+    // An empty states map behaves as no map at all, matching readEnum: `{}`
+    // never matches any key, so decode always falls through to the plain
+    // value branches (fix-round 3, fold-in 1).
+    //
+    // Collect EVERY key whose label matches, not just the first, and refuse
+    // unless exactly one does (fix-round 3, IMPORTANT A). `.find` returning
+    // the first case-insensitive match let {"1":"High","2":"HIGH"} silently
+    // resolve "high" to 1 even when the device's current raw value was 2 --
+    // a user re-selecting their OWN current mode would get the wrong one
+    // written, with ok:true. Two codes sharing a label are genuinely
+    // ambiguous: the panel cannot distinguish them either, so refusing is
+    // the only correct answer, the same as an unknown label.
+    //
+    // Non-string labels are skipped rather than crashing on .toLowerCase()
+    // (fix-round 3, fold-in 3) -- main.ts's detectDevices now validates
+    // common.states so a real device should never produce one, but a states
+    // map built any other way (a test, a future caller) still cannot throw.
+    const wanted = label.trim().toLowerCase();
+    const matches = entries.filter(
+      ([, candidate]) => typeof candidate === 'string' && candidate.trim().toLowerCase() === wanted,
+    );
+    const onlyMatch = matches.length === 1 ? matches[0] : undefined;
+    if (!onlyMatch) return undefined;
+    raw = onlyMatch[0];
   }
 
   switch (codec?.type) {
@@ -117,18 +159,10 @@ export function encodeChannelValue(codec: ChannelCodec | undefined, label: strin
       const numeric = Number(text);
       return Number.isFinite(numeric) ? numeric : undefined;
     }
-    case 'boolean':
-      // toBoolState only ever EMITS 'on' or 'off' for a genuine boolean
-      // channel ('unknown' means nothing boolean was recoverable at all), so
-      // those are the only two labels with a faithful raw value to
-      // reconstruct -- accepting more (e.g. toBoolState's lenient INPUT
-      // vocabulary like "1"/"yes") would accept values decode never emits.
-      if (raw === STATE_ON) return true;
-      if (raw === STATE_OFF) return false;
-      return undefined;
     default:
       // 'string', 'mixed', and no captured type at all: the safe default is
-      // to write back exactly what arrived.
+      // to write back exactly what arrived (or what the states map
+      // reversed it to, for an untyped enum channel).
       return raw;
   }
 }
