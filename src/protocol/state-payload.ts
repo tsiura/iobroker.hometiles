@@ -1,5 +1,6 @@
 import type { Domain, VirtualEntity } from '../registry/types';
 import { buildClimatePayload } from './climate';
+import { buildCoverPayload } from './cover';
 import { entityStateTopic } from './topics';
 
 export interface StatePublish {
@@ -65,6 +66,16 @@ export function buildStatePublish(haPrefix: string, entity: VirtualEntity): Stat
   // into the generic loop below.
   if (entity.domain === 'climate') {
     return { topic, payload: buildClimatePayload(entity), retain: true };
+  }
+
+  // Cover publishes a different shape than the generic JSON loop below for
+  // the same reason as climate: an explicit supported_features must be
+  // computed from `writable` and sent on every publish (task 7; see
+  // src/protocol/cover.ts and docs/contract-climate-cover.md), never left to
+  // the generic attribute loop, which would forward whatever happens to be
+  // in `attributes` and never add supported_features at all.
+  if (entity.domain === 'cover') {
+    return { topic, payload: buildCoverPayload(entity), retain: true };
   }
 
   const body: Record<string, unknown> = {};

@@ -103,6 +103,30 @@ describe('protocol/state-payload', () => {
     expect(parsed).to.not.have.keys('temperature', 'min_temp', 'max_temp', 'state');
   });
 
+  it('routes cover through buildCoverPayload instead of the generic JSON body', () => {
+    // Full rule coverage (explicit supported_features, Ruling 27's gate
+    // case, position/tilt 0-vs-absent) lives in protocol/cover.test.ts; this
+    // just pins that buildStatePublish actually delegates to it rather than
+    // falling into the generic attribute loop, which would forward whatever
+    // is in attributes verbatim and never add supported_features at all --
+    // silently handing capability inference back to the firmware.
+    const p = buildStatePublish(
+      'ha/statestream',
+      entity({
+        entityId: 'cover.kitchen_blind',
+        domain: 'cover',
+        state: 'open',
+        attributes: { current_position: 40 },
+        writable: { position: true, open: true, close: true, stop: true },
+      }),
+    );
+    expect(p!.topic).to.equal('ha/statestream/cover/kitchen_blind/state');
+    const parsed = JSON.parse(p!.payload) as Record<string, unknown>;
+    expect(parsed.supported_features).to.be.a('number');
+    expect(parsed).to.not.have.property('state', undefined);
+    expect(parsed.state).to.equal('open');
+  });
+
   it('publishes nothing for a scene', () => {
     expect(buildStatePublish('ha/statestream', entity({ entityId: 'scene.n', domain: 'scene' }))).to.equal(null);
   });
