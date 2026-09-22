@@ -1,7 +1,11 @@
 import type { ChannelInput, DeviceInput, Domain } from './types';
 
 export interface DetectedChannel {
-  id: string;
+  /**
+   * Absent on every pattern state the detector did NOT match to an object:
+   * it returns the whole pattern, matched or not (Ruling 34).
+   */
+  id?: string;
   /** Upper-case detector channel token, e.g. SET, ACTUAL, ON_SET, DIMMER, RED. */
   name: string;
   write?: boolean;
@@ -257,6 +261,8 @@ export function mapControlToDevice(
 
   const channels: Record<string, ChannelInput> = {};
   for (const state of control.states) {
+    // No id means no object behind it: not a channel (Ruling 34).
+    if (!state.id) continue;
     const name = channelName(control.type, state);
     if (!name) continue;
     if (channels[name]) continue;
@@ -269,8 +275,11 @@ export function mapControlToDevice(
     if (info?.min !== undefined) channel.min = info.min;
     if (info?.max !== undefined) channel.max = info.max;
     if (info?.states) channel.states = info.states;
+    // The object's own common.write first (Ruling 35): the detector skips its
+    // write check for an object carrying the pattern's defaultRole, so a
+    // match proves nothing. The pattern's write fills in only when silent.
     if (state.write !== undefined || info?.write !== undefined) {
-      channel.write = state.write ?? info?.write;
+      channel.write = info?.write ?? state.write;
     }
     channels[name] = channel;
   }
