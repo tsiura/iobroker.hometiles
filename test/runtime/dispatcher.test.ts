@@ -248,6 +248,28 @@ describe('runtime/dispatcher', () => {
       expect(writes).to.deep.equal([['zig.0.single.heat', 19]]);
     });
 
+    it('rejects a single-value setpoint on a true dual-setpoint device, which never gets writable.setpoint at all', async () => {
+      // Fix-round I1: the synth's hasHeating && hasCooling branch sets
+      // target_temp_low/target_temp_high but never touches writable.setpoint
+      // (registry/synth/climate.ts) -- so a single-value set_temperature
+      // aimed at a true dual-setpoint device must find nothing to write, not
+      // fall through to set_heating/set_cooling as if it were the lone-side
+      // case. The synth decides WHETHER a setpoint role exists; the
+      // dispatcher's candidate order only decides WHICH channel backs one
+      // that does. Real synth output omits the key entirely rather than
+      // setting it false; both read the same way through `!== true`.
+      const trueDual = entity({
+        entityId: 'climate.dual',
+        domain: 'climate',
+        source: { set_heating: 'zig.0.dual.heat', set_cooling: 'zig.0.dual.cool' },
+        writable: { setpoint: false, target_temp_low: true, target_temp_high: true },
+      });
+      const d = new Dispatcher(lookup([trueDual]), write, silentLog);
+      const result = await d.dispatch({ kind: 'set_temperature', entityId: 'climate.dual', value: 21 });
+      expect(result).to.deep.equal({ ok: false, reason: 'no_writable_channel', applied: 0 });
+      expect(writes).to.have.length(0);
+    });
+
     it('writes both bounds of a dual-setpoint range when both channels are writable', async () => {
       const dual = entity({
         entityId: 'climate.dual',
@@ -340,7 +362,12 @@ describe('runtime/dispatcher', () => {
       expect(writes).to.deep.equal([['zig.0.ac.mode', 'cool']]);
     });
 
-    it('writes fan_mode to the named SPEED channel when present', async () => {
+    it('writes fan_mode to the named SPEED channel when present, coerced to a number', async () => {
+      // Fix-round I2: SPEED is Number-typed too (@iobroker/type-detector's
+      // FanPatterns.speed), just usually decoded through a states label map
+      // -- '2' here stands in for a raw enum code (e.g. LOW), the only form
+      // this layer can round-trip without the states map (see the case
+      // comment in dispatcher.ts).
       const ac = entity({
         entityId: 'climate.ac',
         domain: 'climate',
@@ -348,11 +375,12 @@ describe('runtime/dispatcher', () => {
         writable: { fan_mode: true },
       });
       const d = new Dispatcher(lookup([ac]), write, silentLog);
-      await d.dispatch({ kind: 'set_fan_mode', entityId: 'climate.ac', mode: 'high' });
-      expect(writes).to.deep.equal([['zig.0.ac.speed', 'high']]);
+      const result = await d.dispatch({ kind: 'set_fan_mode', entityId: 'climate.ac', mode: '2' });
+      expect(result).to.deep.equal({ ok: true, writes: 1 });
+      expect(writes).to.deep.equal([['zig.0.ac.speed', 2]]);
     });
 
-    it('falls back to SPEED_LEVEL when the device has no named SPEED channel', async () => {
+    it('falls back to SPEED_LEVEL when the device has no named SPEED channel, coerced to a number', async () => {
       const ac = entity({
         entityId: 'climate.ac',
         domain: 'climate',
@@ -360,8 +388,29 @@ describe('runtime/dispatcher', () => {
         writable: { fan_mode: true },
       });
       const d = new Dispatcher(lookup([ac]), write, silentLog);
-      await d.dispatch({ kind: 'set_fan_mode', entityId: 'climate.ac', mode: '42' });
-      expect(writes).to.deep.equal([['zig.0.ac.speed_pct', '42']]);
+      const result = await d.dispatch({ kind: 'set_fan_mode', entityId: 'climate.ac', mode: '42' });
+      expect(result).to.deep.equal({ ok: true, writes: 1 });
+      expect(writes).to.deep.equal([['zig.0.ac.speed_pct', 42]]);
+    });
+
+    it('rejects a blank, non-numeric or "NaN" fan_mode rather than writing 0 or a string into a numeric state', async () => {
+      // Number('') is 0 and finite -- the exact trap that has introduced this
+      // bug class before. A label SPEED cannot reverse without its states
+      // map (see the case comment in dispatcher.ts) falls in the same bucket
+      // as genuine garbage: refused, not written as the wrong type.
+      const ac = entity({
+        entityId: 'climate.ac',
+        domain: 'climate',
+        source: { speed_level: 'zig.0.ac.speed_pct' },
+        writable: { fan_mode: true },
+      });
+      const d = new Dispatcher(lookup([ac]), write, silentLog);
+      for (const mode of ['', 'abc', 'NaN']) {
+        writes = [];
+        const result = await d.dispatch({ kind: 'set_fan_mode', entityId: 'climate.ac', mode });
+        expect(result, mode).to.deep.equal({ ok: false, reason: 'no_writable_channel', applied: 0 });
+        expect(writes, mode).to.have.length(0);
+      }
     });
 
     it('rejects set_humidity when the device has no writable humidity channel', async () => {

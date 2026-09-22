@@ -23,6 +23,23 @@ export type DispatchResult =
 type CallKind = ServiceCall['kind'];
 
 /**
+ * SPEED and SPEED_LEVEL (climate's fan_mode channels) are both Number-typed
+ * ioBroker states, verified against @iobroker/type-detector's
+ * typePatterns.js FanPatterns.speed/speedLevel — SPEED is usually decoded
+ * through a states label map (e.g. AUTO/HIGH/LOW/MEDIUM/QUIET/TURBO,
+ * synth/climate.ts's readEnum) but is not itself a string channel. Writing
+ * ServiceCall's string mode verbatim was writing a string into a numeric
+ * state. Number('') is 0 and finite, so a blank must be rejected, not
+ * coerced to zero — the same trap this project has hit before.
+ */
+function numericModeValue(mode: string): number | undefined {
+  const text = mode.trim();
+  if (!text) return undefined;
+  const numeric = Number(text);
+  return Number.isFinite(numeric) ? numeric : undefined;
+}
+
+/**
  * The security boundary. A command may only reach a channel listed here, on an
  * entity already present in the registry. Nothing else is reachable from MQTT.
  */
@@ -125,9 +142,12 @@ export class Dispatcher {
     // can also be "the" setpoint writer for that role (see synth/climate.ts).
     // Candidates are tried in order; the first one the entity actually has
     // wins. Same mechanism also covers fan_mode's SPEED/SPEED_LEVEL fallback.
+    const resolveChannel = (role: string, channels: readonly string[]): string | undefined => {
+      if (entity.writable?.[role] !== true) return undefined;
+      return channels.find((name) => entity.source[name]);
+    };
     const pushRole = (role: string, channels: readonly string[], value: unknown): void => {
-      if (entity.writable?.[role] !== true) return;
-      const channel = channels.find((name) => entity.source[name]);
+      const channel = resolveChannel(role, channels);
       if (channel) push(channel, value);
     };
 
@@ -176,11 +196,22 @@ export class Dispatcher {
       case 'set_hvac_mode':
         pushRole('hvac_mode', ['mode'], call.mode);
         break;
-      case 'set_fan_mode':
+      case 'set_fan_mode': {
         // SPEED (named steps) and SPEED_LEVEL (a percentage) are alternates
-        // for the same role, same as light's dimmer/brightness pair.
-        pushRole('fan_mode', ['speed', 'speed_level'], call.mode);
+        // for the same role, same as light's dimmer/brightness pair — but
+        // unlike dimmer/brightness, both are Number-typed states here, so
+        // call.mode (always a string, see commands.ts's requireMode) must be
+        // converted, never written verbatim. A label SPEED decodes through a
+        // states map (e.g. "high") has no code to reverse it back to without
+        // that map, which VirtualEntity does not carry — refused rather than
+        // written as the wrong type, same as a blank or non-numeric value.
+        const channel = resolveChannel('fan_mode', ['speed', 'speed_level']);
+        if (channel) {
+          const numeric = numericModeValue(call.mode);
+          if (numeric !== undefined) push(channel, numeric);
+        }
         break;
+      }
       case 'set_preset_mode':
         pushRole('preset_mode', ['preset'], call.mode);
         break;

@@ -67,15 +67,19 @@ describe('runtime/panel-session', () => {
     expect(subscribed).to.include('hometiles/cmnd/light');
     expect(subscribed).to.include('hometiles/cmnd/switch');
     expect(subscribed).to.include('hometiles/cmnd/scene');
+    expect(subscribed).to.include('hometiles/cmnd/climate');
     expect(subscribed).to.include('hometiles/stat/connected');
     expect(subscribed).to.include('hometiles/stat/ip');
     expect(subscribed).to.include('tab5_lvgl/config/a1/bridge/request');
   });
 
-  it('does not subscribe to the domains v0.1 does not implement', async () => {
+  it('does not subscribe to domains this adapter does not implement yet', async () => {
+    // climate moved out of this list once Task 5 gave it real commands;
+    // cover/media_player/camera still have no ServiceCall kinds at all
+    // (dispatcher.ts's ALLOWED_CALLS), so subscribing would only let
+    // malformed/unhandled traffic reach the session for nothing.
     const { session, subscribed } = harness();
     await session.start();
-    expect(subscribed).to.not.include('hometiles/cmnd/climate');
     expect(subscribed).to.not.include('hometiles/cmnd/cover');
     expect(subscribed).to.not.include('hometiles/cmnd/media');
     expect(subscribed).to.not.include('hometiles/cmnd/camera');
@@ -183,6 +187,26 @@ describe('runtime/panel-session', () => {
     await session.start();
     await session.handleMessage('hometiles/cmnd/switch', '{"entity_id":"switch.k","state":"on"}');
     expect(writes).to.deep.equal([['shelly.0.on', true]]);
+  });
+
+  it('routes a climate command to the dispatcher, proving the leaf reaches parseCommand end to end', async () => {
+    const { session, writes, registryEntities } = harness();
+    registryEntities.set(
+      'climate.hall',
+      entity({
+        entityId: 'climate.hall',
+        domain: 'climate',
+        state: 'heat',
+        source: { mode: 'zig.0.hall.mode' },
+        writable: { hvac_mode: true },
+      }),
+    );
+    await session.start();
+    await session.handleMessage(
+      'hometiles/cmnd/climate',
+      '{"entity_id":"climate.hall","command":"set_hvac_mode","hvac_mode":"cool"}',
+    );
+    expect(writes).to.deep.equal([['zig.0.hall.mode', 'cool']]);
   });
 
   it('routes a plain-text scene command to the dispatcher', async () => {

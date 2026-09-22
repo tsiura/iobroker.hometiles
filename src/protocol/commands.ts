@@ -1,3 +1,5 @@
+import { ALLOWED_PRESET_MODES } from './climate';
+
 export type ServiceCall =
   | { kind: 'turn_on'; entityId: string }
   | { kind: 'turn_off'; entityId: string }
@@ -66,16 +68,6 @@ function requireNumber(value: unknown, code: string): number {
   if (!Number.isFinite(numeric)) throw new CommandError(code);
   return numeric;
 }
-
-/**
- * The firmware's preset name table (tile_renderer.cpp's climate_preset_id,
- * docs/contract-climate-cover.md "preset_mode name table is closed") only
- * recognises these 8 HA-core names; anything else is silently discarded on
- * the firmware side. Duplicated from protocol/climate.ts rather than
- * imported: that module belongs to a different in-flight change and must not
- * be touched here.
- */
-const ALLOWED_PRESET_MODES = new Set(['none', 'eco', 'away', 'boost', 'comfort', 'home', 'sleep', 'activity']);
 
 function requireMode(value: unknown, code: string): string {
   const text = typeof value === 'string' ? value.trim().toLowerCase() : '';

@@ -66,7 +66,7 @@ const CLIMATE_STRING_KEYS = [
  * custom integration preset must be dropped here rather than sent and
  * silently discarded on the other end.
  */
-const ALLOWED_PRESET_MODES = new Set(['none', 'eco', 'away', 'boost', 'comfort', 'home', 'sleep', 'activity']);
+export const ALLOWED_PRESET_MODES = new Set(['none', 'eco', 'away', 'boost', 'comfort', 'home', 'sleep', 'activity']);
 
 /**
  * Number('') and Number('   ') are both 0 and finite, so a blank reading

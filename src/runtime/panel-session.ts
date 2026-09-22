@@ -22,8 +22,8 @@ export interface PanelTransport {
   unsubscribe(topic: string): Promise<void>;
 }
 
-/** Command leaves v0.1 implements. Everything else is deliberately not subscribed. */
-const COMMAND_LEAVES = ['light', 'switch', 'scene'] as const;
+/** Command leaves this adapter implements. Everything else is deliberately not subscribed. */
+const COMMAND_LEAVES = ['light', 'switch', 'scene', 'climate'] as const;
 type CommandLeaf = (typeof COMMAND_LEAVES)[number];
 
 export class PanelSession {
