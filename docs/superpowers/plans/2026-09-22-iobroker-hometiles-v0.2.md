@@ -499,6 +499,18 @@ interactivity.
 
 ---
 
+## Task 5c: Make detection match the real type-detector (added in execution, Rulings 34-35)
+
+Full brief: `.superpowers/sdd/2026-09-22-iobroker-hometiles-v0.2/task-5c-brief.md`.
+The real ChannelDetector returns every state of a matched pattern, including
+unmatched ones with no id, and mapControlToDevice turned each into a channel
+with an undefined objectId; it also let the pattern's write flag override the
+object's own common.write. Both date from v0.1 and were invisible because
+every test hand-built the detector output. Fix both, and add a suite that
+drives the REAL detector end to end for every implemented domain.
+
+---
+
 ## Task 6: Cover registry — detection and synthesis
 
 **Read first:** `docs/contract-iobroker-types.md` (blinds, blindButtons, gate).
