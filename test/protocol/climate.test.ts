@@ -1,6 +1,7 @@
 import { expect } from 'chai';
 import { buildClimatePayload } from '../../src/protocol/climate';
-import type { VirtualEntity } from '../../src/registry/types';
+import { synthClimate } from '../../src/registry/synth/climate';
+import type { DeviceInput, VirtualEntity } from '../../src/registry/types';
 
 function entity(over: Partial<VirtualEntity> = {}): VirtualEntity {
   return {
@@ -211,12 +212,13 @@ describe('protocol/climate', () => {
   it('does not forward an attribute outside the validated allow-list, even one the firmware would read as a fallback key', () => {
     // Review round 1, M5. unit_of_measurement (temperature_unit fallback),
     // humidity (target_humidity fallback), precision (target_temp_step
-    // fallback), state (hvac_mode fallback), supported_features, an
-    // hvac_modes array and a nested "attributes" object are all names the
-    // firmware's scanner recognises (tile_renderer.cpp:2148,2178,2230,2259,
-    // 2270). An open-ended pass-through would forward every one of these
-    // unvalidated -- including as a literal null, reopening exactly the
-    // hazard the never-null string rule above exists to close.
+    // fallback), state (hvac_mode fallback), supported_features and a nested
+    // "attributes" object are all names the firmware's scanner recognises
+    // (tile_renderer.cpp:2148,2178,2230,2259,2270). An open-ended
+    // pass-through would forward every one of these unvalidated -- including
+    // as a literal null, reopening exactly the hazard the never-null string
+    // rule above exists to close. supported_features is always COMPUTED from
+    // `writable` (0 here: this entity has none), never the attribute's 999.
     const p = JSON.parse(
       buildClimatePayload(
         entityWithOnly({
@@ -225,13 +227,108 @@ describe('protocol/climate', () => {
           precision: 1,
           state: 'heat',
           supported_features: 999,
-          hvac_modes: ['off', 'heat'],
           attributes: { temperature: 99 },
           made_up_key: 'x',
         }),
       ),
     );
-    expect(p).to.deep.equal({ available: true });
+    expect(p).to.deep.equal({ available: true, supported_features: 0 });
+  });
+
+  describe('*_modes lists (Task 5b)', () => {
+    const LIST_KEYS = ['hvac_modes', 'fan_modes', 'swing_modes', 'swing_horizontal_modes'] as const;
+
+    it('forwards every non-empty list synthClimate built', () => {
+      const lists = {
+        hvac_modes: ['off', 'heat', 'cool'],
+        fan_modes: ['auto', 'low'],
+        swing_modes: ['vertical'],
+        swing_horizontal_modes: ['off', 'on'],
+      };
+      const p = JSON.parse(buildClimatePayload(entityWithOnly(lists)));
+      for (const key of LIST_KEYS) expect(p[key], key).to.deep.equal(lists[key]);
+    });
+
+    it('omits a list that is absent, empty, not an array or without one usable name -- never sending null', () => {
+      // An absent array leaves its mask at 0: no option list at all
+      // (tile_renderer.cpp:2190-2211). An empty or null-bearing one is never
+      // the way to say that.
+      const raw = buildClimatePayload(
+        entityWithOnly({ hvac_modes: [], fan_modes: null, swing_modes: 'off,on', swing_horizontal_modes: [null, '  ', 5] }),
+      );
+      const p = JSON.parse(raw);
+      for (const key of LIST_KEYS) expect(p, key).to.not.have.property(key);
+      expect(raw).to.not.match(/null/);
+    });
+  });
+
+  describe('supported_features (Task 5b)', () => {
+    // HomeTiles src/ui/popups/climate/climate_popup.h:6-16. With no mask the
+    // firmware assumes EVERY feature (renderer.cpp:74-77, climate_popup.cpp:
+    // 280-286: legacy_supported = true), which is why a read-only setpoint
+    // used to look tappable.
+    const TARGET_TEMPERATURE = 1;
+    const TARGET_TEMPERATURE_RANGE = 2;
+    const TARGET_HUMIDITY = 4;
+    const FAN_MODE = 8;
+    const PRESET_MODE = 16;
+    const SWING_MODE = 32;
+    const SWING_HORIZONTAL_MODE = 512;
+
+    function thermostat(setWritable: boolean) {
+      const device: DeviceInput = {
+        objectId: 'hm.0',
+        name: 'Thermostat',
+        detectorType: 'thermostat',
+        domain: 'climate',
+        channels: {
+          set: { objectId: 'hm.0.set', type: 'number', write: setWritable },
+          actual: { objectId: 'hm.0.actual', type: 'number', write: false },
+        },
+      };
+      const values = { 'hm.0.set': { val: 21, ack: true, q: 0, ts: 1 }, 'hm.0.actual': { val: 20.5, ack: true, q: 0, ts: 1 } };
+      return synthClimate(device, 'climate.hm', values)!;
+    }
+
+    it('makes a read-only setpoint non-interactive and keeps a writable one interactive', () => {
+      // Built through the REAL synthClimate. An explicit mask without the
+      // TARGET_TEMPERATURE bit is what slot_is_interactive (renderer.cpp:
+      // 84-86), mini_target_command_supported (:150-152) and the popup's
+      // temperature_control_available (climate_popup.cpp:288-296) all read
+      // as "not adjustable"; the temperature itself is still displayed.
+      const readOnly = JSON.parse(buildClimatePayload(thermostat(false)));
+      expect(readOnly.temperature).to.equal(21);
+      expect(readOnly).to.have.property('supported_features');
+      expect(readOnly.supported_features & TARGET_TEMPERATURE).to.equal(0);
+
+      const writable = JSON.parse(buildClimatePayload(thermostat(true)));
+      expect(writable.supported_features & TARGET_TEMPERATURE).to.equal(TARGET_TEMPERATURE);
+    });
+
+    it('sets each remaining bit from its writable role, the range only when both bounds are writable', () => {
+      const all = entity({
+        writable: {
+          target_temp_low: true,
+          target_temp_high: true,
+          target_humidity: true,
+          fan_mode: true,
+          preset_mode: true,
+          swing_mode: true,
+          swing_horizontal_mode: true,
+          // No firmware bit exists for these (climate_popup.cpp:310-311 never
+          // gates HVAC; power/boost are not climate controls at all).
+          hvac_mode: true,
+          power: true,
+          boost: true,
+        },
+      });
+      expect(JSON.parse(buildClimatePayload(all)).supported_features).to.equal(
+        TARGET_TEMPERATURE_RANGE | TARGET_HUMIDITY | FAN_MODE | PRESET_MODE | SWING_MODE | SWING_HORIZONTAL_MODE,
+      );
+
+      const halfRange = entity({ writable: { target_temp_low: true, target_temp_high: false } });
+      expect(JSON.parse(buildClimatePayload(halfRange)).supported_features).to.equal(0);
+    });
   });
 
   it('never sends a bare "state" key that would feed the hvac_mode fallback with a placeholder', () => {

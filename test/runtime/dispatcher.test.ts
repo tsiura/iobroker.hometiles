@@ -1,6 +1,9 @@
 import { expect } from 'chai';
+import { buildClimatePayload } from '../../src/protocol/climate';
+import { parseClimateCommand } from '../../src/protocol/commands';
+import { synthClimate } from '../../src/registry/synth/climate';
 import { Dispatcher, type EntityLookup } from '../../src/runtime/dispatcher';
-import type { VirtualEntity } from '../../src/registry/types';
+import type { DeviceInput, SourceValue, VirtualEntity } from '../../src/registry/types';
 
 function entity(over: Partial<VirtualEntity>): VirtualEntity {
   return {
@@ -512,6 +515,106 @@ describe('runtime/dispatcher', () => {
         ok: false,
         reason: 'call_not_allowed_for_domain',
         applied: 0,
+      });
+    });
+
+    // Task 5b: every name a panel is SHOWN must reach the device as the
+    // channel's exact native value. Nothing here is hand-built: the entity
+    // comes from the real synthClimate, the lists from the real MQTT payload,
+    // the call from the real command parser, the write from this dispatcher.
+    describe('published *_modes round trip (Task 5b)', () => {
+      const COMMAND_FOR = {
+        hvac_modes: ['set_hvac_mode', 'hvac_mode'],
+        fan_modes: ['set_fan_mode', 'fan_mode'],
+        swing_modes: ['set_swing_mode', 'swing_mode'],
+        swing_horizontal_modes: ['set_swing_horizontal_mode', 'swing_horizontal_mode'],
+      } as const;
+
+      type Landed = Record<string, Record<string, [string, unknown]>>;
+
+      /** list key -> name the panel sent -> [objectId, value] that landed. */
+      async function roundTrip(device: DeviceInput, values: Record<string, SourceValue>): Promise<Landed> {
+        const synthesised = synthClimate(device, 'climate.ac', values);
+        expect(synthesised).to.not.equal(null);
+        const published = JSON.parse(buildClimatePayload(synthesised!)) as Record<string, unknown>;
+        const d = new Dispatcher(lookup([synthesised!]), write, silentLog);
+        const landed: Landed = {};
+        for (const [listKey, [command, field]] of Object.entries(COMMAND_FOR)) {
+          const names = published[listKey];
+          if (names === undefined) continue;
+          const perName: Record<string, [string, unknown]> = {};
+          for (const name of names as string[]) {
+            // The firmware lowercases the list on ingest (tile_renderer.cpp:
+            // 2019-2027) and sends the chosen option back verbatim
+            // (climate_popup.cpp:1781-1818).
+            const sent = name.trim().toLowerCase();
+            writes = [];
+            const result = await d.dispatch(parseClimateCommand(JSON.stringify({ entity_id: 'climate.ac', command, [field]: sent })));
+            expect(result, `${listKey} "${sent}"`).to.deep.equal({ ok: true, writes: 1 });
+            perName[sent] = writes[0] as [string, unknown];
+          }
+          landed[listKey] = perName;
+        }
+        return landed;
+      }
+
+      function expectNativeValues(landed: Landed, expected: Landed): void {
+        expect(landed).to.deep.equal(expected);
+        for (const [listKey, perName] of Object.entries(expected)) {
+          for (const [name, [, value]] of Object.entries(perName)) {
+            expect(typeof landed[listKey]?.[name]?.[1], `${listKey} "${name}"`).to.equal(typeof value);
+          }
+        }
+      }
+
+      const state = (val: unknown): SourceValue => ({ val, ack: true, q: 0, ts: 1 });
+
+      it('writes every published name back as the numeric or boolean code the device uses', async () => {
+        const device: DeviceInput = {
+          objectId: 'ac.0',
+          name: 'AC',
+          detectorType: 'airCondition',
+          domain: 'climate',
+          channels: {
+            mode: { objectId: 'ac.0.mode', type: 'number', write: true, states: { '0': 'OFF', '1': 'HEAT', '2': 'COOL', '3': 'MANU' } },
+            // type-detector's own FanPatterns.speed / FanPatterns.swing defaultStates
+            speed: {
+              objectId: 'ac.0.speed',
+              type: 'number',
+              write: true,
+              states: { '0': 'AUTO', '1': 'HIGH', '2': 'LOW', '3': 'MEDIUM', '4': 'QUIET', '5': 'TURBO' },
+            },
+            swing: {
+              objectId: 'ac.0.swing',
+              type: 'number',
+              write: true,
+              states: { '0': 'AUTO', '1': 'HORIZONTAL', '2': 'STATIONARY', '3': 'VERTICAL' },
+            },
+            swing_toggle: { objectId: 'ac.0.swing_toggle', type: 'boolean', write: true },
+          },
+        };
+        const values = { 'ac.0.mode': state(3), 'ac.0.speed': state(4), 'ac.0.swing': state(2), 'ac.0.swing_toggle': state(false) };
+        expectNativeValues(await roundTrip(device, values), {
+          hvac_modes: { off: ['ac.0.mode', 0], heat: ['ac.0.mode', 1], cool: ['ac.0.mode', 2] },
+          fan_modes: { auto: ['ac.0.speed', 0], low: ['ac.0.speed', 2], medium: ['ac.0.speed', 3], high: ['ac.0.speed', 1] },
+          swing_modes: { vertical: ['ac.0.swing', 3], horizontal: ['ac.0.swing', 1] },
+          swing_horizontal_modes: { off: ['ac.0.swing_toggle', false], on: ['ac.0.swing_toggle', true] },
+        });
+      });
+
+      it('writes a string MODE back in its own case, not the lowercased name the panel sent', async () => {
+        const device: DeviceInput = {
+          objectId: 'ac.0',
+          name: 'AC',
+          detectorType: 'airCondition',
+          domain: 'climate',
+          channels: {
+            mode: { objectId: 'ac.0.mode', type: 'string', write: true, states: { AUTO: 'Auto', HEAT: 'Heat', COOL: 'Cool', ECO: 'Eco' } },
+          },
+        };
+        expectNativeValues(await roundTrip(device, { 'ac.0.mode': state('HEAT') }), {
+          hvac_modes: { heat: ['ac.0.mode', 'HEAT'], cool: ['ac.0.mode', 'COOL'], auto: ['ac.0.mode', 'AUTO'] },
+        });
       });
     });
   });

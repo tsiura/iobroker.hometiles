@@ -237,4 +237,109 @@ describe('registry/synth/climate', () => {
     const { device: empty, values: emptyValues } = deviceWith({});
     expect(synthesise(empty, 'climate.y', emptyValues)).to.equal(null);
   });
+
+  // Task 5b (Ruling 26): the firmware draws mode/fan/swing buttons ONLY from
+  // explicit *_modes arrays, matched against fixed name tables
+  // (tile_renderer.cpp:2029-2136). Every name published here must be one a
+  // panel can send back (lowercased) and encodeChannelValue can reverse into
+  // the channel's exact native value; the end-to-end proof of that lives in
+  // test/runtime/dispatcher.test.ts.
+  describe('*_modes lists', () => {
+    function withChannels(channels: DeviceInput['channels'], values: Record<string, SourceValue> = {}) {
+      const device: DeviceInput = { objectId: 'ac.0', name: 'AC', detectorType: 'airCondition', domain: 'climate', channels };
+      return synthClimate(device, 'climate.ac', values);
+    }
+
+    it('keeps only the firmware hvac names from a MODE states map, never an unknown label', () => {
+      const e = withChannels({
+        mode: { objectId: 'ac.0.mode', type: 'number', write: true, states: { '0': 'OFF', '1': 'HEAT', '2': 'COOL', '3': 'MANU' } },
+      });
+      expect(e?.attributes.hvac_modes).to.deep.equal(['off', 'heat', 'cool']);
+      expect(e?.attributes.hvac_modes).to.not.include('manu');
+    });
+
+    it('publishes no list at all without a states map, or when no label is a firmware name', () => {
+      const noStates = withChannels({ mode: { objectId: 'ac.0.mode', type: 'number', write: true } });
+      expect(noStates?.attributes).to.not.have.property('hvac_modes');
+
+      const noFirmwareName = withChannels({
+        mode: { objectId: 'ac.0.mode', type: 'number', write: true, states: { '0': 'MANU', '1': 'PARTY' } },
+      });
+      expect(noFirmwareName?.attributes).to.not.have.property('hvac_modes');
+    });
+
+    it('publishes no list for a string enum channel with no states map (Ruling 30)', () => {
+      // Its valid values are unknown. The panel lowercases every command, so
+      // a raw "AUTO" passed back as "auto" would be written verbatim, wrong,
+      // with ok:true. With no list there is no button, so no such command.
+      const e = withChannels({ mode: { objectId: 'ac.0.mode', type: 'string', write: true } }, { 'ac.0.mode': numState('AUTO') });
+      expect(e?.attributes.hvac_mode).to.equal('AUTO');
+      expect(e?.attributes).to.not.have.property('hvac_modes');
+    });
+
+    it('publishes no list for a read-only channel, whose buttons the dispatcher would have to refuse', () => {
+      const e = withChannels({
+        mode: { objectId: 'ac.0.mode', type: 'number', write: false, states: { '0': 'OFF', '1': 'HEAT' } },
+      });
+      expect(e?.attributes).to.not.have.property('hvac_modes');
+    });
+
+    it('publishes no list when the channel type is unknown or mixed, so its native type cannot be pinned', () => {
+      const states = { '0': 'OFF', '1': 'HEAT' };
+      expect(withChannels({ mode: { objectId: 'ac.0.mode', write: true, states } })?.attributes).to.not.have.property('hvac_modes');
+      expect(withChannels({ mode: { objectId: 'ac.0.mode', type: 'mixed', write: true, states } })?.attributes).to.not.have.property(
+        'hvac_modes',
+      );
+    });
+
+    it('never publishes a label two states share case-insensitively, which the encoder must refuse', () => {
+      const e = withChannels({
+        mode: { objectId: 'ac.0.mode', type: 'number', write: true, states: { '0': 'OFF' } },
+        speed: { objectId: 'ac.0.speed', type: 'number', write: true, states: { '1': 'High', '2': 'HIGH', '3': 'LOW' } },
+      });
+      expect(e?.attributes.fan_modes).to.deep.equal(['low']);
+    });
+
+    it('takes fan_modes from SPEED whenever SPEED is configured, from SPEED_LEVEL only when it is not (Ruling 25)', () => {
+      const mode = { objectId: 'ac.0.mode', type: 'number' as const, write: true, states: { '0': 'OFF' } };
+      const both = withChannels({
+        mode,
+        speed: { objectId: 'ac.0.speed', type: 'number', write: true, states: { '0': 'AUTO' } },
+        speed_level: { objectId: 'ac.0.speed_level', type: 'number', write: true, states: { '50': 'MEDIUM' } },
+      });
+      expect(both?.attributes.fan_modes).to.deep.equal(['auto']);
+
+      const levelOnly = withChannels({
+        mode,
+        speed_level: { objectId: 'ac.0.speed_level', type: 'number', write: true, states: { '50': 'MEDIUM' } },
+      });
+      expect(levelOnly?.attributes.fan_modes).to.deep.equal(['medium']);
+    });
+
+    it('takes swing_modes from the numeric SWING and swing_horizontal_modes from the boolean toggle', () => {
+      const e = withChannels({
+        mode: { objectId: 'ac.0.mode', type: 'number', write: true, states: { '0': 'OFF' } },
+        // type-detector's own FanPatterns.swing defaultStates
+        swing: {
+          objectId: 'ac.0.swing',
+          type: 'number',
+          write: true,
+          states: { '0': 'AUTO', '1': 'HORIZONTAL', '2': 'STATIONARY', '3': 'VERTICAL' },
+        },
+        swing_toggle: { objectId: 'ac.0.swing_toggle', type: 'boolean', write: true },
+      });
+      expect(e?.attributes.swing_modes).to.deep.equal(['vertical', 'horizontal']);
+      expect(e?.attributes.swing_horizontal_modes).to.deep.equal(['off', 'on']);
+    });
+
+    it('never lets a static list make a device with no usable value look available', () => {
+      // `available` counts attribute keys beyond the friendly_name/icon
+      // baseline; a list is channel metadata, not a reading.
+      const e = withChannels({
+        mode: { objectId: 'ac.0.mode', type: 'number', write: true, states: { '0': 'OFF', '1': 'HEAT' } },
+      });
+      expect(e?.available).to.equal(false);
+      expect(e?.state).to.equal('unavailable');
+    });
+  });
 });

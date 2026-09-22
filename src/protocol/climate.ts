@@ -38,8 +38,55 @@ import type { VirtualEntity } from '../registry/types';
  * (tile_renderer.cpp:2148,2178,2230,2259,2270) — an open-ended pass-through
  * would forward any of those unvalidated, including as a literal JSON null,
  * which is exactly the hazard the never-null rule below exists to close.
+ * supported_features and four of the lists now have dedicated, validated
+ * paths below (Task 5b); none of them is ever forwarded from here.
  */
 const PASSTHROUGH_KEYS = ['friendly_name', 'icon', 'power', 'boost'] as const;
+
+/**
+ * The control lists synthClimate builds (Task 5b). The firmware draws a mode,
+ * fan or swing option list ONLY from these arrays (tile_renderer.cpp:
+ * 2190-2211); an absent array leaves its mask at 0, so the popup offers at
+ * most the current value as a lone option (climate_popup.cpp:458-460).
+ * preset_modes is deliberately absent: no synth reads a preset channel, so
+ * there is never a list to send.
+ */
+const MODES_KEYS = ['hvac_modes', 'fan_modes', 'swing_modes', 'swing_horizontal_modes'] as const;
+
+/**
+ * `writable` roles to the ClimateSupportedFeature bit each authorises, read
+ * from HomeTiles (read-only repo) src/ui/popups/climate/climate_popup.h:6-16.
+ * Once a mask is present every control whose bit is clear is disabled
+ * (renderer.cpp:74-97, climate_popup.cpp:280-324); with NO mask the firmware
+ * assumes every feature (legacy_supported = true), which is what made a
+ * read-only setpoint look tappable.
+ *
+ * The range needs BOTH bounds: the firmware has one bit for both handles and
+ * always sends both bounds together, so with one side read-only the
+ * dispatcher would write the other alone and report ok:true for a drag that
+ * moved nothing. hvac_mode has no bit at all: climate_popup.cpp:310-311 shows
+ * the mode control whenever it has an option, even the lone current-value
+ * fallback, so only hvac_modes (and hvac_mode itself) shape it.
+ * TURN_OFF (128) and TURN_ON (256) are declared but never read by the
+ * firmware, and this adapter has no climate on/off command to back them.
+ */
+const FEATURE_BY_ROLES: ReadonlyArray<readonly [roles: readonly string[], bit: number]> = [
+  [['setpoint'], 1 << 0], // CLIMATE_FEATURE_TARGET_TEMPERATURE
+  [['target_temp_low', 'target_temp_high'], 1 << 1], // CLIMATE_FEATURE_TARGET_TEMPERATURE_RANGE
+  [['target_humidity'], 1 << 2], // CLIMATE_FEATURE_TARGET_HUMIDITY
+  [['fan_mode'], 1 << 3], // CLIMATE_FEATURE_FAN_MODE
+  [['preset_mode'], 1 << 4], // CLIMATE_FEATURE_PRESET_MODE
+  [['swing_mode'], 1 << 5], // CLIMATE_FEATURE_SWING_MODE
+  [['swing_horizontal_mode'], 1 << 9], // CLIMATE_FEATURE_SWING_HORIZONTAL_MODE
+];
+
+function supportedFeatures(writable: Record<string, boolean> | undefined): number {
+  let mask = 0;
+  for (const [roles, bit] of FEATURE_BY_ROLES) {
+    if (roles.every((role) => writable?.[role] === true)) mask |= bit;
+  }
+  return mask;
+}
 
 /**
  * Wire keys for plain climate string fields. The firmware's hand-rolled
@@ -177,6 +224,19 @@ export function buildClimatePayload(entity: VirtualEntity): string {
   // table, so don't send a name it will silently discard.
   const preset = usableString(attrs.preset_mode)?.toLowerCase();
   if (preset !== undefined && ALLOWED_PRESET_MODES.has(preset)) body.preset_mode = preset;
+
+  // Control lists: only real, non-blank names, and only when one survives --
+  // omission, never an empty or null-bearing array (see MODES_KEYS above).
+  for (const key of MODES_KEYS) {
+    const value = attrs[key];
+    if (!Array.isArray(value)) continue;
+    const names = value.map(usableString).filter((name): name is string => name !== undefined);
+    if (names.length) body[key] = names;
+  }
+
+  // Always explicit, computed from what can actually be commanded, never
+  // forwarded from an attribute (see FEATURE_BY_ROLES above).
+  body.supported_features = supportedFeatures(entity.writable);
 
   return JSON.stringify(body);
 }

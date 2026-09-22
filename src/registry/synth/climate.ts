@@ -1,6 +1,6 @@
 import type { ChannelInput, DeviceInput, VirtualEntity } from '../types';
 import { STATE_UNAVAILABLE, STATE_UNKNOWN } from '../types';
-import { baseEntity, isUsable, readChannel, toBoolState, type Values } from './common';
+import { baseEntity, encodeChannelValue, isUsable, readChannel, toBoolState, type Values } from './common';
 
 /**
  * Channels that can make the firmware's own payload-acceptance check pass.
@@ -76,6 +76,50 @@ function readBoolAttr(device: DeviceInput, name: string, values: Values): string
 
 function setWritable(writable: Record<string, boolean>, role: string, channel: ChannelInput | undefined): void {
   if (channel) writable[role] = channel.write === true;
+}
+
+/**
+ * The firmware's fixed control-name tables, read from HomeTiles (read-only
+ * repo) src/tiles/runtime/tile_renderer.cpp, the code that turns a published
+ * array into a button mask: climate_modes_mask :2029-2047,
+ * climate_fan_modes_mask :2073-2093, climate_swing_modes_mask :2095-2114 (the
+ * same names as the mask enums in src/types/climate/state.h:45-53, 99-110,
+ * 125-131). A name matches only exactly, after trim+lowercase
+ * (climate_normalize_modes :2019-2027); anything else is silently dropped.
+ *
+ * The fourth table, swing_horizontal (:2116-2136, state.h:145-153: off/on/
+ * left/center/right/swing/wide), is reduced to off/on below: this role's only
+ * channel is the boolean SWING toggle, and commands.ts's requireOnOff carries
+ * nothing else. There is no preset list: no synth reads a preset channel
+ * (neither the thermostat nor the airCondition pattern has one), so nothing
+ * can back it.
+ */
+const HVAC_MODE_NAMES = ['off', 'heat', 'cool', 'heat_cool', 'auto', 'dry', 'fan_only'] as const;
+const FAN_MODE_NAMES = ['auto', 'low', 'medium', 'high', 'on', 'off', 'top', 'middle', 'focus', 'diffuse'] as const;
+const SWING_MODE_NAMES = ['off', 'on', 'vertical', 'horizontal', 'both'] as const;
+
+/**
+ * The firmware names a panel can send back for a readEnum-decoded channel
+ * (MODE, SPEED/SPEED_LEVEL, the numeric SWING) and have land as that
+ * channel's exact native value (Task 5b):
+ *
+ * - read-only or absent: none. Every button would send a command the
+ *   dispatcher refuses (writable[role] is exactly channel.write === true).
+ * - not number/string: none. Untyped, the dispatcher may apply a role
+ *   fallback type never visible here; mixed has no single native type;
+ *   boolean decodes through toBoolState, not labels. Natural detection always
+ *   carries number or string here (type-detector matches on common.type).
+ * - no states map: none (Ruling 30). The valid values are unknown, and the
+ *   panel lowercases every command, so a raw "AUTO" sent back as "auto"
+ *   would be written verbatim, wrong, with ok:true.
+ * - otherwise: exactly the names encodeChannelValue, the function the
+ *   dispatcher itself calls, can reverse. That excludes by construction a
+ *   label two states share case-insensitively and a key the type cannot hold.
+ */
+function enumModes(channel: ChannelInput | undefined, names: readonly string[]): string[] {
+  if (channel?.write !== true || (channel.type !== 'number' && channel.type !== 'string')) return [];
+  if (!channel.states || !Object.keys(channel.states).length) return [];
+  return names.filter((name) => encodeChannelValue(channel, name) !== undefined);
 }
 
 export function synthClimate(device: DeviceInput, entityId: string, values: Values): VirtualEntity | null {
@@ -178,7 +222,8 @@ export function synthClimate(device: DeviceInput, entityId: string, values: Valu
     fanMode = speedLevel !== undefined ? String(speedLevel) : undefined;
   }
   if (fanMode !== undefined) attributes.fan_mode = fanMode;
-  setWritable(writable, 'fan_mode', device.channels.speed ?? device.channels.speed_level);
+  const fanChannel = device.channels.speed ?? device.channels.speed_level;
+  setWritable(writable, 'fan_mode', fanChannel);
 
   // The two SWING channels are resolved by role at the detector layer
   // (detector.ts's channelName): 'swing' is the numeric multi-position
@@ -209,6 +254,24 @@ export function synthClimate(device: DeviceInput, entityId: string, values: Valu
   // and SPEED_LEVEL when SPEED is configured (Ruling 25).
   const available = Object.keys(attributes).length > baselineKeys;
   const state = hvacMode ?? (available ? STATE_UNKNOWN : STATE_UNAVAILABLE);
+
+  // Task 5b: the firmware draws a mode/fan/swing option list ONLY from these
+  // lists. Added only now that `available` is settled: a list is channel
+  // metadata, not a reading, and must never make a valueless device look
+  // available. Each comes from the one channel its role reads and writes
+  // (fanChannel above, Ruling 25), and each is omitted when empty.
+  for (const [key, channel, names] of [
+    ['hvac_modes', device.channels.mode, HVAC_MODE_NAMES],
+    ['fan_modes', fanChannel, FAN_MODE_NAMES],
+    ['swing_modes', device.channels.swing, SWING_MODE_NAMES],
+  ] as const) {
+    const modes = enumModes(channel, names);
+    if (modes.length) attributes[key] = modes;
+  }
+  // toBoolState never reads a states map, and encodeChannelValue maps exactly
+  // on/off to true/false on a boolean channel -- nothing else round-trips.
+  const swingToggle = device.channels.swing_toggle;
+  if (swingToggle?.write === true && swingToggle.type === 'boolean') attributes.swing_horizontal_modes = ['off', 'on'];
 
   return { entityId, domain: 'climate', source, state, attributes, available, lastChanged, writable, channelMeta };
 }
