@@ -379,6 +379,7 @@ class HomeTiles extends utils.Adapter {
             : null;
         }
         const entity = synthesise(device, entityId, values);
+        if (!entity) return reply({ error: 'no_usable_channel' });
         const publish = buildStatePublish(this.options.haPrefix, entity);
         return reply({ entity, publish: publish ?? { note: 'this domain publishes no state' } });
       }

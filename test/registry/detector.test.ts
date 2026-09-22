@@ -55,8 +55,11 @@ describe('registry/detector mapping', () => {
     expect(DETECTOR_TYPE_TO_DOMAIN.buttonSensor).to.equal(undefined);
   });
 
-  it('returns null for a detector type outside v0.1 scope rather than guessing', () => {
-    const control: DetectedControl = { type: 'thermostat', states: [{ id: 'x.0.set', name: 'SET', write: true }] };
+  it('returns null for a detector type this adapter does not map, rather than guessing', () => {
+    // 'occupancy' is not a real type-detector 6.x member either (see the test
+    // above); the point is that mapControlToDevice bails out on the type
+    // alone, before ever looking at whether states carries a usable channel.
+    const control: DetectedControl = { type: 'occupancy', states: [{ id: 'x.0.set', name: 'SET', write: true }] };
     expect(mapControlToDevice('x.0', control, META)).to.equal(null);
   });
 
@@ -175,6 +178,34 @@ describe('registry/detector mapping', () => {
   it('returns null when the control has no usable channel left after filtering', () => {
     const control: DetectedControl = { type: 'socket', states: [{ id: 'shelly.0.plug.unreach', name: 'UNREACH' }] };
     expect(mapControlToDevice('shelly.0.plug', control, META)).to.equal(null);
+  });
+
+  it('maps thermostat and airCondition to the climate domain', () => {
+    expect(DETECTOR_TYPE_TO_DOMAIN.thermostat).to.equal('climate');
+    expect(DETECTOR_TYPE_TO_DOMAIN.airCondition).to.equal('climate');
+  });
+
+  it("resolves airCondition's duplicate SWING channels by role, not by name", () => {
+    // Verified directly against node_modules/@iobroker/type-detector/build/
+    // typePatterns.js: airCondition's states array carries FanPatterns.swing
+    // (defaultRole 'level.mode.swing', a numeric multi-position control) and
+    // FanPatterns.swingBoolean (defaultRole 'switch.mode.swing', a plain
+    // on/off toggle) back to back - two distinct state definitions that both
+    // carry name SWING. Keying the channel map on name alone (as channelName
+    // already does for every other channel) would let the second SWING
+    // silently overwrite the first.
+    const control: DetectedControl = {
+      type: 'airCondition',
+      states: [
+        { id: 'ac.0.mode', name: 'MODE', write: true },
+        { id: 'ac.0.swing_level', name: 'SWING', write: true, defaultRole: 'level.mode.swing' },
+        { id: 'ac.0.swing_switch', name: 'SWING', write: true, defaultRole: 'switch.mode.swing' },
+      ],
+    };
+    const device = mapControlToDevice('ac.0', control, {});
+    expect(device).to.not.equal(null);
+    expect(device!.channels.swing?.objectId).to.equal('ac.0.swing_level');
+    expect(device!.channels.swing_toggle?.objectId).to.equal('ac.0.swing_switch');
   });
 
   it('falls back to the last object id segment when no name is known', () => {

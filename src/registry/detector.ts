@@ -67,6 +67,13 @@ export const DETECTOR_TYPE_TO_DOMAIN: Record<string, Domain> = {
   // that outright rather than reporting success, but the tile should not
   // exist in the first place. `button`, which has SET(w), stays.
   button: 'scene',
+  // thermostat has NO required channel at all, and airCondition requires only
+  // MODE (docs/contract-iobroker-types.md) — a detected climate device may
+  // therefore expose nothing this adapter can read or write. This map only
+  // decides the domain; src/registry/synth/climate.ts is the layer that
+  // refuses to synthesise an entity with nothing usable behind it.
+  thermostat: 'climate',
+  airCondition: 'climate',
 };
 
 /**
@@ -116,8 +123,8 @@ const IGNORED_CHANNELS = new Set([
  * ON_ACTUAL. Renaming here means every downstream module can rely on one set of
  * channel names regardless of the detector type.
  */
-function channelName(controlType: string, detectorName: string): string | null {
-  const upper = detectorName.toUpperCase();
+function channelName(controlType: string, state: DetectedChannel): string | null {
+  const upper = state.name.toUpperCase();
   if (IGNORED_CHANNELS.has(upper)) return null;
 
   // The writable POWER channel, which every downstream module knows as `set`.
@@ -142,6 +149,19 @@ function channelName(controlType: string, detectorName: string): string | null {
     if (upper === 'ACTUAL') return 'dimmer_actual';
   }
 
+  // airCondition's states array carries two distinct state definitions both
+  // named SWING (verified against node_modules/@iobroker/type-detector/build/
+  // typePatterns.js: FanPatterns.swing and FanPatterns.swingBoolean). Both
+  // match the same role-matching regex (/swing$/), so `defaultRole` — the
+  // pattern's own semantic tag, copied onto every detected state — is the
+  // only field that tells them apart: 'level.mode.swing' is the numeric
+  // multi-position control, 'switch.mode.swing' is a plain on/off toggle.
+  // Keying on name alone, like every other channel here, would let the
+  // second SWING silently overwrite the first in the map below.
+  if (upper === 'SWING') {
+    return state.defaultRole === 'switch.mode.swing' ? 'swing_toggle' : 'swing';
+  }
+
   return upper.toLowerCase();
 }
 
@@ -159,7 +179,7 @@ export function mapControlToDevice(
 
   const channels: Record<string, ChannelInput> = {};
   for (const state of control.states) {
-    const name = channelName(control.type, state.name);
+    const name = channelName(control.type, state);
     if (!name) continue;
     if (channels[name]) continue;
 

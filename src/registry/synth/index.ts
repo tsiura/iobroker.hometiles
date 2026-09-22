@@ -1,5 +1,6 @@
 import type { DeviceInput, VirtualEntity } from '../types';
 import { synthBinarySensor } from './binary_sensor';
+import { synthClimate } from './climate';
 import type { Values } from './common';
 import { synthLight } from './light';
 import { synthScene } from './scene';
@@ -8,7 +9,14 @@ import { synthSwitch } from './switch';
 
 export type { Values } from './common';
 
-export function synthesise(device: DeviceInput, entityId: string, values: Values): VirtualEntity {
+/**
+ * VirtualEntity | null: climate is the first domain that can legitimately
+ * detect a device with nothing usable behind it at all (thermostat has no
+ * required channel; see synthClimate). Returning null here means no hollow
+ * entity is ever registered, rather than one that reports "unavailable"
+ * forever.
+ */
+export function synthesise(device: DeviceInput, entityId: string, values: Values): VirtualEntity | null {
   switch (device.domain) {
     case 'sensor':
       return synthSensor(device, entityId, values);
@@ -21,6 +29,7 @@ export function synthesise(device: DeviceInput, entityId: string, values: Values
     case 'scene':
       return synthScene(device, entityId, values);
     case 'climate':
+      return synthClimate(device, entityId, values);
     case 'cover':
     case 'media_player':
     case 'weather':

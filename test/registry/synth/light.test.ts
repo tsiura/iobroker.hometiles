@@ -211,7 +211,12 @@ describe('registry/synth light and scene', () => {
   });
 
   it('dispatches to the right synthesiser by domain', () => {
-    expect(synthesise(onOff, 'light.decke', { 'hue.0.decke.on': value(true) }).domain).to.equal('light');
-    expect(synthesise({ ...onOff, domain: 'switch' }, 'switch.decke', { 'hue.0.decke.on': value(true) }).domain).to.equal('switch');
+    // synthesise's return type is VirtualEntity | null because climate can
+    // detect a device with nothing usable at all (see synthClimate); light
+    // and switch never return null, hence the non-null assertions here.
+    expect(synthesise(onOff, 'light.decke', { 'hue.0.decke.on': value(true) })!.domain).to.equal('light');
+    expect(
+      synthesise({ ...onOff, domain: 'switch' }, 'switch.decke', { 'hue.0.decke.on': value(true) })!.domain,
+    ).to.equal('switch');
   });
 });

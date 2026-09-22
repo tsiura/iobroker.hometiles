@@ -74,6 +74,15 @@ export interface VirtualEntity {
   available: boolean;
   /** Epoch milliseconds of the last state change. */
   lastChanged: number;
+  /**
+   * Per-role write availability, keyed by a short role name (e.g. "setpoint",
+   * "hvac_mode"). Optional: only domains where writability can differ role by
+   * role need it (light/switch have exactly one writable thing, discoverable
+   * from `source` alone). A role absent here has nowhere to write, and a
+   * command dispatcher must refuse it rather than writing nothing and still
+   * reporting success.
+   */
+  writable?: Record<string, boolean>;
 }
 
 export const STATE_UNAVAILABLE = 'unavailable';

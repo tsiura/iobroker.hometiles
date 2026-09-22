@@ -48,7 +48,11 @@ export class EntityRegistry {
       const entityId = entityIds[device.objectId];
       if (!entityId) continue;
 
+      // climate can detect a device with nothing usable behind it at all
+      // (see synthClimate); synthesise returns null rather than a hollow
+      // entity, and that device gets no slot and no channel subscriptions.
       const entity = synthesise(device, entityId, this.valuesFor(device));
+      if (!entity) continue;
       nextSlots.set(entityId, { device, entity });
 
       for (const channel of Object.values(device.channels)) {
@@ -163,6 +167,12 @@ export class EntityRegistry {
     if (!slot) return;
 
     const next = synthesise(slot.device, entityId, this.valuesFor(slot.device));
+    // Not reachable in practice: a slot only exists because synthesise once
+    // returned non-null for this exact device, and a climate device's null
+    // vs. non-null outcome depends only on which channels are configured,
+    // which does not change between rebuilds. Guarded anyway for the type
+    // checker, and because "no change" is the safe reading if it ever did.
+    if (!next) return;
     if (sameEntity(slot.entity, next)) return;
 
     slot.entity = next;
