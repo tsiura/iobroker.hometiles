@@ -61,8 +61,12 @@ light and switch.
 - payload shape per domain (bare string vs JSON) — v0.1 learned the hard way
   that this differs per domain and a wrong guess is silent
 - history request/response payload schema, including the `day` / `week` ranges
-- energy request/response schema and the `grid`/`solar`/`battery`/`gas`/
-  `water`/`_cost` keys `parseEnergySection` reads
-  (`ha_bridge_config.cpp:1108`)
+- ~~energy request/response schema and the keys `parseEnergySection` reads~~
+  **CORRECTED 2026-09-22:** `parseEnergySection`
+  (`ha_bridge_config.cpp:1108`) is *not* the energy/response handler. It
+  parses an unrelated entity-catalog array inside the `bridge/apply`
+  config-sync payload. The energy response is a separate contract; see
+  `docs/contract-history-energy.md`. Treating these as one thing would
+  misroute the whole implementation.
 - whether `numbers`, `selects` and `datetimes` share one `editable_meta` or
   need separate name entries
