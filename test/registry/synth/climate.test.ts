@@ -69,6 +69,18 @@ describe('registry/synth/climate', () => {
     expect(synth({})).to.equal(null);
   });
 
+  it('returns null for a device exposing only channels the firmware payload can never validate on', () => {
+    // Review round 1, M6: tile_renderer.cpp's parse_climate_payload only
+    // marks a payload valid when it carries hvac_mode/hvac_action, a
+    // temperature/humidity has_* flag, or a target range -- fan_mode,
+    // swing_mode, swing_horizontal_mode, power and boost are never in that
+    // check, so a device with only these would always publish a payload the
+    // firmware discards outright. Such a device is not a climate entity in
+    // the wire-format sense, however ioBroker's type-detector classified it.
+    const e = synth({ SPEED_LEVEL: numState(45), SWING: numState(1), POWER: numState(true), BOOST: numState(false) });
+    expect(e).to.equal(null);
+  });
+
   it('marks a thermostat with ACTUAL but no SET as read-only', () => {
     const e = synth({ ACTUAL: numState(21.5) });
     expect(e?.attributes.current_temperature).to.equal(21.5);
@@ -82,6 +94,40 @@ describe('registry/synth/climate', () => {
     expect(e?.attributes.target_temperature).to.equal(undefined);
     expect(e?.writable?.target_temp_low).to.equal(true);
     expect(e?.writable?.target_temp_high).to.equal(true);
+  });
+
+  it('treats a lone SET_HEATING with no SET_COOLING as a single target, not half a range', () => {
+    // Review round 1, ruling 14: HA's own model for a heat-only thermostat
+    // (only SET_HEATING configured) is a SINGLE target, not a range missing
+    // its cool side -- the firmware's has_target_range/has_target_temperature
+    // are mutually exclusive in the popup (climate_popup.cpp), so treating
+    // this as target_temp_low would permanently disable its single-target UI.
+    const e = synth({ SET_HEATING: numState(19) });
+    expect(e?.attributes.target_temperature).to.equal(19);
+    expect(e?.attributes.target_temp_low).to.equal(undefined);
+    expect(e?.attributes.target_temp_high).to.equal(undefined);
+    expect(e?.writable?.setpoint).to.equal(true);
+    expect(e?.writable?.target_temp_low).to.equal(undefined);
+    // Task 5's dispatcher looks up the setpoint writer by trying
+    // 'set'/'set_heating'/'set_cooling' in order against entity.source, so
+    // the channel key itself must still be 'set_heating', unrenamed.
+    expect(e?.source.set_heating).to.equal('climate.0.set_heating');
+  });
+
+  it('treats a lone SET_COOLING with no SET_HEATING as a single target, not half a range', () => {
+    const e = synth({ SET_COOLING: numState(26) });
+    expect(e?.attributes.target_temperature).to.equal(26);
+    expect(e?.attributes.target_temp_low).to.equal(undefined);
+    expect(e?.attributes.target_temp_high).to.equal(undefined);
+    expect(e?.writable?.setpoint).to.equal(true);
+    expect(e?.writable?.target_temp_high).to.equal(undefined);
+    expect(e?.source.set_cooling).to.equal('climate.0.set_cooling');
+  });
+
+  it('prefers a plain SET over SET_HEATING/SET_COOLING when all three are configured', () => {
+    const e = synth({ SET: numState(21), SET_HEATING: numState(18), SET_COOLING: numState(24) });
+    expect(e?.attributes.target_temperature).to.equal(21);
+    expect(e?.writable?.setpoint).to.equal(true);
   });
 
   it('reads the two independently-resolved SWING channels into separate attributes', () => {
@@ -137,13 +183,21 @@ describe('registry/synth/climate', () => {
   });
 
   it('falls back to SPEED_LEVEL for fan_mode when SPEED is not configured', () => {
-    const e = synth({ SPEED_LEVEL: numState(45) });
+    // MODE is included purely to keep this device valid under the firmware's
+    // acceptance rule (M6 above) -- SPEED_LEVEL alone would now return null,
+    // which is covered by its own test, not this one. This test is only
+    // about the SPEED/SPEED_LEVEL fallback.
+    const e = synth({ MODE: numState('cool'), SPEED_LEVEL: numState(45) });
     expect(e?.attributes.fan_mode).to.equal('45');
     expect(e?.writable?.fan_mode).to.equal(true);
   });
 
   it('reads POWER and BOOST as on/off and records them writable', () => {
-    const e = synth({ POWER: numState(true), BOOST: numState(false) });
+    // ACTUAL keeps this device valid under the firmware's acceptance rule
+    // (M6 above); a POWER/BOOST-only device is covered by its own
+    // null-return test, not this one, which is only about the POWER/BOOST
+    // decode itself.
+    const e = synth({ ACTUAL: numState(21.5), POWER: numState(true), BOOST: numState(false) });
     expect(e?.attributes.power).to.equal('on');
     expect(e?.attributes.boost).to.equal('off');
     expect(e?.writable?.power).to.equal(true);

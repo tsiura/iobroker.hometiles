@@ -86,15 +86,21 @@ describe('protocol/state-payload', () => {
 
   it('routes climate through buildClimatePayload instead of the generic JSON body', () => {
     // Full rule coverage (overwrite semantics, null-string hazard, paired
-    // setpoint, preset allow-list) lives in protocol/climate.test.ts; this
-    // just pins that buildStatePublish actually delegates to it rather than
-    // falling into the generic attribute loop, which would diff instead of
-    // always publishing the complete attribute set.
+    // setpoint, preset allow-list, has_* presence-flag correctness) lives in
+    // protocol/climate.test.ts; this just pins that buildStatePublish
+    // actually delegates to it rather than falling into the generic
+    // attribute loop, which would forward entity.state under a "state" key
+    // and forward arbitrary attributes the firmware's scanner recognises as
+    // fallback keys, unvalidated.
     const p = buildStatePublish('ha/statestream', entity({ entityId: 'climate.living_room', domain: 'climate', attributes: { current_temperature: 21 } }));
     expect(p!.topic).to.equal('ha/statestream/climate/living_room/state');
     const parsed = JSON.parse(p!.payload) as Record<string, unknown>;
-    expect(parsed).to.include.keys('temperature', 'min_temp', 'max_temp', 'available');
-    expect(parsed).to.not.have.property('state');
+    // temperature/min_temp/max_temp are correctly absent here: this entity
+    // only knows current_temperature, and has_target_temperature must never
+    // be fabricated (review round 1, C1) -- see climate.test.ts for the full
+    // rule and its rationale.
+    expect(parsed).to.include.keys('current_temperature', 'available');
+    expect(parsed).to.not.have.keys('temperature', 'min_temp', 'max_temp', 'state');
   });
 
   it('publishes nothing for a scene', () => {

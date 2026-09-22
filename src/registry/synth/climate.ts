@@ -3,28 +3,26 @@ import { STATE_UNAVAILABLE, STATE_UNKNOWN } from '../types';
 import { baseEntity, isUsable, readChannel, toBoolState, type Values } from './common';
 
 /**
- * Channel roles this synthesiser understands, by their internal (lowercased)
- * name in DeviceInput.channels — see detector.ts's channelName. thermostat
- * has NO required channel at all (docs/contract-iobroker-types.md) and
- * airCondition requires only MODE, so a detected climate device may have none
- * of these configured. If none are present, synthClimate returns null rather
- * than emitting an entity with nothing behind it.
+ * Channels that can make the firmware's own payload-acceptance check pass.
+ * tile_renderer.cpp's parse_climate_payload only sets `valid` when the
+ * result carries `!available`, a non-empty hvac_mode/hvac_action, or one of
+ * the has_current_temperature/has_target_temperature/has_current_humidity/
+ * has_target_humidity/has_target_range flags (tile_renderer.cpp:2297-2300);
+ * anything else is dropped outright, cache untouched. SPEED, SPEED_LEVEL,
+ * SWING, SWING_TOGGLE, POWER and BOOST are real synth attributes but none of
+ * them can ever satisfy that check on their own (fan_mode/swing_mode/
+ * swing_horizontal_mode/power/boost are not in the firmware's OR-list at
+ * all), so a device with only one of those would always publish a payload
+ * the firmware discards -- not a climate entity in the wire-format sense,
+ * whatever ioBroker calls it (review round 1, M6).
+ *
+ * thermostat has NO required channel at all (docs/contract-iobroker-types.md)
+ * and airCondition requires only MODE, so a detected device may have none of
+ * these configured either; returning null here rather than an entity with
+ * nothing behind it is the same defence as before, just drawn at the
+ * boundary the firmware actually enforces.
  */
-const TRACKED_CHANNELS = [
-  'set',
-  'set_heating',
-  'set_cooling',
-  'actual',
-  'humidity',
-  'mode',
-  'working_mode',
-  'speed',
-  'speed_level',
-  'swing',
-  'swing_toggle',
-  'power',
-  'boost',
-] as const;
+const VALIDITY_CHANNELS = ['set', 'set_heating', 'set_cooling', 'actual', 'humidity', 'mode', 'working_mode'] as const;
 
 /**
  * Reads a numeric channel safely. Number('') and Number('  ') are both 0 and
@@ -84,29 +82,54 @@ export function synthClimate(device: DeviceInput, entityId: string, values: Valu
   // The trap: thermostat has no required channel and airCondition requires
   // only MODE, so a detected device may have nothing among the roles below.
   // Returning null here — rather than an "unavailable" entity — means no
-  // hollow tile is ever registered for it.
-  if (!TRACKED_CHANNELS.some((name) => device.channels[name])) return null;
+  // hollow tile is ever registered for it. Narrowed to VALIDITY_CHANNELS
+  // (review round 1, M6): a device exposing only SPEED/SPEED_LEVEL/SWING/
+  // SWING_TOGGLE/POWER/BOOST would previously have synthesised anyway, then
+  // published a payload the firmware always rejects as invalid.
+  if (!VALIDITY_CHANNELS.some((name) => device.channels[name])) return null;
 
   const { source, lastChanged, friendly } = baseEntity(device, entityId, values);
   const attributes: Record<string, unknown> = { ...friendly };
   const baselineKeys = Object.keys(attributes).length;
   const writable: Record<string, boolean> = {};
 
-  // Single setpoint. Never fabricated from ACTUAL: a read-only thermostat
-  // (ACTUAL present, SET absent) must not appear to have a settable target.
-  const targetTemperature = readNumber(device, 'set', values);
-  if (targetTemperature !== undefined) attributes.target_temperature = targetTemperature;
-  setWritable(writable, 'setpoint', device.channels.set);
+  // Single vs. dual setpoint (review round 1, ruling 14). A plain SET always
+  // wins as the one target, unchanged from before. Otherwise, Home
+  // Assistant's own model is that a thermostat with exactly ONE of
+  // SET_HEATING/SET_COOLING and no SET is a heat-only or cool-only device
+  // with a SINGLE target, not a range missing one side — so that lone
+  // channel becomes target_temperature, not target_temp_low/target_temp_high.
+  // target_temp_low/target_temp_high are populated ONLY when BOTH
+  // SET_HEATING and SET_COOLING exist: that is the only shape the firmware's
+  // shared has_target_range flag and the popup's range mode (climate_popup.cpp:
+  // has_range = has_target_range && !has_target_temperature) can represent as
+  // an actual range. Channel KEYS in `source` are unaffected either way —
+  // baseEntity populates them from device.channels directly — so Task 5's
+  // dispatcher can still look up 'set'/'set_heating'/'set_cooling' by name.
+  const hasPlainSet = device.channels.set !== undefined;
+  const hasHeating = device.channels.set_heating !== undefined;
+  const hasCooling = device.channels.set_cooling !== undefined;
 
-  // Dual setpoint. SET_HEATING/SET_COOLING are separate from SET: a
-  // dual-setpoint thermostat may expose only these two and no SET at all.
-  const targetLow = readNumber(device, 'set_heating', values);
-  if (targetLow !== undefined) attributes.target_temp_low = targetLow;
-  setWritable(writable, 'target_temp_low', device.channels.set_heating);
+  if (hasPlainSet) {
+    // Never fabricated from ACTUAL: a read-only thermostat (ACTUAL present,
+    // SET absent) must not appear to have a settable target.
+    const targetTemperature = readNumber(device, 'set', values);
+    if (targetTemperature !== undefined) attributes.target_temperature = targetTemperature;
+    setWritable(writable, 'setpoint', device.channels.set);
+  } else if (hasHeating && hasCooling) {
+    const targetLow = readNumber(device, 'set_heating', values);
+    if (targetLow !== undefined) attributes.target_temp_low = targetLow;
+    setWritable(writable, 'target_temp_low', device.channels.set_heating);
 
-  const targetHigh = readNumber(device, 'set_cooling', values);
-  if (targetHigh !== undefined) attributes.target_temp_high = targetHigh;
-  setWritable(writable, 'target_temp_high', device.channels.set_cooling);
+    const targetHigh = readNumber(device, 'set_cooling', values);
+    if (targetHigh !== undefined) attributes.target_temp_high = targetHigh;
+    setWritable(writable, 'target_temp_high', device.channels.set_cooling);
+  } else if (hasHeating || hasCooling) {
+    const loneChannel = hasHeating ? 'set_heating' : 'set_cooling';
+    const targetTemperature = readNumber(device, loneChannel, values);
+    if (targetTemperature !== undefined) attributes.target_temperature = targetTemperature;
+    setWritable(writable, 'setpoint', device.channels[loneChannel]);
+  }
 
   // ACTUAL and HUMIDITY are read-only telemetry in both thermostat and
   // airCondition patterns (write:false) — there is no writable channel to

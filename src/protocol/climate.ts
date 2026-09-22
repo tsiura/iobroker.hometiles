@@ -3,17 +3,43 @@ import type { VirtualEntity } from '../registry/types';
 /**
  * Climate is unlike every v0.1 domain: the firmware caches state by full
  * overwrite, never by merge (docs/contract-climate-cover.md, "The overwrite
- * problem"). A key this module omits does not mean "unchanged" to the
- * firmware -- it snaps straight back to one of the hardcoded struct defaults
- * below. These three have no "unknown" representation in the firmware at
- * all (no has_* flag), so leaving one out is never neutral. Values match
- * src/types/climate/state.h as cited in the contract doc.
+ * problem") — a diffing publisher that only sends changed keys would let
+ * stale attributes accumulate wrong. That does NOT mean every field must be
+ * force-filled, though (review round 1 correction of this file's original
+ * comment here): most climate fields have a real "unknown" struct default
+ * gated behind a has_* presence flag (has_target_temperature,
+ * has_target_range, has_current_temperature, has_current_humidity,
+ * has_target_humidity — src/types/climate/state.h), and the panel gates real
+ * UI on those flags (e.g. src/types/climate/renderer.cpp's
+ * slot_is_interactive only makes the target-temperature slot interactive
+ * when has_target_temperature is set; src/ui/popups/climate/climate_popup.cpp
+ * only enters dual-range mode when has_target_range && !has_target_temperature).
+ * Omitting a key is how you tell the firmware "no such value" — it is never
+ * safe to substitute the firmware's own struct default in place of an
+ * unknown value, because that default is not inert: it becomes a real,
+ * interactive, commandable value the moment its presence flag is set.
+ * min_temp/max_temp are the only two fields with no presence flag at all
+ * (state.h) — sending or omitting them is equally safe wire-wise — but they
+ * follow the same emit-only-what-is-known rule anyway, for one uniform rule
+ * across every numeric field rather than a field-by-field exception list.
  */
-const DEFAULT_TEMPERATURE = 20.0;
-const DEFAULT_MIN_TEMP = 7.0;
-const DEFAULT_MAX_TEMP = 35.0;
-const DEFAULT_TARGET_TEMP_LOW = 18.0;
-const DEFAULT_TARGET_TEMP_HIGH = 24.0;
+
+/**
+ * Non-climate attributes this module knows are safe to forward verbatim:
+ * plain metadata the firmware's climate scanner never looks for under these
+ * names, and always a defined, non-blank string in practice (see
+ * synth/common.ts's baseEntity for friendly_name/icon, synth/climate.ts's
+ * readBoolAttr for power/boost). This is an explicit allow-list, not an
+ * exclude-list (review round 1, M5): the firmware's scanner also recognises
+ * "state" (hvac_mode fallback), "unit_of_measurement" (temperature_unit
+ * fallback), "humidity" (target_humidity fallback), "precision"
+ * (target_temp_step fallback), "supported_features", the five *_modes
+ * arrays, and a nested "attributes" object that triggers a second scan pass
+ * (tile_renderer.cpp:2148,2178,2230,2259,2270) — an open-ended pass-through
+ * would forward any of those unvalidated, including as a literal JSON null,
+ * which is exactly the hazard the never-null rule below exists to close.
+ */
+const PASSTHROUGH_KEYS = ['friendly_name', 'icon', 'power', 'boost'] as const;
 
 /**
  * Wire keys for plain climate string fields. The firmware's hand-rolled
@@ -41,25 +67,6 @@ const CLIMATE_STRING_KEYS = [
  * silently discarded on the other end.
  */
 const ALLOWED_PRESET_MODES = new Set(['none', 'eco', 'away', 'boost', 'comfort', 'home', 'sleep', 'activity']);
-
-/**
- * Keys this module reads out of entity.attributes under a name that differs
- * from (or needs extra handling beyond) a plain passthrough, so the generic
- * forwarding loop below must not also copy them verbatim under their
- * internal name.
- */
-const HANDLED_KEYS = new Set<string>([
-  'target_temperature',
-  'min_temp',
-  'max_temp',
-  'target_temp_low',
-  'target_temp_high',
-  'current_temperature',
-  'current_humidity',
-  'target_humidity',
-  'preset_mode',
-  ...CLIMATE_STRING_KEYS,
-]);
 
 /**
  * Number('') and Number('   ') are both 0 and finite, so a blank reading
@@ -97,45 +104,51 @@ export function buildClimatePayload(entity: VirtualEntity): string {
   const attrs = entity.attributes;
   const body: Record<string, unknown> = {};
 
-  // Everything the entity carries outside the climate schema (friendly_name,
-  // icon, power, boost, ...) forwards unchanged, same as the generic JSON
-  // domains in state-payload.ts. entity.state is deliberately NOT forwarded
-  // under a "state" key here: the firmware treats "state" as a fallback
-  // name for hvac_mode, and entity.state is "unknown"/"unavailable" exactly
-  // when hvac_mode is unset (see synth/climate.ts) -- forwarding it would
-  // smuggle a placeholder into the one string field rule 2 exists to guard.
-  for (const [key, value] of Object.entries(attrs)) {
-    if (value === undefined || HANDLED_KEYS.has(key)) continue;
-    body[key] = value;
+  // Explicit allow-list forward (see PASSTHROUGH_KEYS above for why this is
+  // not a generic "forward everything else" loop). entity.state is
+  // deliberately never forwarded under a "state" key here: the firmware
+  // treats "state" as a fallback name for hvac_mode, and entity.state is
+  // "unknown"/"unavailable" exactly when hvac_mode is unset (see
+  // synth/climate.ts) -- forwarding it would smuggle a placeholder into the
+  // one string field rule 2 exists to guard.
+  for (const key of PASSTHROUGH_KEYS) {
+    const value = attrs[key];
+    if (typeof value === 'string' && value.length > 0) body[key] = value;
   }
 
   body.available = entity.available;
 
-  // temperature/min_temp/max_temp have no "unknown" state in the firmware,
-  // so they are always given a concrete number: the real reading when known,
-  // the firmware's own default otherwise (the same number it would apply on
-  // its own if the key were missing -- sending it explicitly just makes that
-  // deliberate instead of accidental). Wire key is "temperature", matching
-  // tile_renderer.cpp's parser, not the internal target_temperature name.
-  body.temperature = usableNumber(attrs.target_temperature) ?? DEFAULT_TEMPERATURE;
-  body.min_temp = usableNumber(attrs.min_temp) ?? DEFAULT_MIN_TEMP;
-  body.max_temp = usableNumber(attrs.max_temp) ?? DEFAULT_MAX_TEMP;
+  // temperature/min_temp/max_temp: emit the real value when known, omit
+  // otherwise. Never substitute the firmware's own struct default in place
+  // of an unknown reading -- see the file-level comment above for why that
+  // is actively harmful for temperature (has_target_temperature gates a
+  // real, interactive, commandable UI slot), even though it is merely
+  // redundant-but-harmless for min_temp/max_temp specifically.
+  const targetTemperature = usableNumber(attrs.target_temperature);
+  if (targetTemperature !== undefined) body.temperature = targetTemperature;
+
+  const minTemp = usableNumber(attrs.min_temp);
+  if (minTemp !== undefined) body.min_temp = minTemp;
+
+  const maxTemp = usableNumber(attrs.max_temp);
+  if (maxTemp !== undefined) body.max_temp = maxTemp;
 
   // target_temp_low/target_temp_high share ONE presence flag in the
   // firmware: sending only one makes it treat both as fresh and silently
-  // revert the other to its default. Emit both (falling back per side) when
-  // either is known, or neither when this entity has no dual setpoint at all.
+  // revert the other to its default. Emit both, verbatim, ONLY when both are
+  // known; fabricating the missing side would itself become a real,
+  // interactive, commandable range bound the moment has_target_range is set
+  // (renderer.cpp's slot_is_interactive, climate_popup.cpp's range mode).
   const low = usableNumber(attrs.target_temp_low);
   const high = usableNumber(attrs.target_temp_high);
-  if (low !== undefined || high !== undefined) {
-    body.target_temp_low = low ?? DEFAULT_TARGET_TEMP_LOW;
-    body.target_temp_high = high ?? DEFAULT_TARGET_TEMP_HIGH;
+  if (low !== undefined && high !== undefined) {
+    body.target_temp_low = low;
+    body.target_temp_high = high;
   }
 
-  // Optional live readouts: these DO have a real "unknown" state in the
-  // firmware (has_current_temperature/has_current_humidity/
-  // has_target_humidity default false), so omitting is the correct way to
-  // say "no reading available", not a bug to work around.
+  // Optional live readouts: a real "unknown" state already exists for these
+  // (has_current_temperature/has_current_humidity/has_target_humidity all
+  // default false), so omitting is the correct way to say "no reading".
   const currentTemperature = usableNumber(attrs.current_temperature);
   if (currentTemperature !== undefined) body.current_temperature = currentTemperature;
 

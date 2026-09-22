@@ -28,28 +28,53 @@ function entityWithPreset(name: string): VirtualEntity {
 }
 
 describe('protocol/climate', () => {
-  it('emits every attribute on every publish, not a diff', () => {
+  it('omits temperature, min_temp and max_temp when unknown, never fabricating the firmware defaults', () => {
+    // Review round 1, C1: has_target_temperature (src/types/climate/state.h)
+    // is only set when the firmware actually finds "temperature" in the
+    // payload, and it gates a REAL, interactive, commandable UI slot
+    // (renderer.cpp's slot_is_interactive) and the popup's single-vs-range
+    // mode (climate_popup.cpp: has_range = has_target_range &&
+    // !has_target_temperature). Fabricating 20.0/7.0/35.0 here would give a
+    // read-only thermostat an interactive setpoint it never had, and would
+    // permanently disable range mode for every dual-setpoint device.
+    // Omission is how you tell the firmware "no such value".
     const p = JSON.parse(buildClimatePayload(entityWithOnly({ current_temperature: 21 })));
-    // Omitting these would snap the panel to 20.0/7.0/35.0. Wire key is
-    // "temperature", not "target_temperature": docs/contract-climate-cover.md
-    // (citing tile_renderer.cpp:2233-2236) is authoritative over the brief,
-    // which named the internal VirtualEntity attribute instead of the wire
-    // key the firmware's scanner actually looks for.
-    expect(p).to.include.keys('temperature', 'min_temp', 'max_temp');
+    expect(p).to.not.have.property('temperature');
+    expect(p).to.not.have.property('min_temp');
+    expect(p).to.not.have.property('max_temp');
   });
 
-  it('uses the real target temperature, min_temp and max_temp when known', () => {
+  it('uses the real temperature, min_temp and max_temp when known', () => {
     const p = JSON.parse(buildClimatePayload(entityWithOnly({ target_temperature: 22, min_temp: 10, max_temp: 30 })));
+    // Wire key is "temperature", not "target_temperature":
+    // docs/contract-climate-cover.md (citing tile_renderer.cpp:2233-2236) is
+    // authoritative over the brief, which named the internal VirtualEntity
+    // attribute instead of the wire key the firmware's scanner looks for.
     expect(p.temperature).to.equal(22);
     expect(p.min_temp).to.equal(10);
     expect(p.max_temp).to.equal(30);
   });
 
-  it('falls back to the firmware defaults for temperature/min_temp/max_temp when unknown', () => {
-    const p = JSON.parse(buildClimatePayload(entityWithOnly({})));
-    expect(p.temperature).to.equal(20.0);
-    expect(p.min_temp).to.equal(7.0);
-    expect(p.max_temp).to.equal(35.0);
+  it('treats a blank, non-finite or null value as unknown for every core numeric field, never zero or a fabricated default', () => {
+    // Review round 1, M7. Covers null, a blank string, NaN and Infinity
+    // across temperature/min_temp/max_temp/target_temp_low/target_temp_high
+    // in one pass rather than one test per field x per bad-value shape.
+    const p = JSON.parse(
+      buildClimatePayload(
+        entityWithOnly({
+          target_temperature: '',
+          min_temp: Number.NaN,
+          max_temp: null,
+          target_temp_low: '   ',
+          target_temp_high: Number.POSITIVE_INFINITY,
+        }),
+      ),
+    );
+    expect(p).to.not.have.property('temperature');
+    expect(p).to.not.have.property('min_temp');
+    expect(p).to.not.have.property('max_temp');
+    expect(p).to.not.have.property('target_temp_low');
+    expect(p).to.not.have.property('target_temp_high');
   });
 
   it('never emits null for a string field', () => {
@@ -68,17 +93,23 @@ describe('protocol/climate', () => {
     }
   });
 
-  it('emits both ends of the dual setpoint or neither', () => {
-    // target_temp_low and target_temp_high share ONE presence flag: sending
-    // only one makes the firmware treat both as fresh and silently revert the
-    // other to its default.
+  it('treats an explicit null the same as absent for a climate string field', () => {
+    const p = JSON.parse(buildClimatePayload(entityWithOnly({ hvac_mode: null, fan_mode: null, preset_mode: null })));
+    expect(p).to.not.have.property('hvac_mode');
+    expect(p).to.not.have.property('fan_mode');
+    expect(p).to.not.have.property('preset_mode');
+  });
+
+  it('omits the dual setpoint entirely when only one side is known', () => {
+    // Review round 1, I2: target_temp_low and target_temp_high share ONE
+    // presence flag, so sending only one makes the firmware treat both as
+    // fresh and silently revert the other to its default -- and that
+    // fabricated default becomes a real, interactive, commandable range
+    // bound the moment has_target_range is set. The fix is to never send
+    // either side unless both are known, not to fill the gap with a default.
     const p = JSON.parse(buildClimatePayload(entityWithOnly({ target_temp_low: 18 })));
-    const has = 'target_temp_low' in p === ('target_temp_high' in p);
-    expect(has).to.equal(true);
-    // The known side keeps its real value, the unknown side gets the
-    // firmware's own default rather than an arbitrary fabricated number.
-    expect(p.target_temp_low).to.equal(18);
-    expect(p.target_temp_high).to.equal(24.0);
+    expect(p).to.not.have.property('target_temp_low');
+    expect(p).to.not.have.property('target_temp_high');
   });
 
   it('emits neither end of the dual setpoint when both are unknown', () => {
@@ -167,7 +198,7 @@ describe('protocol/climate', () => {
     expect(JSON.parse(buildClimatePayload(entity({ available: false }))).available).to.equal(false);
   });
 
-  it('forwards attributes outside the climate schema unchanged, like the generic JSON domains do', () => {
+  it('forwards only the validated non-climate keys: friendly_name, icon, power, boost', () => {
     const p = JSON.parse(
       buildClimatePayload(entityWithOnly({ friendly_name: 'Living room', icon: 'mdi:thermostat', power: 'on', boost: 'off' })),
     );
@@ -175,6 +206,32 @@ describe('protocol/climate', () => {
     expect(p.icon).to.equal('mdi:thermostat');
     expect(p.power).to.equal('on');
     expect(p.boost).to.equal('off');
+  });
+
+  it('does not forward an attribute outside the validated allow-list, even one the firmware would read as a fallback key', () => {
+    // Review round 1, M5. unit_of_measurement (temperature_unit fallback),
+    // humidity (target_humidity fallback), precision (target_temp_step
+    // fallback), state (hvac_mode fallback), supported_features, an
+    // hvac_modes array and a nested "attributes" object are all names the
+    // firmware's scanner recognises (tile_renderer.cpp:2148,2178,2230,2259,
+    // 2270). An open-ended pass-through would forward every one of these
+    // unvalidated -- including as a literal null, reopening exactly the
+    // hazard the never-null string rule above exists to close.
+    const p = JSON.parse(
+      buildClimatePayload(
+        entityWithOnly({
+          unit_of_measurement: null,
+          humidity: 41,
+          precision: 1,
+          state: 'heat',
+          supported_features: 999,
+          hvac_modes: ['off', 'heat'],
+          attributes: { temperature: 99 },
+          made_up_key: 'x',
+        }),
+      ),
+    );
+    expect(p).to.deep.equal({ available: true });
   });
 
   it('never sends a bare "state" key that would feed the hvac_mode fallback with a placeholder', () => {
