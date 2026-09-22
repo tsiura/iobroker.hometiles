@@ -32,7 +32,19 @@ matching `*_meta`, and state on the state topic.
 
 ## Extra topics beyond state/cmnd
 
-Built in `network_manager.cpp:587-593` from the configured base topic:
+**CORRECTED 2026-09-22:** these are NOT built from the user-configured base
+topic. `network_manager.cpp:585-587` hardcodes the root:
+
+```cpp
+String base = "tab5_lvgl/config/";
+base += did;                                  // eFuse MAC-derived device id
+bridge_apply_topic_ = base + "/bridge/apply";
+```
+
+So the config-plane topics live under `tab5_lvgl/config/<deviceId>/`,
+independent of `baseTopic` and `haPrefix`. v0.1 already implements this
+correctly via `CONFIG_TOPIC_ROOT` in `src/protocol/topics.ts`; only this note
+was wrong. Built in `network_manager.cpp:585-593`:
 
     <base>/bridge/apply
     <base>/history/request     <base>/history/response
