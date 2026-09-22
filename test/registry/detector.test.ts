@@ -185,6 +185,57 @@ describe('registry/detector mapping', () => {
     expect(DETECTOR_TYPE_TO_DOMAIN.airCondition).to.equal('climate');
   });
 
+  it('maps blind, blindButtons and gate to the cover domain', () => {
+    // The pattern is keyed 'blinds' but its Types value -- what
+    // DetectedControl.type actually carries at runtime -- is 'blind'
+    // (docs/contract-iobroker-types.md's "pattern keys are not Types
+    // values" trap; verified directly against node_modules/@iobroker/
+    // type-detector/build/types.js: Types["blind"] = "blind", and there is
+    // no Types["blinds"] at all). blindButtons and gate already agree with
+    // their own pattern keys.
+    expect(DETECTOR_TYPE_TO_DOMAIN.blind).to.equal('cover');
+    expect(DETECTOR_TYPE_TO_DOMAIN.blindButtons).to.equal('cover');
+    expect(DETECTOR_TYPE_TO_DOMAIN.gate).to.equal('cover');
+    // The plural pattern key must NOT be used as a map key, or every real
+    // blind silently fails to detect: mapControlToDevice sees `domain` come
+    // back undefined and returns null, with no error anywhere (the exact
+    // "silent 'no such pattern'" trap the contract doc warns about).
+    expect(DETECTOR_TYPE_TO_DOMAIN.blinds).to.equal(undefined);
+  });
+
+  it('maps a real blind control (Types value "blind") to the cover domain end to end', () => {
+    const control: DetectedControl = {
+      type: 'blind',
+      states: [
+        { id: 'shelly.0.blind.level', name: 'SET', write: true },
+        { id: 'shelly.0.blind.direction', name: 'DIRECTION' },
+      ],
+    };
+    const device = mapControlToDevice('shelly.0.blind', control, {});
+    expect(device).to.not.equal(null);
+    expect(device!.domain).to.equal('cover');
+    expect(device!.channels.set!.objectId).to.equal('shelly.0.blind.level');
+  });
+
+  it('drops DIRECTION and DIRECTION_ENUM from a detected blind: no cover role reads either', () => {
+    // Both are optional on blind/blindButtons/gate (typePatterns.js:
+    // SharedPatterns.direction, SharedPatterns.direction_enum, always
+    // listed as a pair) and neither has an HA Cover attribute behind it --
+    // keeping either would only add a foreign-state subscription and an
+    // entity recompute on every direction change, the exact churn
+    // IGNORED_CHANNELS exists to stop.
+    const control: DetectedControl = {
+      type: 'blind',
+      states: [
+        { id: 'shelly.0.blind.level', name: 'SET', write: true },
+        { id: 'shelly.0.blind.direction', name: 'DIRECTION' },
+        { id: 'shelly.0.blind.direction_enum', name: 'DIRECTION_ENUM' },
+      ],
+    };
+    const device = mapControlToDevice('shelly.0.blind', control, {});
+    expect(Object.keys(device!.channels)).to.deep.equal(['set']);
+  });
+
   it("resolves airCondition's duplicate SWING channels by role, not by name", () => {
     // Verified directly against node_modules/@iobroker/type-detector/build/
     // typePatterns.js: airCondition's states array carries FanPatterns.swing

@@ -74,6 +74,17 @@ export const DETECTOR_TYPE_TO_DOMAIN: Record<string, Domain> = {
   // refuses to synthesise an entity with nothing usable behind it.
   thermostat: 'climate',
   airCondition: 'climate',
+  // The trap (docs/contract-iobroker-types.md): the pattern object is keyed
+  // 'blinds', but its Types VALUE -- what DetectedControl.type actually
+  // carries at runtime -- is 'blind' (verified directly against
+  // node_modules/@iobroker/type-detector/build/types.js: Types["blind"] =
+  // "blind"; there is no Types["blinds"] at all). Keying this map on
+  // 'blinds' would leave every real blind unmapped: mapControlToDevice sees
+  // `domain` come back undefined and returns null, silently, with no error.
+  // blindButtons and gate already agree with their own pattern keys.
+  blind: 'cover',
+  blindButtons: 'cover',
+  gate: 'cover',
 };
 
 /**
@@ -103,6 +114,12 @@ const IGNORED_CHANNELS = new Set([
   'ERROR',
   'WORKING',
   'DIRECTION',
+  // blind/blindButtons/gate's alternate-role sibling of DIRECTION (verified
+  // against typePatterns.js: SharedPatterns.direction_enum, always listed
+  // alongside SharedPatterns.direction). Neither has an HA Cover attribute
+  // behind it; keeping it would only add a foreign-state subscription and a
+  // recompute on every direction change.
+  'DIRECTION_ENUM',
   'CONNECTED',
   'RSSI',
   'BATTERY',

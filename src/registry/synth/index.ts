@@ -2,6 +2,7 @@ import type { DeviceInput, VirtualEntity } from '../types';
 import { synthBinarySensor } from './binary_sensor';
 import { synthClimate } from './climate';
 import type { Values } from './common';
+import { synthCover } from './cover';
 import { synthLight } from './light';
 import { synthScene } from './scene';
 import { synthSensor } from './sensor';
@@ -31,6 +32,7 @@ export function synthesise(device: DeviceInput, entityId: string, values: Values
     case 'climate':
       return synthClimate(device, entityId, values);
     case 'cover':
+      return synthCover(device, entityId, values);
     case 'media_player':
     case 'weather':
     case 'number':
