@@ -47,4 +47,25 @@ describe('protocol/topics', () => {
   it('rejects an entity id without a domain separator', () => {
     expect(() => entityStateTopic('ha/statestream', 'kueche')).to.throw('invalid entity id');
   });
+
+  it('defaults to the state leaf so v0.1 callers are unchanged', () => {
+    expect(entityStateTopic('ha', 'sensor.kitchen')).to.equal('ha/sensor/kitchen/state');
+  });
+
+  it('uses the literal word weather for the weather domain, not state', () => {
+    // firmware: <ha_prefix>/weather/<object_id>/weather — see
+    // docs/contract-media-weather.md. Using /state here renders an empty tile
+    // with no error anywhere.
+    expect(entityStateTopic('ha', 'weather.home', 'weather'))
+      .to.equal('ha/weather/home/weather');
+  });
+
+  it('uses the control leaf for editable domains', () => {
+    expect(entityStateTopic('ha', 'number.setpoint', 'control'))
+      .to.equal('ha/number/setpoint/control');
+  });
+
+  it('still rejects an entity id with no dot', () => {
+    expect(() => entityStateTopic('ha', 'bogus', 'state')).to.throw('invalid entity id');
+  });
 });

@@ -64,11 +64,11 @@ export function ioStateTopic(baseTopic: string, channelId: string): string {
  * multi-dot id is a bug upstream, and one slash-joined topic segment per dot
  * would silently address the wrong entity rather than fail loudly.
  */
-export function entityStateTopic(haPrefix: string, entityId: string): string {
+export function entityStateTopic(haPrefix: string, entityId: string, leaf: 'state' | 'weather' | 'control' = 'state'): string {
   const dot = entityId.indexOf('.');
   if (dot <= 0 || dot === entityId.length - 1) {
     throw new Error(`invalid entity id: ${entityId}`);
   }
   const path = entityId.toLowerCase().replace('.', '/');
-  return `${haPrefix}/${path}/state`;
+  return `${haPrefix}/${path}/${leaf}`;
 }
