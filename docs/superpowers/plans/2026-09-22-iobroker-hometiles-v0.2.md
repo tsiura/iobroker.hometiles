@@ -643,6 +643,39 @@ session's subscription list includes it. The leaf is `cover` — taken from
 the contract document, and NOT necessarily the same string as the
 `cover` domain name.
 
+**Three cross-cutting fixes folded in during execution.** Each is a guard at
+the command trust boundary, and each belongs in the dispatcher's SHARED write
+path rather than in a per-command check.
+
+- **Ruling 32 — a string- or mixed-typed SET is neither a toggle nor a
+  position.** `setChannelKind` in `src/registry/synth/cover.ts` currently sends
+  such a SET to the detector-name fallback. Give it a third kind so it is
+  writable as neither. Task 7 now derives `supported_features` from
+  `writable`, so without this a string SET advertises a position slider.
+- **Ruling 38 — honour the channel's `write` flag for EVERY domain.** Carry
+  each channel's `write` into `channelMeta` in `baseEntity`, and refuse in the
+  dispatcher's shared `push()` when the target channel's `write` is exactly
+  `false` (reason `no_writable_channel`, logged). Today the v0.1 switch, light
+  and scene paths write to read-only objects and report success. `write`
+  undefined stays allowed.
+- **Ruling 41 — re-selecting the current value writes the current value.**
+  The encoder does not know a role's current value, which causes two
+  defects: any MQTT client can write an arbitrary finite number into a
+  mapped number channel (e.g. `7` into a SPEED mapped 0..3), and a current
+  value outside the states map whose text equals ANOTHER entry's label
+  resolves to that other key (`{B1:'Boost'}` at `"BOOST"` writes `"B1"`).
+  When the incoming label matches the role's current decoded value
+  case-insensitively and that value lies outside the map, write the current
+  value coerced to the channel type, before any map reversal; otherwise
+  reverse through the map (unambiguous only). The numeric out-of-map fallback
+  then applies only to the current value.
+
+Required tests: a string-typed SET cover advertises no position and no
+toggle; a read-only switch, light and scene each refuse `turn_on` with
+nothing written; `7` into a SPEED mapped 0..3 is refused; `{B1:'Boost'}` at
+`"BOOST"` re-selected writes `"BOOST"`; the SPEED_LEVEL `"50"` fallback still
+writes `50`.
+
 - [ ] **Step 1: Write the failing tests**
 
 ```ts
