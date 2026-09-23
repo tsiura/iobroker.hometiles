@@ -766,6 +766,28 @@ session's subscription list includes it. The leaf is `media` — taken from
 the contract document, and NOT necessarily the same string as the
 `media_player` domain name.
 
+**Three firmware facts found by Task 9, folded in during execution.** Each is
+a place where the panel's command does not match what the ioBroker state
+expects, so writing it verbatim would be a wrong value reported as success.
+
+- **Mute.** The panel's mute icon sends `volume_set` — even when the volume
+  slider is disabled — and never sends `volume_mute`. Read the firmware to
+  see exactly what value it sends, and map it to the player's MUTE channel
+  where one exists, rather than writing a volume of 0 over the user's level.
+- **Seek.** The panel sends a position in SECONDS; ioBroker's `SEEK` state is
+  a PERCENTAGE of the track. Convert using the current duration, and refuse
+  (logged) when the duration is unknown rather than guessing.
+- **Transport buttons.** The firmware ALWAYS draws previous, play/pause and
+  next, so "advertised = commandable" cannot be enforced by hiding them.
+  Record writability for each in the synth, and refuse — logged, nothing
+  written — a transport command whose channel is absent or read-only.
+
+Required tests, through the real synth and dispatcher: a mute press on a
+player with a MUTE channel toggles MUTE and leaves the volume untouched;
+seeking to 90 s in a 180 s track writes 50 to SEEK; a seek with no known
+duration writes nothing; a `next` on a player with no NEXT channel writes
+nothing and logs why.
+
 - [ ] **Step 1: Write the failing tests**
 
 ```ts
