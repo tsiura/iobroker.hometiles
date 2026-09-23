@@ -108,7 +108,8 @@ const MAX_NUMERIC_HISTORY_VALUES = 288;
 type HistorySample = { ts: number; val: unknown };
 
 /**
- * Builds the `history/response` payload for a numeric graph request. `now`
+ * Builds the `history/response` payload for a numeric graph request, or
+ * returns null for a malformed range, which gets no response at all. `now`
  * and every `ts` are epoch milliseconds, as ioBroker history stamps rows.
  *
  * No timestamps go on the wire: the array index is the time. Both firmware
@@ -119,61 +120,69 @@ type HistorySample = { ts: number; val: unknown };
  * `points`, mqtt_handlers.cpp:2393), oldest first, the last one ending at
  * `now`; a shorter array would be stretched over the whole axis.
  *
- * A bucket's value is the mean of its numeric samples (the request asks for
- * `"stat":"mean"`, mqtt_handlers.cpp:2419); a sample at exactly `now` is in
- * the last bucket, a later one is not history. A bucket with no numeric sample
- * is `null`, never 0 -- a non-numeric, blank or non-finite `val` counts as
- * nothing. Both firmware readers take `null` as a gap (ArduinoJson,
- * sensor_popup.cpp:383-384; the hand-rolled scanner, tile_renderer.cpp:4537-4541)
- * and fill it: the last value carries forward, and a LEADING gap takes the
- * first value after it (sensor_popup.cpp:2360-2381, tile_renderer.cpp:4573-4594).
- * That back-fill would paint a later reading over the start of the window,
- * so an empty first bucket takes the reading in effect when the window
- * opened -- the latest sample before it, if that is a number.
+ * A reading is a numeric sample: a non-numeric, blank or non-finite `val` is
+ * none, never 0. A sample at exactly `now` is in the last bucket; a later one
+ * is not history. A bucket with readings holds their mean (the request asks
+ * for `"stat":"mean"`, mqtt_handlers.cpp:2419). An empty bucket carries the
+ * reading in effect -- the latest reading before it, one from before the
+ * window included -- because both firmware readers would fill a `null` by
+ * copying the previous element (sensor_popup.cpp:2351-2380,
+ * tile_renderer.cpp:4573-4594), and that is a bucket's MEAN: after one
+ * 2000 W minute logged on change, it would paint 1000 W over the idle hours
+ * that follow. So a value is `null` only while no reading exists yet, a
+ * leading gap the firmware back-fills from the first value.
  *
  * `entity_id`, `hours` and `period_minutes` are echoed verbatim -- the popup
  * drops a response whose hours or period differ from its range
  * (sensor_popup.cpp:2324-2329) -- and nothing else is emitted: `stat` and
- * `points` are never read back. A range of fewer than 1 or more than 288
- * buckets gets no values, the firmware's own "no history" answer
- * (mqtt_handlers.cpp:306, rendered at sensor_popup.cpp:2343-2347).
+ * `points` are never read back. A malformed range -- zero, negative or
+ * non-finite hours or period_minutes, or more than 288 buckets -- is refused:
+ * the firmware never sends one, and the tile graph applies any response for
+ * its entity without checking the range (tile_renderer.cpp:4498-4514), so even
+ * an empty answer would wipe it. A valid range with no readings still gets an
+ * answer, every value null, so a stale graph clears.
  */
 export function buildNumericHistoryResponse(
   req: Extract<HistoryRequest, { kind: 'numeric' }>,
   samples: readonly HistorySample[],
   now: number,
-): string {
+): string | null {
   const { entityId, hours, periodMinutes } = req;
   // Checked before dividing: -24 hours over -5 minutes is +288 buckets.
   const count = periodMinutes > 0 ? Math.floor((hours * 60) / periodMinutes) : 0;
-  const values =
-    count >= 1 && count <= MAX_NUMERIC_HISTORY_VALUES ? bucketMeans(samples, now, periodMinutes * 60_000, count) : [];
+  if (!(count >= 1 && count <= MAX_NUMERIC_HISTORY_VALUES)) return null;
+  const values = bucketValues(samples, now, periodMinutes * 60_000, count);
   return JSON.stringify({ entity_id: entityId, hours, period_minutes: periodMinutes, values });
 }
 
-function bucketMeans(
+type Bucket = { sum: number; n: number; lastTs: number; last: number | null };
+
+function bucketValues(
   samples: readonly HistorySample[],
   now: number,
   periodMs: number,
   count: number,
 ): Array<number | null> {
   const start = now - count * periodMs;
-  const buckets: number[][] = Array.from({ length: count }, () => []);
-  let carriedTs = -Infinity;
-  let carried: number | undefined;
+  const newBucket = (): Bucket => ({ sum: 0, n: 0, lastTs: -Infinity, last: null });
+  const before = newBucket(); // readings before the window: only the latest is used
+  const buckets = Array.from({ length: count }, newBucket);
   for (const { ts, val } of samples) {
-    if (!Number.isFinite(ts) || ts > now) continue;
     const value = usableNumber(val);
-    if (ts < start) {
-      if (ts >= carriedTs) {
-        carriedTs = ts;
-        carried = value;
-      }
-    } else if (value !== undefined) {
-      buckets[Math.min(Math.floor((ts - start) / periodMs), count - 1)]?.push(value);
+    if (value === undefined || !Number.isFinite(ts) || ts > now) continue;
+    const bucket = ts < start ? before : buckets[Math.min(Math.floor((ts - start) / periodMs), count - 1)];
+    if (!bucket) continue;
+    bucket.sum += value;
+    bucket.n += 1;
+    if (ts >= bucket.lastTs) {
+      bucket.lastTs = ts;
+      bucket.last = value;
     }
   }
-  const first = buckets[0];
-  if (first?.length === 0 && carried !== undefined) first.push(carried);
-  return buckets.map((bucket) => (bucket.length ? bucket.reduce((sum, v) => sum + v, 0) / bucket.length : null));
+  let inEffect = before.last;
+  return buckets.map((bucket) => {
+    if (bucket.n === 0) return inEffect;
+    inEffect = bucket.last;
+    return bucket.sum / bucket.n;
+  });
 }
