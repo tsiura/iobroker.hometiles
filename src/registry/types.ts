@@ -55,9 +55,11 @@ export interface ChannelInput {
  * toBoolState. `write` is the object's own write flag: the dispatcher never
  * writes a channel whose flag is exactly false (Ruling 38). `current` is the
  * channel's newest usable raw value, so re-selecting the current value writes
- * exactly that value (Ruling 41).
+ * exactly that value (Ruling 41). `min`/`max` are the declared bounds a
+ * percentage is scaled over (Ruling 49), and `unit` tells a colour temperature
+ * in mireds from one in kelvin (Ruling 59).
  */
-export type ChannelCodec = Pick<ChannelInput, 'type' | 'states' | 'write' | 'min' | 'max'> & { current?: unknown };
+export type ChannelCodec = Pick<ChannelInput, 'type' | 'states' | 'write' | 'min' | 'max' | 'unit'> & { current?: unknown };
 
 /** A device as classified by the detector plus the admin's overrides. */
 export interface DeviceInput {
@@ -95,8 +97,8 @@ export interface VirtualEntity {
    */
   writable?: Record<string, boolean>;
   /**
-   * Per-channel ChannelCodec (type, states, write flag, current raw value),
-   * keyed by the same channel names as
+   * Per-channel ChannelCodec (type, states, write flag, bounds, unit, current
+   * raw value), keyed by the same channel names as
    * `source` (NOT by role, unlike `writable`). Lets a command dispatcher
    * reverse a decoded display label back into the raw value a write needs
    * (synth/common.ts's encodeChannelValue) instead of writing the label

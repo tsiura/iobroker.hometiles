@@ -1,5 +1,14 @@
 import { expect } from 'chai';
-import { encodeChannelValue, fromPercent, toBoolState, toPercent, withinDeclaredRange } from '../../../src/registry/synth/common';
+import {
+  colorTempFromKelvin,
+  colorTempScale,
+  colorTempToKelvin,
+  encodeChannelValue,
+  fromPercent,
+  toBoolState,
+  toPercent,
+  withinDeclaredRange,
+} from '../../../src/registry/synth/common';
 import { synthClimate } from '../../../src/registry/synth/climate';
 import type { ChannelCodec, DeviceInput, SourceValue } from '../../../src/registry/types';
 
@@ -217,6 +226,82 @@ describe('registry/synth/common: encodeChannelValue', () => {
       // temperature -- such a pair means nothing, so it is ignored.
       expect(withinDeclaredRange(41, range(40, 40))).to.equal(true);
       expect(withinDeclaredRange(50, range(255, 0))).to.equal(true);
+    });
+  });
+
+  // Ruling 59 (round 3): the panel speaks whole kelvin; a colour-temperature
+  // channel may store mireds (ioBroker.zigbee2mqtt's default) or kelvin, and
+  // the panel clamps to the range it is sent after rounding it.
+  describe('colour temperature (Ruling 59)', () => {
+    const ct = (over: Partial<ChannelCodec>): ChannelCodec => ({ type: 'number', ...over });
+
+    it("reads a declared mired channel as kelvin, its bounds swapped: zigbee2mqtt's 150..500 mired is 2000..6666 K", () => {
+      const codec = ct({ unit: 'mired', min: 150, max: 500, current: 370 });
+      expect(colorTempScale(codec)).to.deep.equal({ unit: 'mired', minKelvin: 2000, maxKelvin: 6666 });
+      expect(colorTempToKelvin(370, colorTempScale(codec)!)).to.equal(2703);
+      expect(colorTempFromKelvin(2703, colorTempScale(codec)!, codec)).to.equal(370);
+      expect(colorTempFromKelvin(4000, colorTempScale(codec)!, codec)).to.equal(250);
+      expect(colorTempScale(ct({ unit: ' Mireds ', min: 153, max: 454 }))).to.deep.equal({ unit: 'mired', minKelvin: 2203, maxKelvin: 6535 });
+    });
+
+    it('publishes whole bounds rounded inward, so the range the panel clamps to is exactly what lands', () => {
+      // The firmware rounds what it is sent (tile_renderer.cpp:1332-1353): a
+      // fractional 6535.95 became 6536, above the channel's own maximum.
+      expect(colorTempScale(ct({ unit: 'K', min: 2202.4, max: 1e6 / 153 }))).to.deep.equal({
+        unit: 'kelvin',
+        minKelvin: 2203,
+        maxKelvin: 6535,
+      });
+      for (const [min, max] of [[150, 500], [153, 454], [153.5, 499.6], [250, 454]] as const) {
+        const codec = ct({ unit: 'mired', min, max });
+        const scale = colorTempScale(codec)!;
+        for (let kelvin = scale.minKelvin; kelvin <= scale.maxKelvin; kelvin++) {
+          const written = colorTempFromKelvin(kelvin, scale, codec);
+          expect(written >= min && written <= max, `${min}..${max} mired at ${kelvin} K wrote ${written}`).to.equal(true);
+        }
+      }
+    });
+
+    it("takes the firmware's own 2000 and 6535 K for a missing bound, and withholds an empty range", () => {
+      expect(colorTempScale(ct({ unit: 'K' }))).to.deep.equal({ unit: 'kelvin', minKelvin: 2000, maxKelvin: 6535 });
+      expect(colorTempScale(ct({ unit: 'K', min: 2700 }))).to.deep.equal({ unit: 'kelvin', minKelvin: 2700, maxKelvin: 6535 });
+      // A declared unit wins over the no-number fallback to kelvin.
+      expect(colorTempScale(ct({ unit: 'mired' }))).to.deep.equal({ unit: 'mired', minKelvin: 2000, maxKelvin: 6535 });
+      for (const codec of [ct({ unit: 'K', max: 1800 }), ct({ unit: 'K', min: 7000 }), ct({ unit: 'K', min: 4000, max: 4000 })]) {
+        expect(colorTempScale(codec), JSON.stringify(codec)).to.equal(undefined);
+      }
+    });
+
+    it('decides an undeclared unit by the 1000 threshold both zigbee adapters use, or the role\'s own kelvin', () => {
+      // ioBroker.zigbee's colortemp declares no unit and no range and holds
+      // mireds (lib/models.js:230-242); its setter, like zigbee2mqtt's, reads
+      // a value above 1000 as kelvin and anything else as mired (toMired).
+      expect(colorTempScale(ct({ current: 370 }))?.unit).to.equal('mired');
+      expect(colorTempScale(ct({ min: 153, max: 500 }))?.unit).to.equal('mired');
+      expect(colorTempScale(ct({ min: 2000, max: 6500, current: 3000 }))?.unit).to.equal('kelvin');
+      // No number to go by: level.color.temperature is "color temperature in
+      // K°" (ioBroker.docs, dev/stateroles.md:253).
+      expect(colorTempScale(ct({}))?.unit).to.equal('kelvin');
+      // Numbers on both sides of 1000 cannot be told apart.
+      expect(colorTempScale(ct({ min: 153, max: 6500 }))).to.equal(undefined);
+    });
+
+    it('withholds a declared unit it cannot convert, such as a percentage, and has no scale without a channel', () => {
+      // Not only through an empty range: without bounds, too.
+      for (const codec of [ct({ unit: '%', min: 0, max: 100 }), ct({ unit: '%' }), ct({ unit: '%', current: 50 })]) {
+        expect(colorTempScale(codec), JSON.stringify(codec)).to.equal(undefined);
+      }
+      expect(colorTempScale(undefined)).to.equal(undefined);
+    });
+
+    it('keeps an exact mired where the declared mired bounds are fractional, and passes kelvin through', () => {
+      const fractional = ct({ unit: 'mired', min: 153.5, max: 499.6 });
+      expect(colorTempFromKelvin(4000, colorTempScale(fractional)!, fractional)).to.equal(250);
+      expect(colorTempFromKelvin(3000, colorTempScale(fractional)!, fractional)).to.equal(1e6 / 3000);
+      const kelvin = ct({ unit: 'K', min: 2200, max: 6500 });
+      expect(colorTempFromKelvin(3000, colorTempScale(kelvin)!, kelvin)).to.equal(3000);
+      expect(colorTempToKelvin(3000.4, colorTempScale(kelvin)!)).to.equal(3000);
+      expect(colorTempToKelvin(0, colorTempScale(kelvin)!)).to.equal(undefined);
     });
   });
 

@@ -2,7 +2,7 @@ import { expect } from 'chai';
 import { synthLight } from '../../../src/registry/synth/light';
 import { synthScene } from '../../../src/registry/synth/scene';
 import { synthesise } from '../../../src/registry/synth/index';
-import type { DeviceInput, SourceValue } from '../../../src/registry/types';
+import type { ChannelInput, DeviceInput, SourceValue } from '../../../src/registry/types';
 
 const NOW = 1_757_000_000_000;
 const value = (val: unknown, q = 0): SourceValue => ({ val, ack: true, q, ts: NOW });
@@ -304,6 +304,57 @@ describe('registry/synth light and scene', () => {
         // Still read as lit from the raw level (N4).
         expect(e.state, JSON.stringify(bounds)).to.equal('on');
       }
+    });
+  });
+
+  // --- Task 8 round 3 (Ruling 59) ----------------------------------------
+
+  describe('colour temperature in kelvin, whatever the channel stores (Ruling 59)', () => {
+    const ctLamp = (temperature: Partial<ChannelInput>, raw?: unknown) =>
+      synthLight(
+        {
+          ...onOff,
+          channels: {
+            set: onOff.channels.set!,
+            dimmer: { objectId: 'l.0.level', type: 'number', min: 0, max: 100, write: true },
+            temperature: { objectId: 'l.0.ct', type: 'number', write: true, ...temperature },
+          },
+        },
+        'light.x',
+        { 'hue.0.decke.on': value(true), ...(raw === undefined ? {} : { 'l.0.ct': value(raw) }) },
+      ).attributes;
+
+    it("shows a zigbee2mqtt bulb's mireds as kelvin, with its range swapped: 150..500 mired at 370", () => {
+      // ioBroker.zigbee2mqtt's default (useKelvin false): unit "mired"
+      // (lib/exposes.js). Published as kelvin these read "370 K".
+      expect(ctLamp({ unit: 'mired', min: 150, max: 500 }, 370)).to.include({
+        color_temp_kelvin: 2703,
+        min_color_temp_kelvin: 2000,
+        max_color_temp_kelvin: 6666,
+      });
+    });
+
+    it('shows an ioBroker.zigbee bulb, which declares no unit and no range, from its mired value', () => {
+      expect(ctLamp({}, 370)).to.include({ color_temp_kelvin: 2703, min_color_temp_kelvin: 2000, max_color_temp_kelvin: 6535 });
+    });
+
+    it('publishes whole bounds rounded inward, the range the firmware will clamp to', () => {
+      expect(ctLamp({ unit: 'K', min: 2202.4, max: 1e6 / 153 }, 3000)).to.include({
+        color_temp_kelvin: 3000,
+        min_color_temp_kelvin: 2203,
+        max_color_temp_kelvin: 6535,
+      });
+    });
+
+    it('withholds colour temperature in a unit it cannot convert, publishing no reading for it', () => {
+      const attributes = ctLamp({ unit: '%', min: 0, max: 100 }, 40);
+      expect(attributes.supported_color_modes).to.deep.equal(['brightness']);
+      expect(attributes).to.not.have.any.keys('color_temp_kelvin', 'min_color_temp_kelvin', 'max_color_temp_kelvin');
+    });
+
+    it('publishes no colour-temperature range at all for a light without a colour-temperature channel', () => {
+      const e = synthLight(dimmer, 'light.esstisch', { 'hue.0.dim.on': value(true), 'hue.0.dim.level': value(60) });
+      expect(e.attributes).to.not.have.any.keys('color_temp_kelvin', 'min_color_temp_kelvin', 'max_color_temp_kelvin');
     });
   });
 

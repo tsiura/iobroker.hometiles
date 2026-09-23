@@ -1,6 +1,17 @@
 import type { ChannelInput, DeviceInput, VirtualEntity } from '../types';
 import { STATE_OFF, STATE_ON } from '../types';
-import { baseEntity, isUsable, percentScale, readChannel, toBoolState, toPercent, UNAVAILABLE, type Values } from './common';
+import {
+  baseEntity,
+  colorTempScale,
+  colorTempToKelvin,
+  isUsable,
+  percentScale,
+  readChannel,
+  toBoolState,
+  toPercent,
+  UNAVAILABLE,
+  type Values,
+} from './common';
 
 /** The panel's 0..100 percent (a dimmer's declared range is scaled into it, Ruling 49) onto HA's 0..255. */
 function percentToHaBrightness(percent: number): number {
@@ -44,7 +55,10 @@ export function synthLight(device: DeviceInput, entityId: string, values: Values
   // picker on the panel whose writes silently do nothing. Such a bulb still
   // works for on/off, brightness and colour temperature.
   const hasRgb = commandable(device.channels.red) && commandable(device.channels.green) && commandable(device.channels.blue);
-  const hasCt = commandable(device.channels.temperature);
+  // Colour temperature needs a unit it can be shown in kelvin from and a
+  // non-empty range (Ruling 59, common.ts's colorTempScale).
+  const ctScale = colorTempScale(channelMeta.temperature);
+  const hasCt = commandable(device.channels.temperature) && ctScale !== undefined;
 
   const modes: string[] = [];
   if (hasCt) modes.push('color_temp');
@@ -97,11 +111,16 @@ export function synthLight(device: DeviceInput, entityId: string, values: Values
     attributes.rgb_color = [Math.round(red), Math.round(green), Math.round(blue)];
   }
 
-  const kelvin = readNumber(device, 'temperature', values);
-  if (kelvin !== undefined) attributes.color_temp_kelvin = Math.round(kelvin);
-  const ctChannel = device.channels.temperature;
-  if (ctChannel?.min !== undefined) attributes.min_color_temp_kelvin = ctChannel.min;
-  if (ctChannel?.max !== undefined) attributes.max_color_temp_kelvin = ctChannel.max;
+  // Ruling 59: in kelvin however the channel stores it -- zigbee2mqtt's
+  // default is mireds, which v0.1 published as "370 K" -- and bounded by the
+  // whole range the panel will clamp to, which is exactly what dispatch
+  // accepts. Nothing is published for a channel in a unit it cannot convert.
+  if (ctScale) {
+    const kelvin = colorTempToKelvin(channelMeta.temperature?.current, ctScale);
+    if (kelvin !== undefined) attributes.color_temp_kelvin = kelvin;
+    attributes.min_color_temp_kelvin = ctScale.minKelvin;
+    attributes.max_color_temp_kelvin = ctScale.maxKelvin;
+  }
 
   // color_mode reports the mode currently in effect, chosen from advertised modes.
   if (hasRgb && attributes.rgb_color) attributes.color_mode = 'rgb';

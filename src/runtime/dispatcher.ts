@@ -1,7 +1,15 @@
 import type { ServiceCall } from '../protocol/commands';
 import type { Domain, VirtualEntity } from '../registry/types';
 import { STATE_OFF, STATE_ON } from '../registry/types';
-import { encodeChannelValue, fromPercent, percentScale, roleCodec, withinDeclaredRange } from '../registry/synth/common';
+import {
+  colorTempFromKelvin,
+  colorTempScale,
+  encodeChannelValue,
+  fromPercent,
+  percentScale,
+  roleCodec,
+  withinDeclaredRange,
+} from '../registry/synth/common';
 import type { Logger } from './mqtt-client';
 
 export type StateWriter = (objectId: string, value: unknown) => Promise<void>;
@@ -180,9 +188,10 @@ export class Dispatcher {
     };
 
     /**
-     * Ruling 49: every numeric command -- setpoint, humidity, colour
-     * temperature, cover position and tilt, light brightness -- goes through
-     * here. A panel percentage (position, tilt, brightness) must be 0..100 and
+     * Ruling 49: every numeric command -- setpoint, humidity, cover position
+     * and tilt, light brightness -- goes through here. (Not colour
+     * temperature: one the light cannot take is skipped out loud in set_light
+     * below, Ruling 59.) A panel percentage (position, tilt, brightness) must be 0..100 and
      * is scaled into the channel's range, the same map the synth publishes
      * with; an absolute value must lie inside the channel's declared bounds
      * (Ruling 55's declaredBounds). Anything else refuses the WHOLE call
@@ -293,7 +302,27 @@ export class Dispatcher {
           push('green', call.rgb[1]);
           push('blue', call.rgb[2]);
         }
-        if (call.kelvin !== undefined) pushNumber('temperature', call.kelvin, false);
+        // Ruling 59: Ruling 54 extends to colour temperature. A light with CT
+        // but no colour is always in CT mode (light_popup.cpp:1616-1618), so
+        // its power button always carries a CT; one the light cannot take is
+        // skipped, out loud, and never refuses the call. What lands is what
+        // was published: a whole kelvin inside the range the panel clamps to,
+        // written in the channel's own unit (mireds, on zigbee2mqtt's default).
+        const skipCt = (why: string): void => this.log.warn(`[Command] Skipping the colour temperature of ${entity.entityId}: ${why}`);
+        if (call.skippedKelvin !== undefined) skipCt(call.skippedKelvin);
+        if (call.kelvin !== undefined) {
+          const codec = entity.channelMeta?.temperature;
+          // No entry at all (an entity built without channelMeta) declares
+          // nothing, exactly like an entry with no unit or bounds: kelvin,
+          // over the firmware's default range -- what the synth publishes.
+          const scale = colorTempScale(codec ?? {});
+          if (!entity.source.temperature) skipCt('the light has no colour-temperature channel');
+          else if (codec?.write === false) skipCt('temperature is read-only');
+          else if (!scale) skipCt('its unit or range cannot be read as kelvin');
+          else if (call.kelvin < scale.minKelvin || call.kelvin > scale.maxKelvin) {
+            skipCt(`${call.kelvin} K is outside ${scale.minKelvin}..${scale.maxKelvin} K`);
+          } else push('temperature', colorTempFromKelvin(call.kelvin, scale, codec));
+        }
         break;
       }
       case 'set_temperature':
@@ -378,10 +407,9 @@ export class Dispatcher {
     }
 
     // Nothing lands when any requested value was out of range: a range with
-    // one bound written, or "on" without the asked-for colour temperature,
-    // would report success for a command that did not happen as asked. (A
-    // brightness the light cannot take at all is a different case, skipped
-    // out loud above -- Ruling 54.)
+    // one bound written would report success for a command that did not
+    // happen as asked. (A brightness or colour temperature the light cannot
+    // take is a different case, skipped out loud above -- Rulings 54 and 59.)
     if (outOfRange) return { writes: [], failureReason: 'value_out_of_range' };
     return { writes, failureReason };
   }

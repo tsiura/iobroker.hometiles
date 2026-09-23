@@ -1,6 +1,6 @@
 import { expect } from 'chai';
 import { buildClimatePayload } from '../../src/protocol/climate';
-import { parseClimateCommand, parseCoverCommand, type ServiceCall } from '../../src/protocol/commands';
+import { parseClimateCommand, parseCoverCommand, parseLightCommand, type ServiceCall } from '../../src/protocol/commands';
 import { buildCoverPayload } from '../../src/protocol/cover';
 import { synthClimate } from '../../src/registry/synth/climate';
 import { synthCover } from '../../src/registry/synth/cover';
@@ -1354,8 +1354,8 @@ describe('runtime/dispatcher', () => {
       write: true,
       ...over,
     });
-    const lightOf = (channels: DeviceInput['channels']): VirtualEntity =>
-      synthLight({ objectId: 'l.0', name: 'L', detectorType: 'rgb', domain: 'light', channels: { set: power, ...channels } }, 'light.l', {});
+    const lightOf = (channels: DeviceInput['channels'], values: Record<string, SourceValue> = {}): VirtualEntity =>
+      synthLight({ objectId: 'l.0', name: 'L', detectorType: 'rgb', domain: 'light', channels: { set: power, ...channels } }, 'light.l', values);
 
     it('writes the panel brightness into a 0..254 or 0..255 dimmer as the scaled raw value, and into a 0..100 one unchanged', async () => {
       for (const [max, landed] of [[254, 127], [255, 128], [100, 50]] as const) {
@@ -1426,23 +1426,77 @@ describe('runtime/dispatcher', () => {
       });
     });
 
-    it('refuses a colour temperature outside the light\'s declared range, the whole command with it', async () => {
-      const d = new Dispatcher(lookup([lightOf({ dimmer: channel('level'), temperature: channel('ct', { min: 2200, max: 6500 }) })]), write, silentLog);
-      for (const kelvin of [2100, 6600]) {
+    // Round 2 refused this whole command, "on" with it. Ruling 59: Ruling 54
+    // extends to colour temperature -- the power button of a CT-only light
+    // always carries its CT (light_popup.cpp:1616-1618) -- so a CT the light
+    // cannot take is skipped, out loud, and the rest still lands.
+    describe('a colour temperature the light cannot take (Ruling 59)', () => {
+      const withWarnings = (light: VirtualEntity) => {
+        const warnings: string[] = [];
+        const d = new Dispatcher(lookup([light]), write, { ...silentLog, warn: (message: string): void => void warnings.push(message) });
+        return { d, warnings };
+      };
+
+      it('skips a CT outside the light\'s range with a warning, and still writes "on" and the brightness', async () => {
+        const { d, warnings } = withWarnings(lightOf({ dimmer: channel('level'), temperature: channel('ct', { min: 2200, max: 6500 }) }));
+        for (const kelvin of [2100, 6600]) {
+          writes = [];
+          warnings.length = 0;
+          expect(await d.dispatch({ kind: 'set_light', entityId: 'light.l', state: 'on', brightnessPct: 40, kelvin }), `${kelvin}`).to.deep.equal({
+            ok: true,
+            writes: 2,
+          });
+          expect(writes, `${kelvin}`).to.deep.equal([
+            ['l.0.on', true],
+            ['l.0.level', 40],
+          ]);
+          expect(warnings.filter((w) => w.includes('colour temperature') && w.includes('2200..6500')), `${kelvin}`).to.have.length(1);
+        }
         writes = [];
-        expect(await d.dispatch({ kind: 'set_light', entityId: 'light.l', state: 'on', kelvin }), `${kelvin}`).to.deep.equal({
-          ok: false,
-          reason: 'value_out_of_range',
-          applied: 0,
-        });
-        expect(writes, `${kelvin}`).to.deep.equal([]);
-      }
-      writes = [];
-      expect(await d.dispatch({ kind: 'set_light', entityId: 'light.l', state: 'on', kelvin: 2200 })).to.deep.equal({ ok: true, writes: 2 });
-      expect(writes).to.deep.equal([
-        ['l.0.on', true],
-        ['l.0.ct', 2200],
-      ]);
+        expect(await d.dispatch({ kind: 'set_light', entityId: 'light.l', state: 'on', kelvin: 2200 })).to.deep.equal({ ok: true, writes: 2 });
+        expect(writes).to.deep.equal([
+          ['l.0.on', true],
+          ['l.0.ct', 2200],
+        ]);
+      });
+
+      it('skips, with its reason, a CT the parser could not read, and still switches the light on', async () => {
+        const { d, warnings } = withWarnings(lightOf({ temperature: channel('ct', { min: 2200, max: 6500 }) }));
+        const call = parseLightCommand('{"entity_id":"light.l","state":"on","color_temp_kelvin":"warm"}');
+        expect(await d.dispatch(call)).to.deep.equal({ ok: true, writes: 1 });
+        expect(writes).to.deep.equal([['l.0.on', true]]);
+        expect(warnings.filter((w) => w.includes('colour temperature')), warnings.join(' | ')).to.have.length(1);
+      });
+
+      it('skips a CT for a light whose CT channel is read-only, or in a unit it cannot convert', async () => {
+        for (const temperature of [channel('ct', { write: false }), channel('ct', { unit: '%', min: 0, max: 100 })]) {
+          const { d, warnings } = withWarnings(lightOf({ temperature }));
+          writes = [];
+          expect(await d.dispatch({ kind: 'set_light', entityId: 'light.l', state: 'on', kelvin: 3000 })).to.deep.equal({ ok: true, writes: 1 });
+          expect(writes).to.deep.equal([['l.0.on', true]]);
+          expect(warnings.filter((w) => w.includes('colour temperature')), JSON.stringify(temperature)).to.have.length(1);
+        }
+      });
+
+      it('writes a CT to a mired channel in mireds, and accepts exactly the whole range it published', async () => {
+        const mired = lightOf({ temperature: channel('ct', { unit: 'mired', min: 150, max: 500 }) });
+        const { d } = withWarnings(mired);
+        for (const [kelvin, landed] of [[2703, 370], [4000, 250], [2000, 500], [6666, 150]] as const) {
+          writes = [];
+          await d.dispatch({ kind: 'set_light', entityId: 'light.l', kelvin });
+          expect(writes, `${kelvin} K`).to.deep.equal([['l.0.ct', landed]]);
+        }
+        // Fractional kelvin bounds: the firmware rounds 6535.95 to 6536 unless
+        // it is sent whole; published whole and inward, 6535 is the top.
+        const fractional = lightOf({ temperature: channel('ct', { unit: 'K', min: 2202.4, max: 1e6 / 153 }) }, { 'l.0.on': at(true) });
+        expect(fractional.attributes).to.include({ min_color_temp_kelvin: 2203, max_color_temp_kelvin: 6535 });
+        const second = withWarnings(fractional);
+        writes = [];
+        expect(await second.d.dispatch({ kind: 'set_light', entityId: 'light.l', state: 'on', kelvin: 6535 })).to.deep.equal({ ok: true, writes: 2 });
+        writes = [];
+        expect(await second.d.dispatch({ kind: 'set_light', entityId: 'light.l', state: 'on', kelvin: 6536 })).to.deep.equal({ ok: true, writes: 1 });
+        expect(writes).to.deep.equal([['l.0.on', true]]);
+      });
     });
 
     it('publishes back exactly the brightness percent it wrote, for every percent over a sweep of ranges (N1)', async () => {

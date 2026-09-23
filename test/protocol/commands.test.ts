@@ -53,22 +53,32 @@ describe('protocol/commands', () => {
   });
 
   // Round 2: this test pinned the clamp -- [999,-4,90] became [255,0,90] and
-  // 90000 K became 15000, each written with ok:true. The same defect class as
-  // M1b: out-of-range components and temperatures are refused, never clamped.
-  // The firmware never sends one (uint8 components; a colour temperature the
-  // popup clamps to the published range, light_popup.cpp:1598-1608).
-  it('refuses rgb components outside 0..255 and a colour temperature outside 1000..15000 K, rather than clamping them', () => {
+  // 90000 K became 15000, each written with ok:true. rgb components are still
+  // refused, never clamped: the firmware sends uint8 components.
+  //
+  // Round 3 (Ruling 59) reverses the colour-temperature half: round 2 refused
+  // 999 and 90000 K here, and with a mired bulb published as kelvin the
+  // panel's own CT (370) fell outside that window and took "on" down with it.
+  // A colour temperature never stops a light switching on: any positive
+  // number passes, rounded, and the light's own range decides at dispatch; a
+  // value that is no temperature at all is skipped, with its reason carried
+  // to the dispatcher to log.
+  it('refuses rgb components outside 0..255, and never refuses a light command for its colour temperature', () => {
     for (const rgb of [[999, 0, 90], [0, -4, 90], [0, 0, 256]]) {
       expect(() => parseLightCommand(JSON.stringify({ entity_id: 'light.d', rgb_color: rgb })), JSON.stringify(rgb)).to.throw(
         CommandError,
         'invalid_rgb',
       );
     }
-    for (const kelvin of [90000, 15001, 999]) {
-      expect(() => parseLightCommand(JSON.stringify({ entity_id: 'light.d', color_temp_kelvin: kelvin })), String(kelvin)).to.throw(
-        CommandError,
-        'invalid_kelvin',
-      );
+    for (const kelvin of [90000, 15001, 999, 370.4]) {
+      const call = parseLightCommand(JSON.stringify({ entity_id: 'light.d', state: 'on', color_temp_kelvin: kelvin }));
+      expect((call as { kelvin?: number }).kelvin, String(kelvin)).to.equal(Math.round(kelvin));
+    }
+    for (const kelvin of ['warm', 0, -5, null]) {
+      const call = parseLightCommand(JSON.stringify({ entity_id: 'light.d', state: 'on', brightness_pct: 40, color_temp_kelvin: kelvin }));
+      expect(call, String(kelvin)).to.deep.include({ kind: 'set_light', state: 'on', brightnessPct: 40 });
+      expect(call, String(kelvin)).to.not.have.property('kelvin');
+      expect((call as { skippedKelvin?: string }).skippedKelvin, String(kelvin)).to.be.a('string');
     }
     expect(parseLightCommand('{"entity_id":"light.d","rgb_color":[255,0,89.6],"color_temp_kelvin":15000}')).to.deep.equal({
       kind: 'set_light',

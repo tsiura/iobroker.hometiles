@@ -11,6 +11,8 @@ export type ServiceCall =
       brightnessPct?: number;
       rgb?: [number, number, number];
       kelvin?: number;
+      /** Why a color_temp_kelvin that was sent is not in `kelvin` (Ruling 59: skipped, never refused). */
+      skippedKelvin?: string;
     }
   | { kind: 'activate_scene'; alias: string }
   | { kind: 'set_temperature'; entityId: string; value?: number; low?: number; high?: number }
@@ -81,7 +83,7 @@ function requireNumber(value: unknown, code: string): number {
 /**
  * A whole number as the firmware sends one, refused -- never clamped --
  * outside min..max: clamping another client's 150 wrote 100 with ok:true
- * (Task 8 round 1, M1b; rgb and kelvin in round 2).
+ * (Task 8 round 1, M1b; rgb in round 2).
  */
 function requireWhole(value: unknown, code: string, min: number, max: number): number {
   const whole = Math.round(requireNumber(value, code));
@@ -157,9 +159,15 @@ export function parseLightCommand(raw: string): ServiceCall {
   }
 
   if (hasKelvin) {
-    // A plausibility bound only: the dispatcher refuses a colour temperature
-    // outside the light's own declared range.
-    call.kelvin = requireWhole(payload.color_temp_kelvin, 'invalid_kelvin', 1000, 15000);
+    // Ruling 59: a colour temperature never refuses the call. The power
+    // button of a light with CT but no colour always sends one together with
+    // "on" (light_popup.cpp:1616-1618, 1021-1038), so a CT the light cannot
+    // take must not stop it switching on. An unusable one is skipped here;
+    // the dispatcher skips one outside the light's own range, both out loud.
+    // The value itself is not echoed: it came from the wire.
+    const kelvin = payload.color_temp_kelvin;
+    if (typeof kelvin === 'number' && Number.isFinite(kelvin) && kelvin > 0) call.kelvin = Math.round(kelvin);
+    else call.skippedKelvin = 'color_temp_kelvin is not a positive number';
   }
 
   return call;

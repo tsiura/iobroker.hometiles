@@ -230,7 +230,8 @@ describe('registry/synth/climate', () => {
     values['climate.0.mode'] = numState(1);
     const e = synthClimate(device, 'climate.test', values);
     // Task 8: `write` (Ruling 38) and the current raw value (Ruling 41) ride
-    // along; round 1 adds the declared range (Ruling 49), none here.
+    // along; round 1 adds the declared range (Ruling 49), round 3 the unit
+    // (Ruling 59), none of either here.
     expect(e?.channelMeta?.mode).to.deep.equal({
       type: 'number',
       states: { '1': 'heat' },
@@ -238,6 +239,7 @@ describe('registry/synth/climate', () => {
       current: 1,
       min: undefined,
       max: undefined,
+      unit: undefined,
     });
   });
 

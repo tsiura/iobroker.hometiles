@@ -224,7 +224,8 @@ describe('registry/synth/cover', () => {
     values['cover.0.set'] = numState(40);
     const e = synthCover(device, 'cover.test', values);
     // Task 8: `write` (Ruling 38) and the current raw value (Ruling 41) ride
-    // along; round 1 adds the declared range (Ruling 49), none here.
+    // along; round 1 adds the declared range (Ruling 49), round 3 the unit
+    // (Ruling 59), none of either here.
     expect(e.channelMeta?.set).to.deep.equal({
       type: 'number',
       states: undefined,
@@ -232,6 +233,7 @@ describe('registry/synth/cover', () => {
       current: 40,
       min: undefined,
       max: undefined,
+      unit: undefined,
     });
   });
 
@@ -246,6 +248,7 @@ describe('registry/synth/cover', () => {
       current: true,
       min: undefined,
       max: undefined,
+      unit: undefined,
     });
   });
 
@@ -481,6 +484,32 @@ describe('registry/synth/cover', () => {
     expect(blind(2).state).to.equal('open');
     expect(blind(254).attributes.current_position).to.equal(100);
     expect(blind(254).state).to.equal('open');
+  });
+
+  it('clamps a reading outside its declared range to 0..100 before the state is derived from it (Ruling 59.4)', () => {
+    // 1..100 at raw 0 is -1%: published as -1 with the state "open", which the
+    // firmware clamped to 0 and so disabled Close on a cover it called open.
+    const blind = (min: number, max: number, raw: number) =>
+      synthCover(
+        {
+          objectId: 'cover.0',
+          name: 'Cover',
+          detectorType: 'blind',
+          domain: 'cover',
+          channels: { set: { objectId: 'cover.0.set', type: 'number', write: true, min, max } },
+        },
+        'cover.test',
+        { 'cover.0.set': numState(raw) },
+      );
+    for (const [min, max, raw, position, state] of [
+      [1, 100, 0, 0, 'closed'],
+      [0, 255, -2, 0, 'closed'],
+      [0, 255, 300, 100, 'open'],
+    ] as const) {
+      const e = blind(min, max, raw);
+      expect(e.attributes.current_position, `${min}..${max} at ${raw}`).to.equal(position);
+      expect(e.state, `${min}..${max} at ${raw}`).to.equal(state);
+    }
   });
 
   describe('bounds a percentage cannot scale over (Ruling 55)', () => {

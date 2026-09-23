@@ -1,5 +1,5 @@
 import { expect } from 'chai';
-import type { ServiceCall } from '../../src/protocol/commands';
+import { parseLightCommand, type ServiceCall } from '../../src/protocol/commands';
 import { buildStatePublish } from '../../src/protocol/state-payload';
 import { discoverDevices } from '../../src/registry/detector';
 import { EntityRegistry } from '../../src/registry/entity-registry';
@@ -170,6 +170,45 @@ const HUE_SET = objects(
   state(`${HUE}.ct`, { role: 'level.color.temperature', type: 'number', min: 2200, max: 6500, unit: 'K', write: true }),
   state(`${HUE}.reachable`, { role: 'indicator.reachable', type: 'boolean', write: false }),
 );
+
+// A bulb exactly as ioBroker.zigbee2mqtt creates one on its DEFAULT
+// configuration (useKelvin false; lib/exposes.js): its colour temperature is
+// in mireds, declared unit "mired", and its colour is one combined string.
+const Z2M = 'zigbee2mqtt.0.0x0017880104a1b2c3';
+const Z2M_SET = objects(
+  device(Z2M, 'Stehlampe'),
+  state(`${Z2M}.state`, { role: 'switch', type: 'boolean', write: true }),
+  state(`${Z2M}.brightness`, { role: 'level.dimmer', type: 'number', min: 0, max: 100, unit: '%', write: true }),
+  state(`${Z2M}.colortemp`, { role: 'level.color.temperature', type: 'number', min: 150, max: 500, unit: 'mired', write: true }),
+  state(`${Z2M}.color`, { role: 'level.color.rgb', type: 'string', write: true }),
+);
+
+// The same bulb through ioBroker.zigbee (lib/models.js:230-242): colortemp
+// declares no unit and no range, and holds zigbee mireds.
+const ZIGBEE = 'zigbee.0.0017880104a1b2c3';
+const ZIGBEE_SET = objects(
+  device(ZIGBEE, 'Stehlampe'),
+  state(`${ZIGBEE}.state`, { role: 'switch', type: 'boolean', write: true }),
+  state(`${ZIGBEE}.brightness`, { role: 'level.dimmer', type: 'number', min: 0, max: 100, unit: '%', write: true }),
+  state(`${ZIGBEE}.colortemp`, { role: 'level.color.temperature', type: 'number', write: true }),
+  state(`${ZIGBEE}.color`, { role: 'level.color.rgb', type: 'string', write: true }),
+);
+
+/**
+ * The colour temperature the panel sends with "on", modelled from the
+ * firmware: bounds rounded (roundf), a missing or non-positive one replaced by
+ * 2000/6535 K, an inverted pair swapped (tile_renderer.cpp:1332-1353), and the
+ * current CT clamped into them (light_popup.cpp:237-252, 1599-1608). A light
+ * with CT but no colour is always in CT mode (light_popup.cpp:1616-1618), so
+ * its power button always carries this.
+ */
+function panelKelvin(payload: Record<string, unknown>): number {
+  const bound = (raw: unknown, fallback: number): number => (typeof raw === 'number' && raw > 0 ? Math.round(raw) : fallback);
+  let min = bound(payload.min_color_temp_kelvin, 2000);
+  let max = bound(payload.max_color_temp_kelvin, 6535);
+  if (min > max) [min, max] = [max, min];
+  return Math.min(max, Math.max(min, Math.round(payload.color_temp_kelvin as number)));
+}
 
 const KEY = 'hm-rpc.1.BidCoS-RF';
 const KEY_SET = objects(
@@ -628,6 +667,49 @@ describe('real type-detector end to end (Task 5c)', () => {
         state: 'on',
       });
     });
+
+    // Ruling 59: mireds published as kelvin showed "370 K", and round 2's
+    // parser then refused the panel's own CT -- every power-button press of a
+    // CT-only bulb carries one -- so nothing at all was written.
+    for (const [label, set, root, bounds] of [
+      ['zigbee2mqtt (default: unit "mired", 150..500)', Z2M_SET, Z2M, { min: 2000, max: 6666 }],
+      ['ioBroker.zigbee (no unit, no range)', ZIGBEE_SET, ZIGBEE, { min: 2000, max: 6535 }],
+    ] as const) {
+      it(`Task 8 round 3: a ${label} mired bulb shows its CT in kelvin, writes CT back in mireds, and always switches on`, async () => {
+        const result = runFor(
+          run(set, { [`${root}.state`]: value(false), [`${root}.brightness`]: value(0), [`${root}.colortemp`]: value(370) }),
+          root,
+        );
+        expect(result.device.channels.temperature?.objectId).to.equal(`${root}.colortemp`);
+        const payload = json(result);
+        expect(payload).to.include({
+          color_temp_kelvin: 2703,
+          min_color_temp_kelvin: bounds.min,
+          max_color_temp_kelvin: bounds.max,
+        });
+        expect(payload.supported_color_modes).to.deep.equal(['color_temp']);
+
+        // Power on from the popup: "on", the restored brightness, the CT.
+        const entityId = result.entity!.entityId;
+        const powerOn = parseLightCommand(
+          JSON.stringify({ entity_id: entityId, state: 'on', brightness_pct: 100, color_temp_kelvin: panelKelvin(payload) }),
+        );
+        const on = await dispatch(result.entity!, powerOn);
+        expect(on.result).to.deep.equal({ ok: true, writes: 3 });
+        expect(on.writes).to.deep.equal([
+          [`${root}.state`, true],
+          [`${root}.brightness`, 100],
+          [`${root}.colortemp`, 370],
+        ]);
+
+        // The CT slider at 4000 K: written back as 250 mired.
+        const slide = await dispatch(result.entity!, parseLightCommand(JSON.stringify({ entity_id: entityId, state: 'on', color_temp_kelvin: 4000 })));
+        expect(slide.writes).to.deep.equal([
+          [`${root}.state`, true],
+          [`${root}.colortemp`, 250],
+        ]);
+      });
+    }
   });
 
   describe('scene', () => {

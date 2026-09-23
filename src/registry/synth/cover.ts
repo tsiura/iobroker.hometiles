@@ -60,12 +60,17 @@ function readBool(device: DeviceInput, name: string, values: Values): boolean | 
  * (0.4%) is 0% AND closed: the panel disables Close at 0 (cover_popup.cpp:
  * 446-449), which is right for a closed cover and was wrong for one it called
  * open.
+ *
+ * Clamped to 0..100 BEFORE that state is derived (Ruling 59.4): a 1..100
+ * blind reporting raw 0 is -1% of its range, which published position -1 --
+ * "open" -- for a cover the panel draws shut. Below its range reads as 0 and
+ * closed, above as 100 and open.
  */
 function readPercent(device: DeviceInput, name: string, values: Values): number | undefined {
   const raw = readNumber(device, name, values);
   const percent = raw === undefined ? undefined : toPercent(raw, device.channels[name]);
-  // `|| 0`: a raw value just below min rounds to -0, which must publish as 0.
-  return percent === undefined ? undefined : Math.round(percent) || 0;
+  // Math.max also turns the -0 of a reading just below min into a plain 0.
+  return percent === undefined ? undefined : Math.min(100, Math.max(0, Math.round(percent)));
 }
 
 /**

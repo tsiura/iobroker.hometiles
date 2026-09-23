@@ -70,7 +70,7 @@ export function baseEntity(
     // write: Ruling 38, for every domain. current: Ruling 41; a value the
     // decoders would not use (isUsable) is no current value either. min/max:
     // the declared range commands are scaled into and checked against
-    // (Ruling 49).
+    // (Ruling 49). unit: what a colour temperature is stored in (Ruling 59).
     channelMeta[name] = {
       type: channel.type,
       states: channel.states,
@@ -78,6 +78,7 @@ export function baseEntity(
       current: isUsable(value) ? value.val : undefined,
       min: channel.min,
       max: channel.max,
+      unit: channel.unit,
     };
     if (value && value.ts > lastChanged) lastChanged = value.ts;
   }
@@ -298,9 +299,9 @@ export function fromPercent(percent: number, codec: Bounds): number | undefined 
 }
 
 /**
- * An absolute channel's declared bounds -- a setpoint, a humidity, a colour
- * temperature. Each finite bound counts on its own, and none is invented; an
- * equal or inverted pair means nothing and is ignored whole (Ruling 55).
+ * An absolute channel's declared bounds -- a setpoint, a humidity. Each finite
+ * bound counts on its own, and none is invented; an equal or inverted pair
+ * means nothing and is ignored whole (Ruling 55).
  */
 export function declaredBounds(codec: Bounds): { min?: number; max?: number } {
   const min = finite(codec?.min);
@@ -312,6 +313,90 @@ export function declaredBounds(codec: Bounds): { min?: number; max?: number } {
 export function withinDeclaredRange(value: number, codec: Bounds): boolean {
   const { min, max } = declaredBounds(codec);
   return (min === undefined || value >= min) && (max === undefined || value <= max);
+}
+
+/**
+ * Ruling 59: a colour-temperature channel as the panel uses it -- in whole
+ * kelvin, however the channel stores it.
+ *
+ * The unit. A declared unit decides: K/kelvin, or mired -- ioBroker.
+ * zigbee2mqtt's DEFAULT (lib/exposes.js: `unit: useKelvin ? 'K' : 'mired'`).
+ * Any other declared unit (a percentage, say) is no temperature this adapter
+ * can convert, so colour temperature is withheld. With no unit declared, two
+ * pieces of evidence decide: ioBroker.zigbee's colortemp declares no unit and
+ * no range and holds zigbee mireds (lib/models.js:230-242), and both zigbee
+ * adapters' own setters read a value above 1000 as kelvin and anything else as
+ * mired (utils.toMired). So the channel's positive numbers -- declared bounds
+ * and current value -- decide by that same threshold; numbers on both sides
+ * cannot be told apart and withhold colour temperature. With no number at
+ * all, the role's documented unit applies: level.color.temperature is "color
+ * temperature in K°" (ioBroker.docs, dev/stateroles.md:253).
+ *
+ * The range. kelvin = 1e6 / mired, so mired bounds swap. A missing bound is
+ * the firmware's own default, 2000 or 6535 K (tile_renderer.cpp:1332-1353),
+ * and both are whole numbers rounded INWARD: the firmware rounds what it is
+ * sent, so a fractional 6535.95 became 6536, above the channel's maximum.
+ * The range the panel clamps to is then exactly the range dispatch accepts,
+ * and every whole kelvin inside it lands inside the channel's declared range.
+ * An empty range withholds colour temperature.
+ */
+export interface ColorTempScale {
+  unit: 'kelvin' | 'mired';
+  minKelvin: number;
+  maxKelvin: number;
+}
+
+type ColorTempCodec = Bounds & Pick<ChannelCodec, 'unit' | 'current'>;
+
+const KELVIN_UNITS = new Set(['k', 'kelvin', '°k', 'k°']);
+const MIRED_UNITS = new Set(['mired', 'mireds', 'mirek', 'mireks']);
+/** utils.toMired in ioBroker.zigbee and ioBroker.zigbee2mqtt: above this, kelvin. */
+const MIRED_MAX = 1000;
+const FIRMWARE_MIN_KELVIN = 2000;
+const FIRMWARE_MAX_KELVIN = 6535;
+
+/** A positive, finite number, from a number or a numeric string. */
+function positive(value: unknown): number | undefined {
+  const numeric = typeof value === 'number' ? value : typeof value === 'string' && value.trim() ? Number(value) : Number.NaN;
+  return Number.isFinite(numeric) && numeric > 0 ? numeric : undefined;
+}
+
+function colorTempUnit(codec: ColorTempCodec): ColorTempScale['unit'] | undefined {
+  const declared = codec.unit?.trim().toLowerCase();
+  if (declared) return KELVIN_UNITS.has(declared) ? 'kelvin' : MIRED_UNITS.has(declared) ? 'mired' : undefined;
+  const numbers = [codec.min, codec.max, codec.current].map(positive).filter((n): n is number => n !== undefined);
+  if (numbers.length && numbers.every((n) => n <= MIRED_MAX)) return 'mired';
+  return numbers.every((n) => n > MIRED_MAX) ? 'kelvin' : undefined;
+}
+
+export function colorTempScale(codec: ColorTempCodec | undefined): ColorTempScale | undefined {
+  const unit = codec && colorTempUnit(codec);
+  if (!unit) return undefined;
+  const min = positive(codec?.min);
+  const max = positive(codec?.max);
+  const [low, high] = unit === 'mired' ? [max && 1e6 / max, min && 1e6 / min] : [min, max];
+  const minKelvin = Math.ceil(low ?? FIRMWARE_MIN_KELVIN);
+  const maxKelvin = Math.floor(high ?? FIRMWARE_MAX_KELVIN);
+  return minKelvin < maxKelvin ? { unit, minKelvin, maxKelvin } : undefined;
+}
+
+/** A channel's reading as the whole kelvin the panel shows (it rounds anyway, tile_renderer.cpp:1324); none if not positive. */
+export function colorTempToKelvin(raw: unknown, scale: ColorTempScale): number | undefined {
+  const value = positive(raw);
+  return value === undefined ? undefined : Math.round(scale.unit === 'mired' ? 1e6 / value : value);
+}
+
+/**
+ * A whole kelvin as the raw value the channel stores. A mired value is
+ * rounded when the declared mired bounds are whole (zigbee2mqtt's 150..500):
+ * every whole kelvin inside the published range then rounds to a mired inside
+ * them. Fractional bounds keep the exact value, which lies inside them.
+ */
+export function colorTempFromKelvin(kelvin: number, scale: ColorTempScale, codec: Bounds): number {
+  if (scale.unit === 'kelvin') return kelvin;
+  const mired = 1e6 / kelvin;
+  const whole = [codec?.min, codec?.max].every((bound) => positive(bound) === undefined || Number.isInteger(bound));
+  return whole ? Math.round(mired) : mired;
 }
 
 export const UNAVAILABLE = STATE_UNAVAILABLE;
