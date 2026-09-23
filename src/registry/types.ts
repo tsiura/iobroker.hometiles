@@ -66,11 +66,16 @@ export type ChannelCodec = Pick<ChannelInput, 'type' | 'states' | 'write' | 'min
   current?: unknown;
 };
 
-/** A device as classified by the detector plus the admin's overrides. */
+/** A device as classified by the detector plus the admin's overrides, or declared by hand (Task 13b). */
 export interface DeviceInput {
+  /**
+   * The key its entity id is persisted under: a detected control's root, or
+   * the state anchoring a root's further control (discoverDevices); for a
+   * manual entity, `manual:<state id>` (registry/manual.ts).
+   */
   objectId: string;
   name: string;
-  /** Raw @iobroker/type-detector type name, kept for diagnostics and the admin table. */
+  /** Raw @iobroker/type-detector type name, or 'manual', kept for diagnostics and the admin table. */
   detectorType: string;
   domain: Domain;
   /**

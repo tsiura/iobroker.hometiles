@@ -11,6 +11,20 @@ export interface AdapterOptions {
   maxPublishQueue: number;
   protocolTrace: boolean;
   deviceOverrides: DeviceOverride[];
+  manualEntities: ManualEntity[];
+}
+
+/**
+ * One state published as one entity of the user's choosing (Task 13b), where
+ * detection reaches none: a 0_userdata.0 helper, a state beside another
+ * control of its channel, a channel's second loose state. Keyed by stateId,
+ * never by list index; registry/manual.ts judges whether the domain suits it.
+ */
+export interface ManualEntity {
+  stateId: string;
+  /** Text as the admin stores it: manualDevices rejects anything but a domain one state can serve. */
+  domain: string;
+  name?: string;
 }
 
 export interface DeviceOverride {
@@ -38,6 +52,7 @@ export const DEFAULTS: AdapterOptions = {
   maxPublishQueue: 2000,
   protocolTrace: false,
   deviceOverrides: [],
+  manualEntities: [],
 };
 
 export function normaliseTopic(value: string | undefined, fallback: string): string {
@@ -90,6 +105,33 @@ function deviceOverrides(value: unknown, warnings: string[]): DeviceOverride[] {
   return overrides;
 }
 
+/** Manual entities as a hand edit may leave them, the shape only (Ruling 58 A). */
+function manualEntities(value: unknown, warnings: string[]): ManualEntity[] {
+  if (value === undefined || value === null) return [];
+  if (!Array.isArray(value)) {
+    warnings.push('manualEntities is not a list; ignoring every manual entity');
+    return [];
+  }
+  const entries: ManualEntity[] = [];
+  value.forEach((raw: unknown, index) => {
+    const entry = raw as Partial<Record<keyof ManualEntity, unknown>> | null;
+    if (typeof entry !== 'object' || entry === null || typeof entry.stateId !== 'string' || !entry.stateId.trim()) {
+      warnings.push(`manualEntities entry ${index + 1} names no state id; ignoring it`);
+      return;
+    }
+    const where = `manualEntities entry ${index + 1} (${entry.stateId})`;
+    if (typeof entry.domain !== 'string') {
+      warnings.push(`${where} names no domain; ignoring it`);
+      return;
+    }
+    const kept: ManualEntity = { stateId: entry.stateId, domain: entry.domain };
+    if (typeof entry.name === 'string') kept.name = entry.name;
+    else if (entry.name !== undefined && entry.name !== null) warnings.push(`${where} has a name that is not text; ignoring the name`);
+    entries.push(kept);
+  });
+  return entries;
+}
+
 function clamp(value: number, min: number, max: number): number {
   if (!Number.isFinite(value)) return min;
   return Math.min(max, Math.max(min, Math.round(value)));
@@ -126,6 +168,7 @@ export function validateOptions(raw: Partial<AdapterOptions>): {
     maxPublishQueue: clamp(raw.maxPublishQueue ?? DEFAULTS.maxPublishQueue, 100, 100000),
     protocolTrace: raw.protocolTrace ?? DEFAULTS.protocolTrace,
     deviceOverrides: deviceOverrides(raw.deviceOverrides, warnings),
+    manualEntities: manualEntities(raw.manualEntities, warnings),
   };
 
   return { options, errors, warnings };

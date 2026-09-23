@@ -110,6 +110,17 @@ describe('registry/entity-id', () => {
     expect(resolved['zigbee.0.abc']).to.equal('sensor.sensor_v1_2');
   });
 
+  it('gives a persisted id to one device only, however the stored map was edited (Task 13b)', () => {
+    // A detected socket keyed by its state and a manual entity on that same
+    // state are two devices; two keys holding one id in a hand-edited store
+    // must not fold them into one entity. The first device keeps the id.
+    const resolved = resolveEntityIds(
+      [device('zigbee.0.abc.state', 'Flur'), device('manual:zigbee.0.abc.state', 'Flur')],
+      { 'zigbee.0.abc.state': 'switch.flur', 'manual:zigbee.0.abc.state': 'switch.flur' },
+    );
+    expect(resolved).to.deep.equal({ 'zigbee.0.abc.state': 'switch.flur', 'manual:zigbee.0.abc.state': 'switch.flur_2' });
+  });
+
   it('falls back to the object id tail when the device has no name', () => {
     const resolved = resolveEntityIds([{ ...device('zigbee.0.kueche', '   '), domain: 'switch' }], {});
     expect(resolved['zigbee.0.kueche']).to.equal('switch.kueche');

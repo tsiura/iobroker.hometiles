@@ -40,10 +40,12 @@ describe('config/options', () => {
       brokerUser: 1,
       brokerPassword: true,
       deviceOverrides: 'none',
+      manualEntities: { stateId: '0_userdata.0.a', domain: 'sensor' },
     } as unknown as Partial<AdapterOptions>;
     const { options, warnings } = validateOptions(raw);
     expect(options).to.deep.equal(DEFAULTS);
-    for (const key of ['brokerHost', 'clientId', 'baseTopic', 'haPrefix', 'brokerUser', 'brokerPassword', 'deviceOverrides']) {
+    const keys = ['brokerHost', 'clientId', 'baseTopic', 'haPrefix', 'brokerUser', 'brokerPassword', 'deviceOverrides', 'manualEntities'];
+    for (const key of keys) {
       expect(warnings.some((warning) => warning.startsWith(`${key} `)), `${key}: ${warnings.join(' | ')}`).to.equal(true);
     }
   });
@@ -64,5 +66,40 @@ describe('config/options', () => {
       { objectId: 'hue.0.b', include: true },
     ]);
     expect(warnings).to.have.length(3);
+  });
+
+  it('keeps only well-formed manual entities, with a warning naming each one dropped (Task 13b)', () => {
+    // The shape only: whether the domain suits the state is manualDevices'
+    // to judge, against the object itself.
+    const raw = {
+      manualEntities: [
+        { stateId: '0_userdata.0.Heizung.Solltemperatur', domain: 'number', name: 'Soll' },
+        null,
+        'sensor',
+        { domain: 'sensor' },
+        { stateId: '   ', domain: 'sensor' },
+        { stateId: 5, domain: 'sensor' },
+        { stateId: '0_userdata.0.Haus.Notiz', domain: 7 },
+        { stateId: '0_userdata.0.Wecker.Aktiv', domain: 'switch', name: 3 },
+        { stateId: '0_userdata.0.Haus.Anwesend', domain: 'binary_sensor', name: null, extra: true },
+        { stateId: '0_userdata.0.Haus.Licht', domain: 'light' },
+      ],
+    } as unknown as Partial<AdapterOptions>;
+    const { options, warnings } = validateOptions(raw);
+    expect(options.manualEntities).to.deep.equal([
+      { stateId: '0_userdata.0.Heizung.Solltemperatur', domain: 'number', name: 'Soll' },
+      { stateId: '0_userdata.0.Wecker.Aktiv', domain: 'switch' },
+      { stateId: '0_userdata.0.Haus.Anwesend', domain: 'binary_sensor' },
+      { stateId: '0_userdata.0.Haus.Licht', domain: 'light' },
+    ]);
+    expect(warnings).to.deep.equal([
+      'manualEntities entry 2 names no state id; ignoring it',
+      'manualEntities entry 3 names no state id; ignoring it',
+      'manualEntities entry 4 names no state id; ignoring it',
+      'manualEntities entry 5 names no state id; ignoring it',
+      'manualEntities entry 6 names no state id; ignoring it',
+      'manualEntities entry 7 (0_userdata.0.Haus.Notiz) names no domain; ignoring it',
+      'manualEntities entry 8 (0_userdata.0.Wecker.Aktiv) has a name that is not text; ignoring the name',
+    ]);
   });
 });

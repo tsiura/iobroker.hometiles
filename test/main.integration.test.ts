@@ -39,6 +39,18 @@ async function waitFor<T>(harness: IntegrationTestHarness, find: () => T | undef
   }
 }
 
+/**
+ * changeAdapterConfig deep-merges (alcalzone-shared extend), which turns a
+ * list the instance's native does not hold yet into an object. manualEntities
+ * has no io-package.json default until its admin table exists (Task 23), so
+ * it is set whole.
+ */
+async function setManualEntities(harness: IntegrationTestHarness, entries: object[]): Promise<void> {
+  const id = 'system.adapter.hometiles.0';
+  const instance = (await harness.objects.getObjectAsync(id)) as { native: Record<string, unknown> } & Record<string, unknown>;
+  await harness.objects.setObjectAsync(id, { ...instance, native: { ...instance.native, manualEntities: entries } });
+}
+
 async function setObjects(harness: IntegrationTestHarness, objects: Record<string, object>): Promise<void> {
   for (const [id, obj] of Object.entries(objects)) await harness.objects.setObjectAsync(id, { _id: id, native: {}, ...obj });
 }
@@ -117,7 +129,25 @@ const BAD_OBJECTS: Record<string, object> = {
   },
 };
 
-const FIXTURE_IDS = [...Object.keys(SENSOR_OBJECTS), ...Object.keys(CORRUPT_ENUM_OBJECTS), ...Object.keys(BAD_OBJECTS)];
+/**
+ * A helper state in a 0_userdata.0 folder: no channel or device above it, so
+ * only a manual entity reaches it (Task 13b).
+ */
+const HELPER = '0_userdata.0.Heizung.Vorlauf';
+const HELPER_OBJECTS: Record<string, object> = {
+  '0_userdata.0.Heizung': { type: 'folder', common: { name: 'Heizung' } },
+  [HELPER]: {
+    type: 'state',
+    common: { name: 'Vorlauf', role: 'value.temperature', type: 'number', unit: '°C', read: true, write: false },
+  },
+};
+
+const FIXTURE_IDS = [
+  ...Object.keys(SENSOR_OBJECTS),
+  ...Object.keys(CORRUPT_ENUM_OBJECTS),
+  ...Object.keys(BAD_OBJECTS),
+  ...Object.keys(HELPER_OBJECTS),
+];
 
 /** A panel as the firmware announces itself: retained on the broker, like its last configuration. */
 const PANEL = 'e2e1';
@@ -381,6 +411,74 @@ if (process.env.HOMETILES_INTEGRATION === '1') {
           expect(named(`${BAD_ALIAS}.ACTUAL`), warnings.join('\n')).to.equal(true);
           // Task 13: the device forced into number is an entity, not left out.
           expect(named(FORCED), warnings.join('\n')).to.equal(false);
+        });
+      });
+
+      suite('manual entities (Task 13b)', (getHarness) => {
+        withCleanFixtures(getHarness);
+        const port = 18855;
+        const { applies, panel } = withBrokerAndPanel(port);
+        const helperState: string[] = [];
+        let logs: LogRecord[] = [];
+
+        it('publishes a 0_userdata state beside the detected devices, with its value', async function () {
+          this.timeout(120000);
+          const harness = getHarness();
+          logs = await captureLogs(harness);
+          await harness.changeAdapterConfig('hometiles', {
+            native: {
+              brokerHost: '127.0.0.1',
+              brokerPort: port,
+              // Overrides are for detected devices: neither key removes it.
+              deviceOverrides: [
+                { objectId: HELPER, include: false },
+                { objectId: `manual:${HELPER}`, include: false },
+              ],
+            },
+          });
+          await setManualEntities(harness, [
+            { stateId: HELPER, domain: 'sensor' },
+            // The detected sensor's own state, under the detected sensor's
+            // own name: the detected one keeps its id.
+            { stateId: `${SENSOR}.temperature`, domain: 'sensor', name: 'Balkon' },
+            { stateId: HELPER, domain: 'number' },
+            { stateId: '0_userdata.0.Heizung.Fehlt', domain: 'sensor' },
+          ]);
+          await setObjects(harness, { ...SENSOR_OBJECTS, ...HELPER_OBJECTS });
+          await harness.states.setStateAsync(HELPER, { val: 41.5, ack: true });
+          panel().on('message', (topic, payload) => {
+            if (topic === 'ha/e2e/sensor/vorlauf/state') helperState.push(payload.toString());
+          });
+          await panel().subscribeAsync('ha/e2e/sensor/vorlauf/state');
+          await harness.startAdapterAndWait(true);
+
+          const apply = await waitFor(harness, () => applies.find((payload) => payload.includes('sensor.vorlauf')), 'the apply');
+          expect(JSON.parse(apply).sensors).to.deep.equal(['sensor.balkon', 'sensor.balkon_2', 'sensor.vorlauf']);
+          const ids = JSON.parse(String((await harness.states.getStateAsync('hometiles.0.info.entityIds'))?.val));
+          expect(ids).to.deep.equal({
+            [SENSOR]: 'sensor.balkon',
+            [`manual:${SENSOR}.temperature`]: 'sensor.balkon_2',
+            [`manual:${HELPER}`]: 'sensor.vorlauf',
+          });
+          await waitFor(harness, () => helperState.find((payload) => payload === '41.5'), "the helper's value");
+        });
+
+        it('publishes the new value when the state changes', async function () {
+          this.timeout(60000);
+          const harness = getHarness();
+          await harness.states.setStateAsync(HELPER, { val: 42, ack: true });
+          await waitFor(harness, () => helperState.find((payload) => payload === '42'), 'the new value');
+        });
+
+        it('names each entry left out once, in one warning, and logs no error', () => {
+          const own = logs.filter((log) => log.message.startsWith('hometiles.0 '));
+          const left = own.filter((log) => log.severity === 'warn' && log.message.includes('Manual entities left out'));
+          expect(left.map((log) => log.message.slice(log.message.indexOf('[Registry]')))).to.deep.equal([
+            `[Registry] Manual entities left out: ${HELPER} (listed more than once; the first entry is used), ` +
+              '0_userdata.0.Heizung.Fehlt (no such object)',
+          ]);
+          const errors = own.filter((log) => log.severity === 'error').map((log) => log.message);
+          expect(errors, errors.join('\n')).to.deep.equal([]);
         });
       });
 

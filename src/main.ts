@@ -12,6 +12,7 @@ import {
 import { discoverDevices, type Discovery, type RootAnchors } from './registry/detector';
 import { parseStringMap } from './registry/entity-id';
 import { EntityRegistry } from './registry/entity-registry';
+import { manualDevices } from './registry/manual';
 import { applyOverrides } from './registry/overrides';
 import { synthesise } from './registry/synth/index';
 import type { DeviceInput, SourceValue, VirtualEntity } from './registry/types';
@@ -309,7 +310,7 @@ class HomeTiles extends utils.Adapter {
   // ---- Registry ----
 
   private async rebuildRegistry(): Promise<void> {
-    const { devices: detected, anchors, ignored, badRoles } = await this.detectDevices();
+    const { devices: detected, anchors, ignored, badRoles, objects } = await this.detectDevices();
     if (ignored.length > 0) {
       this.log.warn(
         `[Registry] Function enums left out, their members are not a list: ${ignored.join(', ')}. ` +
@@ -322,7 +323,16 @@ class HomeTiles extends utils.Adapter {
           'They are detected again once repaired',
       );
     }
-    this.devices = applyOverrides(detected, (this.options.deviceOverrides ?? []) as DeviceOverride[]);
+    const manual = manualDevices(this.options.manualEntities, objects, this.namespace);
+    if (manual.rejected.length > 0) {
+      const rejected = manual.rejected.map(({ stateId, reason }) => `${stateId} (${reason})`);
+      this.log.warn(`[Registry] Manual entities left out: ${rejected.join(', ')}`);
+    }
+    // Overrides are for detected devices; a manual entity is already explicit
+    // (Task 13b). After the detected ones, it never takes an id one of them
+    // would be given.
+    const overridden = applyOverrides(detected, (this.options.deviceOverrides ?? []) as DeviceOverride[]);
+    this.devices = [...overridden, ...manual.devices];
     this.rootAnchors = anchors;
     await this.saveJsonMap(ROOT_ANCHOR_STATE, 'Root anchors: the state each root id stays with', anchors);
 
@@ -374,7 +384,8 @@ class HomeTiles extends utils.Adapter {
     await this.setState('info.entities', this.registry.all().length, true);
   }
 
-  private async detectDevices(): Promise<Discovery> {
+  /** The discovery, and the objects it read: the manual entities' states are among them. */
+  private async detectDevices(): Promise<Discovery & { objects: Record<string, ioBroker.Object> }> {
     const objects = {
       ...(await this.objectsOfType('state')),
       ...(await this.objectsOfType('channel')),
@@ -382,7 +393,7 @@ class HomeTiles extends utils.Adapter {
       // The detector reads function enums from the same map (a lamp in "Licht").
       ...(await this.objectsOfType('enum', 'enum.functions.')),
     };
-    return discoverDevices(objects, this.namespace, this.rootAnchors);
+    return { ...discoverDevices(objects, this.namespace, this.rootAnchors), objects };
   }
 
   /**

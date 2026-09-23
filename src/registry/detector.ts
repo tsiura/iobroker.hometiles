@@ -307,8 +307,36 @@ function channelName(controlType: string, state: DetectedChannel): string | null
   return upper.toLowerCase();
 }
 
-function lastSegment(objectId: string): string {
+export function lastSegment(objectId: string): string {
   return objectId.split('.').pop() ?? objectId;
+}
+
+/**
+ * One state's ChannelInput, from its object's metadata (objectMeta). A
+ * pattern's defaultRole and write flag fill in only where the object is
+ * silent; a manual entity has no pattern and passes none (Task 13b), so both
+ * paths build a channel one way.
+ */
+export function channelInput(
+  objectId: string,
+  info: ObjectMeta | undefined,
+  pattern: Pick<DetectedChannel, 'defaultRole' | 'write'> = {},
+): ChannelInput {
+  const channel: ChannelInput = { objectId };
+  if (info?.role ?? pattern.defaultRole) channel.role = info?.role ?? pattern.defaultRole;
+  if (info?.unit) channel.unit = info.unit;
+  if (info?.type) channel.type = info.type as ChannelInput['type'];
+  if (info?.min !== undefined) channel.min = info.min;
+  if (info?.max !== undefined) channel.max = info.max;
+  if (info?.step !== undefined) channel.step = info.step;
+  if (info?.states) channel.states = info.states;
+  // The object's own common.write first (Ruling 35): the detector skips its
+  // write check for an object carrying the pattern's defaultRole, so a
+  // match proves nothing. The pattern's write fills in only when silent.
+  if (pattern.write !== undefined || info?.write !== undefined) {
+    channel.write = info?.write ?? pattern.write;
+  }
+  return channel;
 }
 
 /**
@@ -344,21 +372,7 @@ export function mapControlToDevice(
     const existing = channels[name];
     if (existing && name !== 'cover') continue;
 
-    const info = meta[state.id];
-    const channel: ChannelInput = { objectId: state.id };
-    if (info?.role ?? state.defaultRole) channel.role = info?.role ?? state.defaultRole;
-    if (info?.unit) channel.unit = info.unit;
-    if (info?.type) channel.type = info.type as ChannelInput['type'];
-    if (info?.min !== undefined) channel.min = info.min;
-    if (info?.max !== undefined) channel.max = info.max;
-    if (info?.step !== undefined) channel.step = info.step;
-    if (info?.states) channel.states = info.states;
-    // The object's own common.write first (Ruling 35): the detector skips its
-    // write check for an object carrying the pattern's defaultRole, so a
-    // match proves nothing. The pattern's write fills in only when silent.
-    if (state.write !== undefined || info?.write !== undefined) {
-      channel.write = info?.write ?? state.write;
-    }
+    const channel = channelInput(state.id, meta[state.id], state);
     if (existing && coverRank(channel.role) >= coverRank(existing.role)) continue;
     channels[name] = channel;
   }
@@ -443,7 +457,11 @@ export interface IoBrokerObject {
  */
 const DETECTED_OBJECT_TYPES = new Set(['state', 'channel', 'device', 'enum']);
 
-function objectMeta(id: string, obj: IoBrokerObject): ObjectMeta {
+/**
+ * What discovery reads of one object. A name is read only as text: a
+ * translated one (an object of languages) is the id's last segment.
+ */
+export function objectMeta(id: string, obj: IoBrokerObject): ObjectMeta {
   const common = (obj.common ?? {}) as Record<string, unknown>;
   return {
     name: typeof common.name === 'string' ? common.name : id.split('.').pop() ?? id,

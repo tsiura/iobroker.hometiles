@@ -66,9 +66,14 @@ export function resolveEntityIds(
   // absent, so a returning device cannot find its id taken by a newcomer.
   for (const entityId of Object.values(persisted)) taken.add(entityId);
 
+  // A persisted id goes to one device only: two keys holding one id, as a
+  // hand-edited store can, would fold two entities into one (Task 13b).
+  const given = new Set<string>();
   for (const device of devices) {
     const existing = persisted[device.objectId];
-    if (existing?.startsWith(`${device.domain}.`)) resolved[device.objectId] = existing;
+    if (!existing?.startsWith(`${device.domain}.`) || given.has(existing)) continue;
+    given.add(existing);
+    resolved[device.objectId] = existing;
   }
 
   for (const device of devices) {
