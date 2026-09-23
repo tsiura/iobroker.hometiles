@@ -436,10 +436,11 @@ function requiredStates(control: DetectedControl): string[] {
  * all). A detection is that control seen again only when an earlier one
  * already claimed EVERY state it requires; one that needs a state nobody
  * claimed is a composite and is kept (Ruling 46). The catch-all `info`
- * means nothing of its own, so it is a repeat when ANY of its states was
- * claimed (Ruling 52). Only state objects count: info's ACTUAL matches any
- * object below its root (ChannelDetector.js:35-37, no objectType), and a
- * channel must never become an entity's reading. The deepest root goes
+ * means nothing of its own: the states an earlier detection claimed are
+ * taken out of it, and it goes only when none of its own is left
+ * (Ruling 57). Only state objects count: info's ACTUAL matches any object
+ * below its root (ChannelDetector.js:35-37, no objectType), and a channel
+ * must never become an entity's reading (Ruling 52). The deepest root goes
  * first, so each control comes from the innermost root that holds it,
  * whatever order the objects came in.
  *
@@ -480,20 +481,25 @@ export function discoverDevices(
     let holder = recorded === undefined ? undefined : controls.find((c) => requiredStates(c).includes(recorded));
     // Kept as recorded: if its control is gone the id goes to nobody.
     if (recorded !== undefined) nextAnchors[rootId] = recorded;
-    for (const control of controls) {
+    for (const detected of controls) {
+      // The catch-all keeps only what no earlier detection claimed: the
+      // kitchen's own note, not the CO2 reading its sub-channel holds.
+      const control =
+        detected.type === 'info'
+          ? { ...detected, states: detected.states.filter((state) => !state.id || !claimed.has(state.id)) }
+          : detected;
       // Claimed even when unmapped, so nothing less specific can later stand
       // in for it over the same states.
       const required = requiredStates(control);
       // The first required state nobody claimed before: none means every one
       // was, and this is a repeat (Ruling 46).
       const own = required.find((id) => !claimed.has(id));
-      const repeat = control.type === 'info' ? control.states.some((s) => s.id && claimed.has(s.id)) : !own;
       for (const id of required) claimed.add(id);
       const anchor = own ?? required[0];
 
       const device = mapControlToDevice(rootId, control, meta);
-      if (device && !holder && recorded === undefined) holder = control;
-      if (control === holder) {
+      if (device && !holder && recorded === undefined) holder = detected;
+      if (detected === holder) {
         if (recorded === undefined && anchor) nextAnchors[rootId] = anchor;
       } else if (device && anchor) {
         device.objectId = anchor;
@@ -504,7 +510,7 @@ export function discoverDevices(
       // holds only what the root's other detections left (:226, :336-361).
       // Beside any other detection, mapped or not, it would publish that
       // control's leftovers as a sensor in its place.
-      if (!device || repeat || (control.type === 'info' && controls.length > 1)) continue;
+      if (!device || !own || (control.type === 'info' && controls.length > 1)) continue;
       devices.push(device);
     }
   }

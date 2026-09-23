@@ -405,9 +405,9 @@ const roomSet = (withLight: boolean, room = ROOM): IoObjects =>
 // A hallway alias channel with one value of its own and a sub-channel that
 // holds nothing (yet): no pattern but info reads the value, and the empty
 // channel object sorts before it.
-const HALL = 'alias.0.Flur';
+const HALL = 'alias.0.Diele';
 const HALL_SET = objects(
-  channel(HALL, 'Flur'),
+  channel(HALL, 'Diele'),
   channel(`${HALL}.Bewegungsmelder`, 'Bewegungsmelder'),
   state(`${HALL}.co2`, { role: 'value.co2', type: 'number', unit: 'ppm', write: false }),
 );
@@ -420,6 +420,26 @@ const KITCHEN_SET = objects(
   channel(`${KITCHEN}.CO2`, 'CO2 Küche'),
   state(`${KITCHEN}.CO2.ACTUAL`, { role: 'value.co2', type: 'number', unit: 'ppm', write: false }),
   state(`${KITCHEN}.Hinweis`, { role: 'text', type: 'string', write: false }),
+);
+
+// The reviewer's two probes (Ruling 57): a hallway channel whose own text
+// state sorts before a CO2 sub-channel, and a station device whose own
+// readings sit beside a PM2.5 sub-channel. Each root's catch-all spans a
+// value the sub-channel holds AND values nothing else holds.
+const FLUR = 'alias.0.Flur';
+const FLUR_SET = objects(
+  channel(FLUR, 'Flur'),
+  state(`${FLUR}.Anzeige`, { role: 'text', type: 'string', write: false }),
+  channel(`${FLUR}.CO2`, 'CO2'),
+  state(`${FLUR}.CO2.ACTUAL`, { role: 'value.co2', type: 'number', unit: 'ppm', write: false }),
+);
+const MQTT_STATION = 'mqtt.0.station';
+const MQTT_STATION_SET = objects(
+  device(MQTT_STATION, 'Station'),
+  state(`${MQTT_STATION}.aqi`, { role: 'value', type: 'number', write: false }),
+  state(`${MQTT_STATION}.status`, { role: 'text', type: 'string', write: false }),
+  channel(`${MQTT_STATION}.pm25`, 'PM2.5'),
+  state(`${MQTT_STATION}.pm25.value`, { role: 'value', type: 'number', unit: 'ug/m3', write: false }),
 );
 
 // A bathroom sensor whose pressure state's own name starts with the root's
@@ -1047,10 +1067,25 @@ describe('discovery orchestration (Task 5d)', () => {
     expect(hall!.payload).to.equal('540');
   });
 
-  it('(Ruling 52) a catch-all that spans a state another control holds is a repeat', () => {
-    // The kitchen's info reads the CO2 channel's state as well as its own
-    // note: publishing it would show the CO2 reading twice, once as "Küche".
-    expect(run(KITCHEN_SET).map(({ device: detected }) => detected.objectId)).to.deep.equal([`${KITCHEN}.CO2`]);
+  it("(Ruling 57) a catch-all drops the states others hold and keeps its own: the kitchen's note", () => {
+    // The kitchen's info spans the CO2 channel's reading and its own note.
+    // Ruling 52(2) dropped it whole; the note is a genuine value, so only
+    // the CO2 reading (held by the CO2 channel) is removed from it.
+    const runs = run(KITCHEN_SET, { [`${KITCHEN}.CO2.ACTUAL`]: value(700), [`${KITCHEN}.Hinweis`]: value('Lüften') });
+    expect(runs.map(({ device: detected }) => detected.objectId)).to.deep.equal([`${KITCHEN}.CO2`, KITCHEN]);
+    expectRealChannels(KITCHEN_SET, runs[1]!.device, { actual: `${KITCHEN}.Hinweis` });
+    expect(runs.map((r) => r.payload)).to.deep.equal(['700', 'Lüften']);
+  });
+
+  it("(Ruling 57) the reviewer's probes: a channel's and a device's own values survive beside a sub-channel", () => {
+    const flur = run(FLUR_SET);
+    expect(flur.map(({ device: detected }) => detected.objectId)).to.deep.equal([`${FLUR}.CO2`, FLUR]);
+    expectRealChannels(FLUR_SET, flur[1]!.device, { actual: `${FLUR}.Anzeige` });
+
+    const station = run(MQTT_STATION_SET);
+    expect(station.map(({ device: detected }) => detected.objectId)).to.deep.equal([`${MQTT_STATION}.pm25`, MQTT_STATION]);
+    expectRealChannels(MQTT_STATION_SET, station[1]!.device, { actual: `${MQTT_STATION}.aqi` });
+    expectNoRequiredStateBacksTwoEntities({ ...FLUR_SET, ...MQTT_STATION_SET });
   });
 
   it("strips the root's name from a state name only as a whole word", () => {
