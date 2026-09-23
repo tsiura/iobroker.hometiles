@@ -81,6 +81,20 @@ describe('registry/entity-id', () => {
     expect(afterReturn['zigbee.0.x']).to.equal('light.decke_2');
   });
 
+  it('does not reuse a persisted id saved under another domain', () => {
+    // The firmware routes a command by the id's domain PREFIX: a light kept
+    // at switch.flurlicht could never receive set_light, and a switch kept at
+    // sensor.pumpe would have every press dropped.
+    const resolved = resolveEntityIds(
+      [
+        { ...device('knx.0.Licht.Flur', 'Flurlicht'), domain: 'light' },
+        { ...device('modbus.0.pumpe', 'Pumpe'), domain: 'switch' },
+      ],
+      { 'knx.0.Licht.Flur': 'switch.flurlicht', 'modbus.0.pumpe': 'sensor.pumpe' },
+    );
+    expect(resolved).to.deep.equal({ 'knx.0.Licht.Flur': 'light.flurlicht', 'modbus.0.pumpe': 'switch.pumpe' });
+  });
+
   it('slugifies a display name whole instead of splitting it on a dot', () => {
     // "Sensor v1.2" must not become sensor.2.
     const resolved = resolveEntityIds([{ ...device('zigbee.0.abc', 'Sensor v1.2'), domain: 'sensor' }], {});

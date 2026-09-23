@@ -32,7 +32,10 @@ export function buildEntityId(domain: Domain, source: string, taken: ReadonlySet
 /**
  * Entity ids are keyed by ioBroker object id and persisted. A rename of the
  * underlying object must never orphan tiles already placed on a panel, so a
- * known object id always keeps the id it was first given.
+ * known object id keeps the id it was first given -- while it stays in that
+ * id's domain. The firmware routes a command by the id's domain prefix, so a
+ * device re-detected as a light at switch.x could never receive set_light;
+ * it gets a new id instead.
  */
 export function resolveEntityIds(
   devices: DeviceInput[],
@@ -47,7 +50,7 @@ export function resolveEntityIds(
 
   for (const device of devices) {
     const existing = persisted[device.objectId];
-    if (existing) resolved[device.objectId] = existing;
+    if (existing?.startsWith(`${device.domain}.`)) resolved[device.objectId] = existing;
   }
 
   for (const device of devices) {

@@ -805,4 +805,12 @@ describe('discovery orchestration (Task 5d)', () => {
     const withoutEnum = Object.fromEntries(Object.entries(LAMP_SET).filter(([, obj]) => obj.type !== 'enum'));
     expect(run(withoutEnum).map(({ device: detected }) => detected.domain)).to.deep.equal(['switch']);
   });
+
+  it('(f) a lamp saved as a socket before its enum existed is not published under the socket id', () => {
+    const registry = new EntityRegistry({ onEntityChanged: () => undefined, onMembershipChanged: () => undefined }, 0);
+    const { entityIds } = registry.rebuild(detectDevices(LAMP_SET), { [LAMP]: 'switch.flurlicht' });
+    expect(entityIds[LAMP]).to.equal('light.flurlicht');
+    const lamp = registry.byId('light.flurlicht')!;
+    expect(buildStatePublish('ha/statestream', lamp)?.topic).to.equal('ha/statestream/light/flurlicht/state');
+  });
 });
