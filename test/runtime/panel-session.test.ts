@@ -1,5 +1,6 @@
 import { expect } from 'chai';
 import { parseAnnouncement } from '../../src/protocol/announce';
+import { buildWeatherPayload } from '../../src/protocol/weather';
 import type { PublishRequest } from '../../src/runtime/mqtt-client';
 import { Dispatcher } from '../../src/runtime/dispatcher';
 import { PanelSession, type PanelTransport } from '../../src/runtime/panel-session';
@@ -33,7 +34,7 @@ function entity(over: Partial<VirtualEntity>): VirtualEntity {
   };
 }
 
-function harness() {
+function harness(now: () => number = Date.now) {
   const published: PublishRequest[] = [];
   const subscribed: string[] = [];
   const transport: PanelTransport = {
@@ -57,7 +58,7 @@ function harness() {
   );
   const warnings: string[] = [];
   const capturingLog = { ...silentLog, warn: (message: string): void => void warnings.push(message) };
-  const session = new PanelSession(parseAnnouncement('a1', ANNOUNCE), transport, dispatcher, capturingLog);
+  const session = new PanelSession(parseAnnouncement('a1', ANNOUNCE), transport, dispatcher, capturingLog, now);
   return { session, published, subscribed, writes, registryEntities, warnings };
 }
 
@@ -319,5 +320,83 @@ describe('runtime/panel-session', () => {
   it('exposes the local I/O channels the panel announced', () => {
     const { session } = harness();
     expect(session.localIo.map((channel) => channel.id)).to.deep.equal(['relay_1']);
+  });
+
+  describe('the weather request (Task 12)', () => {
+    // The popup's cold-cache nudge (mqtt_handlers.cpp:2515-2529): a request
+    // with no response topic, answered by the retained weather state itself.
+    const REQUEST = 'tab5_lvgl/config/a1/weather/request';
+    const home = entity({
+      entityId: 'weather.home',
+      domain: 'weather',
+      state: 'unknown',
+      attributes: { friendly_name: 'Zuhause', temperature: 18.5, temperature_unit: '°C', weather_state: 'Sonnig' },
+    });
+    const answer = { topic: 'ha/statestream/weather/home/weather', payload: buildWeatherPayload(home), retain: true };
+
+    async function started(now: () => number = Date.now): Promise<ReturnType<typeof harness>> {
+      const run = harness(now);
+      await run.session.start();
+      run.session.pushEntityState(home);
+      run.session.pushEntityState(entity({ entityId: 'sensor.t' }));
+      run.published.length = 0;
+      return run;
+    }
+
+    it("subscribes to its own device id's weather request", async () => {
+      const { session, subscribed } = harness();
+      await session.start();
+      expect(subscribed).to.include(REQUEST);
+      expect(session.commandTopics()).to.include(REQUEST);
+    });
+
+    it("answers by publishing the entity's retained weather payload again, on its weather leaf, and on no response topic", async () => {
+      const { session, published } = await started();
+      expect(await session.handleMessage(REQUEST, '{"entity_id":"weather.home"}')).to.equal(true);
+      expect(published).to.deep.equal([answer]);
+    });
+
+    it('ignores malformed JSON and an id that is no weather entity this panel was given', async () => {
+      const { session, published } = await started();
+      for (const payload of ['not json', 'null', '[]', '{}', '{"entity_id":7}', '{"entity_id":"sensor.t"}', '{"entity_id":"weather.elsewhere"}']) {
+        expect(await session.handleMessage(REQUEST, payload), payload).to.equal(true);
+      }
+      expect(published).to.deep.equal([]);
+    });
+
+    it('ignores a repeat for the same entity within a second of its answer', async () => {
+      let now = 10_000;
+      const { session, published } = await started(() => now);
+      await session.handleMessage(REQUEST, '{"entity_id":"weather.home"}');
+      now += 999;
+      await session.handleMessage(REQUEST, '{"entity_id":"weather.home"}');
+      expect(published).to.have.length(1);
+      now += 1;
+      await session.handleMessage(REQUEST, '{"entity_id":"weather.home"}');
+      expect(published).to.deep.equal([answer, answer]);
+    });
+
+    it('answers with the newest state, and no longer once the entity is gone', async () => {
+      let now = 10_000;
+      const { session, published } = await started(() => now);
+      const rainy = { ...home, attributes: { ...home.attributes, weather_state: 'Regen' } };
+      session.pushEntityState(rainy);
+      published.length = 0;
+      await session.handleMessage(REQUEST, '{"entity_id":"weather.home"}');
+      expect(published).to.deep.equal([{ ...answer, payload: buildWeatherPayload(rainy) }]);
+
+      session.clearEntityState('weather.home');
+      expect(published[1]).to.deep.equal({ topic: 'ha/statestream/weather/home/weather', payload: '', retain: true });
+      published.length = 0;
+      now += 1000; // past the repeat window, so only the removal can keep it silent
+      await session.handleMessage(REQUEST, '{"entity_id":"weather.home"}');
+      expect(published).to.deep.equal([]);
+    });
+
+    it("does not take another panel's weather request", async () => {
+      const { session, published } = await started();
+      expect(await session.handleMessage('tab5_lvgl/config/b2/weather/request', '{"entity_id":"weather.home"}')).to.equal(false);
+      expect(published).to.deep.equal([]);
+    });
   });
 });

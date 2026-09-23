@@ -3,6 +3,7 @@ import { buildClimatePayload } from './climate';
 import { buildCoverPayload } from './cover';
 import { buildMediaPayload } from './media';
 import { entityStateTopic } from './topics';
+import { buildWeatherPayload } from './weather';
 
 export interface StatePublish {
   topic: string;
@@ -49,11 +50,21 @@ function payloadShape(domain: Domain): PayloadShape {
   }
 }
 
+/**
+ * Weather's leaf is the literal word `weather`, every other domain's `state`
+ * (mqtt_handlers.cpp:1415). By the id's domain prefix, which is always the
+ * entity's domain (entity-id.ts), so a clear, which has only the id, hits the
+ * topic the publish used.
+ */
+function stateLeaf(entityId: string): 'state' | 'weather' {
+  return entityId.startsWith('weather.') ? 'weather' : 'state';
+}
+
 export function buildStatePublish(haPrefix: string, entity: VirtualEntity): StatePublish | null {
   const shape = payloadShape(entity.domain);
   if (shape === 'none') return null;
 
-  const topic = entityStateTopic(haPrefix, entity.entityId);
+  const topic = entityStateTopic(haPrefix, entity.entityId, stateLeaf(entity.entityId));
 
   if (shape === 'bare') {
     return { topic, payload: entity.state, retain: true };
@@ -86,6 +97,13 @@ export function buildStatePublish(haPrefix: string, entity: VirtualEntity): Stat
     return { topic, payload: buildMediaPayload(entity), retain: true };
   }
 
+  // Weather: an allow-list too. The generic loop would send the provider's
+  // own text, icon URL and raw dates, none of which the panel can place
+  // (src/protocol/weather.ts).
+  if (entity.domain === 'weather') {
+    return { topic, payload: buildWeatherPayload(entity), retain: true };
+  }
+
   const body: Record<string, unknown> = {};
   for (const [key, value] of Object.entries(entity.attributes)) {
     if (value === undefined) continue;
@@ -100,5 +118,5 @@ export function buildStatePublish(haPrefix: string, entity: VirtualEntity): Stat
 
 /** An empty retained payload removes the retained value from the broker. */
 export function buildStateClear(haPrefix: string, entityId: string): StatePublish {
-  return { topic: entityStateTopic(haPrefix, entityId), payload: '', retain: true };
+  return { topic: entityStateTopic(haPrefix, entityId, stateLeaf(entityId)), payload: '', retain: true };
 }

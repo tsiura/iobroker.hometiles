@@ -34,6 +34,11 @@ export function bridgeRequestTopic(deviceId: string): string {
   return `${CONFIG_TOPIC_ROOT}/${deviceId}/bridge/request`;
 }
 
+/** The weather popup's request (network_manager.cpp:583-591). It has no response topic. */
+export function weatherRequestTopic(deviceId: string): string {
+  return `${CONFIG_TOPIC_ROOT}/${deviceId}/weather/request`;
+}
+
 export function commandTopic(baseTopic: string, leaf: string): string {
   return `${baseTopic}/cmnd/${leaf}`;
 }

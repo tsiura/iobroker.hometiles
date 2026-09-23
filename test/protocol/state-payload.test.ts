@@ -1,5 +1,6 @@
 import { expect } from 'chai';
 import { buildStateClear, buildStatePublish } from '../../src/protocol/state-payload';
+import { buildWeatherPayload } from '../../src/protocol/weather';
 import { DOMAINS, type VirtualEntity } from '../../src/registry/types';
 
 function entity(over: Partial<VirtualEntity>): VirtualEntity {
@@ -144,6 +145,29 @@ describe('protocol/state-payload', () => {
     expect(JSON.parse(p!.payload)).to.deep.equal({ state: 'playing', entity_picture: '', media_title: 'Ruhe' });
   });
 
+  it('routes weather through buildWeatherPayload, on the literal `weather` leaf the panel subscribes', () => {
+    // Full rule coverage lives in protocol/weather.test.ts. The firmware
+    // subscribes <prefix>/weather/<id>/weather only (mqtt_handlers.cpp:1415);
+    // the generic loop would send the provider's text and icon URL as they are.
+    const home = entity({
+      entityId: 'weather.home',
+      domain: 'weather',
+      state: 'unknown',
+      attributes: { friendly_name: 'Zuhause', weather_state: 'Leichter Regen', weather_icon: 'https://openweathermap.org/img/w/10d.png' },
+    });
+    const p = buildStatePublish('ha/statestream', home);
+    expect(p).to.deep.equal({ topic: 'ha/statestream/weather/home/weather', payload: buildWeatherPayload(home), retain: true });
+    expect(JSON.parse(p!.payload)).to.deep.equal({ state: 'rainy', condition: 'rainy', name: 'Zuhause' });
+  });
+
+  it('keeps every other domain on the state leaf', () => {
+    for (const domain of DOMAINS.filter((d) => d !== 'weather' && d !== 'scene')) {
+      expect(buildStatePublish('ha/statestream', entity({ entityId: `${domain}.t`, domain, state: 'on' }))!.topic, domain).to.equal(
+        `ha/statestream/${domain}/t/state`,
+      );
+    }
+  });
+
   it('publishes nothing for a scene', () => {
     expect(buildStatePublish('ha/statestream', entity({ entityId: 'scene.n', domain: 'scene' }))).to.equal(null);
   });
@@ -153,6 +177,10 @@ describe('protocol/state-payload', () => {
     expect(p.topic).to.equal('ha/statestream/sensor/gone/state');
     expect(p.payload).to.equal('');
     expect(p.retain).to.equal(true);
+  });
+
+  it('clears a weather entity on the weather leaf it was published on', () => {
+    expect(buildStateClear('ha/statestream', 'weather.gone')).to.deep.equal({ topic: 'ha/statestream/weather/gone/weather', payload: '', retain: true });
   });
 
   it('assigns every domain an explicit payload shape', () => {

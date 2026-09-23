@@ -1,6 +1,6 @@
 import type { Announcement, LocalIoChannel } from '../protocol/announce';
 import { buildApplyPayload, buildIconsPayload, configSignature } from '../protocol/apply';
-import { CommandError, parseCommand } from '../protocol/commands';
+import { CommandError, parseCommand, requireEntityId } from '../protocol/commands';
 import { buildStateClear, buildStatePublish } from '../protocol/state-payload';
 import {
   applyTopic,
@@ -10,6 +10,7 @@ import {
   ioStateTopic,
   PANEL_SETTING_LEAVES,
   stateTopic,
+  weatherRequestTopic,
 } from '../protocol/topics';
 import type { VirtualEntity } from '../registry/types';
 import type { Dispatcher } from './dispatcher';
@@ -30,10 +31,17 @@ export interface PanelTransport {
 const COMMAND_LEAVES = ['light', 'switch', 'scene', 'climate', 'cover', 'media'] as const;
 type CommandLeaf = (typeof COMMAND_LEAVES)[number];
 
+/** A weather request repeated within this long of its answer is not answered again. */
+const WEATHER_REQUEST_REPEAT_MS = 1000;
+
 export class PanelSession {
   private lastSignature: string | null = null;
   private lastIconsPayload: string | null = null;
   private started = false;
+  /** The weather entities pushed to this panel, as last pushed: what its weather request is answered with. */
+  private readonly weathers = new Map<string, VirtualEntity>();
+  /** entity id -> when its weather request was last answered */
+  private readonly weatherAnswered = new Map<string, number>();
 
   online = false;
   ip: string | null = null;
@@ -43,6 +51,7 @@ export class PanelSession {
     private readonly transport: PanelTransport,
     private readonly dispatcher: Dispatcher,
     private readonly log: Logger,
+    private readonly now: () => number = Date.now,
   ) {}
 
   get deviceId(): string {
@@ -82,6 +91,7 @@ export class PanelSession {
     topics.push(stateTopic(this.baseTopic, 'connected'));
     topics.push(stateTopic(this.baseTopic, 'ip'));
     topics.push(bridgeRequestTopic(this.deviceId));
+    topics.push(weatherRequestTopic(this.deviceId));
     for (const leaf of PANEL_SETTING_LEAVES) topics.push(stateTopic(this.baseTopic, leaf));
     for (const channel of this.announcement.localIo) topics.push(ioStateTopic(this.baseTopic, channel.id));
     return topics;
@@ -150,10 +160,12 @@ export class PanelSession {
   pushEntityState(entity: VirtualEntity): void {
     const publish = buildStatePublish(this.haPrefix, entity);
     if (!publish) return;
+    if (entity.domain === 'weather') this.weathers.set(entity.entityId, entity);
     this.transport.publish(publish);
   }
 
   clearEntityState(entityId: string): void {
+    this.weathers.delete(entityId);
     this.transport.publish(buildStateClear(this.haPrefix, entityId));
   }
 
@@ -182,6 +194,11 @@ export class PanelSession {
         return true;
       }
       this.onRefreshRequested(payload.trim() === 'force');
+      return true;
+    }
+
+    if (topic === weatherRequestTopic(this.deviceId)) {
+      this.answerWeatherRequest(payload);
       return true;
     }
 
@@ -214,6 +231,32 @@ export class PanelSession {
 
   /** Set by the manager so a forced refresh can reach the entity registry. */
   onRefreshRequested?: (forced: boolean) => void;
+
+  /**
+   * The weather popup's cold-cache nudge, {"entity_id":"weather.x"}
+   * (mqtt_handlers.cpp:2515-2529). It has no response topic: the answer is the
+   * entity's retained weather state, published again on its weather leaf
+   * (docs/contract-media-weather.md). Unreadable JSON, an id that is no
+   * weather entity of this panel, and a repeat within a second of the last
+   * answer are ignored.
+   */
+  private answerWeatherRequest(payload: string): void {
+    let entityId: string;
+    try {
+      entityId = requireEntityId(JSON.parse(payload) as Record<string, unknown>);
+    } catch {
+      return;
+    }
+    const entity = this.weathers.get(entityId);
+    if (!entity) {
+      this.log.debug(`[Panel ${this.deviceId}] Weather request for ${entityId} ignored: no weather entity of this panel`);
+      return;
+    }
+    const now = this.now();
+    if (now - (this.weatherAnswered.get(entityId) ?? -Infinity) < WEATHER_REQUEST_REPEAT_MS) return;
+    this.weatherAnswered.set(entityId, now);
+    this.pushEntityState(entity);
+  }
 
   private async executeCommand(leaf: CommandLeaf, payload: string): Promise<void> {
     try {

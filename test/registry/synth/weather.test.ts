@@ -1,4 +1,5 @@
 import { expect } from 'chai';
+import { buildStatePublish } from '../../../src/protocol/state-payload';
 import { discoverDevices } from '../../../src/registry/detector';
 import { EntityRegistry } from '../../../src/registry/entity-registry';
 import { synthesise } from '../../../src/registry/synth/index';
@@ -1061,5 +1062,102 @@ describe('weather with the real type-detector (Task 11)', () => {
     // temperature and text; no wind, pressure, humidity, sun or charts.
     expect(subscribe.filter((id) => /\.(windSpeed|pressure|humidity|sunrise|clouds|visibility)$/.test(id))).to.deep.equal([]);
     expect(subscribe).to.include.members([`${OWM}.current.temperature`, `${OWM}.current.state`, `${OWM}.day5.temperatureMax`]);
+  });
+});
+
+describe('the published weather payload, from the real type-detector (Task 12)', () => {
+  /** Runs `read` with the host in `zone`. Node re-reads process.env.TZ on assignment. */
+  function inZone<T>(zone: string, read: () => T): T {
+    const saved = process.env.TZ;
+    process.env.TZ = zone;
+    try {
+      return read();
+    } finally {
+      if (saved === undefined) delete process.env.TZ;
+      else process.env.TZ = saved;
+    }
+  }
+
+  /** Discovery, synth and buildStatePublish -- the path main.ts takes to a panel. */
+  function published(all: IoObjects, values: Record<string, SourceValue>, objectId: string): { topic: string; payload: string } {
+    const publish = buildStatePublish('ha/statestream', only(runAll(all, values), objectId).entity!);
+    expect(publish, 'a weather publish').to.not.equal(null);
+    expect(publish!.retain).to.equal(true);
+    return publish!;
+  }
+
+  it('OpenWeatherMap: the current icon code decides the condition, day by day too; weekday names give no dates', () => {
+    const { topic, payload } = published(OPENWEATHERMAP, OPENWEATHERMAP_VALUES, `${OWM}.day0`);
+    expect(topic).to.equal('ha/statestream/weather/under_test/weather');
+    // The current icon is 10d (rain) beside "Leichter Regen"; day k's is 0(k+1)d.
+    expect(JSON.parse(payload)).to.deep.equal({
+      state: 'rainy',
+      condition: 'rainy',
+      temperature: 18.6,
+      temperature_unit: '°C',
+      name: 'Actual weather or forecast',
+      forecast: [
+        { condition: 'sunny', temperature: 19, templow: 9 },
+        { condition: 'partlycloudy', temperature: 20, templow: 10 },
+        { condition: 'partlycloudy', temperature: 21, templow: 11 },
+        { condition: 'cloudy', temperature: 22, templow: 12 },
+        // 05d and 06d are no code OpenWeatherMap documents: the day's text goes out.
+        { condition: 'Tag 4', temperature: 23, templow: 13 },
+        { condition: 'Tag 5', temperature: 24, templow: 14 },
+      ],
+    });
+  });
+
+  it('DasWetter: the day entity says its missing current temperature with "" ahead of the day, whose date is local', () => {
+    const values = {
+      ...DASWETTER_VALUES,
+      [`${DW}.ForecastDaily.Day_2.symbol_description`]: val('Leichter Regen bei bewölktem Himmel'),
+    };
+    // date_full is 2026-09-23T22:00:00.000Z: local midnight of the 24th in
+    // Berlin, still the 23rd in New York.
+    for (const [zone, date] of [
+      ['Europe/Berlin', '2026-09-24'],
+      ['America/New_York', '2026-09-23'],
+    ] as const) {
+      const { payload } = inZone(zone, () => published(DASWETTER, values, `${DW}.ForecastDaily.Day_2`));
+      const json = JSON.parse(payload) as Record<string, unknown>;
+      expect(json, zone).to.deep.equal({
+        state: 'rainy',
+        condition: 'rainy',
+        temperature: '',
+        temperature_unit: '°C',
+        precipitation_unit: 'mm',
+        name: 'ForecastDaily Day_2',
+        forecast: [{ date_local: date, condition: 'rainy', temperature: 18, templow: 8, precipitation: 1 }],
+      });
+      // Order is the panel's business: its lookups take the first match, so
+      // the day's own `temperature` must come after the current one.
+      expect(Object.keys(json)).to.deep.equal(['state', 'condition', 'temperature', 'temperature_unit', 'precipitation_unit', 'name', 'forecast']);
+    }
+  });
+
+  it('Weather Underground: its YYYY-MM-DD days go out as they are, its text is mapped', () => {
+    const { payload } = inZone('America/New_York', () => published(WEATHERUNDERGROUND, WEATHERUNDERGROUND_VALUES, `${WU}.0d`));
+    const json = JSON.parse(payload) as { forecast: Array<Record<string, unknown>> } & Record<string, unknown>;
+    expect(json).to.include({ state: 'cloudy', condition: 'cloudy', temperature: 16.2, temperature_unit: '°C' });
+    expect(json.forecast.map((day) => day.date_local)).to.deep.equal(['2026-09-23', '2026-09-24', '2026-09-25', '2026-09-26', '2026-09-27', '2026-09-28']);
+    // The icon URLs are no condition, and no `icon` goes out.
+    expect(json.forecast[2]).to.deep.equal({ date_local: '2026-09-25', temperature: 19, templow: 9, precipitation_probability: 10 });
+    expect(payload).to.not.include('wxug');
+  });
+
+  it('publishes no null and no icon for any real adapter tree', () => {
+    for (const [all, values] of [
+      [OPENWEATHERMAP, OPENWEATHERMAP_VALUES],
+      [WEATHERUNDERGROUND, WEATHERUNDERGROUND_VALUES],
+      [ACCUWEATHER, ACCUWEATHER_VALUES],
+      [DASWETTER, DASWETTER_VALUES],
+      [aliasWeather('Jetzt'), aliasValues('Jetzt')],
+    ] as const) {
+      for (const run of weathers(runAll(all, values))) {
+        const payload = buildStatePublish('ha/statestream', run.entity!)!.payload;
+        expect(payload, run.device.objectId).to.not.match(/null|"icon"/);
+      }
+    }
   });
 });

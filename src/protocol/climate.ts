@@ -143,7 +143,7 @@ export function usableNumber(value: unknown): number | undefined {
 }
 
 /** A blank or whitespace-only string is "no value", same reasoning as usableNumber. */
-function usableString(value: unknown): string | undefined {
+export function usableString(value: unknown): string | undefined {
   if (typeof value !== 'string') return undefined;
   const text = value.trim();
   return text ? text : undefined;
