@@ -82,6 +82,19 @@ function requireNumber(value: unknown, code: string): number {
   return numeric;
 }
 
+/**
+ * A percentage as the firmware sends one: a whole number in 0..100
+ * (mqttPublishLightCommand and mqttPublishCoverCommand both cap it). Outside
+ * that it is refused, never clamped -- clamping another client's 150 wrote
+ * 100 with ok:true (Task 8 round 1, M1b).
+ */
+function requirePercent(value: unknown, code: string): number {
+  const percent = Math.round(requireNumber(value, code));
+  if (percent < 0 || percent > 100) throw new CommandError(code);
+  // `|| 0`: -0.4 rounds to -0, which must land as a plain 0.
+  return percent || 0;
+}
+
 function requireMode(value: unknown, code: string): string {
   const text = typeof value === 'string' ? value.trim().toLowerCase() : '';
   if (!text) throw new CommandError(code);
@@ -131,7 +144,7 @@ export function parseLightCommand(raw: string): ServiceCall {
   }
 
   if (hasBrightness) {
-    call.brightnessPct = clamp(requireNumber(payload.brightness_pct, 'invalid_brightness'), 0, 100);
+    call.brightnessPct = requirePercent(payload.brightness_pct, 'invalid_brightness');
   }
 
   if (hasRgb) {
@@ -222,8 +235,9 @@ export function parseClimateCommand(raw: string): ServiceCall {
  * All ten cover commands share one topic, cmnd/cover, discriminated by a
  * "command" field -- exactly the firmware's fixed allow-list
  * (mqttPublishCoverCommand, mqtt_handlers.cpp:2268-2271; see
- * docs/contract-climate-cover.md, Cover "Outbound commands"). Positions are
- * clamped to 0..100 as the firmware's own publisher does (:2290-2291).
+ * docs/contract-climate-cover.md, Cover "Outbound commands"). The firmware's
+ * own publisher clamps a position to 0..100 (:2290-2291), so one outside it
+ * came from another client and is refused (requirePercent).
  */
 export function parseCoverCommand(raw: string): ServiceCall {
   const payload = parseObject(raw);
@@ -232,16 +246,12 @@ export function parseCoverCommand(raw: string): ServiceCall {
 
   switch (command) {
     case 'set_cover_position':
-      return {
-        kind: 'set_cover_position',
-        entityId,
-        value: clamp(requireNumber(payload.position, 'invalid_position'), 0, 100),
-      };
+      return { kind: 'set_cover_position', entityId, value: requirePercent(payload.position, 'invalid_position') };
     case 'set_cover_tilt_position':
       return {
         kind: 'set_cover_tilt_position',
         entityId,
-        value: clamp(requireNumber(payload.tilt_position, 'invalid_tilt_position'), 0, 100),
+        value: requirePercent(payload.tilt_position, 'invalid_tilt_position'),
       };
     case 'open_cover':
     case 'close_cover':

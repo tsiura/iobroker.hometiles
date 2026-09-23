@@ -1,8 +1,8 @@
-import type { DeviceInput, VirtualEntity } from '../types';
+import type { ChannelInput, DeviceInput, VirtualEntity } from '../types';
 import { STATE_OFF, STATE_ON } from '../types';
-import { baseEntity, isUsable, readChannel, toBoolState, UNAVAILABLE, type Values } from './common';
+import { baseEntity, isUsable, readChannel, toBoolState, toPercent, UNAVAILABLE, type Values } from './common';
 
-/** ioBroker dimmers are 0..100 percent; Home Assistant brightness is 0..255. */
+/** The panel's 0..100 percent (a dimmer's declared range is scaled into it, Ruling 49) onto HA's 0..255. */
 function percentToHaBrightness(percent: number): number {
   const clamped = Math.min(100, Math.max(0, percent));
   return Math.round((clamped * 255) / 100);
@@ -28,16 +28,28 @@ export function synthLight(device: DeviceInput, entityId: string, values: Values
   const { source, channelMeta, lastChanged, friendly } = baseEntity(device, entityId, values);
   const attributes: Record<string, unknown> = { ...friendly };
 
-  // Colour modes come only from channels that exist. Never from a current value.
-  const hasDimmer = Boolean(device.channels.dimmer || device.channels.brightness);
+  // Colour modes come only from channels that can be COMMANDED -- configured
+  // and not read-only (Ruling 38 refuses a write to one) -- never from a
+  // current value (Task 8 round 1, M3). The level is the channel the
+  // dispatcher writes a brightness to: DIMMER when the device has one, else
+  // BRIGHTNESS.
+  const commandable = (channel: ChannelInput | undefined): boolean => channel !== undefined && channel.write !== false;
+  const hasDimmer = commandable(device.channels.dimmer ?? device.channels.brightness);
   // Colour is advertised ONLY when the three component channels exist, because
   // those are the only ones the dispatcher can write. rgbSingle, rgbwSingle and
   // cie carry colour on a single combined channel (rgb / rgbw / cie) that the
   // v0.1 command path has no encoder for; advertising them would put a colour
   // picker on the panel whose writes silently do nothing. Such a bulb still
   // works for on/off, brightness and colour temperature.
-  const hasRgb = Boolean(device.channels.red && device.channels.green && device.channels.blue);
-  const hasCt = Boolean(device.channels.temperature);
+  //
+  // Colour and colour temperature also need a commandable level: the panel
+  // draws a brightness slider for every colour and colour-temperature mode
+  // (HomeTiles tile_renderer.cpp:1446, "every color and color-temperature mode
+  // is also dimmable"), so without one each slider move would drop its
+  // brightness and still report success.
+  const hasRgb =
+    hasDimmer && commandable(device.channels.red) && commandable(device.channels.green) && commandable(device.channels.blue);
+  const hasCt = hasDimmer && commandable(device.channels.temperature);
 
   const modes: string[] = [];
   if (hasCt) modes.push('color_temp');
@@ -56,9 +68,14 @@ export function synthLight(device: DeviceInput, entityId: string, values: Values
   const setRead = actualRead && isUsable(actualRead.value) ? actualRead : setChannelRead;
   // rgb, rgbSingle, rgbwSingle, hue, ct and cie carry their level on DIMMER
   // *or* BRIGHTNESS, depending on which detector pattern matched (see
-  // hasDimmer above, and dispatcher.ts's matching write-side fallback). Both
-  // are ioBroker 0..100 percent, so the same scaling applies to either.
-  const dimmerPercent = readNumber(device, 'dimmer', values) ?? readNumber(device, 'brightness', values);
+  // hasDimmer above, and dispatcher.ts's matching write-side fallback). Each
+  // is read in its own declared range (Ruling 49): a 0..254 dimmer at 127 is
+  // 50%, not 100% clamped.
+  const levelPercent = (name: string): number | undefined => {
+    const raw = readNumber(device, name, values);
+    return raw === undefined ? undefined : toPercent(raw, device.channels[name]);
+  };
+  const dimmerPercent = levelPercent('dimmer') ?? levelPercent('brightness');
   const anyUsable = Boolean(setRead && isUsable(setRead.value)) || dimmerPercent !== undefined;
 
   if (!anyUsable) {

@@ -1,6 +1,6 @@
 import type { ChannelInput, DeviceInput, VirtualEntity } from '../types';
 import { STATE_OFF, STATE_ON, STATE_UNAVAILABLE, STATE_UNKNOWN } from '../types';
-import { baseEntity, isUsable, readChannel, toBoolState, type Values } from './common';
+import { baseEntity, isUsable, readChannel, toBoolState, toPercent, type Values } from './common';
 
 /**
  * The two steady Cover states this synth can derive on its own. blinds/
@@ -47,13 +47,23 @@ function readBool(device: DeviceInput, name: string, values: Values): boolean | 
 }
 
 /**
+ * A position channel's reading as the panel's percentage, in that channel's
+ * OWN declared range (Ruling 49): raw 200 of a 0..255 blind is ~78%, never
+ * 200, which the firmware would clamp to fully open.
+ */
+function readPercent(device: DeviceInput, name: string, values: Values): number | undefined {
+  const raw = readNumber(device, name, values);
+  return raw === undefined ? undefined : toPercent(raw, device.channels[name]);
+}
+
+/**
  * Position, preferring live feedback over the last commanded target -- the
  * same precedence switch.ts and light.ts already use for their own
  * ACTUAL/SET pairs ("ACTUAL is real feedback and wins over the last command
  * written to SET").
  */
 function readPosition(device: DeviceInput, actualName: string, setName: string, values: Values): number | undefined {
-  return readNumber(device, actualName, values) ?? readNumber(device, setName, values);
+  return readPercent(device, actualName, values) ?? readPercent(device, setName, values);
 }
 
 function setWritable(writable: Record<string, boolean>, role: string, channel: ChannelInput | undefined): void {

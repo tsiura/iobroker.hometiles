@@ -210,6 +210,57 @@ describe('registry/synth light and scene', () => {
     expect(e.attributes.friendly_name).to.equal('Gute Nacht');
   });
 
+  // --- Task 8 round 1 --------------------------------------------------
+
+  it('reads a dimmer in its own declared range (Ruling 49): 0..254 and 0..255 dimmers', () => {
+    const level = (max: number, raw: number) =>
+      synthLight(
+        {
+          ...dimmer,
+          channels: { dimmer: { objectId: 'hue.0.dim.level', type: 'number', min: 0, max, write: true } },
+        },
+        'light.esstisch',
+        { 'hue.0.dim.level': value(raw) },
+      ).attributes;
+    expect(level(254, 127)).to.include({ brightness_pct: 50, brightness: 128 });
+    expect(level(255, 255)).to.include({ brightness_pct: 100, brightness: 255 });
+    // Raw 200 of 255 is HA brightness 200, not 255 (200% clamped).
+    expect(level(255, 200)).to.include({ brightness_pct: 78, brightness: 200 });
+  });
+
+  describe('advertises only what can be commanded (M3)', () => {
+    const modes = (channels: DeviceInput['channels']): unknown =>
+      synthLight({ ...onOff, channels: { set: onOff.channels.set!, ...channels } }, 'light.x', {}).attributes.supported_color_modes;
+    const level = (write?: boolean) => ({ objectId: 'l.0.level', type: 'number' as const, write });
+    const ct = (write?: boolean) => ({ objectId: 'l.0.ct', type: 'number' as const, write });
+    const rgb = (write?: boolean) => ({
+      red: { objectId: 'l.0.r', type: 'number' as const, write: true },
+      green: { objectId: 'l.0.g', type: 'number' as const, write },
+      blue: { objectId: 'l.0.b', type: 'number' as const, write: true },
+    });
+
+    it('drops brightness for a read-only DIMMER or BRIGHTNESS, and keeps one whose write flag is silent', () => {
+      expect(modes({ dimmer: level(false) })).to.deep.equal(['onoff']);
+      expect(modes({ brightness: level(false) })).to.deep.equal(['onoff']);
+      expect(modes({ dimmer: level(undefined) })).to.deep.equal(['brightness']);
+    });
+
+    it('drops colour temperature and colour whose own channel is read-only', () => {
+      expect(modes({ dimmer: level(true), temperature: ct(false) })).to.deep.equal(['brightness']);
+      expect(modes({ dimmer: level(true), ...rgb(false) })).to.deep.equal(['brightness']);
+      expect(modes({ dimmer: level(true), temperature: ct(true), ...rgb(true) })).to.deep.equal(['color_temp', 'rgb']);
+    });
+
+    it('drops colour and colour temperature when the level cannot be commanded, since the panel dims every colour mode', () => {
+      // HomeTiles tile_renderer.cpp:1446: supports_brightness is set by any
+      // colour or colour-temperature mode, so each of these would draw a
+      // brightness slider whose value lands nowhere.
+      expect(modes({ dimmer: level(false), temperature: ct(true), ...rgb(true) })).to.deep.equal(['onoff']);
+      expect(modes({ temperature: ct(true) })).to.deep.equal(['onoff']);
+      expect(modes({ ...rgb(true) })).to.deep.equal(['onoff']);
+    });
+  });
+
   it('dispatches to the right synthesiser by domain', () => {
     // synthesise's return type is VirtualEntity | null because climate can
     // detect a device with nothing usable at all (see synthClimate); light

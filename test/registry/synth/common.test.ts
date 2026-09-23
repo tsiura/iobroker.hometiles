@@ -1,5 +1,5 @@
 import { expect } from 'chai';
-import { encodeChannelValue, toBoolState } from '../../../src/registry/synth/common';
+import { encodeChannelValue, fromPercent, toBoolState, toPercent, withinDeclaredRange } from '../../../src/registry/synth/common';
 import { synthClimate } from '../../../src/registry/synth/climate';
 import type { ChannelCodec, DeviceInput, SourceValue } from '../../../src/registry/types';
 
@@ -22,9 +22,11 @@ describe('registry/synth/common: encodeChannelValue', () => {
   });
 
   it('round-trips a numeric MODE with no states map', () => {
-    // readEnum: raw=3 (number, no states) -> String(3) -> decodes "3".
-    const codec: ChannelCodec = { type: 'number' };
-    const encoded = encodeChannelValue(codec, '3');
+    // readEnum: raw=3 (number, no states) -> String(3) -> decodes "3". With
+    // no map no list is published, so the decoded current value is the only
+    // name the panel can send back (Task 8 round 1, M1a).
+    const codec: ChannelCodec = { type: 'number', current: 3 };
+    const encoded = encodeChannelValue(codec, '3', '3');
     expect(encoded).to.equal(3);
     expect(typeof encoded).to.equal('number');
   });
@@ -120,8 +122,82 @@ describe('registry/synth/common: encodeChannelValue', () => {
       expect(encodeChannelValue({ type: 'number', states: { '0': 'AUS', '100': 'MAX' }, current: 100 }, '100', '100')).to.equal(100);
     });
 
-    it('leaves an unmapped number channel accepting any finite number, as before', () => {
-      expect(encodeChannelValue({ type: 'number', current: 42 }, '43', '42')).to.equal(43);
+    // Task 8 round 1, M1a (reverses what this test pinned in Task 8): with no
+    // map there is no list to publish, so the panel can only ever send the
+    // current value back. Anything else came from another MQTT client:
+    // "100000" into a SPEED_LEVEL declared 0..100, "42" into an unmapped MODE.
+    it('lets an unmapped number channel take only its current value', () => {
+      expect(encodeChannelValue({ type: 'number', current: 42 }, '42', '42')).to.equal(42);
+      expect(encodeChannelValue({ type: 'number', current: 42 }, '43', '42')).to.equal(undefined);
+      expect(encodeChannelValue({ type: 'number', current: 50, min: 0, max: 100 }, '100000', '50')).to.equal(undefined);
+      // With no current value known there is nothing it could re-select.
+      expect(encodeChannelValue({ type: 'number' }, '42')).to.equal(undefined);
+      expect(encodeChannelValue({ type: 'number', current: 42 }, '42')).to.equal(undefined);
+    });
+  });
+
+  // Ruling 49: the panel speaks percent for cover position/tilt and light
+  // brightness; a channel speaks its declared min..max. One linear map, both
+  // directions.
+  describe('percent scaling (Ruling 49)', () => {
+    const range = (min?: number, max?: number): ChannelCodec => ({ type: 'number', min, max });
+
+    it('is the identity for a 0..100 channel and for one that declares no range', () => {
+      for (const codec of [range(0, 100), range(), undefined]) {
+        for (const value of [0, 1, 33.3, 50, 99.5, 100]) {
+          expect(toPercent(value, codec), `${JSON.stringify(codec)} ${value}`).to.equal(value);
+          expect(fromPercent(value, codec), `${JSON.stringify(codec)} ${value}`).to.equal(value);
+        }
+      }
+    });
+
+    it('never invents a range: one bound, equal bounds, inverted or non-finite bounds all pass through unscaled', () => {
+      for (const codec of [range(0), range(undefined, 255), range(40, 40), range(255, 0), range(0, Number.POSITIVE_INFINITY), range(Number.NaN, 255)]) {
+        expect(toPercent(200, codec), JSON.stringify(codec)).to.equal(200);
+        expect(fromPercent(50, codec), JSON.stringify(codec)).to.equal(50);
+      }
+    });
+
+    it('scales a 0..255 channel both ways: published exactly, written as the nearest whole number', () => {
+      // Publish: exact. The firmware's read_int truncates a fraction
+      // (cover/renderer.cpp:50-58), as it already does for a 0..100 reading.
+      expect(toPercent(200, range(0, 255))).to.equal((200 * 100) / 255);
+      expect(toPercent(0, range(0, 255))).to.equal(0);
+      expect(toPercent(255, range(0, 255))).to.equal(100);
+      // Write: 50% is 127.5; a whole-number range of at least 100 steps keeps
+      // an integral device integral, and every percent still lands on its own
+      // step.
+      expect(fromPercent(50, range(0, 255))).to.equal(128);
+      expect(fromPercent(1, range(0, 255))).to.equal(3);
+      expect(fromPercent(0, range(0, 255))).to.equal(0);
+      expect(fromPercent(100, range(0, 255))).to.equal(255);
+      expect(fromPercent(50, range(0, 254))).to.equal(127);
+      const steps = new Set(Array.from({ length: 101 }, (_, percent) => fromPercent(percent, range(0, 255))));
+      expect(steps.size, 'no two percentages collapse onto one raw value').to.equal(101);
+    });
+
+    it('keeps the exact value for a fractional or narrow range, and shifts an offset range', () => {
+      expect(fromPercent(50, range(0, 1))).to.equal(0.5);
+      expect(toPercent(0.25, range(0, 1))).to.equal(25);
+      expect(fromPercent(55, range(0, 10))).to.equal(5.5);
+      expect(fromPercent(50, range(10, 30))).to.equal(20);
+      expect(toPercent(20, range(10, 30))).to.equal(50);
+    });
+
+    it('checks each bound a channel declares, and invents none', () => {
+      expect(withinDeclaredRange(30, range(5, 30))).to.equal(true);
+      expect(withinDeclaredRange(30.5, range(5, 30))).to.equal(false);
+      expect(withinDeclaredRange(4.9, range(5, 30))).to.equal(false);
+      expect(withinDeclaredRange(1e9, range(5))).to.equal(true);
+      expect(withinDeclaredRange(4, range(5))).to.equal(false);
+      expect(withinDeclaredRange(-1e9, range(undefined, 30))).to.equal(true);
+      expect(withinDeclaredRange(31, range(undefined, 30))).to.equal(false);
+      expect(withinDeclaredRange(1e9, range())).to.equal(true);
+      expect(withinDeclaredRange(1e9, undefined)).to.equal(true);
+      // Taken literally: an equal pair admits one value, an inverted pair none.
+      expect(withinDeclaredRange(40, range(40, 40))).to.equal(true);
+      expect(withinDeclaredRange(41, range(40, 40))).to.equal(false);
+      expect(withinDeclaredRange(50, range(255, 0))).to.equal(false);
     });
   });
 
@@ -161,9 +237,10 @@ describe('registry/synth/common: encodeChannelValue', () => {
 
   it('round-trips SPEED_LEVEL, a plain numeric percentage with no states map', () => {
     // synth/climate.ts: fanMode falls back to String(speedLevel) when SPEED
-    // itself is not configured, e.g. raw=42 -> decodes "42".
-    const codec: ChannelCodec = { type: 'number' };
-    const encoded = encodeChannelValue(codec, '42');
+    // itself is not configured, e.g. raw=42 -> decodes "42" -- the current
+    // value, and with no map the only one the panel can send (M1a).
+    const codec: ChannelCodec = { type: 'number', current: 42 };
+    const encoded = encodeChannelValue(codec, '42', '42');
     expect(encoded).to.equal(42);
     expect(typeof encoded).to.equal('number');
   });
@@ -224,8 +301,10 @@ describe('registry/synth/common: encodeChannelValue', () => {
   // Fix-round 3, fold-in 1: readEnum treats {} exactly like no map at all
   // (no key of an empty object can ever match), so the encoder must too.
   it('treats an empty states map as no map at all', () => {
-    const codec: ChannelCodec = { type: 'number', states: {} };
-    expect(encodeChannelValue(codec, '3')).to.equal(3);
+    // Exactly as an unmapped channel since M1a: its current value, and nothing else.
+    const codec: ChannelCodec = { type: 'number', states: {}, current: 3 };
+    expect(encodeChannelValue(codec, '3', '3')).to.equal(3);
+    expect(encodeChannelValue(codec, '4', '3')).to.equal(undefined);
   });
 
   // Fix-round 3, fold-in 3: a non-string label must be skipped, not thrown

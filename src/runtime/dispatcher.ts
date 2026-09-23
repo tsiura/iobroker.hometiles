@@ -1,11 +1,18 @@
 import type { ServiceCall } from '../protocol/commands';
 import type { Domain, VirtualEntity } from '../registry/types';
 import { STATE_OFF, STATE_ON } from '../registry/types';
-import { encodeChannelValue, roleCodec } from '../registry/synth/common';
+import { encodeChannelValue, fromPercent, roleCodec, withinDeclaredRange } from '../registry/synth/common';
 import type { Logger } from './mqtt-client';
 
 export type StateWriter = (objectId: string, value: unknown) => Promise<void>;
 
+/**
+ * Both lookups return the entity as of the newest values received: a lookup
+ * that batches recomputes (EntityRegistry) applies a pending one first. A
+ * command reads the channel's current value from the entity (Ruling 41), and
+ * one taken from before the batch landed wrote a stale value with ok:true
+ * (Task 8 round 1, M2).
+ */
 export interface EntityLookup {
   byId(entityId: string): VirtualEntity | undefined;
   bySceneAlias(alias: string): VirtualEntity | undefined;
@@ -173,6 +180,30 @@ export class Dispatcher {
     };
 
     /**
+     * Ruling 49: every numeric command -- setpoint, humidity, cover position
+     * and tilt, light brightness -- goes through here. A panel percentage
+     * (position, tilt, brightness) is scaled into the channel's declared
+     * range, the same map the synth publishes with; any value outside a
+     * declared bound refuses the WHOLE call below, never clamped: clamping
+     * would write something other than what was asked and still report
+     * success.
+     */
+    let outOfRange = false;
+    const pushNumber = (channel: string | undefined, value: number, percent: boolean): void => {
+      if (!channel) return;
+      const codec = entity.channelMeta?.[channel];
+      const raw = percent ? fromPercent(value, codec) : value;
+      if (!withinDeclaredRange(raw, codec)) {
+        this.log.warn(`[Command] ${raw} is outside the declared range of ${channel} on ${entity.entityId}`);
+        outOfRange = true;
+        return;
+      }
+      push(channel, raw);
+    };
+    const pushRoleNumber = (role: string, channels: readonly string[], value: number, percent: boolean): void =>
+      pushNumber(resolveChannel(role, channels), value, percent);
+
+    /**
      * For the five climate commands that carry a decoded display LABEL
      * (hvac_mode, fan_mode, swing_mode, swing_horizontal_mode, preset_mode):
      * reverses that label back into the raw value the channel actually needs
@@ -237,7 +268,7 @@ export class Dispatcher {
         // to 'dimmer' left a BRIGHTNESS-only bulb's slider with no channel to
         // write to at all.
         if (call.brightnessPct !== undefined) {
-          push(entity.source.dimmer ? 'dimmer' : 'brightness', call.brightnessPct);
+          pushNumber(entity.source.dimmer ? 'dimmer' : 'brightness', call.brightnessPct, true);
         }
         if (call.rgb) {
           push('red', call.rgb[0]);
@@ -250,12 +281,12 @@ export class Dispatcher {
       case 'set_temperature':
         // Do not hardcode 'set': whatever channel the registry recorded as
         // the setpoint writer is the one to write (see pushRole above).
-        if (call.value !== undefined) pushRole('setpoint', ['set', 'set_heating', 'set_cooling'], call.value);
-        if (call.low !== undefined) pushRole('target_temp_low', ['set_heating'], call.low);
-        if (call.high !== undefined) pushRole('target_temp_high', ['set_cooling'], call.high);
+        if (call.value !== undefined) pushRoleNumber('setpoint', ['set', 'set_heating', 'set_cooling'], call.value, false);
+        if (call.low !== undefined) pushRoleNumber('target_temp_low', ['set_heating'], call.low, false);
+        if (call.high !== undefined) pushRoleNumber('target_temp_high', ['set_cooling'], call.high, false);
         break;
       case 'set_humidity':
-        pushRole('target_humidity', ['humidity'], call.value);
+        pushRoleNumber('target_humidity', ['humidity'], call.value, false);
         break;
       case 'set_hvac_mode':
         // No structural type guarantee (MODE can be Number- or String-typed
@@ -294,7 +325,7 @@ export class Dispatcher {
         pushRole('stop', ['stop'], true);
         break;
       case 'set_cover_position':
-        pushRole('position', ['set'], call.value);
+        pushRoleNumber('position', ['set'], call.value, true);
         break;
       case 'open_cover_tilt':
         pushRole('tilt_open', ['tilt_open'], true);
@@ -306,7 +337,7 @@ export class Dispatcher {
         pushRole('tilt_stop', ['tilt_stop'], true);
         break;
       case 'set_cover_tilt_position':
-        pushRole('tilt_position', ['tilt_set'], call.value);
+        pushRoleNumber('tilt_position', ['tilt_set'], call.value, true);
         break;
       // toggle_cover and toggle_cover_tilt have no caller anywhere in the
       // firmware (allow-list only, mqtt_handlers.cpp:2270-2271), so there is
@@ -328,6 +359,10 @@ export class Dispatcher {
       }
     }
 
+    // Nothing lands when any requested value was out of range: a range with
+    // one bound written, or "on" without the asked-for brightness, would
+    // report success for a command that did not happen as asked.
+    if (outOfRange) return { writes: [], failureReason: 'value_out_of_range' };
     return { writes, failureReason };
   }
 }

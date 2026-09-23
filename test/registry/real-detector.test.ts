@@ -584,6 +584,10 @@ describe('real type-detector end to end (Task 5c)', () => {
         temperature: 21,
         current_temperature: 19.5,
         supported_features: 1,
+        // Task 8 round 1: SET_TEMPERATURE's declared 4.5..30.5, so the panel
+        // offers exactly the setpoints the dispatcher accepts.
+        min_temp: 4.5,
+        max_temp: 30.5,
       });
     });
 
@@ -708,6 +712,17 @@ describe('real type-detector end to end (Task 5c)', () => {
         CIRCUIT,
       );
       expect(json(withReading).current_temperature).to.equal(20);
+    });
+
+    it("Task 8 round 1: an air conditioner's setpoint range reaches the panel, and a setpoint outside it is refused", async () => {
+      const result = runFor(run(AC_SET, { [`${AC}.MODE`]: value(3), [`${AC}.SET`]: value(23) }), AC);
+      expect(json(result)).to.include({ min_temp: 16, max_temp: 30 });
+      const entityId = result.entity!.entityId;
+      const refused = await dispatch(result.entity!, { kind: 'set_temperature', entityId, value: 31 });
+      expect(refused.result).to.deep.equal({ ok: false, reason: 'value_out_of_range', applied: 0 });
+      expect(refused.writes).to.deep.equal([]);
+      const landed = await dispatch(result.entity!, { kind: 'set_temperature', entityId, value: 30 });
+      expect(landed.writes).to.deep.equal([[`${AC}.SET`, 30]]);
     });
   });
 

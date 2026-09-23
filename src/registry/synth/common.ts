@@ -68,12 +68,16 @@ export function baseEntity(
     source[name] = channel.objectId;
     const value = values[channel.objectId];
     // write: Ruling 38, for every domain. current: Ruling 41; a value the
-    // decoders would not use (isUsable) is no current value either.
+    // decoders would not use (isUsable) is no current value either. min/max:
+    // the declared range commands are scaled into and checked against
+    // (Ruling 49).
     channelMeta[name] = {
       type: channel.type,
       states: channel.states,
       write: channel.write,
       current: isUsable(value) ? value.val : undefined,
+      min: channel.min,
+      max: channel.max,
     };
     if (value && value.ts > lastChanged) lastChanged = value.ts;
   }
@@ -185,42 +189,40 @@ export function encodeChannelValue(
     return coerce(codec?.type, current);
   }
 
-  let raw = label;
+  // With no map (an empty one behaves as none, matching readEnum: `{}` never
+  // matches any key -- fix-round 3, fold-in 1) no list is published, so the
+  // panel's only option is the current value, taken above. Any other label
+  // came from another MQTT client -- fan_mode "100000" into a SPEED_LEVEL
+  // declared 0..100, hvac_mode "42" into an unmapped MODE -- and is refused
+  // (Task 8 round 1, M1a).
   const entries = codec?.states ? Object.entries(codec.states) : [];
-  if (entries.length > 0) {
-    // An empty states map behaves as no map at all, matching readEnum: `{}`
-    // never matches any key, so decode always falls through to the plain
-    // value branches (fix-round 3, fold-in 1).
-    //
-    // Collect EVERY key whose label matches, not just the first, and refuse
-    // unless exactly one does (fix-round 3, IMPORTANT A). `.find` returning
-    // the first case-insensitive match let {"1":"High","2":"HIGH"} silently
-    // resolve "high" to 1 even when the device's current raw value was 2 --
-    // a user re-selecting their OWN current mode would get the wrong one
-    // written, with ok:true. Two codes sharing a label are genuinely
-    // ambiguous: the panel cannot distinguish them either, so refusing is
-    // the only correct answer, the same as an unknown label.
-    //
-    // Non-string labels are skipped rather than crashing on .toLowerCase()
-    // (fix-round 3, fold-in 3) -- main.ts's detectDevices now validates
-    // common.states so a real device should never produce one, but a states
-    // map built any other way (a test, a future caller) still cannot throw.
-    const matches = entries.filter(
-      ([, candidate]) => typeof candidate === 'string' && candidate.trim().toLowerCase() === wanted,
-    );
-    // A label outside the map is refused on every channel type. Ruling 36
-    // let a number channel coerce one instead, so the panel's lone fallback
-    // option (an out-of-map current value, e.g. "50") was no dead button;
-    // Ruling 41 keeps that through the current-value branch above and closes
-    // the rest: any MQTT client could write 7 into a SPEED mapped 0..3.
-    const [onlyMatch] = matches;
-    if (!onlyMatch || matches.length > 1) return undefined;
-    raw = onlyMatch[0];
-  }
+  if (entries.length === 0) return undefined;
 
-  // 'string', 'mixed' or no captured type is reachable only through a states
-  // map (Ruling 33) or the current value, so `raw` is the channel's own value.
-  return coerce(codec?.type, raw);
+  // Collect EVERY key whose label matches, not just the first, and refuse
+  // unless exactly one does (fix-round 3, IMPORTANT A). `.find` returning
+  // the first case-insensitive match let {"1":"High","2":"HIGH"} silently
+  // resolve "high" to 1 even when the device's current raw value was 2 --
+  // a user re-selecting their OWN current mode would get the wrong one
+  // written, with ok:true. Two codes sharing a label are genuinely
+  // ambiguous: the panel cannot distinguish them either, so refusing is
+  // the only correct answer, the same as an unknown label.
+  //
+  // Non-string labels are skipped rather than crashing on .toLowerCase()
+  // (fix-round 3, fold-in 3) -- main.ts's detectDevices now validates
+  // common.states so a real device should never produce one, but a states
+  // map built any other way (a test, a future caller) still cannot throw.
+  const matches = entries.filter(
+    ([, candidate]) => typeof candidate === 'string' && candidate.trim().toLowerCase() === wanted,
+  );
+  // A label outside the map is refused on every channel type. Ruling 36
+  // let a number channel coerce one instead, so the panel's lone fallback
+  // option (an out-of-map current value, e.g. "50") was no dead button;
+  // Ruling 41 keeps that through the current-value branch above and closes
+  // the rest: any MQTT client could write 7 into a SPEED mapped 0..3.
+  const [onlyMatch] = matches;
+  if (!onlyMatch || matches.length > 1) return undefined;
+  // The key the label reversed to is the channel's own value.
+  return coerce(codec?.type, onlyMatch[0]);
 }
 
 /** A raw value as a channel of this type holds it, or undefined when it cannot be one. */
@@ -238,6 +240,60 @@ function coerce(type: ChannelCodec['type'], raw: unknown): number | boolean | st
   }
   // 'mixed' and untyped have no single native type: the value stays as it is.
   return type === 'string' ? String(raw) : raw;
+}
+
+/**
+ * Ruling 49: the panel speaks percent for cover position/tilt and light
+ * brightness; a channel speaks its own declared min..max. This one linear map
+ * serves both directions, so what is published and what is written cannot
+ * disagree. It scales only over a real two-sided range: a 0..100 channel is
+ * the identity by construction, and one bound, equal or inverted bounds, or
+ * none at all pass through unscaled -- a missing bound is never invented, and
+ * there is never a zero span to divide by.
+ */
+function percentRange(codec: Pick<ChannelCodec, 'min' | 'max'> | undefined): { min: number; max: number } | undefined {
+  const min = codec?.min;
+  const max = codec?.max;
+  if (typeof min !== 'number' || typeof max !== 'number' || !Number.isFinite(min) || !Number.isFinite(max)) return undefined;
+  return min < max && !(min === 0 && max === 100) ? { min, max } : undefined;
+}
+
+/**
+ * A channel's raw value as the panel's percentage, exact. The panel's own
+ * integer fields do the rounding: light.ts rounds brightness_pct, and the
+ * firmware's read_int truncates a fractional cover position
+ * (cover/renderer.cpp:50-58), as it always has for a 0..100 reading.
+ */
+export function toPercent(raw: number, codec: Pick<ChannelCodec, 'min' | 'max'> | undefined): number {
+  const range = percentRange(codec);
+  return range ? ((raw - range.min) * 100) / (range.max - range.min) : raw;
+}
+
+/**
+ * The panel's percentage as a raw value for the channel. Rounded to a whole
+ * number only when the declared range is whole and spans at least 100: an
+ * integral device (0..255, 0..254) then keeps an integral value, and every
+ * percent still lands on its own step. A fractional or narrower range (0..1,
+ * a 0..10 V dimmer) keeps the exact value.
+ */
+export function fromPercent(percent: number, codec: Pick<ChannelCodec, 'min' | 'max'> | undefined): number {
+  const range = percentRange(codec);
+  if (!range) return percent;
+  const raw = range.min + (percent * (range.max - range.min)) / 100;
+  return Number.isInteger(range.min) && Number.isInteger(range.max) && range.max - range.min >= 100 ? Math.round(raw) : raw;
+}
+
+/**
+ * Whether a value may be written to the channel (Ruling 49): each bound the
+ * channel declares is enforced and none is invented. Equal or inverted bounds
+ * are taken as declared, so they admit one value or none: a channel whose
+ * metadata allows nothing takes nothing.
+ */
+export function withinDeclaredRange(value: number, codec: Pick<ChannelCodec, 'min' | 'max'> | undefined): boolean {
+  const min = codec?.min;
+  const max = codec?.max;
+  if (typeof min === 'number' && Number.isFinite(min) && value < min) return false;
+  return !(typeof max === 'number' && Number.isFinite(max) && value > max);
 }
 
 export const UNAVAILABLE = STATE_UNAVAILABLE;

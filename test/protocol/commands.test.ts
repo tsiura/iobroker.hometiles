@@ -52,8 +52,9 @@ describe('protocol/commands', () => {
     });
   });
 
-  it('clamps brightness, rgb components and kelvin at the boundary', () => {
-    const call = parseLightCommand('{"entity_id":"light.d","brightness_pct":500,"rgb_color":[999,-4,90],"color_temp_kelvin":90000}');
+  it('clamps rgb components and kelvin at the boundary', () => {
+    // Task 8 round 1 took brightness out of this test: see the next one.
+    const call = parseLightCommand('{"entity_id":"light.d","brightness_pct":100,"rgb_color":[999,-4,90],"color_temp_kelvin":90000}');
     expect(call).to.deep.equal({
       kind: 'set_light',
       entityId: 'light.d',
@@ -61,6 +62,18 @@ describe('protocol/commands', () => {
       rgb: [255, 0, 90],
       kelvin: 15000,
     });
+  });
+
+  it('refuses a brightness outside 0..100 rather than clamping it (Task 8 round 1, M1b)', () => {
+    // The firmware never sends one (mqttPublishLightCommand caps at 100);
+    // clamping another client's 500 wrote 100 with ok:true.
+    for (const pct of [500, 101, -1]) {
+      expect(() => parseLightCommand(JSON.stringify({ entity_id: 'light.d', brightness_pct: pct })), String(pct)).to.throw(
+        CommandError,
+        'invalid_brightness',
+      );
+    }
+    expect((parseLightCommand('{"entity_id":"light.d","brightness_pct":99.6}') as { brightnessPct: number }).brightnessPct).to.equal(100);
   });
 
   it('rejects a non-numeric brightness rather than coercing it to zero', () => {
@@ -309,14 +322,22 @@ describe('protocol/commands', () => {
       });
     });
 
-    it('keeps a legitimate zero and clamps to 0..100 like the firmware publisher does', () => {
-      // mqtt_handlers.cpp:2290-2291 clamps before formatting an integer.
+    it('keeps a legitimate zero, rounds to the whole percent the firmware sends, and refuses one outside 0..100', () => {
+      // mqtt_handlers.cpp:2290-2291 clamps before formatting an integer, so
+      // the panel never sends one outside 0..100. Task 8 round 1 (M1b):
+      // another client's -5 or 150 is refused, no longer clamped to 0 or 100.
       const position = (value: unknown): unknown =>
         (parseCoverCommand(cover({ command: 'set_cover_position', position: value })) as { value: number }).value;
       expect(position(0)).to.equal(0);
-      expect(position(-5)).to.equal(0);
-      expect(position(150)).to.equal(100);
+      expect(position(100)).to.equal(100);
       expect(position(33.6)).to.equal(34);
+      for (const value of [-5, 150, 100.6]) {
+        expect(() => position(value), String(value)).to.throw(CommandError, 'invalid_position');
+        expect(() => parseCoverCommand(cover({ command: 'set_cover_tilt_position', tilt_position: value })), String(value)).to.throw(
+          CommandError,
+          'invalid_tilt_position',
+        );
+      }
     });
 
     it('rejects a missing, blank or non-numeric position rather than writing zero', () => {

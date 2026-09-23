@@ -223,15 +223,30 @@ describe('registry/synth/cover', () => {
     device.channels.set = { objectId: 'cover.0.set', write: true, type: 'number' };
     values['cover.0.set'] = numState(40);
     const e = synthCover(device, 'cover.test', values);
-    // Task 8: `write` (Ruling 38) and the current raw value (Ruling 41) ride along.
-    expect(e.channelMeta?.set).to.deep.equal({ type: 'number', states: undefined, write: true, current: 40 });
+    // Task 8: `write` (Ruling 38) and the current raw value (Ruling 41) ride
+    // along; round 1 adds the declared range (Ruling 49), none here.
+    expect(e.channelMeta?.set).to.deep.equal({
+      type: 'number',
+      states: undefined,
+      write: true,
+      current: 40,
+      min: undefined,
+      max: undefined,
+    });
   });
 
   it("carries gate's boolean SET type through channelMeta, distinct from blind's number", () => {
     const { device, values } = gateDevice(numState(true));
     device.channels.set = { objectId: 'gate.0.set', write: true, type: 'boolean' };
     const e = synthCover(device, 'gate.test', values);
-    expect(e.channelMeta?.set).to.deep.equal({ type: 'boolean', states: undefined, write: true, current: true });
+    expect(e.channelMeta?.set).to.deep.equal({
+      type: 'boolean',
+      states: undefined,
+      write: true,
+      current: true,
+      min: undefined,
+      max: undefined,
+    });
   });
 
   it('dispatches to synthCover through synthesise', () => {
@@ -389,5 +404,50 @@ describe('registry/synth/cover', () => {
     expect(e.channelMeta?.set).to.include({ write: false, current: 30 });
     expect(e.channelMeta?.stop?.write).to.equal(undefined);
     expect(e.channelMeta?.stop?.current).to.equal(undefined);
+  });
+
+  // --- Task 8 round 1 (Ruling 49) --------------------------------------
+
+  it('publishes a 0..255 position and tilt as the percentage the panel reads, each in its own range', () => {
+    // The panel's current_position is a percentage: raw 200 of 255 is ~78%,
+    // not 200 (which the firmware would clamp to fully open).
+    const device: DeviceInput = {
+      objectId: 'cover.0',
+      name: 'Cover',
+      detectorType: 'blind',
+      domain: 'cover',
+      channels: {
+        set: { objectId: 'cover.0.set', type: 'number', write: true, min: 0, max: 255 },
+        actual: { objectId: 'cover.0.actual', type: 'number', min: 0, max: 1000 },
+        tilt_set: { objectId: 'cover.0.tilt_set', type: 'number', write: true, min: 0, max: 255 },
+      },
+    };
+    const fromSet = synthCover(device, 'cover.test', { 'cover.0.set': numState(200), 'cover.0.tilt_set': numState(51) });
+    expect(fromSet.attributes.current_position).to.equal((200 * 100) / 255);
+    expect(fromSet.attributes.current_tilt_position).to.equal(20);
+    expect(fromSet.channelMeta?.set).to.include({ min: 0, max: 255 });
+    // ACTUAL wins, and is read in ITS own range, not SET's.
+    const fromActual = synthCover(device, 'cover.test', { 'cover.0.set': numState(200), 'cover.0.actual': numState(250) });
+    expect(fromActual.attributes.current_position).to.equal(25);
+  });
+
+  it('derives closed from the bottom of the declared range, whatever its raw value', () => {
+    const device: DeviceInput = {
+      objectId: 'cover.0',
+      name: 'Cover',
+      detectorType: 'blind',
+      domain: 'cover',
+      channels: { set: { objectId: 'cover.0.set', type: 'number', write: true, min: 10, max: 30 } },
+    };
+    expect(synthCover(device, 'cover.test', { 'cover.0.set': numState(10) }).state).to.equal('closed');
+    expect(synthCover(device, 'cover.test', { 'cover.0.set': numState(11) }).state).to.equal('open');
+  });
+
+  it('leaves a position exactly as it was read on a 0..100 channel, and on one that declares no range', () => {
+    const { device, values } = deviceWith({ SET: numState(40.5), TILT_SET: numState(33.3) });
+    device.channels.set = { ...device.channels.set!, min: 0, max: 100 };
+    const e = synthCover(device, 'cover.test', values);
+    expect(e.attributes.current_position).to.equal(40.5);
+    expect(e.attributes.current_tilt_position).to.equal(33.3);
   });
 });

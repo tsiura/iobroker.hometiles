@@ -108,7 +108,17 @@ export class EntityRegistry {
     return [...this.slots.values()].map((slot) => slot.entity);
   }
 
+  /**
+   * The entity as of the newest values received. A command reads the
+   * channel's current value from it (Ruling 41), so a recompute still waiting
+   * in the batching window is applied first; the dispatcher's lookup comes
+   * through here, bySceneAlias included (Task 8 round 1, M2).
+   */
   byId(entityId: string): VirtualEntity | undefined {
+    if (this.timers.has(entityId)) {
+      this.cancelTimer(entityId);
+      this.recompute(entityId);
+    }
     return this.slots.get(entityId)?.entity;
   }
 

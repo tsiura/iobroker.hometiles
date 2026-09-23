@@ -498,19 +498,24 @@ describe('runtime/dispatcher', () => {
     it('writes fan_mode to the named SPEED channel when present, coerced to a number', async () => {
       // Fix-round I2: SPEED is Number-typed too (@iobroker/type-detector's
       // FanPatterns.speed), just usually decoded through a states label map
-      // -- '2' here stands in for a raw enum code (e.g. LOW), the only form
-      // this layer can round-trip without the states map (see the case
-      // comment in dispatcher.ts).
+      // -- '2' here stands in for a raw enum code (e.g. LOW). With no map it
+      // can only be the current value (Task 8 round 1, M1a), so the fixture
+      // now carries that current value; any other number is refused.
       const ac = entity({
         entityId: 'climate.ac',
         domain: 'climate',
         source: { speed: 'zig.0.ac.speed', speed_level: 'zig.0.ac.speed_pct' },
         writable: { fan_mode: true },
+        attributes: { fan_mode: '2' },
+        channelMeta: { speed: { current: 2 }, speed_level: { current: 7 } },
       });
       const d = new Dispatcher(lookup([ac]), write, silentLog);
       const result = await d.dispatch({ kind: 'set_fan_mode', entityId: 'climate.ac', mode: '2' });
       expect(result).to.deep.equal({ ok: true, writes: 1 });
       expect(writes).to.deep.equal([['zig.0.ac.speed', 2]]);
+      writes = [];
+      expect((await d.dispatch({ kind: 'set_fan_mode', entityId: 'climate.ac', mode: '3' })).ok).to.equal(false);
+      expect(writes).to.deep.equal([]);
     });
 
     it('falls back to SPEED_LEVEL when the device has no named SPEED channel, coerced to a number', async () => {
@@ -519,11 +524,16 @@ describe('runtime/dispatcher', () => {
         domain: 'climate',
         source: { speed_level: 'zig.0.ac.speed_pct' },
         writable: { fan_mode: true },
+        attributes: { fan_mode: '42' },
+        channelMeta: { speed_level: { current: 42 } },
       });
       const d = new Dispatcher(lookup([ac]), write, silentLog);
       const result = await d.dispatch({ kind: 'set_fan_mode', entityId: 'climate.ac', mode: '42' });
       expect(result).to.deep.equal({ ok: true, writes: 1 });
       expect(writes).to.deep.equal([['zig.0.ac.speed_pct', 42]]);
+      writes = [];
+      expect((await d.dispatch({ kind: 'set_fan_mode', entityId: 'climate.ac', mode: '43' })).ok).to.equal(false);
+      expect(writes).to.deep.equal([]);
     });
 
     it('reverses a labelled SPEED through its states map -- the case fix-round 1 made refuse, which now works', async () => {
@@ -854,6 +864,107 @@ describe('runtime/dispatcher', () => {
         expect(result).to.deep.equal({ ok: true, writes: 1 });
         expect(writes).to.deep.equal([['ac.0.speed_level', 100]]);
       });
+
+      // Task 8 round 1, M1a: an unmapped channel publishes no list, so the
+      // panel's only option is the current value; the reviewer's probes wrote
+      // these with ok:true.
+      it('refuses anything but the current value on an unmapped channel: fan_mode "100000", hvac_mode "42"', async () => {
+        const level = airCondition({
+          mode: { objectId: 'ac.0.mode', type: 'number', write: true },
+          speed_level: { objectId: 'ac.0.speed_level', type: 'number', write: true, min: 0, max: 100 },
+        });
+        expect(await send(level, { 'ac.0.speed_level': at(50) }, { command: 'set_fan_mode', fan_mode: '100000' })).to.deep.equal({
+          ok: false,
+          reason: 'cannot_encode_value',
+          applied: 0,
+        });
+        expect(await send(level, { 'ac.0.speed_level': at(50) }, { command: 'set_fan_mode', fan_mode: '50' })).to.deep.equal({
+          ok: true,
+          writes: 1,
+        });
+        expect(writes).to.deep.equal([['ac.0.speed_level', 50]]);
+
+        const mode = airCondition({ mode: { objectId: 'ac.0.mode', type: 'number', write: true } });
+        expect((await send(mode, { 'ac.0.mode': at(1) }, { command: 'set_hvac_mode', hvac_mode: '42' })).ok).to.equal(false);
+        expect(writes).to.deep.equal([]);
+        expect((await send(mode, { 'ac.0.mode': at(1) }, { command: 'set_hvac_mode', hvac_mode: '1' })).ok).to.equal(true);
+        expect(writes).to.deep.equal([['ac.0.mode', 1]]);
+      });
+    });
+
+    // Task 8 round 1, M1b: a setpoint outside the channel's declared range is
+    // refused -- never clamped, which would write something other than what
+    // was asked and still report success. The range is also what the payload
+    // now tells the panel (min_temp/max_temp), so the two are one set.
+    describe('setpoints outside the declared range (Ruling 49)', () => {
+      const at = (val: unknown): SourceValue => ({ val, ack: true, q: 0, ts: 1 });
+      const setpoint = (objectId: string, min: number, max: number): ChannelInput => ({
+        objectId,
+        type: 'number',
+        write: true,
+        min,
+        max,
+      });
+      const thermostat = (channels: DeviceInput['channels']): VirtualEntity =>
+        synthClimate({ objectId: 'rt.0', name: 'RT', detectorType: 'thermostat', domain: 'climate', channels }, 'climate.rt', {
+          'rt.0.set': at(21),
+          'rt.0.heat': at(20),
+          'rt.0.cool': at(24),
+        })!;
+
+      it('lands every setpoint inside the published min_temp..max_temp and refuses one outside it', async () => {
+        const rt = thermostat({ set: setpoint('rt.0.set', 4.5, 30.5) });
+        const published = JSON.parse(buildClimatePayload(rt)) as Record<string, unknown>;
+        expect(published).to.include({ min_temp: 4.5, max_temp: 30.5 });
+        const d = new Dispatcher(lookup([rt]), write, silentLog);
+        for (const [value, lands] of [[4.5, true], [30.5, true], [21, true], [4.4, false], [30.6, false], [35, false]] as const) {
+          writes = [];
+          const result = await d.dispatch({ kind: 'set_temperature', entityId: 'climate.rt', value });
+          if (lands) {
+            expect(result, `${value}`).to.deep.equal({ ok: true, writes: 1 });
+            expect(writes, `${value}`).to.deep.equal([['rt.0.set', value]]);
+          } else {
+            expect(result, `${value}`).to.deep.equal({ ok: false, reason: 'value_out_of_range', applied: 0 });
+            expect(writes, `${value}`).to.deep.equal([]);
+          }
+        }
+      });
+
+      it('refuses the whole range command when either bound is out of range, writing neither', async () => {
+        const dual = thermostat({ set_heating: setpoint('rt.0.heat', 5, 25), set_cooling: setpoint('rt.0.cool', 18, 32) });
+        const d = new Dispatcher(lookup([dual]), write, silentLog);
+        expect(await d.dispatch({ kind: 'set_temperature', entityId: 'climate.rt', low: 26, high: 30 })).to.deep.equal({
+          ok: false,
+          reason: 'value_out_of_range',
+          applied: 0,
+        });
+        expect(writes).to.deep.equal([]);
+        expect(await d.dispatch({ kind: 'set_temperature', entityId: 'climate.rt', low: 20, high: 30 })).to.deep.equal({
+          ok: true,
+          writes: 2,
+        });
+        expect(writes).to.deep.equal([
+          ['rt.0.heat', 20],
+          ['rt.0.cool', 30],
+        ]);
+      });
+
+      it('refuses a target humidity outside its channel\'s declared range', async () => {
+        // No detected pattern makes target humidity writable (synth/climate.ts),
+        // so the entity is built by hand to exercise the shared numeric path.
+        const ac = entity({
+          entityId: 'climate.ac',
+          domain: 'climate',
+          source: { humidity: 'zig.0.ac.humidity' },
+          writable: { target_humidity: true },
+          channelMeta: { humidity: { type: 'number', min: 30, max: 70 } },
+        });
+        const d = new Dispatcher(lookup([ac]), write, silentLog);
+        expect((await d.dispatch({ kind: 'set_humidity', entityId: 'climate.ac', value: 80 })).ok).to.equal(false);
+        expect(writes).to.deep.equal([]);
+        expect(await d.dispatch({ kind: 'set_humidity', entityId: 'climate.ac', value: 55 })).to.deep.equal({ ok: true, writes: 1 });
+        expect(writes).to.deep.equal([['zig.0.ac.humidity', 55]]);
+      });
     });
   });
 
@@ -1121,6 +1232,115 @@ describe('runtime/dispatcher', () => {
         applied: 0,
       });
       expect(writes).to.deep.equal([]);
+    });
+
+    // Task 8 round 1, Ruling 49: the panel's percentage lands scaled into the
+    // channel's declared range. The reviewer's probe wrote 50 -- about 20% --
+    // into a 0..255 blind with ok:true, and published raw 200 as 200%.
+    it('publishes and writes a 0..255 position and tilt through the declared range', async () => {
+      const wide = coverOf(
+        {
+          set: { ...level('set'), min: 0, max: 255 },
+          tilt_set: { ...level('tilt_set'), min: 0, max: 255 },
+        },
+        { 'cover.0.set': at(200), 'cover.0.tilt_set': at(51) },
+      );
+      const published = JSON.parse(buildCoverPayload(wide)) as Record<string, unknown>;
+      expect(published).to.include({ current_position: (200 * 100) / 255, current_tilt_position: 20 });
+      expect(await send(wide, 'set_cover_position', { position: 50 })).to.deep.equal({ ok: true, writes: 1 });
+      expect(writes).to.deep.equal([['cover.0.set', 128]]);
+      expect(await send(wide, 'set_cover_tilt_position', { tilt_position: 100 })).to.deep.equal({ ok: true, writes: 1 });
+      expect(writes).to.deep.equal([['cover.0.tilt_set', 255]]);
+    });
+
+    it('writes a position unchanged into a 0..100 channel', async () => {
+      await send(coverOf({ set: { ...level('set'), min: 0, max: 100 } }), 'set_cover_position', { position: 37 });
+      expect(writes).to.deep.equal([['cover.0.set', 37]]);
+    });
+
+    it('refuses, never clamps, a position above a one-sided declared maximum', async () => {
+      // One bound is no range to scale over and none is invented, so the
+      // percentage passes through unscaled -- and 80 is above the maximum 50.
+      const capped = coverOf({ set: { ...level('set'), max: 50 } });
+      expect(await send(capped, 'set_cover_position', { position: 80 })).to.deep.equal({
+        ok: false,
+        reason: 'value_out_of_range',
+        applied: 0,
+      });
+      expect(writes).to.deep.equal([]);
+      expect(await send(capped, 'set_cover_position', { position: 40 })).to.deep.equal({ ok: true, writes: 1 });
+    });
+  });
+
+  describe('lights: declared ranges and advertised controls (Task 8 round 1)', () => {
+    const power: ChannelInput = { objectId: 'l.0.on', type: 'boolean', write: true };
+    const channel = (name: string, over: Partial<ChannelInput> = {}): ChannelInput => ({
+      objectId: `l.0.${name}`,
+      type: 'number',
+      write: true,
+      ...over,
+    });
+    const lightOf = (channels: DeviceInput['channels']): VirtualEntity =>
+      synthLight({ objectId: 'l.0', name: 'L', detectorType: 'rgb', domain: 'light', channels: { set: power, ...channels } }, 'light.l', {});
+
+    it('writes the panel brightness into a 0..254 or 0..255 dimmer as the scaled raw value, and into a 0..100 one unchanged', async () => {
+      for (const [max, landed] of [[254, 127], [255, 128], [100, 50]] as const) {
+        writes = [];
+        const d = new Dispatcher(lookup([lightOf({ dimmer: channel('level', { min: 0, max }) })]), write, silentLog);
+        const result = await d.dispatch({ kind: 'set_light', entityId: 'light.l', state: 'on', brightnessPct: 50 });
+        expect(result, `0..${max}`).to.deep.equal({ ok: true, writes: 2 });
+        expect(writes, `0..${max}`).to.deep.equal([
+          ['l.0.on', true],
+          ['l.0.level', landed],
+        ]);
+      }
+    });
+
+    it('refuses the whole command, power included, when its brightness falls outside the declared range', async () => {
+      const d = new Dispatcher(lookup([lightOf({ brightness: channel('level', { max: 60 }) })]), write, silentLog);
+      expect(await d.dispatch({ kind: 'set_light', entityId: 'light.l', state: 'on', brightnessPct: 80 })).to.deep.equal({
+        ok: false,
+        reason: 'value_out_of_range',
+        applied: 0,
+      });
+      expect(writes).to.deep.equal([]);
+    });
+
+    // M3: every control the payload advertises must land. The panel draws a
+    // brightness slider for "brightness" AND for every colour and colour-
+    // temperature mode (HomeTiles tile_renderer.cpp:1446), and sends that
+    // slider as "on" plus the brightness (light_popup.cpp:1168-1180).
+    it('advertises no control whose command would be dropped', async () => {
+      const fixtures: Array<[string, DeviceInput['channels']]> = [
+        ['on/off only', {}],
+        ['writable dimmer', { dimmer: channel('level') }],
+        ['read-only dimmer', { dimmer: channel('level', { write: false }) }],
+        ['read-only BRIGHTNESS', { brightness: channel('level', { write: false }) }],
+        ['colour and CT', { dimmer: channel('level'), temperature: channel('ct'), red: channel('r'), green: channel('g'), blue: channel('b') }],
+        ['colour and CT, read-only dimmer', { dimmer: channel('level', { write: false }), temperature: channel('ct'), red: channel('r'), green: channel('g'), blue: channel('b') }],
+        ['CT with no level at all', { temperature: channel('ct') }],
+        ['read-only CT', { dimmer: channel('level'), temperature: channel('ct', { write: false }) }],
+        ['one read-only colour component', { dimmer: channel('level'), red: channel('r'), green: channel('g', { write: false }), blue: channel('b') }],
+      ];
+      for (const [label, channels] of fixtures) {
+        const light = lightOf(channels);
+        const modes = light.attributes.supported_color_modes as string[];
+        const d = new Dispatcher(lookup([light]), write, silentLog);
+        const landsOn = async (call: Omit<Extract<ServiceCall, { kind: 'set_light' }>, 'kind' | 'entityId'>, objectId: string) => {
+          writes = [];
+          await d.dispatch({ kind: 'set_light', entityId: 'light.l', ...call });
+          return writes.some(([id]) => id === objectId);
+        };
+        if (modes.some((mode) => ['brightness', 'color_temp', 'rgb'].includes(mode))) {
+          expect(await landsOn({ state: 'on', brightnessPct: 40 }, 'l.0.level'), `${label}: the brightness slider`).to.equal(true);
+        }
+        if (modes.includes('color_temp')) {
+          expect(await landsOn({ state: 'on', kelvin: 3000 }, 'l.0.ct'), `${label}: the CT slider`).to.equal(true);
+        }
+        if (modes.includes('rgb')) {
+          expect(await landsOn({ state: 'on', rgb: [1, 2, 3] }, 'l.0.g'), `${label}: the colour wheel`).to.equal(true);
+        }
+      }
     });
   });
 });

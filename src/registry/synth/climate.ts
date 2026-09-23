@@ -308,5 +308,17 @@ export function synthClimate(device: DeviceInput, entityId: string, values: Valu
   }
   if (swingToggleCommandable) attributes.swing_horizontal_modes = ['off', 'on'];
 
+  // Task 8 round 1 (Ruling 49): the panel clamps every setpoint it offers to
+  // min_temp..max_temp (7..35 when absent, climate_popup.cpp:225-231), and
+  // the dispatcher refuses one outside the setpoint channel's declared range.
+  // Publishing that range keeps the two one set -- metadata again, so it
+  // waits for `available` like the lists above. A range's two handles share
+  // one min/max: the heating minimum and the cooling maximum. A bound the
+  // channel does not declare is left to the firmware, never invented.
+  const low = hasPlainSet ? device.channels.set : (device.channels.set_heating ?? device.channels.set_cooling);
+  const high = hasPlainSet ? device.channels.set : (device.channels.set_cooling ?? device.channels.set_heating);
+  if (typeof low?.min === 'number' && Number.isFinite(low.min)) attributes.min_temp = low.min;
+  if (typeof high?.max === 'number' && Number.isFinite(high.max)) attributes.max_temp = high.max;
+
   return { entityId, domain: 'climate', source, state, attributes, available, lastChanged, writable, channelMeta };
 }

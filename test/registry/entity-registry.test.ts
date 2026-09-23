@@ -195,11 +195,11 @@ describe('registry/entity-registry', () => {
     expect(registry.byId('switch.kaffee')).to.equal(undefined);
   });
 
-  it('keeps the raw value behind an unchanged view current, so re-selecting it writes that value (Ruling 41)', async () => {
+  describe('the current value a re-select writes back (Ruling 41)', () => {
     // {3:'5'} decodes 3 and 5 alike: the panel sees "5" either way, so there
     // is nothing to re-publish -- but the value a re-select writes back is the
-    // one the device holds NOW. A registry that kept the entity from before
-    // the change would write 3 into a device sitting at 5.
+    // one the device holds NOW. A registry that handed out the entity from
+    // before the change would write 3 into a device sitting at 5.
     const AC: DeviceInput = {
       objectId: 'ac.0',
       name: 'Klima',
@@ -207,20 +207,44 @@ describe('registry/entity-registry', () => {
       domain: 'climate',
       channels: { mode: { objectId: 'ac.0.mode', type: 'number', write: true, states: { '3': '5' } } },
     };
-    const { registry, changed } = harness();
-    const entityId = registry.rebuild([AC], {}).entityIds['ac.0']!;
-    registry.applyStateChange('ac.0.mode', value(3));
-    const shown = registry.byId(entityId)!;
-    changed.length = 0;
-
-    registry.applyStateChange('ac.0.mode', value(5, NOW + 1000));
-    expect(changed, 'nothing the panel sees changed').to.have.length(0);
-    expect(registry.byId(entityId)!.lastChanged, 'an unseen change is not a change').to.equal(shown.lastChanged);
-
-    const writes: Array<[string, unknown]> = [];
     const silentLog = { info: () => undefined, warn: () => undefined, error: () => undefined, debug: () => undefined };
-    const dispatcher = new Dispatcher(registry, async (objectId, val) => void writes.push([objectId, val]), silentLog);
-    expect(await dispatcher.dispatch({ kind: 'set_hvac_mode', entityId, mode: '5' })).to.deep.equal({ ok: true, writes: 1 });
-    expect(writes).to.deep.equal([['ac.0.mode', 5]]);
+
+    async function reselectFive(registry: EntityRegistry, entityId: string): Promise<Array<[string, unknown]>> {
+      const writes: Array<[string, unknown]> = [];
+      const dispatcher = new Dispatcher(registry, async (objectId, val) => void writes.push([objectId, val]), silentLog);
+      expect(await dispatcher.dispatch({ kind: 'set_hvac_mode', entityId, mode: '5' })).to.deep.equal({ ok: true, writes: 1 });
+      return writes;
+    }
+
+    it('keeps the raw value behind an unchanged view current', async () => {
+      const { registry, changed } = harness();
+      const entityId = registry.rebuild([AC], {}).entityIds['ac.0']!;
+      registry.applyStateChange('ac.0.mode', value(3));
+      const shown = registry.byId(entityId)!;
+      changed.length = 0;
+
+      registry.applyStateChange('ac.0.mode', value(5, NOW + 1000));
+      expect(changed, 'nothing the panel sees changed').to.have.length(0);
+      expect(registry.byId(entityId)!.lastChanged, 'an unseen change is not a change').to.equal(shown.lastChanged);
+      expect(await reselectFive(registry, entityId)).to.deep.equal([['ac.0.mode', 5]]);
+    });
+
+    it('applies a batched value before handing the entity to a command, inside a real batching window (M2)', async () => {
+      // The default window is 200 ms (config/options.ts), up to 5000 ms. A
+      // command arriving inside it used to read the entity from BEFORE the
+      // value, and wrote 3 with ok:true.
+      const { registry, changed } = harness(200);
+      const entityId = registry.rebuild([AC], {}).entityIds['ac.0']!;
+      registry.applyStateChange('ac.0.mode', value(3));
+      registry.flush();
+      changed.length = 0;
+
+      registry.applyStateChange('ac.0.mode', value(5, NOW + 1000));
+      expect(await reselectFive(registry, entityId)).to.deep.equal([['ac.0.mode', 5]]);
+
+      // The window's own timer was consumed: nothing lands late or twice.
+      await new Promise((resolve) => setTimeout(resolve, 300));
+      expect(changed).to.have.length(0);
+    });
   });
 });

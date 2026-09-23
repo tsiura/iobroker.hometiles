@@ -229,8 +229,58 @@ describe('registry/synth/climate', () => {
     device.channels.mode = { objectId: 'climate.0.mode', write: true, type: 'number', states: { '1': 'heat' } };
     values['climate.0.mode'] = numState(1);
     const e = synthClimate(device, 'climate.test', values);
-    // Task 8: `write` (Ruling 38) and the current raw value (Ruling 41) ride along.
-    expect(e?.channelMeta?.mode).to.deep.equal({ type: 'number', states: { '1': 'heat' }, write: true, current: 1 });
+    // Task 8: `write` (Ruling 38) and the current raw value (Ruling 41) ride
+    // along; round 1 adds the declared range (Ruling 49), none here.
+    expect(e?.channelMeta?.mode).to.deep.equal({
+      type: 'number',
+      states: { '1': 'heat' },
+      write: true,
+      current: 1,
+      min: undefined,
+      max: undefined,
+    });
+  });
+
+  // Task 8 round 1: the panel clamps every setpoint it offers to
+  // min_temp..max_temp (7..35 when absent; climate_popup.cpp:225-231), and the
+  // dispatcher refuses one outside the channel's declared range (Ruling 49).
+  // Publishing that range keeps the two one set -- and it is channel
+  // metadata, so like the *_modes lists it never makes a device available.
+  describe('min_temp/max_temp from the setpoint channel (Ruling 49)', () => {
+    const setpoint = (name: string, min?: number, max?: number): ChannelInput => ({
+      objectId: `climate.0.${name}`,
+      type: 'number',
+      write: true,
+      min,
+      max,
+    });
+    const withSetpoints = (channels: DeviceInput['channels'], values: Record<string, SourceValue> = {}) =>
+      synthClimate({ objectId: 'climate.0', name: 'Climate', detectorType: 'thermostat', domain: 'climate', channels }, 'climate.t', values);
+
+    it('publishes a single setpoint channel\'s declared range, SET or a lone SET_HEATING', () => {
+      expect(withSetpoints({ set: setpoint('set', 4.5, 30.5) })?.attributes).to.include({ min_temp: 4.5, max_temp: 30.5 });
+      expect(withSetpoints({ set_heating: setpoint('set_heating', 5, 25) })?.attributes).to.include({ min_temp: 5, max_temp: 25 });
+    });
+
+    it('publishes a dual setpoint as its heating minimum and cooling maximum', () => {
+      const e = withSetpoints({ set_heating: setpoint('set_heating', 5, 25), set_cooling: setpoint('set_cooling', 18, 32) });
+      expect(e?.attributes).to.include({ min_temp: 5, max_temp: 32 });
+    });
+
+    it('publishes only the bounds a channel declares, never inventing one', () => {
+      const onlyMax = withSetpoints({ set: setpoint('set', undefined, 30) })?.attributes;
+      expect(onlyMax).to.include({ max_temp: 30 });
+      expect(onlyMax).to.not.have.property('min_temp');
+      const none = withSetpoints({ set: setpoint('set') })?.attributes;
+      expect(none).to.not.have.property('min_temp');
+      expect(none).to.not.have.property('max_temp');
+    });
+
+    it('never makes a valueless device available', () => {
+      const e = withSetpoints({ set: setpoint('set', 4.5, 30.5) });
+      expect(e?.available).to.equal(false);
+      expect(e?.state).to.equal('unavailable');
+    });
   });
 
   it('dispatches to synthClimate through synthesise, including its null result', () => {

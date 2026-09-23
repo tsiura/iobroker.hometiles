@@ -57,7 +57,7 @@ export interface ChannelInput {
  * channel's newest usable raw value, so re-selecting the current value writes
  * exactly that value (Ruling 41).
  */
-export type ChannelCodec = Pick<ChannelInput, 'type' | 'states' | 'write'> & { current?: unknown };
+export type ChannelCodec = Pick<ChannelInput, 'type' | 'states' | 'write' | 'min' | 'max'> & { current?: unknown };
 
 /** A device as classified by the detector plus the admin's overrides. */
 export interface DeviceInput {
