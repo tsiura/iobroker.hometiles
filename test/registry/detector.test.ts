@@ -313,12 +313,13 @@ describe('registry/detector mapping', () => {
     expect(DETECTOR_TYPE_TO_DOMAIN.mediaPlayer).to.equal(undefined);
   });
 
-  describe("mediaPlayer's two COVER states: the panel shows one cover, chosen by role", () => {
+  describe('a control carrying two COVERs, which type-detector 6.0.1 never returns: the role decides', () => {
     // typePatterns.js declares COVER twice: /^media\.cover(\.big)?$/ (defaultRole
-    // media.cover), then /^media\.cover(\..*)$/. The 6.0.1 detector keeps only
-    // the first it finds (ChannelDetector.js:201-204) and maps it into the first
-    // slot whatever its role, so the defaultRole it reports says nothing: the
-    // object's own role decides, in whatever order the states arrive.
+    // media.cover), then /^media\.cover(\..*)$/. 6.0.1 returns one COVER only
+    // (ChannelDetector.js:201-204) -- which one is pinned through the real
+    // detector in real-detector.test.ts. These guard a later detector that
+    // returns both, in the first slot's defaultRole whatever their roles: the
+    // object's own role decides, in whatever order they arrive.
     const meta: Record<string, ObjectMeta> = {
       'sonos.0.p.cover': { name: 'Cover', role: 'media.cover', type: 'string' },
       'sonos.0.p.cover_big': { name: 'Cover big', role: 'media.cover.big', type: 'string' },

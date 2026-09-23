@@ -58,9 +58,9 @@ describe('registry/synth/media_player', () => {
   });
 
   describe('state', () => {
-    it('decodes a boolean STATE as playing, and false as idle: all it says is "not playing"', () => {
+    it('decodes a boolean STATE as ioBroker documents media.state: true playing, false pause', () => {
       expect(stateOf({ type: 'boolean', value: val(true) })).to.equal('playing');
-      expect(stateOf({ type: 'boolean', value: val(false) })).to.equal('idle');
+      expect(stateOf({ type: 'boolean', value: val(false) })).to.equal('paused');
       expect(stateOf({ type: 'boolean', value: val('true') })).to.equal('playing');
     });
 

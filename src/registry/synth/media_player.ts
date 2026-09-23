@@ -14,13 +14,13 @@ import {
 
 /**
  * Home Assistant's state names by the words ioBroker uses: a string STATE's
- * value or a states-map label. ioBroker documents media.state as
- * 'play'/'stop'/'pause', as 0 pause / 1 play / 2 stop, or as true/false; HA
- * calls a stopped player idle. The panel gives playing, paused, idle, standby
- * and off their own label and shows "no playback" for anything else, unknown
- * and unavailable included (tile_renderer.cpp:2904-2914); only "playing" shows
- * the pause button and advances the seek bar (:2954-2967, media_popup.cpp:
- * 289-296).
+ * value or a states-map label. ioBroker's role list documents media.state as
+ * 'play'/'stop'/'pause', as 0 pause / 1 play / 2 stop, or as true playing /
+ * false pause; HA calls a stopped player idle. The panel gives playing,
+ * paused, idle, standby and off their own label and shows "no playback" for
+ * anything else, unknown and unavailable included (tile_renderer.cpp:
+ * 2904-2914); only "playing" shows the pause button and advances the seek bar
+ * (:2954-2967, media_popup.cpp:289-296).
  */
 const STATE_NAMES: ReadonlyMap<string, string> = new Map([
   ['play', 'playing'],
@@ -39,16 +39,14 @@ const STATE_NAMES: ReadonlyMap<string, string> = new Map([
 const NUMERIC_STATES = ['paused', 'playing', 'idle'];
 
 /**
- * A boolean says only "playing" or not, and not playing is HA's idle: the
- * panel shows the state's name only when no title is known (tile_renderer.cpp:
- * 4334-4337), which for a player that is not playing is the idle case. A
+ * A boolean is read as documented, true playing and false pause. A
  * states-map label or a string is read by name; a number whose label names no
  * state (a localised "Wiedergabe") falls back to the numeric convention.
  */
 function mediaState(raw: unknown, channel: ChannelInput): string | undefined {
   if (typeof raw === 'boolean' || channel.type === 'boolean') {
     const on = toBoolState(raw);
-    return on === STATE_ON ? 'playing' : on === STATE_OFF ? 'idle' : undefined;
+    return on === STATE_ON ? 'playing' : on === STATE_OFF ? 'paused' : undefined;
   }
   const named = STATE_NAMES.get(String(channel.states?.[String(raw)] ?? raw).trim().toLowerCase());
   return named ?? (typeof raw === 'number' ? NUMERIC_STATES[raw] : undefined);

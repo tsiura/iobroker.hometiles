@@ -264,6 +264,13 @@ function channelName(controlType: string, state: DetectedChannel): string | null
     return state.defaultRole === 'switch.mode.swing' ? 'swing_toggle' : 'swing';
   }
 
+  // mediaPlayer sets Chromecast's …paused and …playerState aside by name
+  // (its IGNORE, /\.(paused|playerState)$/), yet its STATE can still take one:
+  // two media.state objects tie on role and the later id wins, so an
+  // isPlaying is replaced by paused -- and paused: true read as "playing".
+  // Neither is the play state; without one there is no media player.
+  if (upper === 'STATE' && controlType === 'media' && /\.(paused|playerState)$/.test(state.id ?? '')) return null;
+
   return upper.toLowerCase();
 }
 
@@ -273,11 +280,15 @@ function lastSegment(objectId: string): string {
 
 /**
  * mediaPlayer declares COVER twice (typePatterns.js): /^media\.cover(\.big)?$/
- * with defaultRole media.cover, then any other /^media\.cover(\..*)$/. The
- * panel shows one cover, so one is kept: by the object's own role, in the
- * pattern's order of preference, never by which arrives first. The 6.0.1
- * detector already returns only one (ChannelDetector.js:201-204), but in the
- * first slot, defaultRole included, whatever its role.
+ * with defaultRole media.cover, then any other /^media\.cover(\..*)$/. With
+ * type-detector 6.0.1 the detector decides, not this: it returns one COVER
+ * only (ChannelDetector.js:201-204) -- a media.cover or media.cover.big object
+ * before any other size, since that pattern is tried first, and between those
+ * two whichever id sorts first. The object it drops never reaches this
+ * mapping, so nothing here can prefer it. coverRank only acts on a control
+ * carrying two COVERs (a later detector without that exception): the object's
+ * own role then decides, in the pattern's order, not the order they arrive
+ * in -- its defaultRole is the first slot's, whatever its role.
  */
 function coverRank(role: string | undefined): number {
   return role === 'media.cover' ? 0 : role === 'media.cover.big' ? 1 : 2;

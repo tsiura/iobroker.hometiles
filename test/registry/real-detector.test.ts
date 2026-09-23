@@ -1175,10 +1175,35 @@ describe('real type-detector end to end (Task 5c)', () => {
       expect(result.device.channels.cover?.objectId).to.equal(`${RADIO}.COVER_SMALL`);
     });
 
+    it('Task 9 round 1: between media.cover and media.cover.big the detector keeps whichever id sorts first', () => {
+      // Its choice, not ours: 6.0.1 returns one COVER only (ChannelDetector.js:201-204).
+      const big = runFor(run(radioSet(['A_COVER_BIG', 'media.cover.big'], ['COVER', 'media.cover'])), RADIO);
+      expect(big.device.channels.cover?.objectId).to.equal(`${RADIO}.A_COVER_BIG`);
+      const plain = runFor(run(radioSet(['COVER', 'media.cover'], ['Z_COVER_BIG', 'media.cover.big'])), RADIO);
+      expect(plain.device.channels.cover?.objectId).to.equal(`${RADIO}.COVER`);
+    });
+
     it("Task 9: the media.state objects the pattern sets aside for Chromecast become no channel", () => {
       const result = runFor(run(CAST_SET, { [`${CAST}.state`]: value(false), [`${CAST}.volume`]: value(0.5) }), CAST);
       expectRealChannels(CAST_SET, result.device, { state: `${CAST}.state`, volume: `${CAST}.volume` });
-      expect(json(result)).to.deep.equal({ state: 'idle', volume_level: 0.5, entity_picture: '' });
+      expect(json(result)).to.deep.equal({ state: 'paused', volume_level: 0.5, entity_picture: '' });
+    });
+
+    it("Task 9 round 1: a Chromecast's …paused side-channel is never its STATE, even when the detector picks it", () => {
+      // With the real state sorting first (isPlaying < paused), the detector
+      // itself replaces it by …paused (same role, the later id wins), and a
+      // paused cast -- paused: true -- read as "playing".
+      const cast = 'chromecast.0.Kueche';
+      const all = objects(
+        device(cast, 'Küche'),
+        state(`${cast}.isPlaying`, { role: 'media.state', type: 'boolean', write: true }),
+        state(`${cast}.paused`, { role: 'media.state', type: 'boolean', write: true }),
+        state(`${cast}.playerState`, { role: 'media.state', type: 'string', write: false }),
+        state(`${cast}.volume`, { role: 'level.volume', type: 'number', min: 0, max: 100, write: true }),
+      );
+      const result = runFor(run(all, { [`${cast}.paused`]: value(true), [`${cast}.volume`]: value(30) }), cast);
+      expect(result.device.channels.state, 'no STATE from …paused').to.equal(undefined);
+      expect(result.entity, 'no media player without its play state').to.equal(null);
     });
   });
 
