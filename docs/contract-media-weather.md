@@ -293,6 +293,8 @@ silently (no MQTT traffic at all, no UI error). All four use
 `mqttEnqueuePublishPriority` (jumps the outbound queue ahead of
 normal-priority publishes such as the weather request above).
 
+> **NOTE (2026-09-23, verified):** `mqttPublishMediaMute` is declared (`mqtt_handlers.h:24`) and defined (`mqtt_handlers.cpp:2098`) but has **no caller** anywhere in the firmware, so no panel ever sends `volume_mute`. The mute icon instead sends `volume_set` with 0 to mute and the last level to unmute. Found during Task 10.
+
 | Action | Function | Payload | Source |
 | --- | --- | --- | --- |
 | Generic transport command | `mqttPublishMediaCommand(entity_id, command)` | `{"entity_id":"<id>","command":"<command>"}`; `command` defaults to `"play_pause"` if null/empty | `mqtt_handlers.cpp:2020-2040` |
