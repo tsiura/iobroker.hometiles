@@ -437,6 +437,8 @@ if (process.env.HOMETILES_INTEGRATION === '1') {
         const port = 18855;
         const { applies, panel } = withBrokerAndPanel(port);
         const helperState: string[] = [];
+        /** topic -> the last /control payload on it */
+        const controls = new Map<string, string>();
         let logs: LogRecord[] = [];
 
         it('publishes a 0_userdata state beside the detected devices, with its value', async function () {
@@ -473,8 +475,9 @@ if (process.env.HOMETILES_INTEGRATION === '1') {
           await harness.states.setStateAsync(DATUM, { val: '23.09.2026', ack: true });
           panel().on('message', (topic, payload) => {
             if (topic === 'ha/e2e/sensor/vorlauf/state') helperState.push(payload.toString());
+            if (topic.endsWith('/control')) controls.set(topic, payload.toString());
           });
-          await panel().subscribeAsync('ha/e2e/sensor/vorlauf/state');
+          await panel().subscribeAsync(['ha/e2e/sensor/vorlauf/state', 'ha/e2e/+/+/control']);
           await harness.startAdapterAndWait(true);
 
           const apply = await waitFor(harness, () => applies.find((payload) => payload.includes('sensor.vorlauf')), 'the apply');
@@ -498,6 +501,44 @@ if (process.env.HOMETILES_INTEGRATION === '1') {
           const harness = getHarness();
           await harness.states.setStateAsync(HELPER, { val: 42, ack: true });
           await waitFor(harness, () => helperState.find((payload) => payload === '42'), 'the new value');
+        });
+
+        it('publishes each editable helper retained on its control leaf, "unknown" until it holds a value (Task 14)', async function () {
+          this.timeout(60000);
+          const harness = getHarness();
+          const control = async (entityId: string): Promise<Record<string, unknown>> => {
+            const topic = `ha/e2e/${entityId.replace('.', '/')}/control`;
+            return JSON.parse(await waitFor(harness, () => controls.get(topic), `${entityId}'s /control`)) as Record<string, unknown>;
+          };
+          // No value yet: the string "unknown", available and editable, never
+          // a null the panel would lock (Ruling 91). Step 1: Home Assistant's
+          // for a range of 13 (Ruling 81).
+          const soll = await control('number.soll');
+          expect(soll).to.deep.include({ version: 1, kind: 'number', state: 'unknown', available: true, writable: true, min: 15, max: 28, step: 1 });
+          expect(await control('datetime.alarm')).to.include({ kind: 'time', state: 'unknown', available: true, writable: true });
+          // The three the panel cannot edit (the m2 warning below).
+          expect(await control('number.stufe')).to.include({ kind: 'number', state: 'unknown', writable: false }).and.not.have.property('min');
+          expect(await control('select.modus')).to.include({ kind: 'select', state: 'unknown', writable: false }).and.not.have.property('options');
+          expect(await control('datetime.datum')).to.include({ kind: 'datetime', state: '23.09.2026', writable: false });
+          const all = await Promise.all(['number.stufe', 'number.soll', 'select.modus', 'datetime.datum', 'datetime.alarm'].map(control));
+          // One session for the process, and never a read-only reason on the wire.
+          expect(new Set(all.map((payload) => payload.session))).to.deep.equal(new Set([soll.session]));
+          expect(soll.session).to.match(/^[0-9a-f]{32}$/);
+          expect(JSON.stringify(all)).to.not.match(/no min\/max|no states|no date or time/);
+
+          // Retained: a panel that subscribes later gets it from the broker.
+          const late = await mqtt.connectAsync(`mqtt://127.0.0.1:${port}`);
+          try {
+            const retained = new Promise<string>((resolve) => {
+              late.on('message', (_topic, payload, packet) => {
+                if (packet.retain) resolve(payload.toString());
+              });
+            });
+            await late.subscribeAsync('ha/e2e/number/soll/control');
+            expect(JSON.parse(await retained)).to.deep.equal(soll);
+          } finally {
+            late.end(true);
+          }
         });
 
         /** The adapter's own warnings that contain `text`, from their `[Registry]` tag on. */

@@ -16,7 +16,7 @@ function idsFor(entities: VirtualEntity[], domain: Domain): string[] {
 }
 
 /** The firmware stores last_changed as unix seconds. */
-function unixSeconds(msValue: number): number {
+export function unixSeconds(msValue: number): number {
   return Math.floor(msValue / 1000);
 }
 

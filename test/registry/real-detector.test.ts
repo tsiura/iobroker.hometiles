@@ -1755,9 +1755,25 @@ describe('number, select and datetime (Task 13)', () => {
     expect(entity.attributes).to.include({ friendly_name: 'Vorlauf Soll', min: 20, max: 60, step: 0.5, unit_of_measurement: '°C' });
     expect(entity.writable).to.deep.equal({ value: true });
     expect(entity.channelMeta?.set).to.include({ type: 'number', write: true, min: 20, max: 60, step: 0.5, current: 45 });
-    // Nothing on the /state leaf: the panel reads an editable value from
-    // /control only (contract-editable.md §3), which Task 14 builds.
-    expect(runs[0]!.payload).to.equal(undefined);
+    // What reaches the panel: the /control payload on the control leaf, never
+    // /state (contract-editable.md §3, Task 14).
+    expect(buildStatePublish('homeassistant', entity)!.topic).to.equal('homeassistant/number/under_test/control');
+    const { session, revision, ...fields } = JSON.parse(runs[0]!.payload!) as Record<string, unknown>;
+    expect(fields).to.deep.equal({
+      version: 1,
+      kind: 'number',
+      state: '45',
+      available: true,
+      writable: true,
+      min: 20,
+      max: 60,
+      step: 0.5,
+      mode: 'auto',
+      unit: '°C',
+      last_changed: 1_758_000_000,
+    });
+    expect(session).to.match(/^[0-9a-f]{32}$/);
+    expect(revision).to.match(/^[0-9a-f]{16}$/);
   });
 
   it('adds no entity to dimmer, blind, thermostat, media and colour-temperature trees', () => {

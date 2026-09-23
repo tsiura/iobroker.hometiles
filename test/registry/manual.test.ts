@@ -1,5 +1,6 @@
 import { expect } from 'chai';
 import type { ManualEntity } from '../../src/config/options';
+import { buildStatePublish } from '../../src/protocol/state-payload';
 import { discoverDevices } from '../../src/registry/detector';
 import { EntityRegistry } from '../../src/registry/entity-registry';
 import { listed, manualDevices } from '../../src/registry/manual';
@@ -705,6 +706,91 @@ describe('registry/manual (Task 13b)', () => {
 
     it("is a datetime's alone: an entry of another domain keeps none", () => {
       expect(only({ stateId: SOLL, domain: 'number', kind: 'time' })).to.not.have.property('kind');
+    });
+  });
+
+  describe('to the panel: the /control payload of a helper (Task 14)', () => {
+    /** The path main.ts takes: the registry's entity, then buildStatePublish. Tokens are checked, then set aside. */
+    function published(entry: ManualEntity, val: unknown, q = 0): { topic: string; fields: Record<string, unknown>; text: string } {
+      const device = only(entry);
+      const registry = new EntityRegistry(QUIET, 0);
+      const { entityIds } = registry.rebuild([device], {});
+      const [channel] = Object.values(device.channels);
+      registry.applyStateChange(channel!.objectId, { val, ack: true, q, ts: 1_758_600_000_000 });
+      const publish = buildStatePublish('ha/statestream', registry.byId(entityIds[device.objectId]!)!)!;
+      expect(publish.retain).to.equal(true);
+      const { session, revision, ...fields } = JSON.parse(publish.payload) as Record<string, unknown>;
+      expect(session).to.match(/^[0-9a-f]{32}$/);
+      expect(revision).to.match(/^[0-9a-f]{16}$/);
+      return { topic: publish.topic, fields, text: publish.payload };
+    }
+
+    it('number: the value, its range, step and unit, writable, on the control leaf', () => {
+      expect(published({ stateId: SOLL, domain: 'number' }, 21.5)).to.deep.include({
+        topic: 'ha/statestream/number/solltemperatur/control',
+        fields: {
+          version: 1,
+          kind: 'number',
+          state: '21.5',
+          available: true,
+          writable: true,
+          min: 15,
+          max: 28,
+          step: 0.5,
+          mode: 'auto',
+          unit: '°C',
+          last_changed: 1_758_600_000,
+        },
+      });
+    });
+
+    it('a helper that holds no value yet goes out as "unknown", available and writable -- never null (Rulings 88, 91)', () => {
+      // A JSON null would make the panel show "--" and refuse every edit
+      // (value_control.cpp:72, :76), so a fresh helper could never be set.
+      expect(published({ stateId: SOLL, domain: 'number' }, null).fields).to.include({ state: 'unknown', available: true, writable: true });
+      expect(published({ stateId: MODUS, domain: 'select' }, null).fields).to.deep.include({
+        state: 'unknown',
+        available: true,
+        writable: true,
+        options: ['Aus', 'Eco', 'Komfort'],
+      });
+    });
+
+    it('a value ioBroker flags as bad goes out as "unavailable", neither available nor writable', () => {
+      expect(published({ stateId: SOLL, domain: 'number' }, 21.5, 0x42).fields).to.include({
+        state: 'unavailable',
+        available: false,
+        writable: false,
+        min: 15,
+      });
+    });
+
+    it('select: the value as its label, the labels as a complete option list', () => {
+      expect(published({ stateId: MODUS, domain: 'select' }, 2)).to.deep.include({
+        topic: 'ha/statestream/select/heizmodus/control',
+        fields: {
+          version: 1,
+          kind: 'select',
+          state: 'Komfort',
+          available: true,
+          writable: true,
+          options_complete: true,
+          options: ['Aus', 'Eco', 'Komfort'],
+          last_changed: 1_758_600_000,
+        },
+      });
+    });
+
+    it('datetime: a time text as kind time', () => {
+      expect(published({ stateId: WECKZEIT, domain: 'datetime' }, '06:45').fields).to.include({ kind: 'time', state: '06:45', writable: true });
+    });
+
+    it('a read-only helper is not writable, and why stays in the log', () => {
+      // A text with no states: no option list (Task 13b m2's "no states").
+      const { fields, text } = published({ stateId: NOTIZ, domain: 'select' }, 'Fenster putzen');
+      expect(fields).to.include({ kind: 'select', state: 'Fenster putzen', writable: false });
+      expect(fields).to.not.have.any.keys('options', 'options_complete');
+      expect(text).to.not.include('no states');
     });
   });
 });

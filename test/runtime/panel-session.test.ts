@@ -241,6 +241,38 @@ describe('runtime/panel-session', () => {
     });
   });
 
+  describe('an editable value (Task 14)', () => {
+    const soll = entity({ entityId: 'number.soll', domain: 'number', state: '21.5', attributes: { min: 15, max: 28, step: 0.5 }, writable: { value: true } });
+    // 64 options of 255 quotes: each quote is 2 bytes on the wire (\"), 33 kB in all.
+    const options = Array.from({ length: 64 }, (_, index) => `${'"'.repeat(253)}${String(index).padStart(2, '0')}`);
+    const huge = (entityId: string): VirtualEntity => entity({ entityId, domain: 'select', state: 'x', attributes: { options }, writable: { value: true } });
+
+    it('publishes its /control payload retained on the control leaf, and clears that leaf', () => {
+      const { session, published } = harness();
+      session.pushEntityState(soll);
+      session.clearEntityState('number.soll');
+      expect(published.map(({ topic, retain }) => [topic, retain])).to.deep.equal([
+        ['ha/statestream/number/soll/control', true],
+        ['ha/statestream/number/soll/control', true],
+      ]);
+      expect(JSON.parse(published[0]!.payload)).to.include({ kind: 'number', state: '21.5', writable: true });
+      expect(published[1]!.payload).to.equal('');
+    });
+
+    it('publishes nothing for a payload too large for the panel, and warns once per entity (Ruling 96)', () => {
+      const { session, published, warnings } = harness();
+      session.pushEntityState(huge('select.gross'));
+      session.pushEntityState(huge('select.gross'));
+      session.pushEntityState(huge('select.riesig'));
+      // A scene publishes nothing either, and that is no reason to warn.
+      session.pushEntityState(entity({ entityId: 'scene.nacht', domain: 'scene' }));
+      expect(published).to.deep.equal([]);
+      expect(warnings).to.have.length(2);
+      expect(warnings[0]).to.include('[Panel a1]').and.include('select.gross').and.include('24576');
+      expect(warnings[1]).to.include('select.riesig');
+    });
+  });
+
   it('routes a switch command to the dispatcher', async () => {
     const { session, writes, registryEntities } = harness();
     registryEntities.set(

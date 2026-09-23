@@ -173,12 +173,56 @@ describe('protocol/state-payload', () => {
     expect(buildStatePublish('ha/statestream', entity({ entityId: 'scene.n', domain: 'scene' }))).to.equal(null);
   });
 
-  it('publishes nothing on the state leaf for an editable value (Task 13)', () => {
-    // The panel reads number, select and datetime from `control` only, in the
-    // /control schema (contract-editable.md §3) that Task 14 builds.
-    for (const domain of ['number', 'select', 'datetime'] as const) {
-      expect(buildStatePublish('ha/statestream', entity({ entityId: `${domain}.t`, domain, state: '1' })), domain).to.equal(null);
-    }
+  describe('number, select and datetime (Task 14, Ruling 97)', () => {
+    const number = (state: string): VirtualEntity =>
+      entity({ entityId: 'number.soll', domain: 'number', state, attributes: { min: 15, max: 28, step: 0.5 }, writable: { value: true } });
+    const editable: Array<[VirtualEntity, string]> = [
+      [number('21.5'), 'number'],
+      [entity({ entityId: 'select.modus', domain: 'select', state: 'Eco', attributes: { options: ['Aus', 'Eco'] }, writable: { value: true } }), 'select'],
+      [
+        entity({ entityId: 'datetime.wecker', domain: 'datetime', state: '06:45', attributes: { has_date: false, has_time: true }, writable: { value: true } }),
+        'time',
+      ],
+    ];
+    const body = (publish: { payload: string } | null): Record<string, unknown> => JSON.parse(publish!.payload) as Record<string, unknown>;
+
+    it('publishes each on its control leaf, retained, in the /control schema -- never on state', () => {
+      // The panel reads them from `control` only (contract-editable.md §3,
+      // mqtt_handlers.cpp:1330, :1456-1459).
+      for (const [value, kind] of editable) {
+        const publish = buildStatePublish('ha/statestream', value)!;
+        expect(publish.topic, kind).to.equal(`ha/statestream/${value.entityId.replace('.', '/')}/control`);
+        expect(publish.retain, kind).to.equal(true);
+        const payload = body(publish);
+        expect(payload, kind).to.include({ version: 1, kind, state: value.state, available: true, writable: true, last_changed: 1_757_000_000 });
+        expect(payload.session, kind).to.match(/^[0-9a-f]{32}$/);
+        expect(payload.revision, kind).to.match(/^[0-9a-f]{16}$/);
+      }
+    });
+
+    it('uses one session for every publish in this process, and keeps the revision while only the value changes', () => {
+      const first = body(buildStatePublish('ha/statestream', number('21.5')));
+      const next = body(buildStatePublish('ha/statestream', number('22')));
+      expect(next.session).to.equal(first.session);
+      expect(next.revision).to.equal(first.revision);
+      for (const [value] of editable) expect(body(buildStatePublish('ha/statestream', value)).session).to.equal(first.session);
+    });
+
+    it('publishes nothing for a payload over the panel\'s 24576 bytes, which the panel drops without a word (Ruling 96)', () => {
+      const options = Array.from({ length: 64 }, (_, index) => `${'"'.repeat(253)}${String(index).padStart(2, '0')}`);
+      const huge = entity({ entityId: 'select.gross', domain: 'select', state: 'x', attributes: { options }, writable: { value: true } });
+      expect(buildStatePublish('ha/statestream', huge)).to.equal(null);
+    });
+
+    it('clears each on the control leaf it was published on', () => {
+      for (const domain of ['number', 'select', 'datetime']) {
+        expect(buildStateClear('ha/statestream', `${domain}.gone`), domain).to.deep.equal({
+          topic: `ha/statestream/${domain}/gone/control`,
+          payload: '',
+          retain: true,
+        });
+      }
+    });
   });
 
   it('clears a retained entity with an empty retained payload', () => {
@@ -200,6 +244,7 @@ describe('protocol/state-payload', () => {
     const shapes = DOMAINS.map((domain) => {
       const publish = buildStatePublish('ha/statestream', entity({ entityId: `${domain}.t`, domain, state: 'on' }));
       if (!publish) return [domain, 'none'] as const;
+      if (publish.topic.endsWith('/control')) return [domain, 'control'] as const;
       return [domain, publish.payload.startsWith('{') ? 'json' : 'bare'] as const;
     });
     expect(Object.fromEntries(shapes)).to.deep.equal({
@@ -212,12 +257,12 @@ describe('protocol/state-payload', () => {
       cover: 'json',
       media_player: 'json',
       weather: 'json',
-      // Task 13 makes these entities real. Their value travels on the
-      // `control` leaf in the /control schema (contract-editable.md §3,
-      // Task 14), never through the generic JSON loop on `state`.
-      number: 'none',
-      select: 'none',
-      datetime: 'none',
+      // Their value travels on the `control` leaf in the /control schema
+      // (contract-editable.md §3, Task 14), never through the generic JSON
+      // loop on `state`.
+      number: 'control',
+      select: 'control',
+      datetime: 'control',
     });
   });
 });

@@ -127,12 +127,23 @@ failure modes exist and an implementer must not confuse them:
 | `version` | int | required, must equal `1` | any other value (including absent, which defaults to `0`) → **hard reject** | `value_control.cpp:67` |
 | `kind` | string | required, one of `"number"`, `"select"`, `"date"`, `"time"`, `"datetime"` | anything else (absent defaults to `""`) → **hard reject** | 68-70 |
 | `state` | string or JSON `null` | **key must be present** | key **absent entirely** → **hard reject** (this is not "unchanged", it discards the whole message); present as JSON `null` → accepted, `has_state=false`; present as a non-string/non-null (number, bool, object) → **hard reject** | 71-73 |
-| `last_changed` | uint64 | optional | absent or wrong type → defaults to `0` (not "unchanged") | 74 |
+| `last_changed` | uint64, epoch **seconds** | optional | absent or wrong type (a float, a negative number, a string) → defaults to `0` (not "unchanged"). Used only to date the popup's new activity entry, and only when it is non-zero (`sensor_popup.cpp:3099`); the Bridge sends `int(changed.timestamp())` (`__init__.py:1534-1536`) | 74 |
 | *(state length)* | — | — | `state` longer than 255 bytes → **hard reject**, regardless of everything else | 75 |
 | `available` | bool | optional | absent → defaults to `false`. Also forced `false` when `state` is JSON `null` (`value.has_state`) and when the literal `state` string equals `"unavailable"`, no matter what this flag says (`value_control.cpp:76`). A null-state payload is therefore never writable | 76 |
 | `writable` | bool | optional | absent → defaults to `false`. Effective `writable` is always `available && writable-flag`, then further narrowed per-kind below | 77 |
-| `session` | string | **required, exactly 32 characters** | any other length (including absent → `""`) → **hard reject** | 78, 80 |
-| `revision` | string | **required, exactly 16 characters** | any other length (including absent → `""`) → **hard reject** | 79, 80 |
+| `session` | string | **required, exactly 32 bytes** (`String::length()`, so 32 characters only when ASCII) | any other length (including absent → `""`) → **hard reject** | 78, 80 |
+| `revision` | string | **required, exactly 16 bytes** | any other length (including absent → `""`) → **hard reject** | 79, 80 |
+
+No other key is read. The Bridge also sends `time_zone` for a date, time or
+datetime (`editable_helpers.py:83`); the firmware never reads it (no match
+for `time_zone` anywhere under `src/`). Numbers are JSON numbers: an integer
+`min` such as `15` passes `finite_json`, since ArduinoJson 7.4.3's
+`is<double>()` is true for every numeric type (`VariantData::isFloat`, the
+`NumberBit` of `VariantContent.hpp`). `\uXXXX` escapes are decoded
+(`ARDUINOJSON_DECODE_UNICODE` defaults to 1), and the
+`DynamicJsonDocument doc(32768)` at `:66` is elastic in ArduinoJson 7, so
+the 24576 bytes of the raw payload, escapes counted as sent, are the only
+size limit.
 
 Kind-specific fields, read **only** when `kind == "number"`:
 
@@ -274,6 +285,17 @@ is easy to misread as a request/ack exchange. It is not one. Precisely:
   sent: if no ack/matching state arrives within 30 s
   (`millis() - c->command_ms >= 30000`), the panel gives up locally and
   shows an error (`value_control.cpp:801-802`).
+- **How the tokens are made** (read from the Bridge, 2026-09-23). `session`
+  is `secrets.token_hex(16)`, once per Home Assistant run
+  (`__init__.py:1077`). `revision` is the first 16 hex characters of a
+  sha256 over the sort-keyed JSON of every payload field except `state`
+  (`editable_helpers.py:94-96`); `last_changed` is added after it
+  (`__init__.py:1534-1536`), so neither the value nor its time moves the
+  revision. Because the panel abandons an edit on any change (`:816-817`),
+  a revision must change with the constraints (range, unit, options, kind,
+  availability, writability, session) and never with the value. This
+  adapter does the same: `CONTROL_SESSION` once per process and
+  `controlRevision` (`src/protocol/editable.ts`, Task 14).
 
 ### The acknowledgement (a third topic, not `/control` or `cmnd/value`)
 
@@ -360,6 +382,15 @@ they ride inside the same `/control` JSON payload as everything else in
   rendered widget, and is stripped back off (`index - c->option_offset`,
   `value_control.cpp:497-498`) before the real option text is put in a
   `cmnd/value` command.
+- **A line break in a select `state` makes the panel write the wrong
+  option.** The placeholder is the display text of the state, joined to the
+  options with `"\n"` (`:845`), and `lv_dropdown` splits on `"\n"`. A
+  state holding one becomes two placeholder rows while `option_offset`
+  stays 1, so each tap on an option below submits the option above it
+  (`:497-498`). The firmware checks options for `\n`/`\r` (`:97`) but never
+  the state. A sender must not send such a state; this adapter sends
+  `"unknown"` for a state with `\n`, `\r` or NUL, as for one over 255 bytes
+  (Task 14).
 
 ## 7. Values treated specially
 
@@ -387,8 +418,8 @@ they ride inside the same `/control` JSON payload as everything else in
 | `stat/value` ack payload | ≤ 1024 bytes | `value_control.cpp:916` |
 | `state` string | ≤ 255 bytes | `value_control.cpp:75` |
 | `unit` string | ≤ 128 bytes (else silently blanked, not rejected) | `value_control.cpp:89` |
-| `session` string | exactly 32 characters | `value_control.cpp:80` |
-| `revision` string | exactly 16 characters | `value_control.cpp:80` |
+| `session` string | exactly 32 bytes | `value_control.cpp:80` |
+| `revision` string | exactly 16 bytes | `value_control.cpp:80` |
 | `options` array | 1–64 entries | `value_control.cpp:92` |
 | each option string | 1–255 bytes, no `\n`/`\r`, unique | `value_control.cpp:97-98` |
 | local command timeout (device-side, independent of `deadline`) | 30 s from publish | `value_control.cpp:801` |
@@ -408,11 +439,8 @@ generation counter so every visible tile re-renders
   else (`value_control.cpp:922-927`); it defines no rejection vocabulary.
   HomeTiles Bridge is a separate repository (per `PROJECT_CONTEXT.md`) and
   was not available to inspect from here.
-- **How `session` and `revision` are generated, and what makes them
-  change** (per-Bridge-boot vs. per-entity; per state update vs. per
-  constraint change). Only the fixed-length contract (32/16 chars) and the
-  firmware's equality-based invalidation are visible from this repo; the
-  generation logic lives in the Bridge.
+- ~~How `session` and `revision` are generated~~ — resolved from the Bridge
+  source: see "How the tokens are made" in §5.
 - **Whether/how the Bridge enforces the `deadline` the device sends.** No
   code path in this firmware depends on it being honored — it is emitted
   and never read back. Not verifiable without the Bridge source.
