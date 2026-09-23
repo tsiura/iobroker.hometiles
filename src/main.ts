@@ -25,6 +25,9 @@ import { mergeSceneAliases } from './runtime/scene-aliases';
 
 const ENTITY_ID_STATE = 'info.entityIds';
 const ROOT_ANCHOR_STATE = 'info.rootAnchors';
+/** A failed discovery is retried after 5 s, 10 s, 20 s ... and at most every 5 minutes. */
+const DISCOVERY_RETRY_FIRST_MS = 5_000;
+const DISCOVERY_RETRY_MAX_MS = 300_000;
 
 class HomeTiles extends utils.Adapter {
   private options!: AdapterOptions;
@@ -36,6 +39,9 @@ class HomeTiles extends utils.Adapter {
   private persistedIds: Record<string, string> = {};
   private rootAnchors: RootAnchors = {};
   private devices: DeviceInput[] = [];
+  /** Until a discovery has succeeded in this run, panels get no configuration (Ruling 56). */
+  private discovered = false;
+  private discoveryRetry: ioBroker.Timeout | undefined;
 
   constructor(options: Partial<utils.AdapterOptions> = {}) {
     super({ ...options, name: 'hometiles' });
@@ -103,7 +109,7 @@ class HomeTiles extends utils.Adapter {
       },
       dispatcher: this.dispatcher,
       log: this.log4,
-      entities: () => this.registry.all(),
+      entities: () => this.panelEntities(),
       onSessionsChanged: async () => {
         await this.syncPanelObjects();
       },
@@ -116,25 +122,64 @@ class HomeTiles extends utils.Adapter {
     });
     this.mqtt.onMessage((topic, payload) => void this.onMqttMessage(topic, payload));
 
-    // One malformed object anywhere in the installation must not keep the
-    // adapter from serving panels: v0.1 crash-looped right here, rejecting
-    // onReady before MQTT ever connected (Ruling 51). Logged, then onward.
-    try {
-      await this.rebuildRegistry();
-    } catch (error) {
-      this.log.error(`[Registry] Discovering devices failed: ${(error as Error)?.stack ?? String(error)}`);
-    }
+    await this.discover();
     await this.subscribeStatesAsync('panels.*');
 
     // A broker that is down must not stop the adapter: the client reconnects.
     await this.mqtt.connect();
     this.log.info(
-      `[HomeTiles] Ready. ${this.devices.length} devices detected, ${this.registry.all().length} entities published`,
+      this.discovered
+        ? `[HomeTiles] Ready. ${this.devices.length} devices detected, ${this.registry.all().length} entities published`
+        : '[HomeTiles] Ready. Devices are published once a discovery succeeds',
     );
+  }
+
+  /**
+   * One malformed object anywhere in the installation must not keep the
+   * adapter from serving panels: v0.1 crash-looped right here, rejecting
+   * onReady before MQTT ever connected (Ruling 51). Nor may a failure publish
+   * an empty world (Ruling 56): it is logged and retried with a bounded
+   * backoff, and until a discovery succeeds no panel gets a configuration,
+   * so each keeps its last one. The first success then proceeds as a normal
+   * start would.
+   */
+  private async discover(attempt = 0): Promise<void> {
+    try {
+      await this.rebuildRegistry();
+    } catch (error) {
+      const delay = Math.min(DISCOVERY_RETRY_FIRST_MS * 2 ** attempt, DISCOVERY_RETRY_MAX_MS);
+      this.log.error(
+        `[Registry] Discovering devices failed: ${error instanceof Error ? error.message : String(error)}. ` +
+          `Panels keep their last configuration; retrying in ${delay / 1000} s`,
+      );
+      this.log.debug(`[Registry] ${error instanceof Error ? error.stack : String(error)}`);
+      this.discoveryRetry = this.setTimeout(() => void this.discover(attempt + 1), delay);
+      return;
+    }
+    this.discovered = true;
+    if (attempt > 0) {
+      this.log.info(
+        `[Registry] Discovery succeeded: ${this.devices.length} devices detected, ${this.registry.all().length} entities published`,
+      );
+    }
+    // Panels that announced meanwhile got nothing; they get everything now.
+    for (const session of this.panels.sessions()) this.pushEverything(session);
+  }
+
+  /** The entities panels may be given: none until a discovery has succeeded (Ruling 56). */
+  private panelEntities(): VirtualEntity[] | null {
+    return this.discovered ? this.registry.all() : null;
+  }
+
+  private pushEverything(session: PanelSession): void {
+    const entities = this.panelEntities();
+    session.pushConfig(entities, true);
+    for (const entity of entities ?? []) session.pushEntityState(entity);
   }
 
   private async onUnload(callback: () => void): Promise<void> {
     try {
+      this.clearTimeout(this.discoveryRetry);
       this.registry?.flush();
       this.registry?.dispose();
       await this.panels?.stopAll();
@@ -223,8 +268,7 @@ class HomeTiles extends utils.Adapter {
     if (!session) return;
 
     if (path === 'control.refresh') {
-      session.pushConfig(this.registry.all(), true);
-      for (const entity of this.registry.all()) session.pushEntityState(entity);
+      this.pushEverything(session);
       await this.setState(id, false, true);
       return;
     }
@@ -286,11 +330,12 @@ class HomeTiles extends utils.Adapter {
   }
 
   private publishEntity(entity: VirtualEntity): void {
+    if (!this.discovered) return;
     for (const session of this.panels.sessions()) session.pushEntityState(entity);
   }
 
   private pushConfigToAllPanels(): void {
-    for (const session of this.panels.sessions()) session.pushConfig(this.registry.all());
+    for (const session of this.panels.sessions()) session.pushConfig(this.panelEntities());
   }
 
   private async syncPanelObjects(): Promise<void> {

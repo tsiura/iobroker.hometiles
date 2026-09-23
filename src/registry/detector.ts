@@ -412,6 +412,21 @@ function controlName(rootName: string, stateName: string | undefined, anchor: st
   return `${rootName} ${own || lastSegment(anchor)}`;
 }
 
+/**
+ * The detector's own error names no object (e.g. "(objects[id].common.role
+ * || "").match is not a function" for a role that is no string,
+ * ChannelDetector.js:90), so the root it was reading is added: the log has to
+ * say where to look (Ruling 56).
+ */
+function detectBelow(detector: DetectorPort, rootId: string): DetectedControl[] {
+  try {
+    return detector.detect(rootId);
+  } catch (error) {
+    const reason = error instanceof Error ? error.message : String(error);
+    throw new Error(`the type-detector failed on the objects below ${rootId}: ${reason}`, { cause: error });
+  }
+}
+
 /** The states that make a detection its type at all: required and requiredOneOf. */
 function requiredStates(control: DetectedControl): string[] {
   return control.states.flatMap((state) => (state.id && (state.required || state.requiredOneOf) ? [state.id] : []));
@@ -473,7 +488,7 @@ export function discoverDevices(
   const nextAnchors: RootAnchors = {};
   for (const rootId of roots) {
     if (rootId.startsWith(`${ownNamespace}.`)) continue;
-    const controls = detector.detect(rootId).map((control) => ({
+    const controls = detectBelow(detector, rootId).map((control) => ({
       ...control,
       states: control.states.filter((state) => !state.id || detectable[state.id]?.type === 'state'),
     }));

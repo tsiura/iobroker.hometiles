@@ -1,6 +1,7 @@
 import Aedes from 'aedes';
 import { expect } from 'chai';
 import { tests, type IntegrationTestHarness } from '@iobroker/testing';
+import mqtt, { type MqttClient } from 'mqtt';
 import { createServer } from 'node:net';
 import path from 'node:path';
 
@@ -82,6 +83,32 @@ const CORRUPT_ENUM_OBJECTS: Record<string, object> = {
 
 const FIXTURE_IDS = [...Object.keys(SENSOR_OBJECTS), ...Object.keys(CORRUPT_ENUM_OBJECTS)];
 
+/** The sensor, hand-corrupted: a role that is no string makes the type-detector itself throw. */
+const BROKEN_SENSOR_OBJECTS: Record<string, object> = {
+  ...SENSOR_OBJECTS,
+  [`${SENSOR}.temperature`]: {
+    type: 'state',
+    common: { name: 'Temperature', role: 5, type: 'number', unit: '°C', read: true, write: false },
+  },
+};
+
+/** A panel as the firmware announces itself: retained on the broker, like its last configuration. */
+const PANEL = 'e2e1';
+const ANNOUNCE_TOPIC = `tab5_lvgl/config/${PANEL}/bridge`;
+const APPLY_TOPIC = `tab5_lvgl/config/${PANEL}/bridge/apply`;
+const ANNOUNCEMENT = JSON.stringify({
+  device_id: PANEL,
+  base_topic: 'hometiles-e2e',
+  ha_prefix: 'ha/e2e',
+  device_name: 'E2E Panel',
+  model: 'waveshare_touch_lcd_8',
+  sensors: [],
+  binary_sensors: [],
+  scene_map: {},
+  local_io: [],
+});
+const LAST_GOOD_APPLY = '{"marker":"the last good configuration"}';
+
 // Opt-in: this downloads and runs a real js-controller, so it stays out of the
 // default suite. Run it with HOMETILES_INTEGRATION=1 npm test.
 if (process.env.HOMETILES_INTEGRATION === '1') {
@@ -149,6 +176,60 @@ if (process.env.HOMETILES_INTEGRATION === '1') {
 
           const errors = logs.filter((log) => log.severity === 'error').map((log) => log.message);
           expect(errors.some((message) => message.includes('members.includes is not a function')), errors.join('\n')).to.equal(true);
+        });
+      });
+
+      suite('a discovery that fails, then recovers (Ruling 56)', (getHarness) => {
+        withCleanFixtures(getHarness);
+        const port = 18852;
+        const broker = new Aedes();
+        const server = createServer(broker.handle);
+        let panel: MqttClient;
+        const applies: string[] = [];
+        before(async () => {
+          await new Promise<void>((resolve) => server.listen(port, resolve));
+          panel = await mqtt.connectAsync(`mqtt://127.0.0.1:${port}`);
+          await panel.publishAsync(APPLY_TOPIC, LAST_GOOD_APPLY, { retain: true });
+          await panel.publishAsync(ANNOUNCE_TOPIC, ANNOUNCEMENT, { retain: true });
+          panel.on('message', (topic, payload) => {
+            if (topic === APPLY_TOPIC) applies.push(payload.toString());
+          });
+          await panel.subscribeAsync(APPLY_TOPIC);
+        });
+        after((done) => {
+          panel.end(true);
+          server.close(() => done());
+          broker.close();
+        });
+
+        it('publishes no apply while discovery fails, and says where and what happens next', async function () {
+          this.timeout(120000);
+          const harness = getHarness();
+          const logs = await captureLogs(harness);
+          await harness.changeAdapterConfig('hometiles', { native: { brokerHost: '127.0.0.1', brokerPort: port } });
+          await setObjects(harness, BROKEN_SENSOR_OBJECTS);
+          await harness.startAdapterAndWait(true);
+          await waitFor(harness, () => logs.find((log) => log.message.includes(`[Panel ${PANEL}] Session started`)), 'the panel');
+          const failure = await waitFor(
+            harness,
+            () => logs.find((log) => log.severity === 'error' && log.message.includes('Discovering devices failed')),
+            'the discovery error',
+          );
+          expect(failure.message).to.include(`the objects below ${SENSOR}`);
+          expect(failure.message).to.include('Panels keep their last configuration; retrying in 5 s');
+          // A retained apply with every list empty would make the firmware
+          // prune the panel's tile bindings and save that to flash.
+          await new Promise((resolve) => setTimeout(resolve, 1000));
+          expect(applies).to.deep.equal([LAST_GOOD_APPLY]);
+        });
+
+        it('publishes the normal apply once a retry succeeds', async function () {
+          this.timeout(120000);
+          const harness = getHarness();
+          await setObjects(harness, SENSOR_OBJECTS);
+          const apply = await waitFor(harness, () => applies.find((payload) => payload.includes('sensor.balkon')), 'the normal apply');
+          expect(JSON.parse(apply).sensors).to.deep.equal(['sensor.balkon']);
+          expect(applies[0]).to.equal(LAST_GOOD_APPLY);
         });
       });
     },

@@ -1113,4 +1113,14 @@ describe('discovery orchestration (Task 5d)', () => {
     const third = discoverDevices(dualSet(false), 'hometiles.0', second.anchors);
     expect(third.devices.map(({ objectId }) => objectId)).to.deep.equal([DUAL]);
   });
+
+  it('(Ruling 56) a type-detector failure names the root whose objects it could not read', () => {
+    // A role that is no string makes the detector itself throw
+    // (ChannelDetector.js:90); the log must say where to look.
+    const broken = objects(
+      device(BALKON, 'Balkon'),
+      state(`${BALKON}.temperature`, { role: 5, type: 'number', unit: '°C', write: false }),
+    );
+    expect(() => discoverDevices(broken, 'hometiles.0')).to.throw(`the objects below ${BALKON}`);
+  });
 });

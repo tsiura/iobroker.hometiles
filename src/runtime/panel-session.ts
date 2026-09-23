@@ -117,7 +117,15 @@ export class PanelSession {
     await this.start();
   }
 
-  pushConfig(entities: VirtualEntity[], force = false): boolean {
+  /**
+   * `null`: the entity list is not known yet, because no discovery has
+   * succeeded in this run, so nothing is published. A retained apply with
+   * every list empty would make the firmware prune the panel's tile bindings
+   * and save that to flash; the panel keeps its last configuration instead
+   * (Ruling 56).
+   */
+  pushConfig(entities: VirtualEntity[] | null, force = false): boolean {
+    if (!entities) return false;
     const payload = buildApplyPayload({ entities, sceneMap: this.sceneMap });
     const signature = configSignature(payload);
     if (!force && signature === this.lastSignature) return false;

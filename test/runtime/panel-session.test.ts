@@ -108,6 +108,14 @@ describe('runtime/panel-session', () => {
     expect(writes).to.deep.equal([['zig.0.blind.level', 30]]);
   });
 
+  it('publishes no configuration while the entity list is not known yet (Ruling 56)', () => {
+    // A retained apply with every list empty makes the firmware prune every
+    // tile binding and save that to flash; the panel keeps its last one.
+    const { session, published } = harness();
+    expect(session.pushConfig(null, true)).to.equal(false);
+    expect(published).to.deep.equal([]);
+  });
+
   it('publishes the configuration retained to the apply topic', () => {
     const { session, published } = harness();
     expect(session.pushConfig([entity({})])).to.equal(true);

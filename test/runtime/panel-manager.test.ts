@@ -29,7 +29,7 @@ const ENTITY: VirtualEntity = {
   lastChanged: 1_757_000_000_000,
 };
 
-function harness() {
+function harness(entities: () => VirtualEntity[] | null = () => [ENTITY]) {
   const published: PublishRequest[] = [];
   const subscribed: string[] = [];
   const unsubscribed: string[] = [];
@@ -58,7 +58,7 @@ function harness() {
     transport,
     dispatcher,
     log,
-    entities: () => [ENTITY],
+    entities,
     onSessionsChanged: () => {
       sessionsChanged++;
     },
@@ -86,6 +86,15 @@ describe('runtime/panel-manager', () => {
     expect(manager.get('a1')).to.not.equal(undefined);
     expect(published.some((p) => p.topic === 'tab5_lvgl/config/a1/bridge/apply')).to.equal(true);
     expect(published.some((p) => p.topic === 'ha/statestream/switch/k/state')).to.equal(true);
+  });
+
+  it('publishes nothing to a panel announcing before discovery has succeeded (Ruling 56)', async () => {
+    const { manager, published } = harness(() => null);
+    await manager.handleAnnouncement('a1', announcement('a1', 'panel-a'));
+    expect(manager.get('a1')).to.not.equal(undefined);
+    // Neither does the panel's own refresh request.
+    await manager.handleMessage('tab5_lvgl/config/a1/bridge/request', 'force');
+    expect(published).to.deep.equal([]);
   });
 
   it('rejects a malformed announcement without creating a session', async () => {

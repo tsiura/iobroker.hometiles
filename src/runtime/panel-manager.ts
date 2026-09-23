@@ -8,8 +8,12 @@ export interface PanelManagerDeps {
   transport: PanelTransport;
   dispatcher: Dispatcher;
   log: Logger;
-  /** Current registry contents, used for the initial push to a new panel. */
-  entities(): VirtualEntity[];
+  /**
+   * Current registry contents, used for the initial push to a new panel, or
+   * null until a discovery has succeeded in this run: then nothing is pushed
+   * and the panel keeps its last configuration (Ruling 56).
+   */
+  entities(): VirtualEntity[] | null;
   /** Called after a session is created, updated or removed. */
   onSessionsChanged(): void | Promise<void>;
   /**
@@ -73,13 +77,13 @@ export class PanelManager {
     const session = new PanelSession(announcement, this.deps.transport, this.deps.dispatcher, this.deps.log);
     session.onRefreshRequested = (): void => {
       session.pushConfig(this.deps.entities(), true);
-      for (const entity of this.deps.entities()) session.pushEntityState(entity);
+      for (const entity of this.deps.entities() ?? []) session.pushEntityState(entity);
     };
 
     this.panels.set(deviceId, session);
     await session.start();
     session.pushConfig(this.deps.entities(), true);
-    for (const entity of this.deps.entities()) session.pushEntityState(entity);
+    for (const entity of this.deps.entities() ?? []) session.pushEntityState(entity);
     await this.deps.onSessionsChanged();
   }
 
