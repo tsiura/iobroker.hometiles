@@ -668,7 +668,47 @@ export function discoverDevices(
     }
   }
   mergeWeatherSources(devices, weatherViews);
+  preferEpochDates(devices, detectable, meta);
   return { devices, anchors: nextAnchors, ignored, badRoles };
+}
+
+/** A forecast day's own date, in any form; a plain `date` is any time of any day. */
+const FORECAST_DATE_ROLE = /^date\.forecast\.\d+$/;
+const parentOf = (id: string): string => id.slice(0, id.lastIndexOf('.'));
+
+/**
+ * Each forecast day's date from its epoch-ms state where the day has one
+ * (Ruling 79(a)). The pattern's DATE and DATE%d take a string only
+ * (typePatterns.js:745-751, :917-924), and ioBroker.openweathermap 2.0.0
+ * gives every day three states of role date.forecast.N -- the epoch-ms `date`
+ * and the weekday names `day` and `day_short` (io-package.json
+ * instanceObjects) -- so the detector binds a weekday, by sort order: no date.
+ * A `date` channel therefore moves to the number state beside it, same parent
+ * and same role, the lowest id should there be several. Only for
+ * date.forecast.N: a plain `date` is any time, such as the moonrise beside a
+ * DasWetter day's date.
+ */
+function preferEpochDates(
+  devices: readonly DeviceInput[],
+  objects: Readonly<Record<string, IoBrokerObject>>,
+  meta: Readonly<Record<string, ObjectMeta>>,
+): void {
+  const epochs = new Map<string, string>();
+  for (const [id, info] of Object.entries(meta)) {
+    if (objects[id]?.type !== 'state' || info.type !== 'number' || !FORECAST_DATE_ROLE.test(info.role ?? '')) continue;
+    const key = `${parentOf(id)} ${info.role}`;
+    const kept = epochs.get(key);
+    if (kept === undefined || id < kept) epochs.set(key, id);
+  }
+  // Only weatherForecast has a DATE (typePatterns.js:749, :919).
+  for (const device of devices) {
+    for (const [name, channel] of Object.entries(device.channels)) {
+      const id = /^date\d*$/.test(name) ? epochs.get(`${parentOf(channel.objectId)} ${channel.role}`) : undefined;
+      if (id === undefined) continue;
+      const write = meta[id]?.write;
+      device.channels[name] = { objectId: id, role: channel.role, type: 'number', ...(write === undefined ? {} : { write }) };
+    }
+  }
 }
 
 /**

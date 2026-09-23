@@ -48,6 +48,11 @@ function panelNumber(payload: string, key: string): number | undefined {
 const tileCondition = (payload: string): string | undefined => panelText(payload, 'state') ?? panelText(payload, 'condition');
 const popupCondition = (payload: string): string | undefined =>
   panelText(payload, 'condition') ?? panelText(payload, 'c') ?? panelText(payload, 'state');
+/** The tile's forecast: from the `[` after the first `"forecast"` to the first `]`, strings or not (tile_renderer.cpp:846-857). */
+function tileForecast(payload: string): string {
+  const open = payload.indexOf('[', payload.indexOf('"forecast"'));
+  return payload.slice(open + 1, payload.indexOf(']', open));
+}
 
 /** Runs `read` with the host in `zone`, restoring the zone after. Node re-reads process.env.TZ on assignment. */
 function inZone<T>(zone: string, read: () => T): T {
@@ -169,6 +174,36 @@ describe('protocol/weather', () => {
       expect(popupCondition(payload), 'popup').to.equal(undefined);
       // The forecast day itself is untouched.
       expect(JSON.parse(payload).forecast).to.deep.equal([{ condition: 'sunny', temperature: 24, templow: 11 }]);
+    });
+
+    it('says it with "" also when the first day lacks the key: the lookup reads the first day that has it', () => {
+      const iconOnly = { weather_icon: 'https://example.com/a.png' };
+      const temperature = publish({ forecast: [iconOnly, { temperature: 21 }] });
+      expect(JSON.parse(temperature)).to.include({ temperature: '' });
+      expect(panelNumber(temperature, 'temperature'), 'not day 1 high').to.equal(undefined);
+
+      const condition = publish({ temperature: 5, forecast: [iconOnly, { weather_state: 'Sonnig' }] });
+      expect(JSON.parse(condition)).to.include({ state: '', condition: '' });
+      expect(tileCondition(condition), 'tile').to.equal(undefined);
+      expect(popupCondition(condition), 'popup').to.equal(undefined);
+    });
+
+    it('treats a name or current text that is a key the panel looks up as absent: the lookup would take it for that key', () => {
+      // Every key a reader looks up over the whole payload: the tile
+      // (tile_renderer.cpp:2552-2570, :2641, :2667), the popup
+      // (weather_popup.cpp:1029-1059, :2501-2511, :2576, :2602, :2700) and the
+      // entity cache, which appends an old payload's tail after
+      // "entity_picture_data" (tab_tiles_unified.cpp:398-416, :435-436).
+      const keys = ['state', 'condition', 'c', 'icon', 'i', 'temperature', 'units', 'temperature_unit', 'precipitation_unit', 'name', 'forecast', 'forecast_hourly', 'entity_picture_data'];
+      for (const key of keys) {
+        expect(parse({ friendly_name: key, temperature: 5 }), `name ${key}`).to.deep.equal({ temperature: 5 });
+        expect(parse({ weather_state: key, temperature: 5 }), `text ${key}`).to.deep.equal({ temperature: 5, name: 'Zuhause' });
+        expect(parse({ weather_state: key, forecast: [{ temperature: 6 }] }), `text ${key}`).to.include({ state: '', condition: '' });
+      }
+      // A friendly name "temperature_unit" with no unit declared was the tile's unit: the next quoted token, a day's key.
+      expect(panelText(publish({ friendly_name: 'temperature_unit', forecast: [{ date: '2026-09-24', temperature: 6 }] }), 'temperature_unit')).to.equal(undefined);
+      // Only the exact key: the panel's match is case-sensitive (json_scan.h:43-45).
+      expect(parse({ friendly_name: 'Icon', weather_state: 'Temperature' })).to.deep.equal({ state: 'Temperature', condition: 'Temperature', name: 'Icon' });
     });
 
     it('leaves a missing value out when no forecast follows: nothing could be misread', () => {
@@ -323,10 +358,35 @@ describe('protocol/weather', () => {
       expect(conditionOf('clear-night')).to.equal('clear-night');
     });
 
-    it('sends text it cannot map unchanged, so the panel shows it with no icon', () => {
+    it('sends current text it cannot map unchanged, so the panel shows it with no icon', () => {
       expect(conditionOf('Heiß')).to.equal('Heiß');
       expect(conditionOf('Tag 3')).to.equal('Tag 3');
-      expect(parse({ forecast: [{ weather_state: 'Ice', temperature: 1 }] }).forecast).to.deep.equal([{ condition: 'Ice', temperature: 1 }]);
+    });
+
+    it("sends a day's condition only when it is one of the 15: a day shows no text, and a `]` or a key's name in it cuts or captures the tile's forecast", () => {
+      // A day keeps only a condition's icon (tile_renderer.cpp:2692, :2702-2704;
+      // ForecastData, weather_popup.cpp:223-236).
+      const payload = publish({
+        forecast: [
+          { weather_state: 'Regen', temperature: 7 },
+          { weather_state: 'Tag [3]', temperature: 8 },
+          { weather_state: 'templow', temperature: 20, templow: 10 },
+          { weather_state: 'Ice', temperature: 1 },
+          { weather_state: 'Sonne', temperature: 9 },
+        ],
+      });
+      const days = JSON.parse(payload).forecast as Array<Record<string, unknown>>;
+      expect(days).to.deep.equal([
+        { condition: 'rainy', temperature: 7 },
+        { temperature: 8 },
+        { temperature: 20, templow: 10 },
+        { temperature: 1 },
+        { condition: 'sunny', temperature: 9 },
+      ]);
+      // The tile's array ends at the first `]`: all five days reach it.
+      expect(tileForecast(payload)).to.equal(JSON.stringify(days).slice(1, -1));
+      // A day's low is looked up in its own entry (tile_renderer.cpp:2687): its low, not its high.
+      expect(panelNumber(JSON.stringify(days[2]), 'templow')).to.equal(10);
     });
 
     it('reads no condition from a number', () => {
@@ -355,9 +415,16 @@ describe('protocol/weather', () => {
       }
     });
 
-    it('sends no date for a weekday name, a timestamp number, or a time with no zone', () => {
+    it('converts an epoch-ms number, as ioBroker dates are, to the local date on either side of UTC (Ruling 79(a))', () => {
+      // 22:30Z on the 23rd is 00:30 on the 24th in Berlin; 02:00Z on the 24th is 22:00 on the 23rd in New York.
+      inZone('Europe/Berlin', () => expect(datesOf(Date.UTC(2026, 8, 23, 22, 30))).to.deep.equal(['2026-09-24']));
+      inZone('America/New_York', () => expect(datesOf(Date.UTC(2026, 8, 24, 2))).to.deep.equal(['2026-09-23']));
+    });
+
+    it('sends no date for a weekday name, a number below 1e11 (epoch seconds), or a time with no zone', () => {
       expect(datesOf('Mittwoch', 'Donnerstag')).to.deep.equal([undefined, undefined]);
-      expect(datesOf(1_758_621_600_000)).to.deep.equal([undefined]);
+      expect(datesOf(1_758_621_600)).to.deep.equal([undefined]);
+      expect(datesOf(99_999_999_999)).to.deep.equal([undefined]);
       expect(datesOf('2026-09-23T07:00:00')).to.deep.equal([undefined]);
     });
 

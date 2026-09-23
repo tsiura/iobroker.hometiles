@@ -19,10 +19,10 @@ import { usableNumber, usableString } from './climate';
  * - Never null: the tile's string reader takes the next quoted token as the
  *   value of a null (tile_renderer.cpp:807-813).
  * - Only one of Home Assistant's 15 conditions gets an icon and a translated
- *   label (weather_popup.cpp:1004-1024, i18n.cpp:1728-1749); other text is
- *   shown as it is. The tile reads `state` first and the popup `condition`
- *   first (tile_renderer.cpp:2552-2554, weather_popup.cpp:1040-1060), so both
- *   carry it.
+ *   label (weather_popup.cpp:1004-1024, i18n.cpp:1728-1749); other current
+ *   text is shown as it is, a day's never. The tile reads `state` first and
+ *   the popup `condition` first (tile_renderer.cpp:2552-2554,
+ *   weather_popup.cpp:1040-1060), so both carry it.
  * - No `icon`: the panel derives exactly the Bridge's icons from the condition
  *   (_WEATHER_ICON_MAP, __init__.py:4819-4835), and a forecast entry's `icon`
  *   would be read as the current one.
@@ -31,7 +31,8 @@ import { usableNumber, usableString } from './climate';
  * - A day's date goes out as date_local, the host's local YYYY-MM-DD (the
  *   Bridge's, __init__.py:3865-3868), only when every day has one: an undated
  *   day takes the first free slot in arrival order (tile_renderer.cpp:2709-2721),
- *   which misorders a mixed set.
+ *   which misorders a mixed set. The panel compares it with its own today, so
+ *   the host's time zone must be the panels' (review M3).
  * - No aggregation (Ruling 72): a day's high and low are the provider's own
  *   daily TEMP_MAX and TEMP_MIN; ioBroker's weather patterns carry no hours.
  */
@@ -97,6 +98,33 @@ const KEYWORDS: ReadonlyArray<readonly [RegExp, string]> = [
   [/sonn|sun|klar|clear|heiter|fair|wolkenlos/, 'sunny'],
 ];
 
+/**
+ * Every key a panel reader looks up over the whole payload: the tile
+ * (tile_renderer.cpp:2552-2570, :2641, :2667), the popup
+ * (weather_popup.cpp:1029-1059, :2501-2511, :2576, :2602, :2700), and the
+ * entity cache, which appends an old payload's tail from
+ * "entity_picture_data" on (tab_tiles_unified.cpp:398-416, :435-436). A lookup
+ * takes a string VALUE equal to its key as well, and reads past the next colon
+ * (json_scan.h:41-47), so a name or current text equal to one is none (review
+ * M2). A `\u` escape is no way out: neither reader decodes a condition.
+ */
+const PANEL_KEYS: ReadonlySet<string> = new Set([
+  'state',
+  'condition',
+  'c',
+  'icon',
+  'i',
+  'temperature',
+  'units',
+  'temperature_unit',
+  'precipitation_unit',
+  'name',
+  'forecast',
+  'forecast_hourly',
+  'entity_picture_data',
+]);
+const notKey = (text: string | undefined): string | undefined => (text !== undefined && PANEL_KEYS.has(text) ? undefined : text);
+
 /** Home Assistant's condition for a provider's text and icon, else the text as it is. */
 function condition(text: unknown, icon: unknown): string | undefined {
   const [, code = '', time] = OWM_ICON.exec(usableString(icon) ?? '') ?? [];
@@ -112,18 +140,21 @@ function condition(text: unknown, icon: unknown): string | undefined {
 const PLAIN_DATE = /^\d{4}-\d{2}-\d{2}$/;
 /** A date and a time with its zone, Z or an offset: one instant (Ruling 74). */
 const INSTANT = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}(:\d{2}(\.\d+)?)?(Z|[+-]\d{2}:\d{2})$/;
+/** Epoch ms, ioBroker's own date (Ruling 79(a)); a smaller number (epoch seconds) is none. */
+const EPOCH_MS_MIN = 1e11;
 const two = (value: number): string => String(value).padStart(2, '0');
 
 /**
  * A day's date as the host's local YYYY-MM-DD, when it has one beyond doubt: a
- * plain date is already local (Weather Underground), an instant is converted
- * (DasWetter's UTC midnight, AccuWeather's offset). A weekday name
- * (OpenWeatherMap), a number or a time with no zone is none.
+ * plain date is already local (Weather Underground); an instant is converted:
+ * DasWetter's UTC midnight, AccuWeather's offset, OpenWeatherMap's epoch ms. A
+ * weekday name, a number below 1e11 or a time with no zone is none.
  */
 function localDate(date: unknown): string | undefined {
   const text = usableString(date) ?? '';
   if (PLAIN_DATE.test(text)) return text;
-  const instant = INSTANT.test(text) ? new Date(text) : undefined;
+  const instant =
+    typeof date === 'number' && date >= EPOCH_MS_MIN ? new Date(date) : INSTANT.test(text) ? new Date(text) : undefined;
   if (!instant || Number.isNaN(instant.getTime())) return undefined;
   return `${instant.getFullYear()}-${two(instant.getMonth() + 1)}-${two(instant.getDate())}`;
 }
@@ -144,24 +175,31 @@ export function buildWeatherPayload(entity: VirtualEntity): string {
   const days = Array.isArray(attrs.forecast) ? (attrs.forecast as Array<Record<string, unknown>>) : [];
   const dates = days.map((day) => localDate(day.date));
   const dated = dates.every((date) => date !== undefined);
-  const forecast = days.map((day, index) => ({
-    date_local: dated ? dates[index] : undefined,
-    condition: condition(day.weather_state, day.weather_icon),
-    temperature: usableNumber(day.temperature),
-    templow: usableNumber(day.templow),
-    precipitation: usableNumber(day.precipitation),
-    precipitation_probability: usableNumber(day.precipitation_probability),
-  }));
+  const forecast = days.map((day, index) => {
+    // A day shows a condition's icon only, never text (tile_renderer.cpp:2692,
+    // :2702-2704; weather_popup.cpp:223-236), and the tile's array ends at the
+    // first `]`, a text's included (tile_renderer.cpp:846-857): so one of the
+    // 15 or none (review M1).
+    const shown = condition(day.weather_state, day.weather_icon);
+    return {
+      date_local: dated ? dates[index] : undefined,
+      condition: shown !== undefined && CONDITIONS.has(shown) ? shown : undefined,
+      temperature: usableNumber(day.temperature),
+      templow: usableNumber(day.templow),
+      precipitation: usableNumber(day.precipitation),
+      precipitation_probability: usableNumber(day.precipitation_probability),
+    };
+  });
   // "" is "none" only where a forecast could be misread in its place.
   const none = forecast.length ? '' : undefined;
-  const now = condition(attrs.weather_state, attrs.weather_icon) ?? none;
+  const now = notKey(condition(attrs.weather_state, attrs.weather_icon)) ?? none;
   return JSON.stringify({
     state: now,
     condition: now,
     temperature: usableNumber(attrs.temperature) ?? none,
     temperature_unit: usableString(attrs.temperature_unit) ?? dayUnit(days, 'temperature_unit', 'templow_unit'),
     precipitation_unit: dayUnit(days, 'precipitation_unit'),
-    name: usableString(attrs.friendly_name),
+    name: notKey(usableString(attrs.friendly_name)),
     forecast: forecast.length ? forecast : undefined,
   });
 }

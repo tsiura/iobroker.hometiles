@@ -615,7 +615,9 @@ const OPENWEATHERMAP_VALUES: Record<string, SourceValue> = {
       [`${OWM}.day${d}.state`, val(`Tag ${d}`)],
       [`${OWM}.day${d}.day`, val(WEEKDAYS[d])],
       [`${OWM}.day${d}.day_short`, val(WEEKDAYS[d]!.slice(0, 2))],
-      [`${OWM}.day${d}.date`, val(1_758_621_600_000 + d * 86_400_000)],
+      // Epoch ms of the day's first 3-hour slot at or after local noon
+      // (build/main.js:198, :216-225): 12:00Z, 14:00 in Berlin.
+      [`${OWM}.day${d}.date`, val(Date.UTC(2026, 8, 23 + d, 12))],
     ]),
   ),
 };
@@ -891,12 +893,30 @@ describe('weather with the real type-detector (Task 11)', () => {
       expect(anchors[OWM]).to.be.a('string').and.not.equal(anchors[`${OWM}.day0`]);
     });
 
-    it("keeps the adapter's dates as they are: weekday names, since its real date is a number the pattern's DATE (a string) cannot bind", () => {
+    it("dates each day by its epoch-ms state, not by a weekday name beside it under the same role (Ruling 79(a))", () => {
       const owm = only(runAll(OPENWEATHERMAP, OPENWEATHERMAP_VALUES), `${OWM}.day0`);
-      // Day 0's DATE is the detector's pick among day0.day/day0.day_short;
-      // days 1..5 come from the device root's DATE%d, day<k>.day first.
-      expect(forecast(owm).map((entry) => entry.date)).to.deep.equal(['Mi', 'Donnerstag', 'Freitag', 'Samstag', 'Sonntag', 'Montag']);
+      // The pattern's DATE is a string, so the detector binds day0.day or
+      // day0.day_short, and the device root's DATE%d day<k>.day: a weekday,
+      // no date. Each day's number beside it, under the same role, is its date.
+      expect(forecast(owm).map((entry) => entry.date)).to.deep.equal([0, 1, 2, 3, 4, 5].map((d) => Date.UTC(2026, 8, 23 + d, 12)));
+      expect([0, 1, 2, 3, 4, 5].map((d) => owm.device.channels[d ? `date${d}` : 'date']?.objectId)).to.deep.equal(
+        [0, 1, 2, 3, 4, 5].map((d) => `${OWM}.day${d}.date`),
+      );
       expect(forecast(owm)[5]).to.include({ temperature: 24, temperature_unit: '°C', templow: 14, templow_unit: '°C' });
+    });
+
+    it("takes the lowest-id number state of the day's role beside its date, in any object order, never a channel object", () => {
+      // No real tree has these: a second number under day 0's role, a channel
+      // object claiming the role with a lower id, and another source's day 0
+      // (a second instance) with a lower id still.
+      const tree = ioObjects([
+        ...Object.values(OPENWEATHERMAP),
+        ioState(`${OWM}.day0.dateUTC`, 'date.forecast.0', 'number'),
+        ioChannel(`${OWM}.day0.clock`, 'clock', { role: 'date.forecast.0', type: 'number' }),
+        ioState('alias.0.other.date', 'date.forecast.0', 'number'),
+      ]);
+      expect(only(runAll(tree, OPENWEATHERMAP_VALUES), `${OWM}.day0`).device.channels.date?.objectId).to.equal(`${OWM}.day0.date`);
+      expectStableDiscovery(tree);
     });
 
     it('keeps discovery stable', () => expectStableDiscovery(OPENWEATHERMAP));
@@ -1086,8 +1106,8 @@ describe('the published weather payload, from the real type-detector (Task 12)',
     return publish!;
   }
 
-  it('OpenWeatherMap: the current icon code decides the condition, day by day too; weekday names give no dates', () => {
-    const { topic, payload } = published(OPENWEATHERMAP, OPENWEATHERMAP_VALUES, `${OWM}.day0`);
+  it('OpenWeatherMap: the icon code decides the condition, day by day too; each day is dated by its epoch ms', () => {
+    const { topic, payload } = inZone('Europe/Berlin', () => published(OPENWEATHERMAP, OPENWEATHERMAP_VALUES, `${OWM}.day0`));
     expect(topic).to.equal('ha/statestream/weather/under_test/weather');
     // The current icon is 10d (rain) beside "Leichter Regen"; day k's is 0(k+1)d.
     expect(JSON.parse(payload)).to.deep.equal({
@@ -1097,15 +1117,40 @@ describe('the published weather payload, from the real type-detector (Task 12)',
       temperature_unit: '°C',
       name: 'Actual weather or forecast',
       forecast: [
-        { condition: 'sunny', temperature: 19, templow: 9 },
-        { condition: 'partlycloudy', temperature: 20, templow: 10 },
-        { condition: 'partlycloudy', temperature: 21, templow: 11 },
-        { condition: 'cloudy', temperature: 22, templow: 12 },
-        // 05d and 06d are no code OpenWeatherMap documents: the day's text goes out.
-        { condition: 'Tag 4', temperature: 23, templow: 13 },
-        { condition: 'Tag 5', temperature: 24, templow: 14 },
+        { date_local: '2026-09-23', condition: 'sunny', temperature: 19, templow: 9 },
+        { date_local: '2026-09-24', condition: 'partlycloudy', temperature: 20, templow: 10 },
+        { date_local: '2026-09-25', condition: 'partlycloudy', temperature: 21, templow: 11 },
+        { date_local: '2026-09-26', condition: 'cloudy', temperature: 22, templow: 12 },
+        // 05d and 06d are no code OpenWeatherMap documents, and a day's text
+        // ("Tag 4") is never shown: no condition (review M1).
+        { date_local: '2026-09-27', temperature: 23, templow: 13 },
+        { date_local: '2026-09-28', temperature: 24, templow: 14 },
       ],
     });
+  });
+
+  it('OpenWeatherMap at 23:30: day 0 is already tomorrow, and goes under tomorrow, dated by its epoch ms (Ruling 79(a))', () => {
+    // After today's last 3-hour slot the adapter's day0 is tomorrow
+    // (build/main.js:331-360), dated by its first slot at or after local noon
+    // (:216-225). Beside each epoch are the weekday names under the same role.
+    const thursdayOn = ['Donnerstag', 'Freitag', 'Samstag', 'Sonntag', 'Montag', 'Dienstag'];
+    const lateEvening = {
+      ...OPENWEATHERMAP_VALUES,
+      ...Object.fromEntries(
+        [0, 1, 2, 3, 4, 5].flatMap((d) => [
+          [`${OWM}.day${d}.date`, val(Date.UTC(2026, 8, 24 + d, 12))],
+          [`${OWM}.day${d}.day`, val(thursdayOn[d])],
+          [`${OWM}.day${d}.day_short`, val(thursdayOn[d]!.slice(0, 2))],
+        ]),
+      ),
+    };
+    const { payload } = inZone('Europe/Berlin', () => published(OPENWEATHERMAP, lateEvening, `${OWM}.day0`));
+    const days = (JSON.parse(payload) as { forecast: Array<Record<string, unknown>> }).forecast;
+    // On the 23rd the panel puts an entry dated the 24th in tomorrow's slot
+    // (iso_date_day_offset, tile_renderer.cpp:2709-2715): undated, it took
+    // today's (:2716-2721).
+    expect(days.map((day) => day.date_local)).to.deep.equal(['2026-09-24', '2026-09-25', '2026-09-26', '2026-09-27', '2026-09-28', '2026-09-29']);
+    expect(days[0]).to.include({ temperature: 19, templow: 9 });
   });
 
   it('DasWetter: the day entity says its missing current temperature with "" ahead of the day, whose date is local', () => {
