@@ -637,7 +637,9 @@ describe('registry/manual (Task 13b)', () => {
       ['a number without a step', 'number', { type: 'number', role: 'level', min: 0, max: 10, write: true }, 3, undefined],
       ['a select without states', 'select', { type: 'string', role: 'text', write: true }, 'a', 'no states'],
       ['a select of 65 states', 'select', { type: 'number', role: 'level.mode', states: SIXTY_FIVE, write: true }, 1, 'more than 64 states'],
-      ['a select with a label on two lines', 'select', { type: 'string', role: 'text', states: { a: 'Eins\nZwei' }, write: true }, 'a', 'an empty, over-long or multi-line state label'],
+      ['a select with a label on two lines', 'select', { type: 'string', role: 'text', states: { a: 'Eins\nZwei' }, write: true }, 'a', 'an empty, over-long, multi-line or malformed state label'],
+      // Task 14 review m1: a lone UTF-16 surrogate, 0 or 4 bytes on the panel.
+      ['a select with a broken label', 'select', { type: 'string', role: 'text', states: { a: 'Eins\udc00' }, write: true }, 'a', 'an empty, over-long, multi-line or malformed state label'],
       ['a select with one label twice', 'select', { type: 'number', role: 'level.mode', states: { 0: 'Aus', 1: 'aus' }, write: true }, 0, 'states that do not map one to one'],
       ['a select that refuses writes', 'select', { type: 'number', role: 'value', states: { 0: 'Aus' }, write: false }, 0, 'write is false'],
       ['a select with its states', 'select', { type: 'number', role: 'level.mode', states: { 0: 'Aus' }, write: true }, 0, undefined],
@@ -791,6 +793,63 @@ describe('registry/manual (Task 13b)', () => {
       expect(fields).to.include({ kind: 'select', state: 'Fenster putzen', writable: false });
       expect(fields).to.not.have.any.keys('options', 'options_complete');
       expect(text).to.not.include('no states');
+    });
+
+    describe('the revision through the real synth (Task 14 review m3)', () => {
+      /** State, kind and revision published after each value in turn, through one registry. */
+      function sequence(entry: ManualEntity, values: unknown[], all: Record<string, IoObject> = ALL): Array<[unknown, unknown, unknown]> {
+        const device = manualDevices([entry], all, NS).devices[0]!;
+        const registry = new EntityRegistry(QUIET, 0);
+        const { entityIds } = registry.rebuild([device], {});
+        const [channel] = Object.values(device.channels);
+        return values.map((val, index) => {
+          registry.applyStateChange(channel!.objectId, { val, ack: true, q: 0, ts: 1_758_600_000_000 + index * 60_000 });
+          const publish = buildStatePublish('ha/statestream', registry.byId(entityIds[device.objectId]!)!)!;
+          const { state: shown, kind, revision } = JSON.parse(publish.payload) as Record<string, unknown>;
+          return [shown, kind, revision];
+        });
+      }
+
+      it('keeps it while only the value changes: a new one would make the panel give up an edit (value_control.cpp:816-817)', () => {
+        const EPOCH = `${U}.Wecker.Epoch`;
+        const runs: Array<[string, ManualEntity, unknown[], Record<string, IoObject>?]> = [
+          ['number', { stateId: SOLL, domain: 'number' }, [21.5, 22, null]],
+          ['select, one value without a label', { stateId: MODUS, domain: 'select' }, [0, 1, 2, 7, null]],
+          // The panel writes a time back as HH:MM:SS (value_control.cpp:398-406)
+          // into a helper that may hold HH:MM: both must be one kind of time.
+          ['text time', { stateId: WECKZEIT, domain: 'datetime' }, ['06:45', '07:00:00', '23:59']],
+          [
+            'epoch datetime',
+            { stateId: EPOCH, domain: 'datetime' },
+            [1_758_600_000_000, 1_758_700_000_000, null],
+            objects(state(EPOCH, { name: 'Epoch', role: 'value.time', type: 'number', write: true })),
+          ],
+        ];
+        for (const [label, entry, values, all] of runs) {
+          const published = sequence(entry, values, all);
+          expect(new Set(published.map(([shown]) => shown)).size, `${label}: every value shown`).to.equal(values.length);
+          expect(new Set(published.map(([, , revision]) => revision)), label).to.have.property('size', 1);
+        }
+      });
+
+      it('changes it when a text changes shape: its kind is a constraint, not a value', () => {
+        // A time that becomes a date is laid out anew (value_control.cpp:824),
+        // and an edit in progress is given up (:816-817): its fields no longer apply.
+        const [time, date] = sequence({ stateId: WECKZEIT, domain: 'datetime' }, ['06:45', '2026-09-23']);
+        expect([time![1], date![1]]).to.deep.equal(['time', 'date']);
+        expect(date![2]).to.not.equal(time![2]);
+      });
+
+      it('changes it with a constraint the object declares, the value the same', () => {
+        const soll = (max: number): IoObject =>
+          state(SOLL, { name: 'Solltemperatur', role: 'level.temperature', type: 'number', unit: '°C', min: 15, max, step: 0.5, write: true });
+        const modus = (states: Record<string, string>): IoObject => state(MODUS, { name: 'Heizmodus', role: 'level.mode', type: 'number', states, write: true });
+        const revision = (entry: ManualEntity, val: unknown, obj: IoObject): unknown => sequence(entry, [val], objects(obj))[0]![2];
+        expect(revision({ stateId: SOLL, domain: 'number' }, 21.5, soll(30))).to.not.equal(revision({ stateId: SOLL, domain: 'number' }, 21.5, soll(28)));
+        expect(revision({ stateId: MODUS, domain: 'select' }, 1, modus({ 0: 'Aus', 1: 'Eco', 2: 'Komfort', 3: 'Boost' }))).to.not.equal(
+          revision({ stateId: MODUS, domain: 'select' }, 1, modus({ 0: 'Aus', 1: 'Eco', 2: 'Komfort' })),
+        );
+      });
     });
   });
 });

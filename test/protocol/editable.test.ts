@@ -1,6 +1,6 @@
 import { expect } from 'chai';
 import { createHash } from 'node:crypto';
-import { buildControlPayload, CONTROL_SESSION, controlRevision, MAX_CONTROL_BYTES } from '../../src/protocol/editable';
+import { buildControlPayload, CONTROL_SESSION, controlRevision, MAX_CONTROL_BYTES, type ControlPayload } from '../../src/protocol/editable';
 import type { VirtualEntity } from '../../src/registry/types';
 
 /*
@@ -51,10 +51,23 @@ const change = (base: VirtualEntity, over: Partial<VirtualEntity>): VirtualEntit
 const withAttributes = (base: VirtualEntity, attributes: Record<string, unknown>): VirtualEntity =>
   change(base, { attributes: { ...base.attributes, ...attributes } });
 
+/** A select whose option list escaping takes over the panel's limit: 64 options of 255 quotes, 2 bytes each on the wire. */
+const HUGE = withAttributes(SELECT, {
+  options: Array.from({ length: 64 }, (_, index) => `${'"'.repeat(253)}${String(index).padStart(2, '0')}`),
+});
+
+/** The builder's result, which is never null: Ruling 98 keeps null for a case that cannot happen. */
+function built(entity: VirtualEntity, session = SESSION): ControlPayload {
+  const result = buildControlPayload(entity, session);
+  expect(result, 'a published payload').to.not.equal(null);
+  return result!;
+}
+
+/** A payload published whole, parsed. */
 function control(entity: VirtualEntity, session = SESSION): Record<string, unknown> {
-  const payload = buildControlPayload(entity, session);
-  expect(payload, 'a published payload').to.be.a('string');
-  return JSON.parse(payload as string) as Record<string, unknown>;
+  const { payload, degraded } = built(entity, session);
+  expect(degraded, 'published whole').to.equal(false);
+  return JSON.parse(payload) as Record<string, unknown>;
 }
 
 const revisionOf = (entity: VirtualEntity, session = SESSION): unknown => control(entity, session).revision;
@@ -132,7 +145,7 @@ describe('protocol/editable: the /control payload (Task 14)', () => {
 
     it('sends no key the panel does not read from /control: no name, icon, entity id or read-only reason', () => {
       const readOnly = change(NUMBER, { writable: { value: false }, readOnly: 'write is false', attributes: { ...NUMBER.attributes, icon: 'mdi:fire' } });
-      const payload = buildControlPayload(readOnly, SESSION) as string;
+      const { payload } = built(readOnly);
       expect(Object.keys(JSON.parse(payload))).to.have.members([
         'version', 'kind', 'state', 'available', 'writable', 'session', 'revision', 'min', 'max', 'step', 'mode', 'unit', 'last_changed',
       ]);
@@ -189,6 +202,19 @@ describe('protocol/editable: the /control payload (Task 14)', () => {
       }
     });
 
+    it('sends "unknown" for a state holding a lone UTF-16 surrogate, which the panel counts longer (review m1)', () => {
+      // Node counts a lone surrogate as U+FFFD, 3 bytes. ArduinoJson 7.4.3
+      // drops a lone high one and turns a lone low one into 4 bytes
+      // (Utf16.hpp:36-50), so 255 bytes here are 256 on the panel, which then
+      // drops the whole message (value_control.cpp:75).
+      for (const state of [`${'x'.repeat(252)}\udc00`, `${'x'.repeat(249)}\udc00\udc00`, '\udc00'.repeat(64), 'Eco\ud800']) {
+        expect(utf8(state), JSON.stringify(state)).to.be.at.most(255);
+        expect(control(change(SELECT, { state })).state, JSON.stringify(state)).to.equal('unknown');
+      }
+      // A valid pair is one character, 4 bytes on both sides.
+      expect(control(change(SELECT, { state: 'Sonne 😀' })).state).to.equal('Sonne 😀');
+    });
+
     it('sends a unit of up to 128 bytes, and none for a longer one, which the panel would blank (value_control.cpp:89)', () => {
       const bytes128 = `${'€'.repeat(42)}xy`;
       expect(utf8(bytes128)).to.equal(128);
@@ -225,6 +251,8 @@ describe('protocol/editable: the /control payload (Task 14)', () => {
         ['a newline', ['Aus', 'Eco\nKomfort']],
         ['a carriage return', ['Aus', 'Eco\rKomfort']],
         ['a NUL', ['Aus', 'Eco\0Komfort']],
+        ['a lone low surrogate, 4 bytes on the panel', ['Aus', `${'x'.repeat(252)}\udc00`]],
+        ['a lone high surrogate, dropped by the panel', ['Aus', 'Eco\ud800']],
         ['a duplicate', ['Aus', 'Eco', 'Aus']],
         ['a number', ['Aus', 2]],
         ['a null', ['Aus', null]],
@@ -296,12 +324,12 @@ describe('protocol/editable: the /control payload (Task 14)', () => {
         domain: 'number',
         entityId: 'number.soll',
       };
-      expect(buildControlPayload(reordered, SESSION)).to.equal(buildControlPayload(NUMBER, SESSION));
+      expect(built(reordered)).to.deep.equal(built(NUMBER));
     });
 
-    it('is what controlRevision gives, the comparison Task 15 makes for a command', () => {
-      for (const entity of [NUMBER, SELECT, TIME, change(SELECT, { attributes: { friendly_name: 'x' } })]) {
-        expect(controlRevision(entity, SESSION), entity.entityId).to.equal(revisionOf(entity));
+    it('is what controlRevision gives, the comparison Task 15 makes for a command, a payload without its list included', () => {
+      for (const entity of [NUMBER, SELECT, TIME, change(SELECT, { attributes: { friendly_name: 'x' } }), HUGE]) {
+        expect(controlRevision(entity, SESSION), entity.entityId).to.equal(JSON.parse(built(entity).payload).revision);
       }
     });
   });
@@ -312,27 +340,43 @@ describe('protocol/editable: the /control payload (Task 14)', () => {
     });
   });
 
-  describe('the size limit (Ruling 96)', () => {
+  describe('the size limit (Ruling 98)', () => {
     /**
-     * A select whose payload is exactly `target` bytes: 48 options of quotes
-     * (each 2 bytes on the wire as \"), unique by a two-digit suffix, and one
-     * option of plain letters, 1 byte each, to top it up.
+     * A select whose whole payload is exactly `target` bytes: 48 options of
+     * quotes (each 2 bytes on the wire as \"), unique by a two-digit suffix,
+     * and one option of plain letters, 1 byte each, to top it up.
      */
     function selectOfSize(target: number): VirtualEntity {
       for (let quotes = 253; quotes > 0; quotes -= 1) {
         const heavy = Array.from({ length: 48 }, (_, index) => `${'"'.repeat(quotes)}${String(index).padStart(2, '0')}`);
-        const probe = buildControlPayload(withAttributes(SELECT, { options: [...heavy, 'x'] }), SESSION);
-        const filler = probe === null ? 0 : 1 + target - utf8(probe);
+        const probe = built(withAttributes(SELECT, { options: [...heavy, 'x'] }));
+        const filler = probe.degraded ? 0 : 1 + target - utf8(probe.payload);
         if (filler >= 1 && filler <= 255) return withAttributes(SELECT, { options: [...heavy, 'x'.repeat(filler)] });
       }
       throw new Error(`no select of ${target} bytes`);
     }
 
-    it('publishes a payload of exactly 24576 bytes and refuses one byte more (value_control.h:8, :65)', () => {
+    /**
+     * Published without its option list: read-only, still showing its
+     * current state, never a stale writable payload left on the panel
+     * (review O1), and with the revision controlRevision gives.
+     */
+    function expectWithoutOptions(entity: VirtualEntity): string {
+      const { payload, degraded } = built(entity);
+      expect(degraded).to.equal(true);
+      const fields = JSON.parse(payload) as Record<string, unknown>;
+      expect(fields).to.not.have.any.keys('options', 'options_complete');
+      expect(fields).to.include({ kind: 'select', state: entity.state, available: true, writable: false });
+      expect(fields.revision).to.equal(controlRevision(entity, SESSION));
+      return payload;
+    }
+
+    it('publishes a payload of exactly 24576 bytes whole, and one byte more without its option list (value_control.h:8, :65)', () => {
       expect(MAX_CONTROL_BYTES).to.equal(24576);
-      const largest = buildControlPayload(selectOfSize(24576), SESSION);
-      expect(largest === null ? 0 : utf8(largest)).to.equal(24576);
-      expect(buildControlPayload(selectOfSize(24577), SESSION)).to.equal(null);
+      const largest = built(selectOfSize(24576));
+      expect([largest.degraded, utf8(largest.payload)]).to.deep.equal([false, 24576]);
+      expect(JSON.parse(largest.payload)).to.include({ options_complete: true, writable: true });
+      expectWithoutOptions(selectOfSize(24577));
     });
 
     it('counts UTF-8 bytes, not string length', () => {
@@ -340,12 +384,11 @@ describe('protocol/editable: the /control payload (Task 14)', () => {
       // units, over it in bytes, which is what the panel measures.
       const quotes = Array.from({ length: 40 }, (_, index) => `${'"'.repeat(253)}${String(index).padStart(2, '0')}`);
       const euros = Array.from({ length: 24 }, (_, index) => `${'€'.repeat(84)}${String(index).padStart(2, '0')}`);
-      const entity = withAttributes(SELECT, { options: [...quotes, ...euros] });
       const wire = JSON.stringify({ options: [...quotes, ...euros] });
       // Room for the ~200 ASCII bytes of the other fields.
       expect(wire.length + 1000).to.be.below(MAX_CONTROL_BYTES);
       expect(utf8(wire)).to.be.above(MAX_CONTROL_BYTES);
-      expect(buildControlPayload(entity, SESSION)).to.equal(null);
+      expectWithoutOptions(withAttributes(SELECT, { options: [...quotes, ...euros] }));
     });
 
     it('cannot be reached by multi-byte text alone: 64 options and a state of 255 bytes each stay far below it', () => {
@@ -354,15 +397,25 @@ describe('protocol/editable: the /control payload (Task 14)', () => {
       const options = Array.from({ length: 64 }, (_, index) => `${'😀'.repeat(62)}é€${String(index).padStart(2, '0')}`);
       const state = `${'😀'.repeat(62)}é€xy`;
       expect([state, ...options].every((text) => utf8(text) === 255)).to.equal(true);
-      const payload = buildControlPayload(withAttributes(change(SELECT, { state }), { options }), SESSION);
-      expect(payload).to.be.a('string');
-      expect(JSON.parse(payload as string)).to.deep.include({ state, options });
-      expect(utf8(payload as string)).to.be.below(17_500);
+      const { payload } = built(withAttributes(change(SELECT, { state }), { options }));
+      expect(control(withAttributes(change(SELECT, { state }), { options }))).to.deep.include({ state, options });
+      expect(utf8(payload)).to.be.below(17_500);
     });
 
-    it('refuses an option list that escaping makes too large: 64 options of 255 quotes', () => {
-      const options = Array.from({ length: 64 }, (_, index) => `${'"'.repeat(253)}${String(index).padStart(2, '0')}`);
-      expect(buildControlPayload(withAttributes(SELECT, { options }), SESSION)).to.equal(null);
+    it('leaves out an option list that escaping makes too large, and keeps the state it shows current', () => {
+      // A skip would leave the panel's old retained payload up, writable,
+      // and every command against it refused as "changed" (review O1).
+      expectWithoutOptions(HUGE);
+      expectWithoutOptions(change(HUGE, { state: 'Komfort' }));
+    });
+
+    it('always fits without its list: the list is the only unbounded part, so the null path cannot run', () => {
+      // The worst escaping everywhere else: a state of 255 control characters,
+      // 6 bytes each on the wire (\u0001), beside 64 such options.
+      const state = '\u0001'.repeat(255);
+      const options = Array.from({ length: 64 }, (_, index) => `${'\u0001'.repeat(253)}${String(index).padStart(2, '0')}`);
+      const payload = expectWithoutOptions(withAttributes(change(SELECT, { state }), { options }));
+      expect(utf8(payload)).to.be.below(2_000);
     });
   });
 });

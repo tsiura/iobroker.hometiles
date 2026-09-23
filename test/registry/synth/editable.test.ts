@@ -231,6 +231,16 @@ describe('registry/synth/editable (Task 13)', () => {
       expect(synthSelect(selectWithStates({ a: 'Alpha', b: 'Bad\rName' }), 'select.test', {})?.attributes.options).to.equal(undefined);
     });
 
+    it('drops the whole list for a lone UTF-16 surrogate, which the panel decodes to 0 or 4 bytes (Task 14 review m1)', () => {
+      for (const bad of [`${'x'.repeat(252)}\udc00`, 'Bad\ud800']) {
+        const e = synthSelect(selectWithStates({ a: 'Alpha', b: bad }), 'select.test', holding('a'));
+        expect(e?.attributes.options, JSON.stringify(bad)).to.equal(undefined);
+        expect(e?.writable).to.deep.equal({ value: false });
+      }
+      // A valid pair is one character.
+      expect(synthSelect(selectWithStates({ a: 'Alpha', b: 'Sonne 😀' }), 'select.test', {})?.attributes.options).to.deep.equal(['Alpha', 'Sonne 😀']);
+    });
+
     it('rejects an option list with a duplicate label', () => {
       expect(synthSelect(selectWithStates({ a: 'Same', b: 'Same' }), 'select.test', {})?.attributes.options).to.equal(undefined);
     });

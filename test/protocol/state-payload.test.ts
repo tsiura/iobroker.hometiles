@@ -193,6 +193,7 @@ describe('protocol/state-payload', () => {
         const publish = buildStatePublish('ha/statestream', value)!;
         expect(publish.topic, kind).to.equal(`ha/statestream/${value.entityId.replace('.', '/')}/control`);
         expect(publish.retain, kind).to.equal(true);
+        expect(publish, kind).to.not.have.property('degraded');
         const payload = body(publish);
         expect(payload, kind).to.include({ version: 1, kind, state: value.state, available: true, writable: true, last_changed: 1_757_000_000 });
         expect(payload.session, kind).to.match(/^[0-9a-f]{32}$/);
@@ -208,10 +209,14 @@ describe('protocol/state-payload', () => {
       for (const [value] of editable) expect(body(buildStatePublish('ha/statestream', value)).session).to.equal(first.session);
     });
 
-    it('publishes nothing for a payload over the panel\'s 24576 bytes, which the panel drops without a word (Ruling 96)', () => {
+    it('publishes a select over the panel\'s 24576 bytes without its option list, read-only and marked degraded (Ruling 98)', () => {
+      // The panel would drop the whole payload without a word; skipping it
+      // would leave an old, writable one up (review O1).
       const options = Array.from({ length: 64 }, (_, index) => `${'"'.repeat(253)}${String(index).padStart(2, '0')}`);
       const huge = entity({ entityId: 'select.gross', domain: 'select', state: 'x', attributes: { options }, writable: { value: true } });
-      expect(buildStatePublish('ha/statestream', huge)).to.equal(null);
+      const publish = buildStatePublish('ha/statestream', huge)!;
+      expect(publish).to.include({ topic: 'ha/statestream/select/gross/control', retain: true, degraded: true });
+      expect(body(publish)).to.include({ kind: 'select', state: 'x', available: true, writable: false }).and.not.have.property('options');
     });
 
     it('clears each on the control leaf it was published on', () => {

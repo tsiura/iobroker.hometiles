@@ -259,17 +259,41 @@ describe('runtime/panel-session', () => {
       expect(published[1]!.payload).to.equal('');
     });
 
-    it('publishes nothing for a payload too large for the panel, and warns once per entity (Ruling 96)', () => {
-      const { session, published, warnings } = harness();
+    const fits = (state: string): VirtualEntity =>
+      entity({ entityId: 'select.gross', domain: 'select', state, attributes: { options: ['Aus', 'Eco', 'Komfort'] }, writable: { value: true } });
+
+    it('publishes a select too large for the panel without its options: read-only, its state current (Ruling 98)', () => {
+      const { session, published } = harness();
+      session.pushEntityState(fits('Eco'));
+      session.pushEntityState({ ...huge('select.gross'), state: 'Komfort' });
+      // Never an old, writable payload left on the panel, where every command
+      // would be refused as "changed" (review O1).
+      const shown = published.map(({ payload }) => {
+        const { state, writable, options } = JSON.parse(payload) as Record<string, unknown>;
+        return [state, writable, options === undefined];
+      });
+      expect(shown).to.deep.equal([
+        ['Eco', true, false],
+        ['Komfort', false, true],
+      ]);
+      // The transport gets a plain retained publish.
+      expect(published.map((request) => Object.keys(request).sort().join())).to.deep.equal(['payload,retain,topic', 'payload,retain,topic']);
+    });
+
+    it('warns once per episode: again after a payload that fits, and again after the entity was removed (review m2)', () => {
+      const { session, warnings } = harness();
       session.pushEntityState(huge('select.gross'));
+      session.pushEntityState(huge('select.gross'));
+      session.pushEntityState(fits('Eco'));
+      session.pushEntityState(huge('select.gross'));
+      session.clearEntityState('select.gross');
       session.pushEntityState(huge('select.gross'));
       session.pushEntityState(huge('select.riesig'));
-      // A scene publishes nothing either, and that is no reason to warn.
+      // A scene publishes nothing, and that is no reason to warn.
       session.pushEntityState(entity({ entityId: 'scene.nacht', domain: 'scene' }));
-      expect(published).to.deep.equal([]);
-      expect(warnings).to.have.length(2);
-      expect(warnings[0]).to.include('[Panel a1]').and.include('select.gross').and.include('24576');
-      expect(warnings[1]).to.include('select.riesig');
+      expect(warnings.map((warning) => warning.includes('select.gross'))).to.deep.equal([true, true, true, false]);
+      expect(warnings[0]).to.include('[Panel a1]').and.include('24576');
+      expect(warnings[3]).to.include('select.riesig');
     });
   });
 

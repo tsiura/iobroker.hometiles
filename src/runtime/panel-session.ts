@@ -2,7 +2,7 @@ import type { Announcement, LocalIoChannel } from '../protocol/announce';
 import { buildApplyPayload, buildIconsPayload, configSignature } from '../protocol/apply';
 import { CommandError, parseCommand, requireEntityId } from '../protocol/commands';
 import { MAX_CONTROL_BYTES } from '../protocol/editable';
-import { buildStateClear, buildStatePublish, publishesControl } from '../protocol/state-payload';
+import { buildStateClear, buildStatePublish } from '../protocol/state-payload';
 import {
   applyTopic,
   bridgeRequestTopic,
@@ -43,7 +43,11 @@ export class PanelSession {
   private readonly weathers = new Map<string, VirtualEntity>();
   /** entity id -> when its weather request was last answered */
   private readonly weatherAnswered = new Map<string, number>();
-  /** Editable values whose /control payload was too large for this panel, each warned about once (Ruling 96). */
+  /**
+   * Editable values last sent without their option list, too large for the
+   * panel with it (Ruling 98): one warning per episode, which ends with a
+   * payload that fits or the entity's removal.
+   */
   private readonly oversized = new Set<string>();
 
   online = false;
@@ -162,24 +166,24 @@ export class PanelSession {
 
   pushEntityState(entity: VirtualEntity): void {
     const publish = buildStatePublish(this.haPrefix, entity);
-    if (!publish) {
-      // An editable value goes unpublished only when its payload is too
-      // large, which the panel itself would drop without a word.
-      if (publishesControl(entity.domain) && !this.oversized.has(entity.entityId)) {
-        this.oversized.add(entity.entityId);
-        this.log.warn(
-          `[Panel ${this.deviceId}] ${entity.entityId} not published: its control payload is over the panel's ` +
-            `${MAX_CONTROL_BYTES}-byte limit, so the panel keeps whatever it last received for it`,
-        );
-      }
-      return;
+    if (!publish) return;
+    const { degraded, ...request } = publish;
+    if (!degraded) {
+      this.oversized.delete(entity.entityId);
+    } else if (!this.oversized.has(entity.entityId)) {
+      this.oversized.add(entity.entityId);
+      this.log.warn(
+        `[Panel ${this.deviceId}] ${entity.entityId} sent without its option list, so read-only: with it, its control ` +
+          `payload is over the panel's ${MAX_CONTROL_BYTES}-byte limit`,
+      );
     }
     if (entity.domain === 'weather') this.weathers.set(entity.entityId, entity);
-    this.transport.publish(publish);
+    this.transport.publish(request);
   }
 
   clearEntityState(entityId: string): void {
     this.weathers.delete(entityId);
+    this.oversized.delete(entityId);
     this.transport.publish(buildStateClear(this.haPrefix, entityId));
   }
 

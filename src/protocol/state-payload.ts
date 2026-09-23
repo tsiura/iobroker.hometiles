@@ -10,6 +10,8 @@ export interface StatePublish {
   topic: string;
   payload: string;
   retain: true;
+  /** An editable value sent without its option list, which took it over the panel's limit (Ruling 98). */
+  degraded?: true;
 }
 
 type PayloadShape = 'bare' | 'json' | 'control' | 'none';
@@ -55,11 +57,6 @@ function payloadShape(domain: Domain): PayloadShape {
   }
 }
 
-/** Whether a domain's value travels in the /control schema, on the `control` leaf. */
-export function publishesControl(domain: Domain): boolean {
-  return payloadShape(domain) === 'control';
-}
-
 /**
  * Weather's leaf is the literal word `weather` (mqtt_handlers.cpp:1415), an
  * editable value's `control` (:1330, :1373), every other domain's `state`.
@@ -69,7 +66,7 @@ export function publishesControl(domain: Domain): boolean {
  */
 function stateLeaf(entityId: string): 'state' | 'weather' | 'control' {
   if (entityId.startsWith('weather.')) return 'weather';
-  return publishesControl(entityId.slice(0, entityId.indexOf('.')) as Domain) ? 'control' : 'state';
+  return payloadShape(entityId.slice(0, entityId.indexOf('.')) as Domain) === 'control' ? 'control' : 'state';
 }
 
 export function buildStatePublish(haPrefix: string, entity: VirtualEntity): StatePublish | null {
@@ -78,11 +75,12 @@ export function buildStatePublish(haPrefix: string, entity: VirtualEntity): Stat
 
   const topic = entityStateTopic(haPrefix, entity.entityId, stateLeaf(entity.entityId));
 
-  // Null when the panel would drop it for its size: nothing is published,
-  // and the panel keeps its last value (Ruling 96).
+  // Too large for the panel, a select goes without its option list, marked
+  // degraded for the session's warning (Ruling 98). Null cannot happen.
   if (shape === 'control') {
-    const payload = buildControlPayload(entity, CONTROL_SESSION);
-    return payload === null ? null : { topic, payload, retain: true };
+    const control = buildControlPayload(entity, CONTROL_SESSION);
+    if (!control) return null;
+    return { topic, payload: control.payload, retain: true, ...(control.degraded ? { degraded: true as const } : {}) };
   }
 
   if (shape === 'bare') {

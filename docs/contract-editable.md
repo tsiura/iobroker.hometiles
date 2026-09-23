@@ -127,8 +127,8 @@ failure modes exist and an implementer must not confuse them:
 | `version` | int | required, must equal `1` | any other value (including absent, which defaults to `0`) → **hard reject** | `value_control.cpp:67` |
 | `kind` | string | required, one of `"number"`, `"select"`, `"date"`, `"time"`, `"datetime"` | anything else (absent defaults to `""`) → **hard reject** | 68-70 |
 | `state` | string or JSON `null` | **key must be present** | key **absent entirely** → **hard reject** (this is not "unchanged", it discards the whole message); present as JSON `null` → accepted, `has_state=false`; present as a non-string/non-null (number, bool, object) → **hard reject** | 71-73 |
-| `last_changed` | uint64, epoch **seconds** | optional | absent or wrong type (a float, a negative number, a string) → defaults to `0` (not "unchanged"). Used only to date the popup's new activity entry, and only when it is non-zero (`sensor_popup.cpp:3099`); the Bridge sends `int(changed.timestamp())` (`__init__.py:1534-1536`) | 74 |
-| *(state length)* | — | — | `state` longer than 255 bytes → **hard reject**, regardless of everything else | 75 |
+| `last_changed` | uint64, epoch **seconds** | optional | absent or wrong type (a float, a negative number, a string) → defaults to `0` (not "unchanged"). Dates the popup's new activity entry when non-zero (`sensor_popup.cpp:3099`). The popup also hashes the whole raw payload, `last_changed` included, for its editable history cache (`editable_history_fingerprint`, `sensor_popup.cpp:2522-2531`), so any change to it invalidates that cache. The Bridge sends `int(changed.timestamp())` (`__init__.py:1534-1536`) | 74 |
+| *(state length)* | — | — | `state` longer than 255 bytes, counted after ArduinoJson decodes it (see the lone-surrogate note below) → **hard reject**, regardless of everything else | 75 |
 | `available` | bool | optional | absent → defaults to `false`. Also forced `false` when `state` is JSON `null` (`value.has_state`) and when the literal `state` string equals `"unavailable"`, no matter what this flag says (`value_control.cpp:76`). A null-state payload is therefore never writable | 76 |
 | `writable` | bool | optional | absent → defaults to `false`. Effective `writable` is always `available && writable-flag`, then further narrowed per-kind below | 77 |
 | `session` | string | **required, exactly 32 bytes** (`String::length()`, so 32 characters only when ASCII) | any other length (including absent → `""`) → **hard reject** | 78, 80 |
@@ -144,6 +144,16 @@ for `time_zone` anywhere under `src/`). Numbers are JSON numbers: an integer
 `DynamicJsonDocument doc(32768)` at `:66` is elastic in ArduinoJson 7, so
 the 24576 bytes of the raw payload, escapes counted as sent, are the only
 size limit.
+
+A lone UTF-16 surrogate escape (`\udXXX`, which `JSON.stringify` writes for
+one) is not decoded as U+FFFD, the 3 bytes Node counts. ArduinoJson keeps one
+`Utf16::Codepoint` per string (`JsonDeserializer.hpp:398`): it drops a lone
+high surrogate and turns a lone low one into a 4-byte sequence
+(`Utf16.hpp:36-50`). The 255-byte state, the 255-byte option and the 128-byte
+unit limits are measured after this decoding, so a text of 255 bytes by
+Node's count can be 256 on the panel, and a state that long drops the whole
+message. This adapter treats a lone surrogate like a line break (Task 14
+review m1).
 
 Kind-specific fields, read **only** when `kind == "number"`:
 
@@ -263,7 +273,7 @@ is easy to misread as a request/ack exchange. It is not one. Precisely:
   pre-existing `/state` suffix, not a replacement.
 - **`session`** and **`revision`** are two opaque tokens carried inside the
   `/control` payload (`value_control.cpp:78-80`), constrained only by exact
-  length (32 and 16 characters respectively — any other length hard-rejects
+  length (32 and 16 bytes respectively — any other length hard-rejects
   the whole message, see §3 table). The firmware never interprets their
   contents. It only ever compares them for equality against the
   previously-accepted pair, to decide `constraints_changed`
@@ -294,8 +304,11 @@ is easy to misread as a request/ack exchange. It is not one. Precisely:
   revision. Because the panel abandons an edit on any change (`:816-817`),
   a revision must change with the constraints (range, unit, options, kind,
   availability, writability, session) and never with the value. This
-  adapter does the same: `CONTROL_SESSION` once per process and
-  `controlRevision` (`src/protocol/editable.ts`, Task 14).
+  adapter follows the same rule with `CONTROL_SESSION` once per process and
+  `controlRevision` (`src/protocol/editable.ts`, Task 14), though not to the
+  same bytes: Python's `json.dumps` puts a space after `,` and `:`, and the
+  Bridge's `time_zone` and null keys are hashed too. Harmless, since the
+  token is opaque and each sender compares only its own.
 
 ### The acknowledgement (a third topic, not `/control` or `cmnd/value`)
 
@@ -384,13 +397,20 @@ they ride inside the same `/control` JSON payload as everything else in
   `cmnd/value` command.
 - **A line break in a select `state` makes the panel write the wrong
   option.** The placeholder is the display text of the state, joined to the
-  options with `"\n"` (`:845`), and `lv_dropdown` splits on `"\n"`. A
-  state holding one becomes two placeholder rows while `option_offset`
-  stays 1, so each tap on an option below submits the option above it
-  (`:497-498`). The firmware checks options for `\n`/`\r` (`:97`) but never
-  the state. A sender must not send such a state; this adapter sends
-  `"unknown"` for a state with `\n`, `\r` or NUL, as for one over 255 bytes
-  (Task 14).
+  options with `"\n"` (`:845`). LVGL 9.5.0 (pinned, `firmware.yml:99`)
+  counts dropdown options only at `\n` (`lv_dropdown.c:201-207`) and maps
+  a tap to an index by line height (`get_id_on_point`, `:1246-1264`), while
+  a label line also ends at `\r` (`lv_text.c:396-405`). A state holding
+  `\n` or `\r` therefore takes two placeholder rows while `option_offset`
+  stays 1, and `:497-498` submits `options[index - 1]`: each tap on an
+  option submits the option **below** it (the next one), a tap on the last
+  option submits nothing, and a tap on the second placeholder row submits
+  the first option. With options `A, B, C` and the state `X\nY`, the rows
+  are `X, Y, A, B, C`, and a tap on A writes B. No other character breaks a
+  row. The firmware checks options for `\n`/`\r` (`:97`) but never the
+  state. A sender must not send such a state; this adapter sends
+  `"unknown"` for a state with `\n`, `\r`, NUL or a lone surrogate, as for
+  one over 255 bytes (Task 14).
 
 ## 7. Values treated specially
 

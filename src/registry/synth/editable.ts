@@ -177,6 +177,17 @@ const MAX_OPTIONS = 64;
 const MAX_OPTION_BYTES = 255;
 
 /**
+ * What the panel cannot take in a text it shows, an option or a state
+ * (protocol/editable.ts uses this too): a line break, which splits its
+ * dropdown into rows (value_control.cpp:97, :845); NUL, where its copy ends
+ * (:96); and a lone UTF-16 surrogate, which ArduinoJson 7.4.3 decodes to 0
+ * or 4 bytes where Node counts 3 (Utf16.hpp:36-50), so a text of 255 bytes
+ * here is longer there (Task 14 review m1). With the u flag a valid pair is
+ * one code point, never \p{Cs}.
+ */
+export const UNSHOWABLE = /[\r\n\0]|\p{Cs}/u;
+
+/**
  * The option list: every label of the channel's states map, or none at all.
  * The panel drops the whole list, and the select goes read-only, when
  * options_complete is not true or any single option is invalid -- no partial
@@ -186,7 +197,8 @@ const MAX_OPTION_BYTES = 255;
  * - 1 to 64 options (§6, §8; :92);
  * - each 1 to 255 UTF-8 bytes, not characters (§6, §8; :97);
  * - no \n or \r in any, the panel's own separator for its dropdown (§6; :97),
- *   and no NUL, where the panel's copy of an option ends (:96; M4);
+ *   no NUL, where the panel's copy of an option ends (:96; M4), and no lone
+ *   surrogate (UNSHOWABLE);
  * - unique (§6, §8; :98), judged the way the value command reads an option
  *   back: each must reverse through encodeChannelValue -- the shared encoder
  *   (Ruling 22), which matches trimmed and case-insensitively -- to a raw
@@ -206,8 +218,8 @@ function selectOptions(channel: ChannelInput): string[] | string {
   if (channel.type !== 'number' && channel.type !== 'string') return notOfType(channel, 'number or string');
   if (labels.length < 1) return 'no states';
   if (labels.length > MAX_OPTIONS) return `more than ${MAX_OPTIONS} states`;
-  const shown = (label: string): boolean => !!label && Buffer.byteLength(label, 'utf8') <= MAX_OPTION_BYTES && !/[\r\n\0]/.test(label);
-  if (!labels.every(shown)) return 'an empty, over-long or multi-line state label';
+  const shown = (label: string): boolean => !!label && Buffer.byteLength(label, 'utf8') <= MAX_OPTION_BYTES && !UNSHOWABLE.test(label);
+  if (!labels.every(shown)) return 'an empty, over-long, multi-line or malformed state label';
   const codec = { type: channel.type, states };
   const reversible = labels.every((label) => {
     const raw = encodeChannelValue(codec, label);
