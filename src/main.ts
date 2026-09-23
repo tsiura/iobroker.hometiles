@@ -9,7 +9,7 @@ import {
   PANEL_SETTING_LEAVES,
   stateTopic,
 } from './protocol/topics';
-import { discoverDevices } from './registry/detector';
+import { discoverDevices, type Discovery, type RootAnchors } from './registry/detector';
 import { EntityRegistry } from './registry/entity-registry';
 import { applyOverrides } from './registry/overrides';
 import { synthesise } from './registry/synth/index';
@@ -23,6 +23,7 @@ import { credentialsFromOptions, pushCredentials } from './runtime/pairing';
 import { mergeSceneAliases } from './runtime/scene-aliases';
 
 const ENTITY_ID_STATE = 'info.entityIds';
+const ROOT_ANCHOR_STATE = 'info.rootAnchors';
 
 class HomeTiles extends utils.Adapter {
   private options!: AdapterOptions;
@@ -32,6 +33,7 @@ class HomeTiles extends utils.Adapter {
   private panelObjects!: PanelObjects;
   private dispatcher!: Dispatcher;
   private persistedIds: Record<string, string> = {};
+  private rootAnchors: RootAnchors = {};
   private devices: DeviceInput[] = [];
 
   constructor(options: Partial<utils.AdapterOptions> = {}) {
@@ -57,7 +59,8 @@ class HomeTiles extends utils.Adapter {
     this.options = options;
 
     await this.setState('info.connection', false, true);
-    this.persistedIds = await this.loadPersistedIds();
+    this.persistedIds = await this.loadJsonMap(ENTITY_ID_STATE);
+    this.rootAnchors = await this.loadJsonMap(ROOT_ANCHOR_STATE);
 
     this.mqtt = new HomeTilesMqttClient(options, this.log4);
     this.registry = new EntityRegistry(
@@ -235,12 +238,14 @@ class HomeTiles extends utils.Adapter {
   // ---- Registry ----
 
   private async rebuildRegistry(): Promise<void> {
-    const detected = await this.detectDevices();
+    const { devices: detected, anchors } = await this.detectDevices();
     this.devices = applyOverrides(detected, (this.options.deviceOverrides ?? []) as DeviceOverride[]);
+    this.rootAnchors = anchors;
+    await this.saveJsonMap(ROOT_ANCHOR_STATE, 'Root anchors: the state each root id stays with', anchors);
 
     const result = this.registry.rebuild(this.devices, this.persistedIds);
     this.persistedIds = result.entityIds;
-    await this.savePersistedIds(result.entityIds);
+    await this.saveJsonMap(ENTITY_ID_STATE, 'Persisted entity ids', result.entityIds);
 
     for (const objectId of result.unsubscribe) await this.unsubscribeForeignStatesAsync(objectId);
     for (const objectId of result.subscribe) await this.subscribeForeignStatesAsync(objectId);
@@ -263,13 +268,13 @@ class HomeTiles extends utils.Adapter {
     await this.setState('info.entities', this.registry.all().length, true);
   }
 
-  private async detectDevices(): Promise<DeviceInput[]> {
+  private async detectDevices(): Promise<Discovery> {
     const objects = (await this.getForeignObjectsAsync('*', 'state')) as Record<string, ioBroker.Object>;
     const channels = (await this.getForeignObjectsAsync('*', 'channel')) as Record<string, ioBroker.Object>;
     const devices = (await this.getForeignObjectsAsync('*', 'device')) as Record<string, ioBroker.Object>;
     // The detector reads function enums from the same map (a lamp in "Licht").
     const enums = (await this.getForeignObjectsAsync('enum.functions.*', 'enum')) as Record<string, ioBroker.Object>;
-    return discoverDevices({ ...objects, ...channels, ...devices, ...enums }, this.namespace);
+    return discoverDevices({ ...objects, ...channels, ...devices, ...enums }, this.namespace, this.rootAnchors);
   }
 
   private publishEntity(entity: VirtualEntity): void {
@@ -292,24 +297,24 @@ class HomeTiles extends utils.Adapter {
     await this.setState('info.panels', sessions.length, true);
   }
 
-  private async loadPersistedIds(): Promise<Record<string, string>> {
-    const state = await this.getStateAsync(ENTITY_ID_STATE);
+  private async loadJsonMap(id: string): Promise<Record<string, string>> {
+    const state = await this.getStateAsync(id);
     if (!state || typeof state.val !== 'string') return {};
     try {
       return JSON.parse(state.val) as Record<string, string>;
     } catch {
-      this.log.warn('[Registry] Stored entity id map is corrupt, starting from scratch');
+      this.log.warn(`[Registry] Stored ${id} is corrupt, starting from scratch`);
       return {};
     }
   }
 
-  private async savePersistedIds(map: Record<string, string>): Promise<void> {
-    await this.setObjectNotExistsAsync(ENTITY_ID_STATE, {
+  private async saveJsonMap(id: string, name: string, map: Record<string, string>): Promise<void> {
+    await this.setObjectNotExistsAsync(id, {
       type: 'state',
-      common: { name: 'Persisted entity ids', type: 'string', role: 'json', read: true, write: false, def: '{}' },
+      common: { name, type: 'string', role: 'json', read: true, write: false, def: '{}' },
       native: {},
     } as ioBroker.SettableObject);
-    await this.setState(ENTITY_ID_STATE, JSON.stringify(map), true);
+    await this.setState(id, JSON.stringify(map), true);
   }
 
   // ---- Admin messages ----
@@ -321,7 +326,7 @@ class HomeTiles extends utils.Adapter {
 
     switch (message.command) {
       case 'listDetected': {
-        const detected = await this.detectDevices();
+        const { devices: detected } = await this.detectDevices();
         reply(
           detected.map((device) => ({
             objectId: device.objectId,

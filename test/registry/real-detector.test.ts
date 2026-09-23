@@ -46,7 +46,7 @@ const functionEnum = (id: string, name: string, members: string[]): IoObject => 
 });
 const objects = (...list: IoObject[]): IoObjects => Object.fromEntries(list.map((obj) => [obj._id, obj]));
 const value = (val: unknown, ack = true): SourceValue => ({ val, ack, q: 0, ts: 1_758_000_000_000 });
-const detectDevices = (all: IoObjects): DeviceInput[] => discoverDevices(all, 'hometiles.0');
+const detectDevices = (all: IoObjects): DeviceInput[] => discoverDevices(all, 'hometiles.0').devices;
 
 interface Run {
   device: DeviceInput;
@@ -183,28 +183,32 @@ const KEY_SET = objects(
 // its datapoints, roled the way hm-rpc roles them (src/lib/roles.ts dpNAME;
 // a read-only level.* becomes plain `value` via readOnlyRole; ACTION
 // datapoints are write-only). MANU_MODE is a second writable
-// level.temperature, so SET has two candidates to choose between.
+// level.temperature, so SET has two candidates to choose between. Names are
+// hm-rega's: the CCU name sync names each datapoint "<channel>.<datapoint>"
+// (hm-rega src/main.ts:1804-1810).
 const RT = 'hm-rpc.0.MEQ0123456';
+const rt4 = (datapoint: string, common: Record<string, unknown>): IoObject =>
+  state(`${RT}.4.${datapoint}`, { name: `Heizung Bad:4.${datapoint}`, ...common });
 const RT_SET = objects(
   device(RT, 'Heizung Bad'),
   channel(`${RT}.4`, 'Heizung Bad:4'),
-  state(`${RT}.4.ACTUAL_TEMPERATURE`, { role: 'value.temperature', type: 'number', unit: '°C', write: false }),
-  state(`${RT}.4.AUTO_MODE`, { role: 'button', type: 'boolean', read: false, write: true }),
-  state(`${RT}.4.BATTERY_STATE`, { role: 'value.voltage', type: 'number', unit: 'V', write: false }),
-  state(`${RT}.4.BOOST_MODE`, { role: 'switch.mode.boost', type: 'boolean', read: false, write: true }),
-  state(`${RT}.4.BOOST_STATE`, { role: 'value', type: 'number', unit: 'min', write: false }),
-  state(`${RT}.4.COMFORT_MODE`, { role: 'button', type: 'boolean', read: false, write: true }),
-  state(`${RT}.4.CONTROL_MODE`, {
+  rt4('ACTUAL_TEMPERATURE', { role: 'value.temperature', type: 'number', unit: '°C', write: false }),
+  rt4('AUTO_MODE', { role: 'button', type: 'boolean', read: false, write: true }),
+  rt4('BATTERY_STATE', { role: 'value.voltage', type: 'number', unit: 'V', write: false }),
+  rt4('BOOST_MODE', { role: 'switch.mode.boost', type: 'boolean', read: false, write: true }),
+  rt4('BOOST_STATE', { role: 'value', type: 'number', unit: 'min', write: false }),
+  rt4('COMFORT_MODE', { role: 'button', type: 'boolean', read: false, write: true }),
+  rt4('CONTROL_MODE', {
     role: 'indicator',
     type: 'number',
     write: false,
     states: { 0: 'AUTO-MODE', 1: 'MANU-MODE', 2: 'PARTY-MODE', 3: 'BOOST-MODE' },
   }),
-  state(`${RT}.4.FAULT_REPORTING`, { role: 'indicator', type: 'number', write: false }),
-  state(`${RT}.4.LOWERING_MODE`, { role: 'button', type: 'boolean', read: false, write: true }),
-  state(`${RT}.4.MANU_MODE`, { role: 'level.temperature', type: 'number', unit: '°C', min: 4.5, max: 30.5, read: false, write: true }),
-  state(`${RT}.4.SET_TEMPERATURE`, { role: 'level.temperature', type: 'number', unit: '°C', min: 4.5, max: 30.5, write: true }),
-  state(`${RT}.4.VALVE_STATE`, { role: 'value.valve', type: 'number', unit: '%', write: false }),
+  rt4('FAULT_REPORTING', { role: 'indicator', type: 'number', write: false }),
+  rt4('LOWERING_MODE', { role: 'button', type: 'boolean', read: false, write: true }),
+  rt4('MANU_MODE', { role: 'level.temperature', type: 'number', unit: '°C', min: 4.5, max: 30.5, read: false, write: true }),
+  rt4('SET_TEMPERATURE', { role: 'level.temperature', type: 'number', unit: '°C', min: 4.5, max: 30.5, write: true }),
+  rt4('VALVE_STATE', { role: 'value.valve', type: 'number', unit: '%', write: false }),
 );
 
 const FLOOR = 'alias.0.Bad.Fussbodenheizung';
@@ -351,6 +355,38 @@ const DWD_SET = objects(
   state(`${DWD}.map`, { role: 'weather.chart.url', type: 'string', write: false }),
 );
 
+// A zigbee weather sensor on the balcony: temperature and pressure, flat
+// under the device, so both are controls of one root (Ruling 45).
+const BALKON = 'zigbee.0.00158d0004a1b2c3';
+const balkonSet = (...extra: IoObject[]): IoObjects =>
+  objects(
+    device(BALKON, 'Balkon'),
+    state(`${BALKON}.temperature`, { role: 'value.temperature', type: 'number', unit: '°C', write: false }),
+    state(`${BALKON}.pressure`, { role: 'value.pressure', type: 'number', unit: 'hPa', write: false }),
+    ...extra,
+  );
+
+// An alias channel nested inside another: both are roots, and the outer one
+// sees the inner one's switch as well (Ruling 45 / M1). In INSTALLATION the
+// outer "Garten" channel also holds GARDEN's thermometer channel.
+const GARDEN_PUMP = 'alias.0.Garten.Pumpe';
+const NESTED_SET = objects(
+  channel('alias.0.Garten', 'Garten'),
+  channel(GARDEN_PUMP, 'Pumpe'),
+  state(`${GARDEN_PUMP}.SET`, { role: 'switch', type: 'boolean', write: true }),
+);
+
+// A weather station whose icon sits on the device and whose temperature sits
+// in a channel: only the device root sees both, which weatherCurrent requires
+// (ACTUAL and ICON), while the channel alone is a temperature (Ruling 46).
+const STATION = 'weather.0.station';
+const WEATHER_SET = objects(
+  device(STATION, 'Wetterstation'),
+  state(`${STATION}.icon`, { role: 'weather.icon', type: 'string', write: false }),
+  channel(`${STATION}.outside`, 'Außen'),
+  state(`${STATION}.outside.temperature`, { role: 'value.temperature', type: 'number', unit: '°C', write: false }),
+);
+
 const INSTALLATION: IoObjects = Object.assign(
   {},
   PROBE,
@@ -374,6 +410,8 @@ const INSTALLATION: IoObjects = Object.assign(
   SHELLY_SET,
   LAMP_SET,
   DWD_SET,
+  NESTED_SET,
+  WEATHER_SET,
 );
 
 /** Every detected device one of whose channels is this state object. */
@@ -382,16 +420,22 @@ const backedBy = (runs: Run[], objectId: string): string[] =>
     .filter(({ device: detected }) => Object.values(detected.channels).some((ch) => ch.objectId === objectId))
     .map(({ device: detected }) => detected.objectId);
 
-/** One entity per physical control: no state object backs two entities. */
-function expectNoStateBacksTwoEntities(runs: Run[]): void {
+/**
+ * One entity per physical control: no REQUIRED state backs two entities.
+ * Each entity is identified by a state it requires -- the anchor recorded for
+ * its root, or the state it is keyed by -- and no two entities share one.
+ * Other states may be shared: a composite shares ACTUAL with the temperature
+ * sensor beside it, as a Home Assistant weather entity does (Ruling 46).
+ */
+function expectNoRequiredStateBacksTwoEntities(all: IoObjects): void {
+  const { devices, anchors } = discoverDevices(all, 'hometiles.0');
   const owners = new Map<string, string>();
-  for (const { device: detected } of runs) {
-    for (const ch of Object.values(detected.channels)) {
-      expect(owners.get(ch.objectId) ?? detected.objectId, `${ch.objectId} backs two entities`).to.equal(
-        detected.objectId,
-      );
-      owners.set(ch.objectId, detected.objectId);
-    }
+  for (const detected of devices) {
+    const anchor = anchors[detected.objectId] ?? detected.objectId;
+    const backing = Object.values(detected.channels).map((ch) => ch.objectId);
+    expect(backing, `${detected.objectId} is backed by its anchor`).to.include(anchor);
+    expect(owners.get(anchor) ?? detected.objectId, `${anchor} backs two entities`).to.equal(detected.objectId);
+    owners.set(anchor, detected.objectId);
   }
 }
 
@@ -524,9 +568,13 @@ describe('real type-detector end to end (Task 5c)', () => {
       expect(backedBy(runs, `${RT}.4.MANU_MODE`)).to.deep.equal([]);
       // Every control the channel yields is kept (Task 5d (c)): the detector
       // finds `button` once per root, and of AUTO/COMFORT/LOWERING_MODE the
-      // later id wins, so the channel also publishes one scene.
+      // later id wins, so the channel also publishes one scene. It is named
+      // after its own datapoint, not after the root alone (Ruling 44), and
+      // hm-rega's "<channel>.<datapoint>" name does not repeat the channel.
       const scenes = runs.filter(({ device: detected }) => detected.domain === 'scene');
-      expect(scenes.map(({ device: detected }) => detected.channels.set?.objectId)).to.deep.equal([`${RT}.4.LOWERING_MODE`]);
+      expect(scenes.map(({ device: detected }) => [detected.name, detected.channels.set?.objectId])).to.deep.equal([
+        ['Heizung Bad:4 LOWERING_MODE', `${RT}.4.LOWERING_MODE`],
+      ]);
       const result = runFor(runs, `${RT}.4`);
       expect(result.entity!.writable).to.deep.equal({ setpoint: true, boost: true });
       expect(json(result)).to.deep.equal({
@@ -738,7 +786,7 @@ describe('discovery orchestration (Task 5d)', () => {
     const runs = run(SCO_SET, { [`${SCO}.1.STATE`]: value(false) });
     expect(backedBy(runs, `${SCO}.1.STATE`)).to.deep.equal([`${SCO}.1`]);
     expect(runFor(runs, `${SCO}.1`).payload).to.equal('off');
-    expectNoStateBacksTwoEntities(runs);
+    expectNoRequiredStateBacksTwoEntities(SCO_SET);
   });
 
   it('(b) a Shelly device -> relay channel tree yields the relay once, named after its channel', () => {
@@ -747,15 +795,20 @@ describe('discovery orchestration (Task 5d)', () => {
     const relay = runFor(runs, `${SHELLY}.Relay0`);
     expect(relay.device.name).to.equal('Kaffeemaschine');
     expect(relay.payload).to.equal('on');
-    expectNoStateBacksTwoEntities(runs);
-    // The device root's first control is the relay again. The root id keys
-    // that control (as in v0.1, so persisted entity ids stay put); with the
-    // repeat dropped, the id must not pass to one of the root's other controls.
+    expectNoRequiredStateBacksTwoEntities(SHELLY_SET);
+    // The device root's first control is the relay again, so the root id is
+    // anchored to the relay; with that repeat dropped, the id passes to none
+    // of the root's other controls.
     expect(runs.map(({ device: detected }) => detected.objectId)).to.not.include(SHELLY);
+    // Those other controls are named after their own state, not the root
+    // alone (Ruling 44): the reboot button is no second "Device SHPLG-...".
+    const names = runs.map(({ device: detected }) => detected.name);
+    expect(names).to.include('Device SHPLG-S#6A1B2C#1 reboot');
+    expect(new Set(names).size, names.join(' | ')).to.equal(names.length);
   });
 
-  it('(b) across a whole installation, no state object backs two entities', () => {
-    expectNoStateBacksTwoEntities(run(INSTALLATION));
+  it('(b) across a whole installation, no required state backs two entities', () => {
+    expectNoRequiredStateBacksTwoEntities(INSTALLATION);
   });
 
   it('(c) an Aqara multisensor keeps temperature (with its humidity) and pressure', () => {
@@ -764,10 +817,11 @@ describe('discovery orchestration (Task 5d)', () => {
       [`${AQARA}.humidity`]: value(48),
       [`${AQARA}.pressure`]: value(1013),
     });
-    expect(runs.map(({ device: detected }) => [detected.objectId, detected.detectorType])).to.deep.equal([
-      [AQARA, 'temperature'],
-      // A root's further controls are keyed by the state that anchors them.
-      [`${AQARA}.pressure`, 'pressure'],
+    expect(runs.map(({ device: detected }) => [detected.objectId, detected.detectorType, detected.name])).to.deep.equal([
+      [AQARA, 'temperature', 'Wohnzimmer Klima'],
+      // A root's further controls are keyed by the state that anchors them,
+      // and named after it too (Ruling 44).
+      [`${AQARA}.pressure`, 'pressure', 'Wohnzimmer Klima pressure'],
     ]);
     expectRealChannels(AQARA_SET, runs[0]!.device, { actual: `${AQARA}.temperature`, second: `${AQARA}.humidity` });
     expectRealChannels(AQARA_SET, runs[1]!.device, { pressure: `${AQARA}.pressure` });
@@ -812,5 +866,67 @@ describe('discovery orchestration (Task 5d)', () => {
     expect(entityIds[LAMP]).to.equal('light.flurlicht');
     const lamp = registry.byId('light.flurlicht')!;
     expect(buildStatePublish('ha/statestream', lamp)?.topic).to.equal('ha/statestream/light/flurlicht/state');
+  });
+
+  it('(Ruling 45) adding an unrelated state does not move sensor.balkon off temperature', () => {
+    const first = discoverDevices(balkonSet(), 'hometiles.0');
+    const before = new EntityRegistry({ onEntityChanged: () => undefined, onMembershipChanged: () => undefined }, 0);
+    const { entityIds } = before.rebuild(first.devices, {});
+    expect(before.byId('sensor.balkon')!.source).to.deep.equal({ actual: `${BALKON}.temperature` });
+
+    // indicator.working is a state of the pressure pattern only, so pressure
+    // now matches more states and the detector sorts it first
+    // (ChannelDetector.js:742-744): the root id used to follow it there.
+    const working = state(`${BALKON}.working`, { role: 'indicator.working', type: 'boolean', write: false });
+    const second = discoverDevices(balkonSet(working), 'hometiles.0', first.anchors);
+    const after = new EntityRegistry({ onEntityChanged: () => undefined, onMembershipChanged: () => undefined }, 0);
+    after.rebuild(second.devices, entityIds);
+    expect(after.byId('sensor.balkon')!.source).to.deep.equal({ actual: `${BALKON}.temperature` });
+    expect(after.byId('sensor.balkon')!.attributes.friendly_name).to.equal('Balkon');
+    expect(after.byId('sensor.balkon_pressure')!.source).to.deep.equal({ pressure: `${BALKON}.pressure` });
+  });
+
+  it('(Ruling 45) when the control a root id stays with disappears, the id goes to no other control', () => {
+    const first = discoverDevices(balkonSet(), 'hometiles.0');
+    const before = new EntityRegistry({ onEntityChanged: () => undefined, onMembershipChanged: () => undefined }, 0);
+    const { entityIds } = before.rebuild(first.devices, {});
+
+    const withoutTemperature = Object.fromEntries(
+      Object.entries(balkonSet()).filter(([id]) => id !== `${BALKON}.temperature`),
+    );
+    const second = discoverDevices(withoutTemperature, 'hometiles.0', first.anchors);
+    // Pressure stays keyed by its own state; sensor.balkon is not repointed
+    // to it, and the record waits for the temperature to come back.
+    expect(second.devices.map(({ objectId }) => objectId)).to.deep.equal([`${BALKON}.pressure`]);
+    expect(second.anchors[BALKON]).to.equal(`${BALKON}.temperature`);
+    const after = new EntityRegistry({ onEntityChanged: () => undefined, onMembershipChanged: () => undefined }, 0);
+    expect(after.rebuild(second.devices, entityIds).entityIds).to.deep.equal({ [`${BALKON}.pressure`]: 'sensor.balkon_pressure' });
+  });
+
+  it('(Ruling 45) reversing the object order changes no entity id', () => {
+    const entityIds = (all: IoObjects): Record<string, string> =>
+      new EntityRegistry({ onEntityChanged: () => undefined, onMembershipChanged: () => undefined }, 0).rebuild(
+        detectDevices(all),
+        {},
+      ).entityIds;
+    const forward = entityIds(INSTALLATION);
+    expect(entityIds(Object.fromEntries(Object.entries(INSTALLATION).reverse()))).to.deep.equal(forward);
+    // Deepest root first: the nested pump channel holds its own switch.
+    expect(forward[GARDEN_PUMP]).to.equal('switch.pumpe');
+  });
+
+  it('(Ruling 46) a composite that needs a state no channel holds survives beside the channel control', () => {
+    const runs = run(WEATHER_SET, { [`${STATION}.outside.temperature`]: value(7.5), [`${STATION}.icon`]: value('rain') });
+    expect(runs.map(({ device: detected }) => [detected.objectId, detected.detectorType])).to.deep.equal([
+      [`${STATION}.outside`, 'temperature'],
+      // Its ACTUAL is the channel's temperature, which the channel claimed
+      // first; its ICON nobody claimed, so it is not a repeat.
+      [STATION, 'weatherCurrent'],
+    ]);
+    expectRealChannels(WEATHER_SET, runs[1]!.device, {
+      actual: `${STATION}.outside.temperature`,
+      icon: `${STATION}.icon`,
+    });
+    expectNoRequiredStateBacksTwoEntities(WEATHER_SET);
   });
 });

@@ -384,26 +384,63 @@ function objectMeta(id: string, obj: IoBrokerObject): ObjectMeta {
   };
 }
 
+/** Root id -> the state anchoring the control that holds the root id. */
+export type RootAnchors = Record<string, string>;
+
+export interface Discovery {
+  devices: DeviceInput[];
+  /** To be persisted and passed back into the next discovery. */
+  anchors: RootAnchors;
+}
+
+/** Ancestors before descendants would let an outer root take a nested root's controls. */
+function deepestFirst(a: string, b: string): number {
+  return b.split('.').length - a.split('.').length || (a < b ? -1 : a > b ? 1 : 0);
+}
+
+/**
+ * A root's further control is named after its own state, or the picker shows
+ * the root's name twice, once for a reboot button (Ruling 44). hm-rega names
+ * a datapoint "<channel>.<datapoint>", so a name that already starts with the
+ * root's is not repeated.
+ */
+function controlName(rootName: string, stateName: string | undefined, anchor: string): string {
+  const own = stateName?.startsWith(rootName) ? stateName.slice(rootName.length).replace(/^[\s.:_-]+/, '') : stateName;
+  return `${rootName} ${own || lastSegment(anchor)}`;
+}
+
 /**
  * Discovery minus the adapter I/O: the ioBroker objects main.ts fetched in,
- * one DeviceInput per physical control out. main.ts and the real-detector
- * suite both call this, so the suite tests the production loop rather than a
- * copy of it. Nothing inside `ownNamespace` is detected: the panel objects
- * are not devices to publish back to the panels.
+ * one DeviceInput per physical control out, plus the root anchors to persist
+ * for the next run. main.ts and the real-detector suite both call this, so
+ * the suite tests the production loop rather than a copy of it. Nothing
+ * inside `ownNamespace` is detected: the panel objects are not devices to
+ * publish back to the panels.
  *
- * Every channel and every device is a root, and a device root detects the
- * controls of its channels over again. The detector cannot prevent that: it
- * discards a caller's used-ids list (ChannelDetector.js:697-700), and
- * detectParent, the one mode that keeps it, widens a channel root to its
+ * Every channel and every device is a root, and an outer root detects the
+ * controls of the roots inside it over again. The detector cannot prevent
+ * that: it discards a caller's used-ids list (ChannelDetector.js:697-700),
+ * and detectParent, the one mode that keeps it, widens a channel root to its
  * whole device (:431-434) and fills the list with every candidate a root
  * merely rejected (:315, :328, :618), so a sibling channel's own control is
- * never found. Repeats are therefore resolved here, by the states each detection
- * requires (required/requiredOneOf: what makes it that type at all). A
- * detection whose required states an earlier one already claimed is that
- * control seen again. Channels go first, so each control comes from the
- * channel that holds it, and a device root adds only what no channel holds.
+ * never found. Repeats are therefore resolved here, by the states each
+ * detection requires (required/requiredOneOf: what makes it that type at
+ * all). A detection is that control seen again only when an earlier one
+ * already claimed EVERY state it requires; one that needs a state nobody
+ * claimed is a composite and is kept (Ruling 46). The deepest root goes
+ * first, so each control comes from the innermost root that holds it,
+ * whatever order the objects came in.
+ *
+ * Identity (Ruling 45): each root id stays with the control holding the
+ * state recorded for that root, however the detector's sort order shifts; a
+ * new root's id goes to its first mapped control. Every other control is
+ * keyed by the first state it requires that nobody claimed before it.
  */
-export function discoverDevices(objects: Readonly<Record<string, IoBrokerObject>>, ownNamespace: string): DeviceInput[] {
+export function discoverDevices(
+  objects: Readonly<Record<string, IoBrokerObject>>,
+  ownNamespace: string,
+  anchors: Readonly<RootAnchors> = {},
+): Discovery {
   const detectable: Record<string, IoBrokerObject> = {};
   const meta: Record<string, ObjectMeta> = {};
   for (const [id, obj] of Object.entries(objects)) {
@@ -411,41 +448,49 @@ export function discoverDevices(objects: Readonly<Record<string, IoBrokerObject>
     detectable[id] = obj;
     meta[id] = objectMeta(id, obj);
   }
-  const rootsOf = (type: string): string[] => Object.keys(detectable).filter((id) => detectable[id]?.type === type);
+  const roots = Object.keys(detectable)
+    .filter((id) => detectable[id]?.type === 'channel' || detectable[id]?.type === 'device')
+    .sort(deepestFirst);
 
   const detector = createIoBrokerDetector(detectable);
   const claimed = new Set<string>();
-  const result: DeviceInput[] = [];
-  for (const rootId of [...rootsOf('channel'), ...rootsOf('device')]) {
+  const devices: DeviceInput[] = [];
+  const nextAnchors: RootAnchors = {};
+  for (const rootId of roots) {
     if (rootId.startsWith(`${ownNamespace}.`)) continue;
     const controls = detector.detect(rootId);
-    let rootKeyed = false;
+    const recorded = anchors[rootId];
+    let holder = recorded === undefined ? undefined : controls.find((c) => c.states.some((s) => s.id === recorded));
+    // The recorded control is gone: its id goes to nobody, not to another.
+    if (recorded !== undefined && !holder) nextAnchors[rootId] = recorded;
     for (const control of controls) {
       // Claimed even when unmapped, so nothing less specific can later stand
       // in for it over the same states.
       const required = control.states.flatMap((state) =>
         state.id && (state.required || state.requiredOneOf) ? [state.id] : [],
       );
-      const repeat = required.some((id) => claimed.has(id));
+      // The first required state nobody claimed before: none means every one
+      // was, and this is a repeat (Ruling 46).
+      const own = required.find((id) => !claimed.has(id));
       for (const id of required) claimed.add(id);
+      const anchor = own ?? required[0];
 
       const device = mapControlToDevice(rootId, control, meta);
-      if (!device) continue;
-      // The root id keys the root's first mapped control, as in v0.1, so a
-      // persisted entity id never passes to a different control, not even
-      // when that first control is a repeat. Further controls are keyed by
-      // the first state they require (every mapped type requires one), which
-      // no earlier kept control can share.
-      if (rootKeyed) device.objectId = required[0] ?? device.objectId;
-      rootKeyed = true;
+      if (device && !holder && recorded === undefined) holder = control;
+      if (control === holder) {
+        if (anchor) nextAnchors[rootId] = anchor;
+      } else if (device && anchor) {
+        device.objectId = anchor;
+        device.name = controlName(device.name, meta[anchor]?.name, anchor);
+      }
       // `info` is the catch-all: tried last (the final pattern in
       // typePatterns.js) and sorted last (ChannelDetector.js:722-729), it
       // holds only what the root's other detections left (:226, :336-361).
       // Beside any other detection, mapped or not, it would publish that
       // control's leftovers as a sensor in its place.
-      if (repeat || (control.type === 'info' && controls.length > 1)) continue;
-      result.push(device);
+      if (!device || !own || (control.type === 'info' && controls.length > 1)) continue;
+      devices.push(device);
     }
   }
-  return result;
+  return { devices, anchors: nextAnchors };
 }
