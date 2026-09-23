@@ -70,7 +70,9 @@ function parseObject(raw: string): Record<string, unknown> {
   return parsed as Record<string, unknown>;
 }
 
-function requireEntityId(payload: Record<string, unknown>): string {
+/** Exported for reuse by protocol/history.ts: every consumer of an inbound
+ * entity_id must apply this exact length/shape policy, not a re-implementation. */
+export function requireEntityId(payload: Record<string, unknown>): string {
   const raw = payload.entity_id;
   if (typeof raw !== 'string') throw new CommandError('missing_entity_id');
   const entityId = raw.trim().toLowerCase();
