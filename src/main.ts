@@ -41,6 +41,8 @@ class HomeTiles extends utils.Adapter {
   private devices: DeviceInput[] = [];
   /** Until a discovery has succeeded in this run, panels get no configuration (Ruling 56). */
   private discovered = false;
+  /** Set first on unload: from then on nothing is published (Ruling 62 B). */
+  private unloading = false;
   private discoveryRetry: ioBroker.Timeout | undefined;
 
   constructor(options: Partial<utils.AdapterOptions> = {}) {
@@ -104,7 +106,10 @@ class HomeTiles extends utils.Adapter {
     );
     this.panels = new PanelManager({
       transport: {
-        publish: (request) => this.mqtt.publish(request),
+        // Every panel publish passes here; none once the adapter stops.
+        publish: (request) => {
+          if (!this.unloading) this.mqtt.publish(request);
+        },
         subscribe: (topic) => this.mqtt.subscribe(topic),
         unsubscribe: (topic) => this.mqtt.unsubscribe(topic),
       },
@@ -138,8 +143,11 @@ class HomeTiles extends utils.Adapter {
   /**
    * One malformed object anywhere in the installation must not keep the
    * adapter from serving panels: v0.1 crash-looped right here, rejecting
-   * onReady before MQTT ever connected (Ruling 51). Nor may a failure publish
-   * an empty world (Ruling 56): it is logged and retried with a bounded
+   * onReady before MQTT ever connected (Ruling 51). A problem confined to one
+   * object leaves out only that object, with a warning naming it
+   * (Ruling 60(2)). What still fails here is systemic -- objects or states
+   * that cannot be read or subscribed at all -- and it must not publish an
+   * empty world either (Ruling 56): it is logged and retried with a bounded
    * backoff, and until a discovery succeeds no panel gets a configuration,
    * so each keeps its last one. The first success then proceeds as a normal
    * start would.
@@ -167,9 +175,13 @@ class HomeTiles extends utils.Adapter {
     for (const session of this.panels.sessions()) this.pushEverything(session);
   }
 
-  /** The entities panels may be given: none until a discovery has succeeded (Ruling 56). */
+  /**
+   * The entities panels may be given: none until a discovery has succeeded
+   * (Ruling 56), nor once the adapter stops, when the registry is emptied
+   * (Ruling 62 B).
+   */
   private panelEntities(): VirtualEntity[] | null {
-    return this.discovered ? this.registry.all() : null;
+    return this.discovered && !this.unloading ? this.registry.all() : null;
   }
 
   private pushEverything(session: PanelSession): void {
@@ -181,7 +193,13 @@ class HomeTiles extends utils.Adapter {
   private async onUnload(callback: () => void): Promise<void> {
     try {
       this.clearTimeout(this.discoveryRetry);
+      // The newest values go out while every entity is still there. Then,
+      // before anything is torn down, publishing stops: the registry is
+      // emptied next, and a panel asking for its configuration meanwhile was
+      // sent an empty one -- the firmware prunes every tile and saves that
+      // (Ruling 62 B). Both are synchronous, so nothing runs in between.
       this.registry?.flush();
+      this.unloading = true;
       this.registry?.dispose();
       await this.panels?.stopAll();
       await this.mqtt?.disconnect();
@@ -309,6 +327,10 @@ class HomeTiles extends utils.Adapter {
     await this.saveJsonMap(ROOT_ANCHOR_STATE, 'Root anchors: the state each root id stays with', anchors);
 
     const result = this.registry.rebuild(this.devices, this.persistedIds);
+    if (result.skipped.length > 0) {
+      const skipped = result.skipped.map(({ objectId, reason }) => `${objectId} (${reason})`);
+      this.log.warn(`[Registry] Devices left out, no entity could be made of them: ${skipped.join(', ')}`);
+    }
     this.persistedIds = result.entityIds;
     await this.saveJsonMap(ENTITY_ID_STATE, 'Persisted entity ids', result.entityIds);
 
@@ -317,17 +339,36 @@ class HomeTiles extends utils.Adapter {
 
     // Seed the registry with the values the sources already hold, so a panel
     // that connects later finds retained state rather than an empty dashboard.
+    // A source whose value cannot be read -- js-controller refuses an alias
+    // whose target id is malformed (adapter.js _getForeignState) -- stays
+    // unavailable until it changes: one bad object must not hold back every
+    // other (Ruling 60(2)). Left unread, it is asked for again should this
+    // attempt fail later (RebuildResult.subscribe).
+    const unread: string[] = [];
     for (const objectId of result.subscribe) {
-      const state = await this.getForeignStateAsync(objectId);
+      let state: ioBroker.State | null | undefined;
+      try {
+        state = await this.getForeignStateAsync(objectId);
+      } catch (error) {
+        unread.push(`${objectId} (${error instanceof Error ? error.message : String(error)})`);
+        continue;
+      }
       this.registry.applyStateChange(
         objectId,
         state ? { val: state.val, ack: state.ack, q: state.q ?? 0, ts: state.ts } : null,
       );
     }
+    if (unread.length > 0) {
+      this.log.warn(`[Registry] Could not read the value of ${unread.join(', ')}; unavailable until it changes`);
+    }
     this.registry.flush();
 
-    for (const entityId of result.removed) {
-      for (const session of this.panels.sessions()) session.clearEntityState(entityId);
+    // Only a panel that was given a configuration is told an entity left it
+    // (Ruling 56).
+    if (this.discovered) {
+      for (const entityId of result.removed) {
+        for (const session of this.panels.sessions()) session.clearEntityState(entityId);
+      }
     }
 
     await this.setState('info.entities', this.registry.all().length, true);

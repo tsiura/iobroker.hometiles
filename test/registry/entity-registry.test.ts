@@ -140,6 +140,32 @@ describe('registry/entity-registry', () => {
     expect(registry.byId('switch.kaffee')).to.equal(undefined);
   });
 
+  it('leaves out a device no entity can be made of, names it, and keeps every other (Ruling 62)', () => {
+    // A hand-edited forcedDomain of a domain with no synth yet reaches
+    // synthesise, which throws: that failed the whole discovery, retried
+    // forever, with a log naming no object.
+    const { registry } = harness();
+    const station: DeviceInput = { ...TEMP, objectId: 'zigbee.0.station', name: 'Station', domain: 'weather' };
+    const result = registry.rebuild([station, TEMP], {});
+    expect(result.skipped).to.deep.equal([{ objectId: 'zigbee.0.station', reason: 'not implemented: weather' }]);
+    expect(registry.all().map((entity) => entity.entityId)).to.deep.equal(['sensor.wohnzimmer']);
+  });
+
+  it('asks again for every source an attempt did not get to read (Ruling 60(3))', () => {
+    // main.ts subscribes and reads what a rebuild asks for. When the attempt
+    // fails part-way, the retry must ask again for what was never read, not
+    // only for what is new: those sources would stay unsubscribed.
+    const { registry, membership } = harness();
+    const first = registry.rebuild([TEMP, PLUG], {});
+    expect(first.subscribe).to.deep.equal(['shelly.0.plug.on', 'zigbee.0.temp.value']);
+    registry.applyStateChange('shelly.0.plug.on', value(true));
+    const before = membership();
+
+    const retry = registry.rebuild([TEMP, PLUG], first.entityIds);
+    expect(retry.subscribe).to.deep.equal(['zigbee.0.temp.value']);
+    expect(membership(), 'the same entities: no membership change').to.equal(before);
+  });
+
   it('keeps a persisted entity id when the device is renamed', () => {
     const { registry } = harness();
     const first = registry.rebuild([TEMP], {});

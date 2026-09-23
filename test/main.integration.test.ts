@@ -82,12 +82,46 @@ const CORRUPT_ENUM_OBJECTS: Record<string, object> = {
   'enum.functions.licht': { type: 'enum', common: { name: 'Licht', members: { length: 1 } } },
 };
 
-const FIXTURE_IDS = [...Object.keys(SENSOR_OBJECTS), ...Object.keys(CORRUPT_ENUM_OBJECTS)];
+/**
+ * One bad object each, beside the good sensor: a role that is not text (the
+ * type-detector threw on it), a device a hand-edited override forces into a
+ * domain with no synth yet (synthesise threw on it), and an alias whose target
+ * id is malformed (js-controller rejects reading it, adapter.js
+ * _getForeignState). Each used to stop the whole discovery.
+ */
+const BAD_ROLE = 'zigbee.0.00158d0004c0ffee';
+const FORCED = 'zigbee.0.00158d0004f0rced';
+const BAD_ALIAS = 'alias.0.Kaputt';
+const BAD_OBJECTS: Record<string, object> = {
+  [BAD_ROLE]: { type: 'device', common: { name: 'Kaputt' } },
+  [`${BAD_ROLE}.status`]: { type: 'state', common: { name: 'Status', role: 5, type: 'number', read: true, write: false } },
+  [FORCED]: { type: 'device', common: { name: 'Erzwungen' } },
+  [`${FORCED}.temperature`]: {
+    type: 'state',
+    common: { name: 'Temperature', role: 'value.temperature', type: 'number', unit: '°C', read: true, write: false },
+  },
+  [BAD_ALIAS]: { type: 'channel', common: { name: 'Kaputt' } },
+  [`${BAD_ALIAS}.ACTUAL`]: {
+    type: 'state',
+    common: {
+      name: 'Temperatur',
+      role: 'value.temperature',
+      type: 'number',
+      unit: '°C',
+      read: true,
+      write: false,
+      alias: { id: 'zigbee.0.nirgends.' },
+    },
+  },
+};
+
+const FIXTURE_IDS = [...Object.keys(SENSOR_OBJECTS), ...Object.keys(CORRUPT_ENUM_OBJECTS), ...Object.keys(BAD_OBJECTS)];
 
 /** A panel as the firmware announces itself: retained on the broker, like its last configuration. */
 const PANEL = 'e2e1';
 const ANNOUNCE_TOPIC = `tab5_lvgl/config/${PANEL}/bridge`;
 const APPLY_TOPIC = `tab5_lvgl/config/${PANEL}/bridge/apply`;
+const REQUEST_TOPIC = `tab5_lvgl/config/${PANEL}/bridge/request`;
 const ANNOUNCEMENT = JSON.stringify({
   device_id: PANEL,
   base_topic: 'hometiles-e2e',
@@ -100,6 +134,33 @@ const ANNOUNCEMENT = JSON.stringify({
   local_io: [],
 });
 const LAST_GOOD_APPLY = '{"marker":"the last good configuration"}';
+
+/** A broker, and a panel client on it that records every apply it receives. */
+function withBrokerAndPanel(port: number): { applies: string[]; panel: () => MqttClient } {
+  const applies: string[] = [];
+  let broker: Aedes;
+  let server: Server;
+  let panel: MqttClient;
+  // Created in the hook: a broker's timers would keep a --grep run that
+  // skips this suite from ever exiting.
+  before(async () => {
+    broker = new Aedes();
+    server = createServer(broker.handle);
+    await new Promise<void>((resolve) => server.listen(port, resolve));
+    panel = await mqtt.connectAsync(`mqtt://127.0.0.1:${port}`);
+    panel.on('message', (topic, payload) => {
+      if (topic === APPLY_TOPIC) applies.push(payload.toString());
+    });
+    await panel.subscribeAsync(APPLY_TOPIC);
+    await panel.publishAsync(ANNOUNCE_TOPIC, ANNOUNCEMENT, { retain: true });
+  });
+  after((done) => {
+    panel.end(true);
+    server.close(() => done());
+    broker.close();
+  });
+  return { applies, panel: () => panel };
+}
 
 /**
  * Objects that cannot be read at all: the object view discovery reads each
@@ -273,6 +334,82 @@ if (process.env.HOMETILES_INTEGRATION === '1') {
           const apply = await waitFor(harness, () => applies.find((payload) => payload.includes('sensor.balkon')), 'the normal apply');
           expect(JSON.parse(apply).sensors).to.deep.equal(['sensor.balkon']);
           expect(applies[0]).to.equal(LAST_GOOD_APPLY);
+        });
+      });
+
+      suite('one bad object is left out, not the whole installation (Rulings 60, 62)', (getHarness) => {
+        withCleanFixtures(getHarness);
+        const port = 18853;
+        const { applies, panel } = withBrokerAndPanel(port);
+        const balkonState: string[] = [];
+        let logs: LogRecord[] = [];
+
+        it('publishes every other device with its value, and logs no error', async function () {
+          this.timeout(120000);
+          const harness = getHarness();
+          logs = await captureLogs(harness);
+          await harness.changeAdapterConfig('hometiles', {
+            native: {
+              brokerHost: '127.0.0.1',
+              brokerPort: port,
+              deviceOverrides: [{ objectId: FORCED, forcedDomain: 'weather' }],
+            },
+          });
+          await setObjects(harness, { ...SENSOR_OBJECTS, ...BAD_OBJECTS });
+          await harness.states.setStateAsync(`${SENSOR}.temperature`, { val: 21.5, ack: true });
+          panel().on('message', (topic, payload) => {
+            if (topic === 'ha/e2e/sensor/balkon/state') balkonState.push(payload.toString());
+          });
+          await panel().subscribeAsync('ha/e2e/sensor/balkon/state');
+          await harness.startAdapterAndWait(true);
+
+          const apply = await waitFor(harness, () => applies.find((payload) => payload.includes('sensor.balkon')), 'the apply');
+          expect(JSON.parse(apply).sensors).to.deep.equal(['sensor.balkon', 'sensor.kaputt']);
+          // The value the sensor held when discovery read it: a failed read of
+          // the alias before it left it unread for good.
+          await waitFor(harness, () => balkonState.find((payload) => payload === '21.5'), "the sensor's value");
+          const errors = logs.filter((log) => log.severity === 'error').map((log) => log.message);
+          expect(errors, errors.join('\n')).to.deep.equal([]);
+        });
+
+        it('names each of them in a warning', () => {
+          const warnings = logs.filter((log) => log.severity === 'warn').map((log) => log.message);
+          const named = (text: string): boolean => warnings.some((message) => message.includes('[Registry]') && message.includes(text));
+          expect(named(`${BAD_ROLE}.status`), warnings.join('\n')).to.equal(true);
+          expect(named(`${FORCED} (not implemented: weather)`), warnings.join('\n')).to.equal(true);
+          expect(named(`${BAD_ALIAS}.ACTUAL`), warnings.join('\n')).to.equal(true);
+        });
+      });
+
+      suite('stopping the adapter (Ruling 62 B)', (getHarness) => {
+        withCleanFixtures(getHarness);
+        const port = 18854;
+        const { applies, panel } = withBrokerAndPanel(port);
+
+        it('publishes no empty configuration, however many requests arrive while it stops', async function () {
+          this.timeout(120000);
+          const harness = getHarness();
+          const logs = await captureLogs(harness);
+          await harness.changeAdapterConfig('hometiles', { native: { brokerHost: '127.0.0.1', brokerPort: port } });
+          await setObjects(harness, SENSOR_OBJECTS);
+          await harness.startAdapterAndWait(true);
+          await waitFor(harness, () => applies.find((payload) => payload.includes('sensor.balkon')), 'the normal apply');
+
+          // The adapter empties its registry while it stops. A panel that asks
+          // for its configuration meanwhile must not be told that everything
+          // is gone: the firmware would prune every tile and save that.
+          const flood = setInterval(() => void panel().publishAsync(REQUEST_TOPIC, 'force'), 1);
+          try {
+            await harness.stopAdapter();
+          } finally {
+            clearInterval(flood);
+          }
+          await new Promise((resolve) => setTimeout(resolve, 500));
+          const empty = applies.filter((payload) => !payload.includes('sensor.balkon'));
+          expect(empty, `${empty.length} of ${applies.length} applies without the sensor`).to.deep.equal([]);
+          // Nor does the log claim one was pushed.
+          const pushed = logs.map((log) => log.message).filter((message) => message.includes('Configuration pushed'));
+          expect(pushed.filter((message) => !message.endsWith(', 1 entities')), pushed.join('\n')).to.deep.equal([]);
         });
       });
     },

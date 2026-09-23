@@ -10,8 +10,15 @@ export interface RegistryEvents {
 export interface RebuildResult {
   entityIds: Record<string, string>;
   removed: string[];
+  /**
+   * Every watched source holding no value yet: the new ones, and any an
+   * earlier attempt failed before it read (Ruling 60(3)). main.ts subscribes
+   * and reads each; a value, read or received, is what marks it done.
+   */
   subscribe: string[];
   unsubscribe: string[];
+  /** Devices no entity could be made of, left out rather than failing the rest (Ruling 62). */
+  skipped: Array<{ objectId: string; reason: string }>;
 }
 
 interface Slot {
@@ -43,6 +50,7 @@ export class EntityRegistry {
 
     const nextSlots = new Map<string, Slot>();
     const nextWatchers = new Map<string, Set<string>>();
+    const skipped: RebuildResult['skipped'] = [];
 
     for (const device of devices) {
       const entityId = entityIds[device.objectId];
@@ -51,8 +59,15 @@ export class EntityRegistry {
       // synthClimate can find nothing usable behind a device (a later ^6
       // type-detector minor or a domain override; see there); synthesise
       // returns null rather than a hollow entity, and that device gets no
-      // slot and no channel subscriptions.
-      const entity = synthesise(device, entityId, this.valuesFor(device));
+      // slot and no channel subscriptions. A domain with no synth yet throws
+      // (a hand-edited forcedDomain): that device alone is left out.
+      let entity: VirtualEntity | null;
+      try {
+        entity = synthesise(device, entityId, this.valuesFor(device));
+      } catch (error) {
+        skipped.push({ objectId: device.objectId, reason: error instanceof Error ? error.message : String(error) });
+        continue;
+      }
       if (!entity) continue;
       nextSlots.set(entityId, { device, entity });
 
@@ -67,7 +82,7 @@ export class EntityRegistry {
     }
 
     const removed = [...previousEntityIds].filter((id) => !nextSlots.has(id)).sort();
-    const subscribe = [...nextWatchers.keys()].filter((id) => !previousObjectIds.has(id)).sort();
+    const subscribe = [...nextWatchers.keys()].filter((id) => !this.values.has(id)).sort();
     const unsubscribe = [...previousObjectIds].filter((id) => !nextWatchers.has(id)).sort();
 
     for (const entityId of removed) this.cancelTimer(entityId);
@@ -78,12 +93,12 @@ export class EntityRegistry {
 
     const membershipChanged =
       removed.length > 0 ||
-      subscribe.length > 0 ||
       unsubscribe.length > 0 ||
+      [...nextWatchers.keys()].some((id) => !previousObjectIds.has(id)) ||
       [...nextSlots.keys()].some((id) => !previousEntityIds.has(id));
     if (membershipChanged) this.events.onMembershipChanged();
 
-    return { entityIds, removed, subscribe, unsubscribe };
+    return { entityIds, removed, subscribe, unsubscribe, skipped };
   }
 
   applyStateChange(objectId: string, value: SourceValue | null): void {
