@@ -267,7 +267,9 @@ class HomeTiles extends utils.Adapter {
     const objects = (await this.getForeignObjectsAsync('*', 'state')) as Record<string, ioBroker.Object>;
     const channels = (await this.getForeignObjectsAsync('*', 'channel')) as Record<string, ioBroker.Object>;
     const devices = (await this.getForeignObjectsAsync('*', 'device')) as Record<string, ioBroker.Object>;
-    return discoverDevices({ ...objects, ...channels, ...devices }, this.namespace);
+    // The detector reads function enums from the same map (a lamp in "Licht").
+    const enums = (await this.getForeignObjectsAsync('enum.functions.*', 'enum')) as Record<string, ioBroker.Object>;
+    return discoverDevices({ ...objects, ...channels, ...devices, ...enums }, this.namespace);
   }
 
   private publishEntity(entity: VirtualEntity): void {

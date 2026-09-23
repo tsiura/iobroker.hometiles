@@ -16,7 +16,7 @@ import { Dispatcher } from '../../src/runtime/dispatcher';
  * (Task 5c, Rulings 34/35; Task 5d).
  */
 
-type IoType = 'device' | 'channel' | 'state';
+type IoType = 'device' | 'channel' | 'state' | 'enum';
 interface IoObject {
   _id: string;
   type: IoType;
@@ -26,11 +26,22 @@ interface IoObject {
 type IoObjects = Record<string, IoObject>;
 
 const device = (id: string, name: string): IoObject => ({ _id: id, type: 'device', common: { name }, native: {} });
-const channel = (id: string, name: string): IoObject => ({ _id: id, type: 'channel', common: { name }, native: {} });
+const channel = (id: string, name: string, common: Record<string, unknown> = {}): IoObject => ({
+  _id: id,
+  type: 'channel',
+  common: { name, ...common },
+  native: {},
+});
 const state = (id: string, common: Record<string, unknown>): IoObject => ({
   _id: id,
   type: 'state',
   common: { name: id.split('.').pop(), read: true, ...common },
+  native: {},
+});
+const functionEnum = (id: string, name: string, members: string[]): IoObject => ({
+  _id: id,
+  type: 'enum',
+  common: { name, members },
   native: {},
 });
 const objects = (...list: IoObject[]): IoObjects => Object.fromEntries(list.map((obj) => [obj._id, obj]));
@@ -168,14 +179,32 @@ const KEY_SET = objects(
   state(`${KEY}.1.PRESS_LONG`, { role: 'button.long', type: 'boolean', read: false, write: true }),
 );
 
+// HM-CC-RT-DN's channel 4 (CLIMATECONTROL_RT_TRANSCEIVER) with every one of
+// its datapoints, roled the way hm-rpc roles them (src/lib/roles.ts dpNAME;
+// a read-only level.* becomes plain `value` via readOnlyRole; ACTION
+// datapoints are write-only). MANU_MODE is a second writable
+// level.temperature, so SET has two candidates to choose between.
 const RT = 'hm-rpc.0.MEQ0123456';
 const RT_SET = objects(
   device(RT, 'Heizung Bad'),
   channel(`${RT}.4`, 'Heizung Bad:4'),
-  state(`${RT}.4.SET_TEMPERATURE`, { role: 'level.temperature', type: 'number', unit: '°C', min: 4.5, max: 30.5, write: true }),
   state(`${RT}.4.ACTUAL_TEMPERATURE`, { role: 'value.temperature', type: 'number', unit: '°C', write: false }),
+  state(`${RT}.4.AUTO_MODE`, { role: 'button', type: 'boolean', read: false, write: true }),
+  state(`${RT}.4.BATTERY_STATE`, { role: 'value.voltage', type: 'number', unit: 'V', write: false }),
+  state(`${RT}.4.BOOST_MODE`, { role: 'switch.mode.boost', type: 'boolean', read: false, write: true }),
+  state(`${RT}.4.BOOST_STATE`, { role: 'value', type: 'number', unit: 'min', write: false }),
+  state(`${RT}.4.COMFORT_MODE`, { role: 'button', type: 'boolean', read: false, write: true }),
+  state(`${RT}.4.CONTROL_MODE`, {
+    role: 'indicator',
+    type: 'number',
+    write: false,
+    states: { 0: 'AUTO-MODE', 1: 'MANU-MODE', 2: 'PARTY-MODE', 3: 'BOOST-MODE' },
+  }),
+  state(`${RT}.4.FAULT_REPORTING`, { role: 'indicator', type: 'number', write: false }),
+  state(`${RT}.4.LOWERING_MODE`, { role: 'button', type: 'boolean', read: false, write: true }),
+  state(`${RT}.4.MANU_MODE`, { role: 'level.temperature', type: 'number', unit: '°C', min: 4.5, max: 30.5, read: false, write: true }),
+  state(`${RT}.4.SET_TEMPERATURE`, { role: 'level.temperature', type: 'number', unit: '°C', min: 4.5, max: 30.5, write: true }),
   state(`${RT}.4.VALVE_STATE`, { role: 'value.valve', type: 'number', unit: '%', write: false }),
-  state(`${RT}.4.BOOST_MODE`, { role: 'switch.boost', type: 'boolean', write: true }),
 );
 
 const FLOOR = 'alias.0.Bad.Fussbodenheizung';
@@ -242,6 +271,108 @@ const GARAGE_SET = objects(
   state(`${GARAGE}.SET`, { role: 'switch.gate', type: 'boolean' }),
 );
 
+// A Homematic shutter contact exactly as hm-rpc builds it: the device, its
+// MAINTENANCE channel 0 and its SHUTTER_CONTACT channel 1 (channel role from
+// hm-rpc's chTYPE, datapoint roles from dpNAME/dpCONTROL).
+const SCO = 'hm-rpc.0.NEQ0987654';
+const SCO_SET = objects(
+  device(SCO, 'Terrassentür'),
+  channel(`${SCO}.0`, 'Terrassentür:0'),
+  state(`${SCO}.0.AES_KEY`, { role: 'state', type: 'number', write: false }),
+  state(`${SCO}.0.CONFIG_PENDING`, { role: 'indicator', type: 'boolean', write: false }),
+  state(`${SCO}.0.LOWBAT`, { role: 'indicator.lowbat', type: 'boolean', write: false }),
+  state(`${SCO}.0.RSSI_DEVICE`, { role: 'value.rssi', type: 'number', unit: 'dBm', write: false }),
+  state(`${SCO}.0.RSSI_PEER`, { role: 'value.rssi', type: 'number', unit: 'dBm', write: false }),
+  state(`${SCO}.0.STICKY_UNREACH`, { role: 'indicator.unreach.sticky', type: 'boolean', write: true }),
+  state(`${SCO}.0.UNREACH`, { role: 'indicator.unreach', type: 'boolean', write: false }),
+  state(`${SCO}.0.UPDATE_PENDING`, { role: 'indicator', type: 'boolean', write: false }),
+  channel(`${SCO}.1`, 'Terrassentür:1', { role: 'sensor' }),
+  state(`${SCO}.1.ERROR`, { role: 'indicator.error', type: 'number', write: false }),
+  state(`${SCO}.1.INSTALL_TEST`, { role: 'indicator', type: 'boolean', write: false }),
+  state(`${SCO}.1.STATE`, { role: 'sensor.window', type: 'boolean', write: false }),
+);
+
+// A Shelly Plug S (gen 1) as ioBroker.shelly builds it: the device object
+// keeps its default name (src/lib/protocol/base.ts), the relay channel
+// carries the relay's own name (setChannelName in src/lib/shelly-helper.ts),
+// and the datapoints come from src/lib/devices/gen1/shellyplugs.ts and the
+// gen-1 defaults in src/lib/devices/default.ts.
+const SHELLY = 'shelly.0.SHPLG-S#6A1B2C#1';
+const SHELLY_SET = objects(
+  device(SHELLY, 'Device SHPLG-S#6A1B2C#1'),
+  channel(`${SHELLY}.Relay0`, 'Kaffeemaschine'),
+  state(`${SHELLY}.Relay0.Switch`, { role: 'switch', type: 'boolean', write: true }),
+  state(`${SHELLY}.Relay0.ChannelName`, { role: 'text', type: 'string', write: true }),
+  state(`${SHELLY}.Relay0.AutoTimerOff`, { role: 'level.timer', type: 'number', unit: 's', write: true }),
+  state(`${SHELLY}.Relay0.Power`, { role: 'value.power', type: 'number', unit: 'W', write: false }),
+  state(`${SHELLY}.Relay0.Energy`, { role: 'value.energy.consumed', type: 'number', unit: 'Wh', write: false }),
+  state(`${SHELLY}.temperatureC`, { role: 'value.temperature', type: 'number', unit: '°C', write: false }),
+  state(`${SHELLY}.temperatureF`, { role: 'value.temperature', type: 'number', unit: '°F', write: false }),
+  state(`${SHELLY}.led_power_disable`, { role: 'state', type: 'boolean', write: true }),
+  state(`${SHELLY}.online`, { role: 'indicator.reachable', type: 'boolean', write: false }),
+  state(`${SHELLY}.firmwareupdate`, { role: 'button', type: 'boolean', read: false, write: true }),
+  state(`${SHELLY}.reboot`, { role: 'button', type: 'boolean', read: false, write: true }),
+  state(`${SHELLY}.rssi`, { role: 'value', type: 'number', unit: 'dBm', write: false }),
+  state(`${SHELLY}.uptime`, { role: 'value.interval', type: 'number', unit: 'sec', write: false }),
+  channel(`${SHELLY}.Sys`, 'Channel Sys'),
+  state(`${SHELLY}.Sys.eco`, { role: 'state', type: 'boolean', write: true }),
+  channel(`${SHELLY}.Cloud`, 'Channel Cloud'),
+  state(`${SHELLY}.Cloud.enabled`, { role: 'switch.enable', type: 'boolean', write: false }),
+);
+
+// A switch actuator whose generic `switch` role says nothing about what it
+// drives: only its membership in a "Licht" function enum makes it a lamp
+// (roleOrEnumLight in type-detector's roleEnumUtils.js).
+const LAMP = 'knx.0.Licht.Flur';
+const LAMP_SET = objects(
+  channel(LAMP, 'Flurlicht'),
+  state(`${LAMP}.Schalten`, { role: 'switch', type: 'boolean', write: true }),
+  functionEnum('enum.functions.licht', 'Licht', [LAMP]),
+);
+
+const INSTALLATION: IoObjects = Object.assign(
+  {},
+  PROBE,
+  AQARA_SET,
+  GARDEN_SET,
+  WINDOW_SET,
+  MOTION_SET,
+  PLUG_SET,
+  KNX_SET,
+  HUE_SET,
+  KEY_SET,
+  RT_SET,
+  FLOOR_SET,
+  FANCOIL_SET,
+  AC_SET,
+  circuitSet(false),
+  BLIND_SET,
+  GATE_SET,
+  GARAGE_SET,
+  SCO_SET,
+  SHELLY_SET,
+  LAMP_SET,
+);
+
+/** Every detected device one of whose channels is this state object. */
+const backedBy = (runs: Run[], objectId: string): string[] =>
+  runs
+    .filter(({ device: detected }) => Object.values(detected.channels).some((ch) => ch.objectId === objectId))
+    .map(({ device: detected }) => detected.objectId);
+
+/** One entity per physical control: no state object backs two entities. */
+function expectNoStateBacksTwoEntities(runs: Run[]): void {
+  const owners = new Map<string, string>();
+  for (const { device: detected } of runs) {
+    for (const ch of Object.values(detected.channels)) {
+      expect(owners.get(ch.objectId) ?? detected.objectId, `${ch.objectId} backs two entities`).to.equal(
+        detected.objectId,
+      );
+      owners.set(ch.objectId, detected.objectId);
+    }
+  }
+}
+
 // ---- Tests ----
 
 describe('real type-detector end to end (Task 5c)', () => {
@@ -280,8 +411,6 @@ describe('real type-detector end to end (Task 5c)', () => {
 
   describe('binary_sensor', () => {
     it('a Homematic window contact is backed only by its STATE object', () => {
-      // main.ts detects the device root AND the channel root, so this tree
-      // yields the same contact twice (reported, not pinned here).
       const runs = run(WINDOW_SET, { [`${WINDOW}.1.STATE`]: value(true) });
       for (const { device: detected } of runs) {
         expectRealChannels(WINDOW_SET, detected, { actual: `${WINDOW}.1.STATE` });
@@ -354,8 +483,20 @@ describe('real type-detector end to end (Task 5c)', () => {
         [`${RT}.4.ACTUAL_TEMPERATURE`]: value(19.5),
         [`${RT}.4.BOOST_MODE`]: value(false),
       });
+      // SET had two candidates carrying its defaultRole, MANU_MODE and
+      // SET_TEMPERATURE; the detector keeps the later id of the two
+      // (ChannelDetector.js:261-269, 305-307), so SET_TEMPERATURE wins.
       const expected = { set: `${RT}.4.SET_TEMPERATURE`, actual: `${RT}.4.ACTUAL_TEMPERATURE`, boost: `${RT}.4.BOOST_MODE` };
-      for (const { device: detected } of runs) expectRealChannels(RT_SET, detected, expected);
+      // One thermostat, from the channel that holds it (Task 5d (b)).
+      const climate = runs.filter(({ device: detected }) => detected.domain === 'climate');
+      expect(climate.map(({ device: detected }) => detected.objectId)).to.deep.equal([`${RT}.4`]);
+      expectRealChannels(RT_SET, climate[0]!.device, expected);
+      expect(backedBy(runs, `${RT}.4.MANU_MODE`)).to.deep.equal([]);
+      // Every control the channel yields is kept (Task 5d (c)): the detector
+      // finds `button` once per root, and of AUTO/COMFORT/LOWERING_MODE the
+      // later id wins, so the channel also publishes one scene.
+      const scenes = runs.filter(({ device: detected }) => detected.domain === 'scene');
+      expect(scenes.map(({ device: detected }) => detected.channels.set?.objectId)).to.deep.equal([`${RT}.4.LOWERING_MODE`]);
       const result = runFor(runs, `${RT}.4`);
       expect(result.entity!.writable).to.deep.equal({ setpoint: true, boost: true });
       expect(json(result)).to.deep.equal({
@@ -530,30 +671,68 @@ describe('real type-detector end to end (Task 5c)', () => {
   });
 
   it('the registry asks main.ts to subscribe only real state objects', () => {
-    // main.ts:246 hands every id here to subscribeForeignStatesAsync, and
+    // main.ts hands every id here to subscribeForeignStatesAsync, and
     // js-controller turns an undefined pattern into '*' (every state).
-    const installation: IoObjects = Object.assign(
-      {},
-      PROBE,
-      AQARA_SET,
-      GARDEN_SET,
-      WINDOW_SET,
-      MOTION_SET,
-      PLUG_SET,
-      KNX_SET,
-      HUE_SET,
-      KEY_SET,
-      RT_SET,
-      FLOOR_SET,
-      FANCOIL_SET,
-      AC_SET,
-      circuitSet(false),
-      BLIND_SET,
-      GATE_SET,
-      GARAGE_SET,
-    );
     const registry = new EntityRegistry({ onEntityChanged: () => undefined, onMembershipChanged: () => undefined }, 0);
-    const { subscribe } = registry.rebuild(detectDevices(installation), {});
-    expect(subscribe.filter((id) => installation[id]?.type !== 'state')).to.deep.equal([]);
+    const { subscribe } = registry.rebuild(detectDevices(INSTALLATION), {});
+    expect(subscribe.filter((id) => INSTALLATION[id]?.type !== 'state')).to.deep.equal([]);
+  });
+});
+
+describe('discovery orchestration (Task 5d)', () => {
+  it('(b) a Homematic device -> channel -> state tree yields its contact once, from the channel that holds it', () => {
+    const runs = run(SCO_SET, { [`${SCO}.1.STATE`]: value(false) });
+    expect(backedBy(runs, `${SCO}.1.STATE`)).to.deep.equal([`${SCO}.1`]);
+    expect(runFor(runs, `${SCO}.1`).payload).to.equal('off');
+    expectNoStateBacksTwoEntities(runs);
+  });
+
+  it('(b) a Shelly device -> relay channel tree yields the relay once, named after its channel', () => {
+    const runs = run(SHELLY_SET, { [`${SHELLY}.Relay0.Switch`]: value(true) });
+    expect(backedBy(runs, `${SHELLY}.Relay0.Switch`)).to.deep.equal([`${SHELLY}.Relay0`]);
+    const relay = runFor(runs, `${SHELLY}.Relay0`);
+    expect(relay.device.name).to.equal('Kaffeemaschine');
+    expect(relay.payload).to.equal('on');
+    expectNoStateBacksTwoEntities(runs);
+    // The device root's first control is the relay again. The root id keys
+    // that control (as in v0.1, so persisted entity ids stay put); with the
+    // repeat dropped, the id must not pass to one of the root's other controls.
+    expect(runs.map(({ device: detected }) => detected.objectId)).to.not.include(SHELLY);
+  });
+
+  it('(b) across a whole installation, no state object backs two entities', () => {
+    expectNoStateBacksTwoEntities(run(INSTALLATION));
+  });
+
+  it('(c) an Aqara multisensor keeps temperature (with its humidity) and pressure', () => {
+    const runs = run(AQARA_SET);
+    expect(runs.map(({ device: detected }) => [detected.objectId, detected.detectorType])).to.deep.equal([
+      [AQARA, 'temperature'],
+      // A root's further controls are keyed by the state that anchors them.
+      [`${AQARA}.pressure`, 'pressure'],
+    ]);
+    expectRealChannels(AQARA_SET, runs[0]!.device, { actual: `${AQARA}.temperature`, second: `${AQARA}.humidity` });
+    expectRealChannels(AQARA_SET, runs[1]!.device, { pressure: `${AQARA}.pressure` });
+
+    // Two entities, not two devices collapsed under one key in the registry.
+    const registry = new EntityRegistry({ onEntityChanged: () => undefined, onMembershipChanged: () => undefined }, 0);
+    registry.rebuild(detectDevices(AQARA_SET), {});
+    expect(registry.all().map((entity) => entity.attributes.device_class)).to.have.members(['temperature', 'pressure']);
+  });
+
+  it('(d) a fan-coil whose control the adapter does not map is not published as a sensor', () => {
+    // The detector finds `fan` (unmapped) and then the catch-all `info` over
+    // the leftover boost switch; neither may stand in for the fan.
+    expect(run(FANCOIL_SET).map(({ device: detected }) => detected.objectId)).to.deep.equal([]);
+  });
+
+  it('(f) a lamp known only through a function enum is detected as a light', () => {
+    const [lamp] = run(LAMP_SET);
+    expect(lamp!.device).to.include({ objectId: LAMP, detectorType: 'light', domain: 'light' });
+    expectRealChannels(LAMP_SET, lamp!.device, { set: `${LAMP}.Schalten` });
+
+    // Without the enum the same channel is only a socket: the enum decides.
+    const withoutEnum = Object.fromEntries(Object.entries(LAMP_SET).filter(([, obj]) => obj.type !== 'enum'));
+    expect(run(withoutEnum).map(({ device: detected }) => detected.domain)).to.deep.equal(['switch']);
   });
 });

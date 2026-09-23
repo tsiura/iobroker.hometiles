@@ -14,7 +14,11 @@ export interface AdapterOptions {
 }
 
 export interface DeviceOverride {
-  /** ioBroker object id of the device root. Overrides are keyed by this, never by list index. */
+  /**
+   * The detected control's DeviceInput.objectId: its root (device or channel),
+   * or for a root's further controls the state that anchors each one
+   * (discoverDevices). Overrides are keyed by this, never by list index.
+   */
   objectId: string;
   include: boolean;
   name?: string;

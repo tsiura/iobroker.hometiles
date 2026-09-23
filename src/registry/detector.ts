@@ -10,6 +10,9 @@ export interface DetectedChannel {
   name: string;
   write?: boolean;
   defaultRole?: string;
+  /** The pattern's own flags: the states that make a detection its type at all. */
+  required?: boolean;
+  requiredOneOf?: string;
 }
 
 export interface DetectedControl {
@@ -123,11 +126,13 @@ export const DETECTOR_TYPE_TO_DOMAIN: Record<string, Domain> = {
   // that outright rather than reporting success, but the tile should not
   // exist in the first place. `button`, which has SET(w), stays.
   button: 'scene',
-  // thermostat has NO required channel at all, and airCondition requires only
-  // MODE (docs/contract-iobroker-types.md) — a detected climate device may
-  // therefore expose nothing this adapter can read or write. This map only
-  // decides the domain; src/registry/synth/climate.ts is the layer that
-  // refuses to synthesise an entity with nothing usable behind it.
+  // In type-detector 6.0.1 thermostat requires one of SET, SET_HEATING or
+  // SET_COOLING (requiredOneOf 'setpoint', typePatterns.js:1874, :44, :55) and
+  // airCondition requires MODE as well (:1750), enforced in
+  // ChannelDetector.js:479-500 and :580-611 (docs/contract-iobroker-types.md).
+  // The dependency is ^6.0.1 and a later minor could relax that, so this map
+  // only decides the domain; src/registry/synth/climate.ts is still the layer
+  // that refuses to synthesise an entity with nothing usable behind it.
   thermostat: 'climate',
   airCondition: 'climate',
   // The trap (docs/contract-iobroker-types.md): the pattern object is keyed
@@ -306,7 +311,6 @@ interface DetectRequest {
   objects: Record<string, unknown>;
   _keysOptional?: string[];
   _keysOptionalSorted?: boolean;
-  _usedIdsOptional?: string[];
   ignoreIndicators?: string[];
   limitTypesToOneOf?: string[][];
 }
@@ -334,13 +338,14 @@ export function createIoBrokerDetector(objects: Record<string, unknown>): Detect
 
   return {
     detect(rootId: string): DetectedControl[] {
-      const usedIds: string[] = [];
+      // No _usedIdsOptional: detect() swaps any list it is given for a fresh
+      // one (ChannelDetector.js:697-700), so it cannot stop two roots claiming
+      // the same states. discoverDevices resolves those repeats instead.
       const controls = detector.detect({
         id: rootId,
         objects,
         _keysOptional: keys,
         _keysOptionalSorted: true,
-        _usedIdsOptional: usedIds,
         ignoreIndicators: ['UNREACH_STICKY'],
         limitTypesToOneOf: [LIGHTING_TYPES],
       });
@@ -355,8 +360,14 @@ export interface IoBrokerObject {
   common?: unknown;
 }
 
-/** The object types that take part in detection. */
-const DETECTED_OBJECT_TYPES = new Set(['state', 'channel', 'device']);
+/**
+ * The object types that take part in detection. The enums are function enums:
+ * the detector finds them in the same object map (roleEnumUtils.js
+ * getFunctionEnums), and they are what lets a generic role match a
+ * role-or-enum pattern -- a `switch` in a "Licht" enum is a light
+ * (ChannelDetector.js:134-139, 145-165).
+ */
+const DETECTED_OBJECT_TYPES = new Set(['state', 'channel', 'device', 'enum']);
 
 function objectMeta(id: string, obj: IoBrokerObject): ObjectMeta {
   const common = (obj.common ?? {}) as Record<string, unknown>;
@@ -375,10 +386,22 @@ function objectMeta(id: string, obj: IoBrokerObject): ObjectMeta {
 
 /**
  * Discovery minus the adapter I/O: the ioBroker objects main.ts fetched in,
- * the detected devices out. main.ts and the real-detector suite both call
- * this, so the suite tests the production loop rather than a copy of it.
- * Nothing inside `ownNamespace` is detected: the panel objects are not
- * devices to publish back to the panels.
+ * one DeviceInput per physical control out. main.ts and the real-detector
+ * suite both call this, so the suite tests the production loop rather than a
+ * copy of it. Nothing inside `ownNamespace` is detected: the panel objects
+ * are not devices to publish back to the panels.
+ *
+ * Every channel and every device is a root, and a device root detects the
+ * controls of its channels over again. The detector cannot prevent that: it
+ * discards a caller's used-ids list (ChannelDetector.js:697-700), and
+ * detectParent, the one mode that keeps it, widens a channel root to its
+ * whole device (:431-434) and fills the list with every candidate a root
+ * merely rejected (:315, :328, :618), so a sibling channel's own control is
+ * never found. Repeats are therefore resolved here, by the states each detection
+ * requires (required/requiredOneOf: what makes it that type at all). A
+ * detection whose required states an earlier one already claimed is that
+ * control seen again. Channels go first, so each control comes from the
+ * channel that holds it, and a device root adds only what no channel holds.
  */
 export function discoverDevices(objects: Readonly<Record<string, IoBrokerObject>>, ownNamespace: string): DeviceInput[] {
   const detectable: Record<string, IoBrokerObject> = {};
@@ -391,14 +414,36 @@ export function discoverDevices(objects: Readonly<Record<string, IoBrokerObject>
   const rootsOf = (type: string): string[] => Object.keys(detectable).filter((id) => detectable[id]?.type === type);
 
   const detector = createIoBrokerDetector(detectable);
+  const claimed = new Set<string>();
   const result: DeviceInput[] = [];
-  const seen = new Set<string>();
-  for (const rootId of [...rootsOf('device'), ...rootsOf('channel')]) {
+  for (const rootId of [...rootsOf('channel'), ...rootsOf('device')]) {
     if (rootId.startsWith(`${ownNamespace}.`)) continue;
-    for (const control of detector.detect(rootId)) {
+    const controls = detector.detect(rootId);
+    let rootKeyed = false;
+    for (const control of controls) {
+      // Claimed even when unmapped, so nothing less specific can later stand
+      // in for it over the same states.
+      const required = control.states.flatMap((state) =>
+        state.id && (state.required || state.requiredOneOf) ? [state.id] : [],
+      );
+      const repeat = required.some((id) => claimed.has(id));
+      for (const id of required) claimed.add(id);
+
       const device = mapControlToDevice(rootId, control, meta);
-      if (!device || seen.has(device.objectId)) continue;
-      seen.add(device.objectId);
+      if (!device) continue;
+      // The root id keys the root's first mapped control, as in v0.1, so a
+      // persisted entity id never passes to a different control, not even
+      // when that first control is a repeat. Further controls are keyed by
+      // the first state they require (every mapped type requires one), which
+      // no earlier kept control can share.
+      if (rootKeyed) device.objectId = required[0] ?? device.objectId;
+      rootKeyed = true;
+      // `info` is the catch-all: tried last (the final pattern in
+      // typePatterns.js) and sorted last (ChannelDetector.js:722-729), it
+      // holds only what the root's other detections left (:226, :336-361).
+      // Beside any other detection, mapped or not, it would publish that
+      // control's leftovers as a sensor in its place.
+      if (repeat || (control.type === 'info' && controls.length > 1)) continue;
       result.push(device);
     }
   }
