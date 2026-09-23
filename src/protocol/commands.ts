@@ -34,7 +34,12 @@ export type ServiceCall =
         | 'toggle_cover_tilt';
       entityId: string;
     }
-  | { kind: 'set_cover_position' | 'set_cover_tilt_position'; entityId: string; value: number };
+  | { kind: 'set_cover_position' | 'set_cover_tilt_position'; entityId: string; value: number }
+  | { kind: 'media_previous' | 'media_play_pause' | 'media_next'; entityId: string }
+  /** `value`: the slider's whole percent, 0..100 -- the wire's 0..1 volume_level times 100. */
+  | { kind: 'media_set_volume'; entityId: string; value: number }
+  /** `position`: seconds into the track, as the panel sends them. */
+  | { kind: 'media_seek'; entityId: string; position: number };
 
 export class CommandError extends Error {
   constructor(public readonly code: string) {
@@ -284,7 +289,47 @@ export function parseCoverCommand(raw: string): ServiceCall {
   }
 }
 
-export function parseCommand(leaf: 'light' | 'switch' | 'scene' | 'climate' | 'cover', raw: string): ServiceCall {
+/**
+ * All media commands share one topic, cmnd/media, discriminated by a
+ * "command" field (docs/contract-media-weather.md, media_player "Outbound
+ * commands"). These are exactly what the panel's controls send: the three
+ * transport buttons (media_popup.cpp:774-794, types/media/renderer.cpp:
+ * 478-498), the volume slider and the mute icon -- both volume_set
+ * (media_popup.cpp:490, :529) -- and the seek bar (:513). No control sends a
+ * stop, and mqttPublishMediaMute has no caller, so volume_mute is refused like
+ * any other command. The firmware clamps a volume to 0..1 and a seek to >= 0
+ * before sending (mqtt_handlers.cpp:2044, :2072-2073); one outside came from
+ * another client and is refused.
+ */
+export function parseMediaCommand(raw: string): ServiceCall {
+  const payload = parseObject(raw);
+  const entityId = requireEntityId(payload);
+  const command = typeof payload.command === 'string' ? payload.command : '';
+
+  switch (command) {
+    case 'previous':
+      return { kind: 'media_previous', entityId };
+    case 'play_pause':
+      return { kind: 'media_play_pause', entityId };
+    case 'next':
+      return { kind: 'media_next', entityId };
+    case 'volume_set': {
+      // A whole slider percent / 100, printed %.3f: times 100 and rounded,
+      // it is that percent again.
+      const level = requireNumber(payload.volume_level, 'invalid_volume_level');
+      return { kind: 'media_set_volume', entityId, value: requireWhole(level * 100, 'invalid_volume_level', 0, 100) };
+    }
+    case 'media_seek': {
+      const position = requireNumber(payload.seek_position, 'invalid_seek_position');
+      if (position < 0) throw new CommandError('invalid_seek_position');
+      return { kind: 'media_seek', entityId, position };
+    }
+    default:
+      throw new CommandError('unsupported_media_command');
+  }
+}
+
+export function parseCommand(leaf: 'light' | 'switch' | 'scene' | 'climate' | 'cover' | 'media', raw: string): ServiceCall {
   switch (leaf) {
     case 'light':
       return parseLightCommand(raw);
@@ -296,6 +341,8 @@ export function parseCommand(leaf: 'light' | 'switch' | 'scene' | 'climate' | 'c
       return parseClimateCommand(raw);
     case 'cover':
       return parseCoverCommand(raw);
+    case 'media':
+      return parseMediaCommand(raw);
     default: {
       // The union makes this unreachable at compile time, and the `never`
       // binding keeps that guarantee if a leaf is added. The throw covers the

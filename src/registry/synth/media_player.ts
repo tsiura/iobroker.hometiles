@@ -38,18 +38,43 @@ const STATE_NAMES: ReadonlyMap<string, string> = new Map([
 
 const NUMERIC_STATES = ['paused', 'playing', 'idle'];
 
+/** STATE's channel as the decoder reads it: a ChannelInput here, a ChannelCodec in the dispatcher. */
+type StateCodec = Pick<ChannelInput, 'type' | 'states'>;
+
 /**
  * A boolean is read as documented, true playing and false pause. A
  * states-map label or a string is read by name; a number whose label names no
  * state (a localised "Wiedergabe") falls back to the numeric convention.
  */
-function mediaState(raw: unknown, channel: ChannelInput): string | undefined {
+function mediaState(raw: unknown, channel: StateCodec): string | undefined {
   if (typeof raw === 'boolean' || channel.type === 'boolean') {
     const on = toBoolState(raw);
     return on === STATE_ON ? 'playing' : on === STATE_OFF ? 'paused' : undefined;
   }
   const named = STATE_NAMES.get(String(channel.states?.[String(raw)] ?? raw).trim().toLowerCase());
   return named ?? (typeof raw === 'number' ? NUMERIC_STATES[raw] : undefined);
+}
+
+/**
+ * The raw value a writable STATE takes to read as `target` (Task 10's
+ * play_pause): mediaState's exact inverse, by construction. Each value the
+ * channel holds -- true/false, its states map's keys, or a number's 0/1/2 --
+ * is decoded, and exactly one must read as `target`. None, or several, is
+ * undefined: never a guess.
+ */
+export function mediaStateValue(channel: StateCodec | undefined, target: string): unknown {
+  if (!channel) return undefined;
+  const keys = Object.keys(channel.states ?? {});
+  const held: unknown[] =
+    channel.type === 'boolean'
+      ? [true, false]
+      : keys.length
+        ? keys.map((key) => (channel.type === 'number' ? Number(key) : key))
+        : channel.type === 'number'
+          ? [0, 1, 2]
+          : [];
+  const matches = held.filter((raw) => mediaState(raw, channel) === target);
+  return matches.length === 1 ? matches[0] : undefined;
 }
 
 function readText(device: DeviceInput, name: string, values: Values): string | undefined {
@@ -104,6 +129,17 @@ export function synthMediaPlayer(device: DeviceInput, entityId: string, values: 
 
   const muted = readBool(device, 'mute', values);
   if (muted !== undefined) attributes.is_volume_muted = muted;
+
+  // Where play_pause, previous, next and the mute icon land
+  // (runtime/dispatcher.ts). The panel draws the three transport buttons
+  // whatever the player has (media_popup.cpp:774-794,
+  // types/media/renderer.cpp:478-498), so none can be withheld like the volume
+  // and seek below: a command with no writable channel is refused, out loud.
+  // play_pause presses PLAY or PAUSE, else writes STATE.
+  for (const name of ['state', 'play', 'pause', 'next', 'prev', 'mute']) {
+    const channel = device.channels[name];
+    if (channel) writable[name] = channel.write === true;
+  }
 
   // VOLUME_ACTUAL is feedback and wins over the last command written to
   // VOLUME, each read in its own range (Ruling 49) as the 0..1 the panel takes.

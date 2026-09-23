@@ -1,10 +1,17 @@
 import { expect } from 'chai';
 import { buildClimatePayload } from '../../src/protocol/climate';
-import { parseClimateCommand, parseCoverCommand, parseLightCommand, type ServiceCall } from '../../src/protocol/commands';
+import {
+  parseClimateCommand,
+  parseCoverCommand,
+  parseLightCommand,
+  parseMediaCommand,
+  type ServiceCall,
+} from '../../src/protocol/commands';
 import { buildCoverPayload } from '../../src/protocol/cover';
 import { synthClimate } from '../../src/registry/synth/climate';
 import { synthCover } from '../../src/registry/synth/cover';
 import { synthLight } from '../../src/registry/synth/light';
+import { synthMediaPlayer } from '../../src/registry/synth/media_player';
 import { synthScene } from '../../src/registry/synth/scene';
 import { synthSwitch } from '../../src/registry/synth/switch';
 import { Dispatcher, type EntityLookup } from '../../src/runtime/dispatcher';
@@ -1570,6 +1577,283 @@ describe('runtime/dispatcher', () => {
           expect(await landsOn({ state: 'on', rgb: [1, 2, 3] }, 'l.0.g'), `${label}: the colour wheel`).to.equal(true);
         }
       }
+    });
+  });
+
+  // Task 10. docs/contract-media-weather.md: one topic, cmnd/media. Entities
+  // come from the REAL synthMediaPlayer and every command goes through the
+  // REAL parser. The result never reaches the panel, so a refusal has to say
+  // why in the log.
+  describe('media_player (Task 10)', () => {
+    type Spec = Omit<ChannelInput, 'objectId'> & { value?: unknown };
+    const playerOf = (specs: Record<string, Spec>): VirtualEntity => {
+      const channels: DeviceInput['channels'] = {};
+      const values: Record<string, SourceValue> = {};
+      for (const [name, { value, ...meta }] of Object.entries(specs)) {
+        channels[name] = { objectId: `media.0.${name}`, ...meta };
+        if (value !== undefined) values[`media.0.${name}`] = { val: value, ack: true, q: 0, ts: 1 };
+      }
+      const device: DeviceInput = { objectId: 'media.0', name: 'TV', detectorType: 'media', domain: 'media_player', channels };
+      const player = synthMediaPlayer(device, 'media_player.tv', values);
+      expect(player, 'a media player').to.not.equal(null);
+      return player as VirtualEntity;
+    };
+    const BUTTON: Spec = { type: 'boolean', write: true };
+    /** A writable boolean STATE: true playing, false paused (ioBroker's media.state). */
+    const PLAYING: Spec = { type: 'boolean', write: true, value: true };
+    const volume = (value: unknown, min = 0, max = 100, write = true): Spec => ({ type: 'number', min, max, write, value });
+    const mute = (value: boolean, write = true): Spec => ({ type: 'boolean', write, value });
+    const volumeSet = (level: number): Record<string, unknown> => ({ command: 'volume_set', volume_level: level });
+    const seekTo = (seconds: number): Record<string, unknown> => ({ command: 'media_seek', seek_position: seconds });
+    const refused = (reason: string) => ({ ok: false, reason, applied: 0 });
+
+    let warnings: string[] = [];
+    async function send(player: VirtualEntity, fields: Record<string, unknown>) {
+      writes = [];
+      warnings = [];
+      const d = new Dispatcher(lookup([player]), write, { ...silentLog, warn: (message: string): void => void warnings.push(message) });
+      return d.dispatch(parseMediaCommand(JSON.stringify({ entity_id: player.entityId, ...fields })));
+    }
+
+    describe('play_pause, previous and next: the panel always draws all three (media_popup.cpp:774-794)', () => {
+      it('maps play_pause to the single toggle channel: a writable STATE takes the state itself', async () => {
+        expect(await send(playerOf({ state: PLAYING }), { command: 'play_pause' })).to.deep.equal({ ok: true, writes: 1 });
+        expect(writes).to.deep.equal([['media.0.state', false]]);
+        expect(await send(playerOf({ state: { ...PLAYING, value: false } }), { command: 'play_pause' })).to.deep.equal({ ok: true, writes: 1 });
+        expect(writes).to.deep.equal([['media.0.state', true]]);
+      });
+
+      it("presses PAUSE while playing and PLAY for any other state, unknown and unavailable included, as the panel's icon shows", async () => {
+        // media_icon_for_state (tile_renderer.cpp:2954-2960): the pause icon
+        // for "playing" only, the play icon for everything else.
+        for (const [value, pressed] of [
+          [1, 'media.0.pause'],
+          [0, 'media.0.play'],
+          [2, 'media.0.play'],
+          [7, 'media.0.play'],
+          [undefined, 'media.0.play'],
+        ] as const) {
+          const player = playerOf({ state: { type: 'number', write: true, value }, play: BUTTON, pause: BUTTON });
+          expect(await send(player, { command: 'play_pause' }), player.state).to.deep.equal({ ok: true, writes: 1 });
+          expect(writes, `${player.state}: the button, before a writable STATE`).to.deep.equal([[pressed, true]]);
+        }
+      });
+
+      it("writes a writable STATE for a direction with no button, through the channel's own states map", async () => {
+        // ioBroker.squeezeboxrpc's shape: PLAY, no PAUSE, STATE {0: pause, 1: play, 2: stop}.
+        const squeeze = (value: number): VirtualEntity =>
+          playerOf({ state: { type: 'number', write: true, states: { 0: 'pause', 1: 'play', 2: 'stop' }, value }, play: BUTTON });
+        await send(squeeze(1), { command: 'play_pause' });
+        expect(writes, 'pause: no button, so STATE').to.deep.equal([['media.0.state', 0]]);
+        await send(squeeze(2), { command: 'play_pause' });
+        expect(writes, 'play: the button').to.deep.equal([['media.0.play', true]]);
+      });
+
+      it('writes STATE as the exact inverse of its decoder: what lands reads back as the state asked for', async () => {
+        for (const [label, spec, playingValue] of [
+          ['boolean', { type: 'boolean' }, true],
+          ['number, the 0/1/2 convention', { type: 'number' }, 1],
+          ['number, its own numbering', { type: 'number', states: { 1: 'play', 2: 'pause', 3: 'stop' } }, 1],
+          ['number, a localised map', { type: 'number', states: { 0: 'Pause', 1: 'Wiedergabe', 2: 'Stopp' } }, 1],
+          ['string, its own map', { type: 'string', states: { PLAY: 'Play', PAUSE: 'Pause' } }, 'PLAY'],
+        ] as const) {
+          const player = (value: unknown): VirtualEntity => playerOf({ state: { ...spec, write: true, value } });
+          expect(player(playingValue).state, `${label}: starts playing`).to.equal('playing');
+          await send(player(playingValue), { command: 'play_pause' });
+          const paused = writes[0]?.[1];
+          expect(player(paused).state, `${label}: pausing wrote ${String(paused)}`).to.equal('paused');
+          await send(player(paused), { command: 'play_pause' });
+          expect(player(writes[0]?.[1]).state, `${label}: playing again`).to.equal('playing');
+        }
+      });
+
+      it('refuses a writable STATE that holds no value for the state asked for, and says so', async () => {
+        const specs: Spec[] = [
+          { type: 'number', states: { 1: 'play', 2: 'stop' }, value: 1 },
+          // Two values read as paused: which one the device means is unknown.
+          { type: 'number', states: { 0: 'pause', 1: 'play', 3: 'paused' }, value: 1 },
+          { type: 'string', value: 'play' },
+        ];
+        for (const spec of specs) {
+          expect(await send(playerOf({ state: { ...spec, write: true } }), { command: 'play_pause' }), spec.type).to.deep.equal(
+            refused('cannot_encode_value'),
+          );
+          expect(writes).to.deep.equal([]);
+          expect(warnings).to.include('[Command] Rejected media_play_pause for media_player.tv: cannot_encode_value');
+        }
+      });
+
+      it('refuses play_pause, out loud, with no writable button for that direction and no writable STATE', async () => {
+        for (const player of [
+          playerOf({ state: { ...PLAYING, write: false }, play: BUTTON }),
+          playerOf({ state: { ...PLAYING, write: false }, play: BUTTON, pause: { ...BUTTON, write: false } }),
+          playerOf({ state: { type: 'boolean', value: true }, play: BUTTON, pause: { type: 'boolean' } }),
+        ]) {
+          expect(await send(player, { command: 'play_pause' })).to.deep.equal(refused('no_writable_channel'));
+          expect(writes).to.deep.equal([]);
+          expect(warnings).to.deep.equal(['[Command] Rejected media_play_pause for media_player.tv: no_writable_channel']);
+        }
+      });
+
+      it('presses PREV and NEXT', async () => {
+        const player = playerOf({ state: PLAYING, prev: BUTTON, next: BUTTON });
+        expect(await send(player, { command: 'previous' })).to.deep.equal({ ok: true, writes: 1 });
+        expect(writes).to.deep.equal([['media.0.prev', true]]);
+        expect(await send(player, { command: 'next' })).to.deep.equal({ ok: true, writes: 1 });
+        expect(writes).to.deep.equal([['media.0.next', true]]);
+      });
+
+      it('a next on a player with no NEXT channel writes nothing and logs why; a read-only one, or PREV, alike', async () => {
+        for (const [player, command, kind] of [
+          [playerOf({ state: PLAYING }), 'next', 'media_next'],
+          [playerOf({ state: PLAYING, next: { ...BUTTON, write: false } }), 'next', 'media_next'],
+          [playerOf({ state: PLAYING, next: BUTTON }), 'previous', 'media_previous'],
+        ] as const) {
+          expect(await send(player, { command })).to.deep.equal(refused('no_writable_channel'));
+          expect(writes).to.deep.equal([]);
+          expect(warnings).to.deep.equal([`[Command] Rejected ${kind} for media_player.tv: no_writable_channel`]);
+        }
+      });
+    });
+
+    describe('volume_set: the slider, and the mute icon too (media_popup.cpp:490, :529)', () => {
+      it("sets a writable volume, scaled into the channel's own declared range", async () => {
+        for (const [min, max, landed] of [
+          [0, 100, 35],
+          [0, 1, 0.35],
+          [0, 255, 89],
+        ] as const) {
+          expect(await send(playerOf({ state: PLAYING, volume: volume(10, min, max) }), volumeSet(0.35))).to.deep.equal({ ok: true, writes: 1 });
+          expect(writes, `${min}..${max}`).to.deep.equal([['media.0.volume', landed]]);
+        }
+      });
+
+      it('refuses a volume command on a player with no volume channel', async () => {
+        expect(await send(playerOf({ state: PLAYING }), volumeSet(0.5))).to.deep.equal(refused('no_writable_channel'));
+        expect(writes).to.deep.equal([]);
+      });
+
+      it('refuses a level it does not advertise -- read-only, or bounds that cannot be scaled -- and says so', async () => {
+        for (const level of [volume(30, 0, 100, false), volume(30, 100, 0)]) {
+          const player = playerOf({ state: PLAYING, volume: level });
+          expect(player.attributes.volume_level, 'not advertised').to.equal(undefined);
+          expect(await send(player, volumeSet(0.5))).to.deep.equal(refused('no_writable_channel'));
+          expect(writes).to.deep.equal([]);
+          expect(warnings.some((message) => message.includes('Skipping the volume of media_player.tv'))).to.equal(true);
+        }
+      });
+
+      // The mute icon sends volume_set, never volume_mute: 0 to mute, and the
+      // last level it showed to unmute (on_volume_mute_click,
+      // media_popup.cpp:517-530) -- live even without the slider.
+      describe('the mute icon', () => {
+        const sonos = (muted: boolean): VirtualEntity => playerOf({ state: PLAYING, volume: volume(25), mute: mute(muted) });
+
+        it('a mute press on a player with a MUTE channel mutes it and leaves the volume untouched', async () => {
+          expect(await send(sonos(false), volumeSet(0))).to.deep.equal({ ok: true, writes: 1 });
+          expect(writes).to.deep.equal([['media.0.mute', true]]);
+        });
+
+        it('the unmute press sets the level it carries and ends the mute', async () => {
+          expect(await send(sonos(true), volumeSet(0.25))).to.deep.equal({ ok: true, writes: 2 });
+          expect(writes).to.deep.equal([
+            ['media.0.volume', 25],
+            ['media.0.mute', false],
+          ]);
+        });
+
+        it('a level for a player that is not muted leaves MUTE alone; one whose mute is unknown is unmuted', async () => {
+          await send(sonos(false), volumeSet(0.6));
+          expect(writes).to.deep.equal([['media.0.volume', 60]]);
+          await send(playerOf({ state: PLAYING, volume: volume(25), mute: { type: 'boolean', write: true } }), volumeSet(0.6));
+          expect(writes, 'the panel shows it unmuted either way').to.deep.equal([
+            ['media.0.volume', 60],
+            ['media.0.mute', false],
+          ]);
+        });
+
+        it('without a writable MUTE, a mute press sets the bottom of the volume range', async () => {
+          for (const player of [
+            playerOf({ state: PLAYING, volume: volume(25, -80, 18) }),
+            playerOf({ state: PLAYING, volume: volume(25, -80, 18), mute: mute(false, false) }),
+          ]) {
+            expect(await send(player, volumeSet(0))).to.deep.equal({ ok: true, writes: 1 });
+            expect(writes).to.deep.equal([['media.0.volume', -80]]);
+          }
+        });
+
+        it('with no settable volume the icon still mutes and unmutes; the level alone is skipped, out loud', async () => {
+          const noLevel = (muted: boolean): VirtualEntity =>
+            playerOf({ state: PLAYING, volume: volume(25, 0, 100, false), mute: mute(muted) });
+          expect(await send(noLevel(true), volumeSet(0.35))).to.deep.equal({ ok: true, writes: 1 });
+          expect(writes).to.deep.equal([['media.0.mute', false]]);
+          expect(warnings.some((message) => message.includes('Skipping the volume of media_player.tv'))).to.equal(true);
+          expect(await send(noLevel(false), volumeSet(0))).to.deep.equal({ ok: true, writes: 1 });
+          expect(writes).to.deep.equal([['media.0.mute', true]]);
+          // Neither the level nor an unmute has anything to do here.
+          expect(await send(noLevel(false), volumeSet(0.35))).to.deep.equal(refused('no_writable_channel'));
+          expect(writes).to.deep.equal([]);
+        });
+
+        it('a level lands on a muted player whose MUTE is read-only; the unmute is skipped, out loud', async () => {
+          const player = playerOf({ state: PLAYING, volume: volume(25), mute: mute(true, false) });
+          expect(await send(player, volumeSet(0.4))).to.deep.equal({ ok: true, writes: 1 });
+          expect(writes).to.deep.equal([['media.0.volume', 40]]);
+          expect(warnings.some((message) => message.includes('Not unmuting media_player.tv'))).to.equal(true);
+        });
+      });
+    });
+
+    describe('media_seek: the panel sends seconds, ioBroker media.seek is a percentage', () => {
+      const seekable = (duration: unknown, seek: Spec = { type: 'number', min: 0, max: 100, unit: '%', write: true }, unit = 'sec') =>
+        playerOf({
+          state: PLAYING,
+          seek,
+          duration: { type: 'number', unit, write: false, value: duration },
+          elapsed: { type: 'number', unit, write: false, value: 0 },
+        });
+
+      it('seeking to 90 s in a 180 s track writes 50 to SEEK', async () => {
+        expect(await send(seekable(180), seekTo(90))).to.deep.equal({ ok: true, writes: 1 });
+        expect(writes).to.deep.equal([['media.0.seek', 50]]);
+      });
+
+      it("scales into SEEK's own range, and converts with a duration declared in milliseconds", async () => {
+        await send(seekable(180, { type: 'number', min: 0, max: 1000, write: true }), seekTo(90));
+        expect(writes).to.deep.equal([['media.0.seek', 500]]);
+        await send(seekable(180_000, undefined, 'ms'), seekTo(45));
+        expect(writes).to.deep.equal([['media.0.seek', 25]]);
+      });
+
+      it('a seek with no known duration writes nothing, and says why', async () => {
+        for (const duration of [undefined, 0]) {
+          expect(await send(seekable(duration), seekTo(90)), String(duration)).to.deep.equal(refused('duration_unknown'));
+          expect(writes).to.deep.equal([]);
+          expect(warnings).to.deep.equal(['[Command] Rejected media_seek for media_player.tv: duration_unknown']);
+        }
+      });
+
+      it('refuses a seek on a player whose SEEK takes no write, which publishes no seek bar', async () => {
+        const player = seekable(180, { type: 'number', min: 0, max: 100, write: false });
+        expect(player.attributes.media_duration, 'not advertised').to.equal(undefined);
+        expect(await send(player, seekTo(90))).to.deep.equal(refused('no_writable_channel'));
+        expect(writes).to.deep.equal([]);
+      });
+
+      it('refuses a position past the end, but takes the end of a track printed one decimal past it', async () => {
+        expect(await send(seekable(180), seekTo(181))).to.deep.equal(refused('value_out_of_range'));
+        expect(writes).to.deep.equal([]);
+        // The seek bar's end is the duration; %.1f prints 179.97 as 180.0 (mqtt_handlers.cpp:2058-2062).
+        expect(await send(seekable(179.97), seekTo(Number(Math.fround(179.97).toFixed(1))))).to.deep.equal({ ok: true, writes: 1 });
+        expect(writes).to.deep.equal([['media.0.seek', 100]]);
+      });
+    });
+
+    it('a media command reaches no other domain, and no other command reaches a media player', async () => {
+      const d = new Dispatcher(lookup([LIGHT, playerOf({ state: PLAYING, next: BUTTON })]), write, silentLog);
+      expect(await d.dispatch({ kind: 'media_next', entityId: 'light.d' })).to.deep.equal(refused('call_not_allowed_for_domain'));
+      expect(await d.dispatch({ kind: 'turn_on', entityId: 'media_player.tv' })).to.deep.equal(refused('call_not_allowed_for_domain'));
+      expect(await d.dispatch({ kind: 'media_next', entityId: 'media_player.tv' })).to.deep.equal({ ok: true, writes: 1 });
     });
   });
 });

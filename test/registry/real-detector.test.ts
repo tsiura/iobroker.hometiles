@@ -1,5 +1,5 @@
 import { expect } from 'chai';
-import { parseLightCommand, type ServiceCall } from '../../src/protocol/commands';
+import { parseLightCommand, parseMediaCommand, type ServiceCall } from '../../src/protocol/commands';
 import { buildStatePublish } from '../../src/protocol/state-payload';
 import { discoverDevices } from '../../src/registry/detector';
 import { EntityRegistry } from '../../src/registry/entity-registry';
@@ -1123,7 +1123,17 @@ describe('real type-detector end to end (Task 5c)', () => {
 
     it('Task 9 / Ruling 23: the real synth carries channelMeta and writable from the detected objects', () => {
       const entity = runFor(run(SONOS_SET, SONOS_VALUES), SONOS).entity!;
-      expect(entity.writable).to.deep.equal({ volume: true, seek: true });
+      // Task 10 records the transport buttons, STATE and MUTE too; STOP has no panel control.
+      expect(entity.writable).to.deep.equal({
+        volume: true,
+        seek: true,
+        state: true,
+        play: true,
+        pause: true,
+        next: true,
+        prev: true,
+        mute: true,
+      });
       expect(entity.channelMeta?.volume).to.include({ type: 'number', min: 0, max: 100, write: true, current: 25 });
       expect(entity.channelMeta?.seek).to.include({ type: 'number', min: 0, max: 100, unit: '%', write: true });
       expect(entity.channelMeta?.state).to.include({ type: 'boolean', write: true, current: true });
@@ -1152,7 +1162,7 @@ describe('real type-detector end to end (Task 5c)', () => {
         duration: `${SQUEEZE}.Duration`,
         elapsed: `${SQUEEZE}.Time`,
       });
-      expect(result.entity!.writable).to.deep.equal({ volume: true });
+      expect(result.entity!.writable).to.deep.equal({ volume: true, state: true, play: true, next: true, prev: true });
       expect(json(result)).to.deep.equal({ state: 'idle', volume_level: 0.4, entity_picture: LMS_COVER, media_title: 'Ruhe' });
     });
 
@@ -1204,6 +1214,73 @@ describe('real type-detector end to end (Task 5c)', () => {
       const result = runFor(run(all, { [`${cast}.paused`]: value(true), [`${cast}.volume`]: value(30) }), cast);
       expect(result.device.channels.state, 'no STATE from …paused').to.equal(undefined);
       expect(result.entity, 'no media player without its play state').to.equal(null);
+    });
+
+    // Task 10: the panel's own commands, through the real detector, synth,
+    // parser and dispatcher.
+    describe('Task 10: media commands', () => {
+      const media = (entity: VirtualEntity, fields: Record<string, unknown>) =>
+        dispatch(entity, parseMediaCommand(JSON.stringify({ entity_id: entity.entityId, ...fields })));
+      const sonos = (values: Record<string, SourceValue> = {}): VirtualEntity =>
+        runFor(run(SONOS_SET, { ...SONOS_VALUES, ...values }), SONOS).entity!;
+      const squeeze = (state: number): VirtualEntity =>
+        runFor(run(SQUEEZE_SET, { [`${SQUEEZE}.state`]: value(state), [`${SQUEEZE}.Volume`]: value(40) }), SQUEEZE).entity!;
+
+      it("a Sonos player: play/pause presses PAUSE while playing and PLAY while paused, the skip buttons PREV and NEXT", async () => {
+        expect((await media(sonos(), { command: 'play_pause' })).writes).to.deep.equal([[`${SONOS}.pause`, true]]);
+        const paused = sonos({ [`${SONOS}.state_simple`]: value(false) });
+        expect((await media(paused, { command: 'play_pause' })).writes).to.deep.equal([[`${SONOS}.play`, true]]);
+        expect((await media(sonos(), { command: 'previous' })).writes).to.deep.equal([[`${SONOS}.prev`, true]]);
+        expect((await media(sonos(), { command: 'next' })).writes).to.deep.equal([[`${SONOS}.next`, true]]);
+      });
+
+      it('a Sonos mute press mutes it and leaves its volume at 25; the unmute press sends 25 back and ends the mute', async () => {
+        expect(await media(sonos(), { command: 'volume_set', volume_level: 0 })).to.deep.equal({
+          result: { ok: true, writes: 1 },
+          writes: [[`${SONOS}.muted`, true]],
+        });
+        const muted = sonos({ [`${SONOS}.muted`]: value(true) });
+        expect((await media(muted, { command: 'volume_set', volume_level: 0.25 })).writes).to.deep.equal([
+          [`${SONOS}.volume`, 25],
+          [`${SONOS}.muted`, false],
+        ]);
+      });
+
+      it('a Sonos seek to 195.5 s of its 391 s track writes 50 to its seek percentage', async () => {
+        expect(await media(sonos(), { command: 'media_seek', seek_position: 195.5 })).to.deep.equal({
+          result: { ok: true, writes: 1 },
+          writes: [[`${SONOS}.seek`, 50]],
+        });
+      });
+
+      it('a squeezebox, with no PAUSE button, pauses through its STATE map and plays by its PLAY button', async () => {
+        expect((await media(squeeze(1), { command: 'play_pause' })).writes).to.deep.equal([[`${SQUEEZE}.state`, 0]]);
+        expect((await media(squeeze(0), { command: 'play_pause' })).writes).to.deep.equal([[`${SQUEEZE}.btnPlay`, true]]);
+        expect((await media(squeeze(1), { command: 'next' })).writes).to.deep.equal([[`${SQUEEZE}.btnForward`, true]]);
+        expect((await media(squeeze(1), { command: 'previous' })).writes).to.deep.equal([[`${SQUEEZE}.btnRewind`, true]]);
+        expect((await media(squeeze(1), { command: 'volume_set', volume_level: 0.35 })).writes).to.deep.equal([[`${SQUEEZE}.Volume`, 35]]);
+        // No SEEK, so no seek bar was published and none lands.
+        expect(await media(squeeze(1), { command: 'media_seek', seek_position: 30 })).to.deep.equal({
+          result: { ok: false, reason: 'no_writable_channel', applied: 0 },
+          writes: [],
+        });
+      });
+
+      it('a radio alias whose one control is its STATE plays and pauses through it, and has no skip buttons', async () => {
+        const radio = (playing: boolean): VirtualEntity =>
+          runFor(run(radioSet(['COVER', 'media.cover']), { [`${RADIO}.STATE`]: value(playing) }), RADIO).entity!;
+        expect((await media(radio(true), { command: 'play_pause' })).writes).to.deep.equal([[`${RADIO}.STATE`, false]]);
+        expect((await media(radio(false), { command: 'play_pause' })).writes).to.deep.equal([[`${RADIO}.STATE`, true]]);
+        expect(await media(radio(true), { command: 'next' })).to.deep.equal({
+          result: { ok: false, reason: 'no_writable_channel', applied: 0 },
+          writes: [],
+        });
+      });
+
+      it("a Chromecast's 0..1 volume takes 35% as 0.35", async () => {
+        const cast = runFor(run(CAST_SET, { [`${CAST}.state`]: value(false), [`${CAST}.volume`]: value(0.5) }), CAST).entity!;
+        expect((await media(cast, { command: 'volume_set', volume_level: 0.35 })).writes).to.deep.equal([[`${CAST}.volume`, 0.35]]);
+      });
     });
   });
 

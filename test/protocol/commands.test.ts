@@ -5,6 +5,7 @@ import {
   parseCommand,
   parseCoverCommand,
   parseLightCommand,
+  parseMediaCommand,
   parseSceneCommand,
   parseSwitchCommand,
 } from '../../src/protocol/commands';
@@ -393,6 +394,84 @@ describe('protocol/commands', () => {
 
     it('dispatches the cover leaf through parseCommand', () => {
       expect(parseCommand('cover', cover({ command: 'stop_cover' })).kind).to.equal('stop_cover');
+    });
+  });
+
+  // Media: one topic, cmnd/media, a "command" field, and exactly what the
+  // panel's controls send (docs/contract-media-weather.md, media_player
+  // "Outbound commands"). Payloads are the firmware's own bytes: its float,
+  // printed %.3f / %.1f (mqtt_handlers.cpp:2036, :2058-2062, :2087-2091).
+  describe('media', () => {
+    const media = (fields: Record<string, unknown>): string => JSON.stringify({ entity_id: 'media_player.tv', ...fields });
+    const volumeSet = (level: number): string =>
+      `{"entity_id":"media_player.tv","command":"volume_set","volume_level":${Math.fround(level).toFixed(3)}}`;
+    const seek = (seconds: number): string =>
+      `{"entity_id":"media_player.tv","command":"media_seek","seek_position":${Math.fround(seconds).toFixed(1)}}`;
+
+    it("parses the three transport buttons' commands, the only ones the panel draws", () => {
+      for (const [command, kind] of [
+        ['previous', 'media_previous'],
+        ['play_pause', 'media_play_pause'],
+        ['next', 'media_next'],
+      ] as const) {
+        expect(parseMediaCommand(media({ command })), command).to.deep.equal({ kind, entityId: 'media_player.tv' });
+      }
+    });
+
+    it('parses volume_set as the whole percent the slider sent, for every slider position', () => {
+      // media_popup.cpp:490 and :529 send a whole slider percent / 100.
+      for (let percent = 0; percent <= 100; percent++) {
+        expect(parseMediaCommand(volumeSet(percent / 100)), `${percent}%`).to.deep.equal({
+          kind: 'media_set_volume',
+          entityId: 'media_player.tv',
+          value: percent,
+        });
+      }
+    });
+
+    it('refuses a volume_level outside 0..1 rather than clamping it, and a missing or non-numeric one', () => {
+      // The firmware clamps to 0..1 before sending (mqtt_handlers.cpp:2072-2073).
+      for (const level of [-0.1, 1.5, 100, undefined, null, '0.5', 'abc']) {
+        expect(() => parseMediaCommand(media({ command: 'volume_set', volume_level: level })), String(level)).to.throw(
+          CommandError,
+          'invalid_volume_level',
+        );
+      }
+    });
+
+    it('parses media_seek as seconds, keeps a real zero, and refuses a negative or missing position', () => {
+      expect(parseMediaCommand(seek(90))).to.deep.equal({ kind: 'media_seek', entityId: 'media_player.tv', position: 90 });
+      expect(parseMediaCommand(seek(0))).to.deep.equal({ kind: 'media_seek', entityId: 'media_player.tv', position: 0 });
+      expect((parseMediaCommand(seek(195.5)) as { position: number }).position).to.equal(195.5);
+      // The firmware turns a negative into 0 (mqtt_handlers.cpp:2044).
+      for (const position of [-1, undefined, null, '90', Number.NaN]) {
+        expect(() => parseMediaCommand(media({ command: 'media_seek', seek_position: position })), String(position)).to.throw(
+          CommandError,
+          'invalid_seek_position',
+        );
+      }
+    });
+
+    it('refuses a stop, volume_mute and anything else no panel control sends', () => {
+      // No control sends a stop; mqttPublishMediaMute has no caller -- the
+      // mute icon sends volume_set (media_popup.cpp:517-530).
+      for (const command of ['stop', 'media_stop', 'volume_mute', 'PLAY_PAUSE', 'turn_on', '', 7]) {
+        expect(() => parseMediaCommand(media({ command, is_volume_muted: true })), String(command)).to.throw(
+          CommandError,
+          'unsupported_media_command',
+        );
+      }
+      expect(() => parseMediaCommand(media({}))).to.throw(CommandError, 'unsupported_media_command');
+    });
+
+    it('rejects a payload with no valid entity_id', () => {
+      expect(() => parseMediaCommand('{"command":"next"}')).to.throw(CommandError, 'missing_entity_id');
+      expect(() => parseMediaCommand('{"entity_id":"tv","command":"next"}')).to.throw(CommandError, 'invalid_entity_id');
+    });
+
+    it('dispatches the media leaf through parseCommand', () => {
+      // The firmware's MEDIA_CMND leaf is "media" (mqtt_topics.cpp:12), not the domain name.
+      expect(parseCommand('media', media({ command: 'next' })).kind).to.equal('media_next');
     });
   });
 });

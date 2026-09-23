@@ -10,6 +10,7 @@ import {
   roleCodec,
   withinDeclaredRange,
 } from '../registry/synth/common';
+import { mediaStateValue } from '../registry/synth/media_player';
 import type { Logger } from './mqtt-client';
 
 export type StateWriter = (objectId: string, value: unknown) => Promise<void>;
@@ -75,7 +76,8 @@ const ALLOWED_CALLS: Record<Domain, ReadonlySet<CallKind>> = {
     'toggle_cover',
     'toggle_cover_tilt',
   ]),
-  media_player: new Set<CallKind>(),
+  // What the panel's media controls send (protocol/commands.ts parseMediaCommand).
+  media_player: new Set<CallKind>(['media_previous', 'media_play_pause', 'media_next', 'media_set_volume', 'media_seek']),
   weather: new Set<CallKind>(),
   number: new Set<CallKind>(),
   select: new Set<CallKind>(),
@@ -151,10 +153,11 @@ export class Dispatcher {
     // [channelName, objectId, value] — the channel name is carried so a failure
     // can say which capability did not apply.
     const writes: Array<[string, string, unknown]> = [];
-    // Set only by pushEncoded and the two cover toggles, and only consulted by
-    // dispatch() when `writes` ends up empty — every command below sets it at
-    // most once per plan(), so there is no ordering ambiguity between an
-    // earlier success and a later failure to worry about.
+    // Set only by pushEncoded, the two cover toggles, media play_pause and
+    // media seek, and only consulted by dispatch() when `writes` ends up
+    // empty — every command below sets it at most once per plan(), so there
+    // is no ordering ambiguity between an earlier success and a later failure
+    // to worry about.
     let failureReason: string | undefined;
     const push = (channel: string, value: unknown): void => {
       const objectId = entity.source[channel];
@@ -402,6 +405,75 @@ export class Dispatcher {
         if (typeof tilt !== 'number') failureReason = 'state_unknown';
         else if (tilt === 0) pushRole('tilt_open', ['tilt_open'], true);
         else pushRole('tilt_close', ['tilt_close'], true);
+        break;
+      }
+      // Media (docs/contract-media-weather.md, media_player "Outbound
+      // commands"). The panel draws previous, play/pause and next whatever
+      // the player has (media_popup.cpp:774-794), so a button with no
+      // writable channel is refused here, never hidden (synth/media_player.ts).
+      case 'media_previous':
+        pushRole('prev', ['prev'], true);
+        break;
+      case 'media_next':
+        pushRole('next', ['next'], true);
+        break;
+      case 'media_play_pause': {
+        // The panel's own rule (media_icon_for_state, tile_renderer.cpp:
+        // 2954-2960): pause while playing, play for anything else, unknown and
+        // unavailable included -- the icon the user pressed. Its button is
+        // pressed; without one, a writable STATE takes the state itself.
+        const target = entity.state === 'playing' ? 'paused' : 'playing';
+        const button = target === 'paused' ? 'pause' : 'play';
+        if (entity.writable?.[button]) pushRole(button, [button], true);
+        else if (entity.writable?.state) {
+          const raw = mediaStateValue(entity.channelMeta?.state, target);
+          if (raw === undefined) {
+            this.log.warn(`[Command] Cannot encode "${target}" for ${entity.entityId} on channel state`);
+            failureReason = 'cannot_encode_value';
+          } else push('state', raw);
+        }
+        break;
+      }
+      case 'media_set_volume': {
+        // The mute icon sends volume_set too, never volume_mute: 0 to mute,
+        // the last level it showed to unmute, with or without a slider
+        // (on_volume_mute_click, media_popup.cpp:517-530). So 0 mutes a player
+        // with a writable MUTE and keeps the user's level. Any other level is
+        // set and ends a mute: the panel shows it unmuted from then on
+        // (set_volume_widgets, :228-233). What cannot land is skipped out
+        // loud, the rest still lands (Ruling 54's precedent): refusing the
+        // whole call would leave the icon unable to unmute at all.
+        if (call.value === 0 && entity.writable?.mute) {
+          push('mute', true);
+          break;
+        }
+        if (entity.writable?.volume) pushRoleNumber('volume', ['volume'], call.value, true);
+        else {
+          const why = entity.source.volume ? 'volume takes no write or declares no usable range' : 'the player has no volume channel';
+          this.log.warn(`[Command] Skipping the volume of ${entity.entityId}: ${why}`);
+        }
+        if (call.value > 0 && entity.source.mute && entity.attributes.is_volume_muted !== false) {
+          if (entity.writable?.mute) push('mute', false);
+          else this.log.warn(`[Command] Not unmuting ${entity.entityId}: mute takes no write`);
+        }
+        break;
+      }
+      case 'media_seek': {
+        // The panel sends seconds (mqttPublishMediaSeek); ioBroker's
+        // media.seek is a percentage of the track. The duration the panel
+        // was shown converts it -- published only while SEEK is writable --
+        // and with none there is nothing to convert with, so nothing is
+        // guessed.
+        if (!entity.writable?.seek) break;
+        const duration = entity.attributes.media_duration;
+        if (typeof duration !== 'number' || duration <= 0) {
+          failureReason = 'duration_unknown';
+          break;
+        }
+        // The bar ends at the duration, and %.1f (mqtt_handlers.cpp:
+        // 2058-2062) can print that end a fraction of a step past it.
+        const seconds = call.position > duration && call.position - duration <= 0.1 ? duration : call.position;
+        pushRoleNumber('seek', ['seek'], (seconds / duration) * 100, true);
         break;
       }
     }

@@ -3,7 +3,8 @@ import { parseAnnouncement } from '../../src/protocol/announce';
 import type { PublishRequest } from '../../src/runtime/mqtt-client';
 import { Dispatcher } from '../../src/runtime/dispatcher';
 import { PanelSession, type PanelTransport } from '../../src/runtime/panel-session';
-import type { VirtualEntity } from '../../src/registry/types';
+import { synthMediaPlayer } from '../../src/registry/synth/media_player';
+import type { DeviceInput, VirtualEntity } from '../../src/registry/types';
 
 const ANNOUNCE = JSON.stringify({
   device_id: 'a1',
@@ -74,14 +75,44 @@ describe('runtime/panel-session', () => {
   });
 
   it('does not subscribe to domains this adapter does not implement yet', async () => {
-    // climate (Task 5) and cover (Task 8) moved out of this list once they
-    // gained real commands; media_player/camera still have no ServiceCall
+    // climate (Task 5), cover (Task 8) and media (Task 10) moved out of this
+    // list once they gained real commands; camera still has no ServiceCall
     // kinds at all (dispatcher.ts's ALLOWED_CALLS), so subscribing would only
     // let malformed/unhandled traffic reach the session for nothing.
     const { session, subscribed } = harness();
     await session.start();
-    expect(subscribed).to.not.include('hometiles/cmnd/media');
     expect(subscribed).to.not.include('hometiles/cmnd/camera');
+  });
+
+  it('subscribes to cmnd/media and routes a real media command to the dispatcher (Task 10)', async () => {
+    // The leaf is the firmware's MEDIA_CMND descriptor, "media"
+    // (mqtt_topics.cpp:12) -- not the domain name, media_player.
+    const { session, subscribed, writes, registryEntities, warnings } = harness();
+    const device: DeviceInput = {
+      objectId: 'sonos.0.root.tv',
+      name: 'TV',
+      detectorType: 'media',
+      domain: 'media_player',
+      channels: {
+        state: { objectId: 'sonos.0.root.tv.state_simple', type: 'boolean', write: true },
+        next: { objectId: 'sonos.0.root.tv.next', type: 'boolean', write: true },
+      },
+    };
+    const player = synthMediaPlayer(device, 'media_player.tv', {
+      'sonos.0.root.tv.state_simple': { val: true, ack: true, q: 0, ts: 1 },
+    });
+    registryEntities.set('media_player.tv', player!);
+    await session.start();
+    expect(subscribed).to.include('hometiles/cmnd/media');
+    expect(subscribed).to.not.include('hometiles/cmnd/media_player');
+
+    expect(await session.handleMessage('hometiles/cmnd/media', '{"entity_id":"media_player.tv","command":"next"}')).to.equal(true);
+    expect(writes).to.deep.equal([['sonos.0.root.tv.next', true]]);
+
+    // Nothing answers the panel, so a refusal lives in the log, with its reason.
+    await session.handleMessage('hometiles/cmnd/media', '{"entity_id":"media_player.tv","command":"previous"}');
+    expect(writes).to.have.length(1);
+    expect(warnings).to.deep.equal(['[Panel a1] Command on media rejected: no_writable_channel']);
   });
 
   it('subscribes to cmnd/cover and routes a real cover command to the dispatcher (Task 8)', async () => {

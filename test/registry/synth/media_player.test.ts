@@ -138,7 +138,7 @@ describe('registry/synth/media_player', () => {
       expect(level({ type: 'number', min: 0, max: 1, write: true, value: val(0.25) })).to.equal(0.25);
       expect(level({ type: 'number', min: -80, max: 18, write: true, value: val(-31) })).to.equal(0.5);
       expect(level({ type: 'number', write: true, value: val(45) })).to.equal(0.45);
-      expect(entity({ state: playing, volume: { type: 'number', write: true, value: val(45) } }).writable).to.deep.equal({ volume: true });
+      expect(entity({ state: playing, volume: { type: 'number', write: true, value: val(45) } }).writable).to.deep.equal({ volume: true, state: true });
     });
 
     it('prefers VOLUME_ACTUAL feedback over the last VOLUME command, each in its own range', () => {
@@ -158,13 +158,13 @@ describe('registry/synth/media_player', () => {
 
     it('publishes no volume it cannot set: read-only, VOLUME_ACTUAL alone, or bounds that cannot be scaled', () => {
       const readOnly = entity({ state: playing, volume: { type: 'number', write: false, value: val(30) } });
-      expect([readOnly.attributes.volume_level, readOnly.writable]).to.deep.equal([undefined, { volume: false }]);
+      expect([readOnly.attributes.volume_level, readOnly.writable]).to.deep.equal([undefined, { volume: false, state: true }]);
 
       const actualOnly = entity({ state: playing, volume_actual: { type: 'number', write: false, value: val(30) } });
-      expect([actualOnly.attributes.volume_level, actualOnly.writable]).to.deep.equal([undefined, {}]);
+      expect([actualOnly.attributes.volume_level, actualOnly.writable]).to.deep.equal([undefined, { state: true }]);
 
       const inverted = entity({ state: playing, volume: { type: 'number', min: 100, max: 0, write: true, value: val(30) } });
-      expect([inverted.attributes.volume_level, inverted.writable]).to.deep.equal([undefined, { volume: false }]);
+      expect([inverted.attributes.volume_level, inverted.writable]).to.deep.equal([undefined, { volume: false, state: true }]);
     });
   });
 
@@ -182,7 +182,7 @@ describe('registry/synth/media_player', () => {
     it('publishes both when a writable SEEK can act on them', () => {
       const e = entity({ state: playing, seek, duration: duration(391), elapsed: elapsed(42) });
       expect(e.attributes).to.include({ media_position: 42, media_duration: 391 });
-      expect(e.writable).to.deep.equal({ seek: true });
+      expect(e.writable).to.deep.equal({ seek: true, state: true });
     });
 
     it('withholds both without a writable SEEK', () => {
@@ -190,7 +190,7 @@ describe('registry/synth/media_player', () => {
       expect(none.attributes).to.not.have.any.keys('media_position', 'media_duration');
       const readOnly = entity({ state: playing, seek: { ...seek, write: false }, duration: duration(391), elapsed: elapsed(42) });
       expect(readOnly.attributes).to.not.have.any.keys('media_position', 'media_duration');
-      expect(readOnly.writable).to.deep.equal({ seek: false });
+      expect(readOnly.writable).to.deep.equal({ seek: false, state: true });
     });
 
     it('withholds both unless both are known and the duration is positive', () => {
@@ -215,5 +215,24 @@ describe('registry/synth/media_player', () => {
     const e = entity({ state: playing, volume: { type: 'number', min: 0, max: 100, unit: '%', write: true, value: val(30) } });
     expect(e.channelMeta?.volume).to.deep.equal({ type: 'number', states: undefined, write: true, current: 30, min: 0, max: 100, unit: '%' });
     expect(e.channelMeta?.state).to.include({ type: 'boolean', write: true, current: true });
+  });
+
+  it("records whether each transport button, STATE and MUTE takes a write, by the object's own flag (Task 10)", () => {
+    // The panel always draws previous, play/pause and next
+    // (media_popup.cpp:774-794), so no payload key can hide one that cannot
+    // act: the dispatcher refuses by these instead.
+    const button = (write?: boolean): Spec => ({ type: 'boolean', ...(write === undefined ? {} : { write }) });
+    const e = entity({
+      state: { type: 'number', write: false, value: val(1) },
+      play: button(true),
+      pause: button(false),
+      next: button(),
+      prev: button(true),
+      stop: button(true),
+      mute: { type: 'boolean', write: true, value: val(false) },
+    });
+    // Only an explicit true writes; STOP has no panel control and no role.
+    expect(e.writable).to.deep.equal({ state: false, play: true, pause: false, next: false, prev: true, mute: true });
+    expect(entity({ state: playing }).writable, 'no role for a channel the player lacks').to.deep.equal({ state: true });
   });
 });

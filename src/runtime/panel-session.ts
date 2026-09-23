@@ -22,8 +22,12 @@ export interface PanelTransport {
   unsubscribe(topic: string): Promise<void>;
 }
 
-/** Command leaves this adapter implements. Everything else is deliberately not subscribed. */
-const COMMAND_LEAVES = ['light', 'switch', 'scene', 'climate', 'cover'] as const;
+/**
+ * Command leaves this adapter implements. Everything else is deliberately not
+ * subscribed. Each is the firmware's own topic leaf (mqtt_topics.cpp:9-14):
+ * media_player's is "media".
+ */
+const COMMAND_LEAVES = ['light', 'switch', 'scene', 'climate', 'cover', 'media'] as const;
 type CommandLeaf = (typeof COMMAND_LEAVES)[number];
 
 export class PanelSession {

@@ -1,4 +1,5 @@
 import { expect } from 'chai';
+import { parseMediaCommand } from '../../src/protocol/commands';
 import { mapControlToDevice, type DetectedControl } from '../../src/registry/detector';
 import { EntityRegistry } from '../../src/registry/entity-registry';
 import type { DeviceInput, SourceValue, VirtualEntity } from '../../src/registry/types';
@@ -388,6 +389,26 @@ describe('registry/entity-registry', () => {
       registry.dispose();
       for (let i = 0; i < 35; i++) tick();
       expect(changed).to.have.length(0);
+    });
+
+    it('Task 10: a seek command lands on SEEK, and the position the device then reports is published at once', async () => {
+      const { registry, tick, seekTo, changed } = playing();
+      tick();
+      tick();
+      const writes: Array<[string, unknown]> = [];
+      const log = { info: () => undefined, warn: () => undefined, error: () => undefined, debug: () => undefined };
+      const dispatcher = new Dispatcher(registry, async (objectId, val) => void writes.push([objectId, val]), log);
+      const entityId = registry.all()[0]?.entityId;
+      // The seek bar's own bytes: 195.5 s of the 391 s track is 50%.
+      const seek = `{"entity_id":"${entityId}","command":"media_seek","seek_position":195.5}`;
+      expect(await dispatcher.dispatch(parseMediaCommand(seek))).to.deep.equal({ ok: true, writes: 1 });
+      expect(writes).to.deep.equal([['player.seek', 50]]);
+      // The panel re-anchored at 195.5 on release (media_popup.cpp:510-512):
+      // a tick from before the device moved would only drag its bar back.
+      tick();
+      expect(changed, 'a tick from before the seek').to.have.length(0);
+      seekTo(195.5);
+      expect(changed.map((entity) => entity.attributes.media_position), 'the device at its new position').to.deep.equal([195.5]);
     });
   });
 });
