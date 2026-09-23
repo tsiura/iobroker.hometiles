@@ -187,6 +187,26 @@ they do when the key is absent entirely. An explicit empty string
 returns `true` with an empty result — so `""` is distinguishable from
 absent/`null` for string fields, but `null` is not.
 
+> **CORRECTION (2026-09-23, verified against firmware source): the rule above
+> is WRONG for `extract_json_string_field_cstr`.** That reader
+> (`tile_renderer.cpp:818-835`) does not go through `stringSpan`. It finds
+> `"key"`, then the colon, then does `strchr(colon, '"')` — the **next quote
+> anywhere after the colon**, without checking that the value itself starts
+> with one. So for `"media_title":null,"media_artist":"X"` it returns the
+> string `media_artist` as the title. A `null` string value is therefore
+> **not** absent: it yields the following quoted token, typically the next
+> key's name. This is the same hazard documented for climate in
+> `contract-climate-cover.md`.
+>
+> Readers built on `hometiles_json::stringSpan` (`json_scan.h:64-87`) — such
+> as `media_artwork::read_string` below — may behave as described above;
+> that has NOT been re-verified per field.
+>
+> **Policy for every sender, regardless of reader: never send `null` for a
+> string field. Omit the key** (or send `""` where the contract says an empty
+> string clears a value). The number and bool extractors are not affected by
+> this finding. Found by the Task 9 implementer during execution.
+
 | Key | Type | Absent/`null` means | Notes |
 | --- | --- | --- | --- |
 | `state` | string | Empty string internally | See state handling below |
@@ -244,6 +264,8 @@ it, and URL changes must always apply."*).
   (`artwork_payload.h:15-22`, built on `hometiles_json::stringSpan`) fails
   for `null` (not quoted) exactly like an absent key, per the general
   null-vs-absent rule above, leaving that variable as an empty `String`.
+  (This relies on `stringSpan`, not on `extract_json_string_field_cstr`; see
+  the CORRECTION above. Do not send `null` for these keys either.)
   Concretely: `"entity_picture":null` and `"entity_picture":""` both end up
   calling `update_media_cover(...,"")` — i.e. both **clear** the cover — the
   only way to leave the cover alone is to omit all three keys from the
