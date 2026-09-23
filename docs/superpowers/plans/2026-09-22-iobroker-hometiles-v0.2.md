@@ -961,6 +961,64 @@ git add -A && git commit -m "feat(registry): synthesise number, select and datet
 
 ---
 
+## Task 13b: Manual entities (added during execution, Ruling 83)
+
+**Why.** Detection plus `deviceOverrides` reaches only states the detector
+finds. Task 13 proved these are unreachable: 0_userdata states and folders, a
+state next to another control at the same root, the second loose state in a
+channel, and states held by unmapped detections. 0_userdata is where ioBroker
+users keep their script and helper states — the ioBroker equivalent of Home
+Assistant's input_number / input_select / input_datetime / template sensors.
+Without a manual path, select and datetime are nearly unusable and no
+0_userdata sensor can reach a panel.
+
+**Files** (follow the existing layout; adjust if the code says otherwise):
+- Modify: `src/config/options.ts` — `manualEntities: ManualEntity[]` in
+  `AdapterOptions`, `DEFAULTS`, and `validateOptions` (:98).
+- Create: `src/registry/manual.ts`
+- Modify: `src/main.ts` — merge manual devices with the detected ones in the
+  rebuild (:312-330).
+- Test: `test/registry/manual.test.ts`, plus registry/main coverage for the
+  merge, the subscription and id stability.
+
+**Interfaces:**
+- `interface ManualEntity { stateId: string; domain: Domain; name?: string }`
+- `manualDevices(entries: ManualEntity[], objects: Record<string, ioBroker.Object>): { devices: DeviceInput[]; rejected: Array<{ stateId: string; reason: string }> }`
+
+**Rules:**
+1. Allowed domains are the single-state ones whose synth accepts a
+   one-channel device: sensor, binary_sensor, switch, number, select,
+   datetime (and scene if its synth fits). Never light, cover, climate,
+   media_player or weather — those stay detection plus overrides.
+2. Build each DeviceInput exactly as detection would: `objectId` = stateId,
+   domain = entry.domain, `detectorType: 'manual'`, one channel under the
+   name that domain's synth reads (writable -> its set channel, otherwise its
+   actual channel). Build the ChannelInput with the SAME helper the detector
+   uses (type, unit, min, max, step, states via validStates, write) — never a
+   second copy. The name is entry.name if non-blank, else the object's name,
+   resolved the way the detector resolves translated names.
+3. Reject, never throw; the reason is logged in English, once per rebuild and
+   per state: missing object, not a `state` object, a domain that is not
+   allowed, a state type the domain cannot use, or a duplicate stateId
+   (first wins).
+4. Entity ids are stable: derived through the existing entity-id rules and
+   persisted ids, unchanged across restarts and list reordering. A state that
+   also backs a detected entity still yields its manual entity (the user
+   asked for it explicitly) under its own id.
+5. The manual state is subscribed and updates its entity through the
+   registry's EXISTING subscription path — no second path.
+6. Overrides do not apply to manual entries (they are already explicit).
+7. The admin table (state picker, domain, name) is Task 23's job, not this
+   task's. Record the config shape for it in the report.
+
+**Tests:** option validation (bad entries dropped with reasons); each allowed
+domain from a realistic 0_userdata state (number with and without
+common.step, select from common.states, datetime, sensor, switch); every
+rejection reason; id stability across two rebuilds and a reordered list; a
+state change reaching the entity; detected devices unchanged.
+
+---
+
 ## Task 14: The /control payload
 
 **Read first:** the `/control` schema and validation rules in `docs/contract-editable.md`.
