@@ -129,7 +129,7 @@ failure modes exist and an implementer must not confuse them:
 | `state` | string or JSON `null` | **key must be present** | key **absent entirely** → **hard reject** (this is not "unchanged", it discards the whole message); present as JSON `null` → accepted, `has_state=false`; present as a non-string/non-null (number, bool, object) → **hard reject** | 71-73 |
 | `last_changed` | uint64 | optional | absent or wrong type → defaults to `0` (not "unchanged") | 74 |
 | *(state length)* | — | — | `state` longer than 255 bytes → **hard reject**, regardless of everything else | 75 |
-| `available` | bool | optional | absent → defaults to `false`. Also forced `false` whenever the literal `state` string equals `"unavailable"`, no matter what this flag says | 76 |
+| `available` | bool | optional | absent → defaults to `false`. Also forced `false` when `state` is JSON `null` (`value.has_state`) and when the literal `state` string equals `"unavailable"`, no matter what this flag says (`value_control.cpp:76`). A null-state payload is therefore never writable | 76 |
 | `writable` | bool | optional | absent → defaults to `false`. Effective `writable` is always `available && writable-flag`, then further narrowed per-kind below | 77 |
 | `session` | string | **required, exactly 32 characters** | any other length (including absent → `""`) → **hard reject** | 78, 80 |
 | `revision` | string | **required, exactly 16 characters** | any other length (including absent → `""`) → **hard reject** | 79, 80 |
@@ -156,17 +156,28 @@ day/month/hour/minute/second limits used by the on-device roller/spinbox
 come from fixed calendar arithmetic (`value_editor_model.h:22-23`), not from
 the wire.
 
-`state` string format expected for these three kinds (only consulted when
-the user starts editing — a malformed string is still displayed verbatim by
-`editable_display_value`, it just fails to seed a local draft),
-`value_editor::parseCalendar` (`value_editor_model.h:28-52`):
+`value_editor::parseCalendar` (`value_editor_model.h:28-52`) runs:
 
-- `"date"` → exactly `YYYY-M-D` (leftover trailing characters fail)
-- `"time"` → exactly `H:M` or `H:M:S`
-- `"datetime"` → `YYYY-M-D` + one separator (`' '` or `'T'`) + `H:M[:S]`
+- each time a new /control payload is applied while the user is not
+  editing, to pre-fill the draft (`value_control.cpp:858-859`);
+- for every pending command, in `command_value_confirmed`
+  (`value_control.cpp:330-334`).
 
-Range-checked to year 1-9999, month 1-12, day valid for that month/year,
-hour 0-23, minute/second 0-59 (`value_editor_model.h:46-49`).
+A malformed string is still shown verbatim (`editable_display_value`), but
+the editor starts blank. The formats are:
+
+- date: `sscanf("%d-%d-%d")`, with nothing after it;
+- time: `%d:%d`, optionally followed by `:%d`;
+- datetime: the date, exactly one `' '` or `'T'`, then the time.
+
+Each `%d` skips leading whitespace and accepts a sign and any number of
+digits. So `26-9-3` is year 26, and `2026- 9- 3` parses. The ranges are then
+year 1-9999, month 1-12, a day valid for the month (Gregorian leap years,
+`value_editor_model.h:17-20`), hour 0-23, and minute and second 0-59
+(`value_editor_model.h:46-49`). A command is confirmed only when the state
+read back parses to the same six fields as the value sent. Seconds count,
+and missing seconds read as 0. A source that cannot store seconds never
+confirms a command with non-zero seconds.
 
 ## 4. Outbound command topic and payload
 
@@ -312,7 +323,10 @@ they ride inside the same `/control` JSON payload as everything else in
   read-only for that update (`writable = writable && complete`, line 103).
   A partially-valid list is never partially accepted.
 - **Duplicates are rejected** — the whole list is cleared if any option
-  string repeats (`std::find(...) != end()`, `value_control.cpp:98`).
+  string repeats (`std::find(...) != end()`, `value_control.cpp:98`). The
+  comparison is exact, byte for byte, so `High` and `HIGH` are two options
+  to the firmware. This adapter refuses both, trimmed and case-insensitive,
+  because its encoder matches that way (Ruling 85).
 - **Comma**: no special handling exists or is needed. Each option is an
   ordinary JSON string element; a literal comma inside it (e.g.
   `"boost, silent"` above) is stored and later displayed byte-for-byte. The
@@ -333,7 +347,11 @@ they ride inside the same `/control` JSON payload as everything else in
   code points, a Bridge that truncates a UTF-8 string to fit could split a
   multi-byte character; the firmware does not fix this — it simply
   invalidates the whole option (and thus the whole list) once
-  `length() > 255`.
+  `length() > 255`. Each option is copied with `String option =
+  item.as<const char*>()` (`value_control.cpp:96`), which stops at the first
+  U+0000. An option containing NUL therefore reaches the dropdown truncated,
+  and two options that are equal up to their NUL count as duplicates. Treat
+  U+0000 like `\n` and `\r`.
 - **Rendering-only behavior, not visible on the wire**: if the current
   `state` doesn't match any string in `options`, the panel locally
   *prepends* one synthetic placeholder entry to the dropdown and shifts
@@ -352,7 +370,7 @@ they ride inside the same `/control` JSON payload as everything else in
 | `"state": ""` (empty string) | any kind | accepted as a normal (non-null) state; for `number` it fails to parse as a float and displays the localized "unknown" label (110-118); for `select`/date/time it is returned and displayed **as an empty string** — i.e. blank, not a placeholder | 124 |
 | `"state": "unavailable"` | any kind | forces `available=false` **unconditionally**, regardless of the `available` flag's own value; displays the localized "unavailable" label | 76, 112-113 |
 | `"state": "unknown"` | any kind | does **not** by itself force `available=false`; if `available` is otherwise `true`, displays the localized "unknown" label; if `available` is `false`, the "unavailable" label wins instead | 112-113 |
-| number `state` outside `[min,max]` | number | displayed as-is (formatted, with unit) — **not** clamped or flagged; only the slider's visual position is clamped to `[0,1]` | 353-354 |
+| number `state` outside `[min,max]` | number | displayed as-is (formatted, with unit) — **not** clamped or flagged; only the slider's visual position is clamped to `[0,1]`; the draft is still pre-filled from it (`:832-833`), and any submit outside `[min, max]` is refused locally (`:304`) | 353-354 |
 | malformed date/time text in `state` | date/time/datetime | still displayed verbatim (raw passthrough, line 124); only the *edit draft* silently fails to seed (`draft_valid=false`), so stepping starts from a blank calendar instead of the shown value | 858-859 |
 | payload `> 24576` bytes | any kind, inbound `/control` | silently dropped, no log | `mqtt_handlers.cpp:1459`, `value_control.h:8` |
 | payload `> 24576` bytes | any kind, cache write | rejected by `updateEditableValue`, cache entry untouched | `ha_bridge_config.cpp:1782` |

@@ -1,6 +1,15 @@
 import type { ChannelInput, DeviceInput, Domain, VirtualEntity } from '../types';
 import { STATE_UNAVAILABLE, STATE_UNKNOWN } from '../types';
-import { baseEntity, encodeChannelValue, isUsable, numberToState, readChannel, readEnum, type Values } from './common';
+import {
+  baseEntity,
+  encodeChannelValue,
+  isUsable,
+  numberToState,
+  percentScale,
+  readChannel,
+  readEnum,
+  type Values,
+} from './common';
 
 /**
  * Editable values: the panel's Number, Select and Date/Time tiles
@@ -17,8 +26,14 @@ import { baseEntity, encodeChannelValue, isUsable, numberToState, readChannel, r
  * value command (Task 15) must refuse any entity where it is not true: a
  * read-only channel, a number without a complete valid range, a select whose
  * option list was dropped, a date or time in a shape this adapter cannot
- * write back.
+ * write back. A channel is read-only only when its object says `write: false`
+ * (Ruling 89): ioBroker's default is writable, the dispatcher refuses only
+ * that (Ruling 38), and a manual entity's channel has no pattern to fill a
+ * silent flag in, as detection's has (channelInput).
  */
+
+/** Only an explicit `write: false` makes a channel read-only (Ruling 89). */
+const writes = (channel: ChannelInput): boolean => channel.write !== false;
 
 /**
  * The one channel an editable entity shows and writes, decided once by which
@@ -40,6 +55,8 @@ export function valueChannel(channels: Readonly<Record<string, unknown>>): 'set'
 interface ValueRead {
   name: 'set' | 'actual';
   channel: ChannelInput;
+  /** ioBroker's quality marks the value untrustworthy (q other than 0). */
+  bad: boolean;
   /** isUsable: present, not null, good quality. */
   usable: boolean;
   raw: unknown;
@@ -50,10 +67,18 @@ function readValue(device: DeviceInput, values: Values): ValueRead | undefined {
   const read = name ? readChannel(device, name, values) : null;
   if (!name || !read) return undefined;
   const usable = isUsable(read.value);
-  return { name, channel: read.channel, usable, raw: usable ? read.value?.val : undefined };
+  return { name, channel: read.channel, bad: !!read.value?.q, usable, raw: usable ? read.value?.val : undefined };
 }
 
-/** No usable value is unavailable, whatever the domain (a sensor's rule too). */
+/**
+ * Availability follows quality, not presence (Ruling 88): a value ioBroker
+ * flags as bad is unavailable; no value yet, or a null one, is `unknown` and
+ * available, as Home Assistant keeps such an entity, so the panel can still
+ * set the first one -- it drafts from min, or from a blank calendar
+ * (value_control.cpp:416-417, :852-860). The panel treats a null state as
+ * never available (:76), so Task 14 must send `unknown` as text. The
+ * sensor's rule is its own.
+ */
 function editableEntity(
   domain: Domain,
   device: DeviceInput,
@@ -69,9 +94,9 @@ function editableEntity(
     entityId,
     domain,
     source,
-    state: read.usable ? state : STATE_UNAVAILABLE,
+    state: read.bad ? STATE_UNAVAILABLE : read.usable ? state : STATE_UNKNOWN,
     attributes: { ...friendly, ...extra },
-    available: read.usable,
+    available: !read.bad,
     lastChanged,
     writable: { value: writable },
     channelMeta,
@@ -80,16 +105,41 @@ function editableEntity(
 
 const finite = (value: number | undefined): value is number => typeof value === 'number' && Number.isFinite(value);
 
+function declaredRange({ min, max }: ChannelInput): { min: number; max: number } | undefined {
+  return finite(min) && finite(max) && min < max ? { min, max } : undefined;
+}
+
 /**
- * The declared range, complete or not at all. The panel edits a number only
- * with a finite min, max and step, min < max, step > 0 and a finite max - min;
- * anything else forces writable false (contract §3, value_control.cpp:82-86).
- * No bound is invented to rescue one -- most ioBroker states declare no step
- * -- and a partial or inconsistent set is published as none.
+ * Home Assistant's step for a number that declares none
+ * (NumberEntity._calculate_step, DEFAULT_STEP 1): divided by 10 while the
+ * range is at most the step, by repeated division -- bit for bit the value
+ * the Bridge relays (Ruling 81, T81-3). For a range above 0 only: Home
+ * Assistant skips the loop at 0, where it would never end (T81-1).
  */
-function numberRange({ min, max, step }: ChannelInput): { min: number; max: number; step: number } | undefined {
-  if (!finite(min) || !finite(max) || !finite(step)) return undefined;
-  return min < max && step > 0 && Number.isFinite(max - min) ? { min, max, step } : undefined;
+function derivedStep(range: number): number {
+  let step = 1;
+  while (range <= step) step /= 10;
+  return step;
+}
+
+/**
+ * The published range, complete or none: the panel edits a number only with
+ * a finite min, max and step, min < max, step > 0 and a finite width; anything
+ * else forces writable false (contract §3, value_control.cpp:82-86).
+ *
+ * - Bounds are the object's own. A percent value's missing bound is its
+ *   unit's, 0 or 100, each on its own (Ruling 82, percentScale): the unit %
+ *   decides, never a missing bound as such (T82-3).
+ * - An absent step is Home Assistant's (Ruling 81). A declared one stays the
+ *   object's, even an invalid one, which leaves the number read-only (T81-2).
+ * - `step` here is the one source of truth for the panel and for the value
+ *   command; channelMeta keeps the step the object declares (T81-4).
+ */
+function numberRange(channel: ChannelInput): { min: number; max: number; step: number } | undefined {
+  const bounds = channel.unit?.trim() === '%' ? percentScale(channel) : declaredRange(channel);
+  if (!bounds || !Number.isFinite(bounds.max - bounds.min)) return undefined;
+  const step = channel.step ?? derivedStep(bounds.max - bounds.min);
+  return finite(step) && step > 0 ? { ...bounds, step } : undefined;
 }
 
 export function synthNumber(device: DeviceInput, entityId: string, values: Values): VirtualEntity | null {
@@ -99,7 +149,7 @@ export function synthNumber(device: DeviceInput, entityId: string, values: Value
   const extra: Record<string, unknown> = { ...range };
   const unit = read.channel.unit?.trim();
   if (unit) extra.unit_of_measurement = unit;
-  const writable = read.channel.write === true && read.channel.type === 'number' && range !== undefined;
+  const writable = writes(read.channel) && read.channel.type === 'number' && range !== undefined;
   return editableEntity('number', device, entityId, values, read, numberToState(read.raw), extra, writable);
 }
 
@@ -116,7 +166,8 @@ const MAX_OPTION_BYTES = 255;
  *
  * - 1 to 64 options (§6, §8; :92);
  * - each 1 to 255 UTF-8 bytes, not characters (§6, §8; :97);
- * - no \n or \r in any, the panel's own separator for its dropdown (§6; :97);
+ * - no \n or \r in any, the panel's own separator for its dropdown (§6; :97),
+ *   and no NUL, where the panel's copy of an option ends (:96; M4);
  * - unique (§6, §8; :98), judged the way the value command reads an option
  *   back: each must reverse through encodeChannelValue -- the shared encoder
  *   (Ruling 22), which matches trimmed and case-insensitively -- to a raw
@@ -136,7 +187,7 @@ function selectOptions(channel: ChannelInput): string[] | undefined {
   if (labels.length < 1 || labels.length > MAX_OPTIONS) return undefined;
   const codec = { type: channel.type, states };
   const valid = labels.every((label) => {
-    if (!label || Buffer.byteLength(label, 'utf8') > MAX_OPTION_BYTES || /[\r\n]/.test(label)) return false;
+    if (!label || Buffer.byteLength(label, 'utf8') > MAX_OPTION_BYTES || /[\r\n\0]/.test(label)) return false;
     const raw = encodeChannelValue(codec, label);
     return raw !== undefined && states[String(raw)] === label;
   });
@@ -153,45 +204,103 @@ export function synthSelect(device: DeviceInput, entityId: string, values: Value
   if (!read) return null;
   const options = selectOptions(read.channel);
   const state = readEnum(device, read.name, values) ?? STATE_UNKNOWN;
-  const writable = read.channel.write === true && options !== undefined;
+  const writable = writes(read.channel) && options !== undefined;
   return editableEntity('select', device, entityId, values, read, state, options ? { options } : {}, writable);
 }
+
+/** Home Assistant's input_datetime flags, which name the panel's kind. */
+export interface CalendarKind {
+  has_date: boolean;
+  has_time: boolean;
+}
+
+const DATE_TIME: CalendarKind = { has_date: true, has_time: true };
 
 /**
  * The panel's own grammar for a date, a time and both (contract §3,
  * value_editor_model.h:28-52): Y-M-D, H:M or H:M:S, and a date, one ' ' or
- * 'T', then a time. Home Assistant's input_datetime flags name the kind.
+ * 'T', then a time.
  */
-const CALENDAR_SHAPES: ReadonlyArray<[RegExp, { has_date: boolean; has_time: boolean }]> = [
-  [/^\d{4}-\d{1,2}-\d{1,2}$/, { has_date: true, has_time: false }],
-  [/^\d{1,2}:\d{1,2}(:\d{1,2})?$/, { has_date: false, has_time: true }],
-  [/^\d{4}-\d{1,2}-\d{1,2}[ T]\d{1,2}:\d{1,2}(:\d{1,2})?$/, { has_date: true, has_time: true }],
+const CALENDAR_SHAPES: ReadonlyArray<[RegExp, CalendarKind]> = [
+  [/^(?<y>\d{4})-(?<mo>\d{1,2})-(?<d>\d{1,2})$/, { has_date: true, has_time: false }],
+  [/^(?<h>\d{1,2}):(?<mi>\d{1,2})(?::(?<s>\d{1,2}))?$/, { has_date: false, has_time: true }],
+  [/^(?<y>\d{4})-(?<mo>\d{1,2})-(?<d>\d{1,2})[ T](?<h>\d{1,2}):(?<mi>\d{1,2})(?::(?<s>\d{1,2}))?$/, DATE_TIME],
 ];
 
-/** Which kind a text in the panel's grammar is; none for any other text. */
-export function calendarKind(text: string): { has_date: boolean; has_time: boolean } | undefined {
-  return CALENDAR_SHAPES.find(([shape]) => shape.test(text))?.[1];
+/** A month's days, by the panel's own leap rule (value_editor_model.h:17-20). */
+function daysIn(year: number, month: number): number {
+  if (month === 2) return year % 4 === 0 && (year % 100 !== 0 || year % 400 === 0) ? 29 : 28;
+  return month === 4 || month === 6 || month === 9 || month === 11 ? 30 : 31;
+}
+
+/**
+ * Which kind a text in the panel's grammar is, within its ranges as well
+ * (M1, value_editor_model.h:46-49): year 1-9999, month 1-12, a day the month
+ * has, hour 0-23, minute and second 0-59. None for any other text, which the
+ * panel could show but not seed its editor from (value_control.cpp:858-859).
+ */
+export function calendarKind(text: string): CalendarKind | undefined {
+  for (const [shape, kind] of CALENDAR_SHAPES) {
+    const fields = shape.exec(text)?.groups;
+    if (!fields) continue;
+    const at = (key: string): number => Number(fields[key] ?? 0);
+    const date = !kind.has_date || (at('y') >= 1 && at('mo') >= 1 && at('mo') <= 12 && at('d') >= 1 && at('d') <= daysIn(at('y'), at('mo')));
+    const time = !kind.has_time || (at('h') <= 23 && at('mi') <= 59 && at('s') <= 59);
+    return date && time ? kind : undefined;
+  }
+  return undefined;
+}
+
+/** Below this a number is no date in epoch milliseconds: 1e11 ms is March 1973 (Ruling 84). */
+const MIN_EPOCH_MS = 1e11;
+
+/**
+ * Epoch milliseconds, ioBroker's date convention, as the panel's date-time
+ * text in the host zone (Ruling 84, T84-1): the local date and time,
+ * zero-padded, `YYYY-MM-DD HH:MM:SS` -- the very shape the panel sends back
+ * (value_control.cpp:405), never toISOString's UTC. Milliseconds below a
+ * second are dropped (T84-7). None for a number that is no such date: below
+ * 1e11, past the host zone's year 9999, or beyond any Date (T84-2).
+ */
+export function epochToCalendar(raw: unknown): string | undefined {
+  if (typeof raw !== 'number' || !(raw >= MIN_EPOCH_MS)) return undefined;
+  const date = new Date(Math.floor(raw));
+  if (Number.isNaN(date.getTime()) || date.getFullYear() > 9999) return undefined;
+  const two = (n: number): string => String(n).padStart(2, '0');
+  return (
+    `${date.getFullYear()}-${two(date.getMonth() + 1)}-${two(date.getDate())} ` +
+    `${two(date.getHours())}:${two(date.getMinutes())}:${two(date.getSeconds())}`
+  );
 }
 
 /**
  * Override-only: type-detector has no date or time type, and a value that
  * merely looks like a date is no reason to make one. Only a device a user
- * forced into this domain becomes a datetime entity; a device as detection
- * alone left it is none, whatever it holds.
+ * forced into this domain, or declared as one by hand (Task 13b), becomes a
+ * datetime entity; a device as detection alone left it is none.
  *
- * The kind comes from the value: a string already in the panel's grammar is
- * shown as it is and may be edited. Any other shape -- an epoch number,
- * whose unit and zone the object does not declare, an ISO text with a zone,
- * a local "23.09.2026" -- is shown as its raw text, with no kind and
- * read-only: the value command could not write the panel's answer back in
- * that shape.
+ * - A number-typed channel holds epoch milliseconds (Ruling 84): a date and
+ *   a time, a kind the channel's type gives even without a value, so the
+ *   tile keeps its layout (T84-3). A number that is no such date is shown as
+ *   it is and never written.
+ * - A text already in the panel's grammar is shown as it is, its kind its
+ *   shape's. Any other text -- ISO with a zone, a local "23.09.2026" -- is
+ *   shown raw, with no kind and read-only: the value command could not write
+ *   the panel's answer back in that shape.
  */
 export function synthDatetime(device: DeviceInput, entityId: string, values: Values): VirtualEntity | null {
   if (device.domain !== 'datetime') return null;
   const read = readValue(device, values);
   if (!read) return null;
+  const { type } = read.channel;
+  if (type === 'number') {
+    const text = epochToCalendar(read.raw);
+    // No value yet is a date still to be set (Ruling 88); a number that is no date is not.
+    const writable = writes(read.channel) && (!read.usable || text !== undefined);
+    return editableEntity('datetime', device, entityId, values, read, text ?? String(read.raw), { ...DATE_TIME }, writable);
+  }
   const text = read.usable ? String(read.raw).trim() : '';
   const kind = typeof read.raw === 'string' ? calendarKind(text) : undefined;
-  const writable = read.channel.write === true && read.channel.type === 'string' && kind !== undefined;
+  const writable = writes(read.channel) && type === 'string' && kind !== undefined;
   return editableEntity('datetime', device, entityId, values, read, text || STATE_UNKNOWN, { ...kind }, writable);
 }

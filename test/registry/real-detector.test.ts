@@ -1,7 +1,7 @@
 import { expect } from 'chai';
 import { parseLightCommand, parseMediaCommand, type ServiceCall } from '../../src/protocol/commands';
 import { buildStatePublish } from '../../src/protocol/state-payload';
-import { createIoBrokerDetector, discoverDevices } from '../../src/registry/detector';
+import { createIoBrokerDetector, discoverDevices, type RootAnchors } from '../../src/registry/detector';
 import { EntityRegistry } from '../../src/registry/entity-registry';
 import { applyOverrides } from '../../src/registry/overrides';
 import { encodeChannelValue } from '../../src/registry/synth/common';
@@ -1667,23 +1667,28 @@ const FLOW_SET = objects(
 const DIM = 'hm-rpc.0.LEQ0123456';
 const dim1 = (datapoint: string, common: Record<string, unknown>): IoObject =>
   state(`${DIM}.1.${datapoint}`, { name: `Dimmer Flur:1.${datapoint}`, ...common });
-const DIM_SET = objects(
+const DIM_BASE = objects(
   device(DIM, 'Dimmer Flur'),
   channel(`${DIM}.0`, 'Dimmer Flur:0'),
   state(`${DIM}.0.UNREACH`, { role: 'indicator.unreach', type: 'boolean', write: false }),
   channel(`${DIM}.1`, 'Dimmer Flur:1'),
   dim1('LEVEL', { role: 'level.dimmer', type: 'number', unit: '%', min: 0, max: 100, write: true }),
   dim1('OLD_LEVEL', { role: 'button', type: 'boolean', read: false, write: true }),
-  dim1('ON_TIME', { role: 'level', type: 'number', unit: 's', min: 0, max: 85825945, read: false, write: true }),
-  dim1('RAMP_TIME', { role: 'level', type: 'number', unit: 's', min: 0, max: 85825945, read: false, write: true }),
   dim1('WORKING', { role: 'indicator.working', type: 'boolean', write: false }),
 );
+const DIM_SET = {
+  ...DIM_BASE,
+  ...objects(
+    dim1('ON_TIME', { role: 'level', type: 'number', unit: 's', min: 0, max: 85825945, read: false, write: true }),
+    dim1('RAMP_TIME', { role: 'level', type: 'number', unit: 's', min: 0, max: 85825945, read: false, write: true }),
+  ),
+};
 
 // A zigbee2mqtt radiator thermostat, flat under its device: setpoint, room
 // temperature, its calibration offset -- a second writable, bounded number,
 // in the same plainest role -- and its mode as text with a states map.
 const TRV = 'zigbee2mqtt.0.0x84fd27fffe0a1b2c';
-const TRV_SET = objects(
+const TRV_BASE = objects(
   device(TRV, 'Heizkörper Bad'),
   state(`${TRV}.occupied_heating_setpoint`, {
     role: 'level.temperature',
@@ -1695,17 +1700,22 @@ const TRV_SET = objects(
     write: true,
   }),
   state(`${TRV}.local_temperature`, { role: 'value.temperature', type: 'number', unit: '°C', write: false }),
-  state(`${TRV}.local_temperature_calibration`, {
-    role: 'level',
-    type: 'number',
-    unit: '°C',
-    min: -12.8,
-    max: 12.7,
-    step: 0.1,
-    write: true,
-  }),
   state(`${TRV}.system_mode`, { role: 'state', type: 'string', write: true, states: { off: 'off', heat: 'heat', auto: 'auto' } }),
 );
+const TRV_SET = {
+  ...TRV_BASE,
+  ...objects(
+    state(`${TRV}.local_temperature_calibration`, {
+      role: 'level',
+      type: 'number',
+      unit: '°C',
+      min: -12.8,
+      max: 12.7,
+      step: 0.1,
+      write: true,
+    }),
+  ),
+};
 
 // Existing trees, each given one writable, bounded `level` beside its control.
 const withLevel = (all: IoObjects, id: string, common: Record<string, unknown>): IoObjects => ({
@@ -1717,6 +1727,20 @@ const BLIND_RUNNING = withLevel(BLIND_SET, `${BLIND}.RUNNING_TIME`, { unit: 's',
 // A plain `level` would compete for mediaPlayer's own VOLUME (/^level(\.volume)?$/)
 // and lose to level.volume, so the bass carries a role of its own.
 const SONOS_BASS = withLevel(SONOS_SET, `${SONOS}.bass`, { role: 'level.bass', min: -10, max: 10 });
+
+// The same trees with a percent spare instead (T82-6): percentage's SET takes
+// any writable level.* in percent, bounds or none. Its role is one no device
+// pattern of these trees claims (a plain `level` would lose a dimmer's,
+// blind's or player's own SET tie-break), so the detector does report a
+// percentage in each.
+const withPercent = (all: IoObjects, id: string): IoObjects => withLevel(all, id, { role: 'level.preset', unit: '%' });
+const PERCENT_SPARES: Array<[string, IoObjects]> = [
+  ['a Homematic dimmer with a percent start level', withPercent(DIM_BASE, `${DIM}.1.STARTUP_LEVEL`)],
+  ['a Hue CT lamp with a percent start level', withPercent(HUE_SET, `${HUE}.startup_level`)],
+  ['a blind with a percent ventilation position', withPercent(BLIND_SET, `${BLIND}.VENTILATION`)],
+  ['a zigbee2mqtt radiator thermostat with a percent valve opening', withPercent(TRV_BASE, `${TRV}.valve_opening_degree`)],
+  ['a Sonos player with a percent treble', withPercent(SONOS_SET, `${SONOS}.treble`)],
+];
 
 describe('number, select and datetime (Task 13)', () => {
   it('a standalone level slider becomes exactly one number, with its declared range, step and unit', () => {
@@ -1761,21 +1785,31 @@ describe('number, select and datetime (Task 13)', () => {
     for (const [, all] of trees) expectNoRequiredStateBacksTwoEntities(all);
   });
 
+  it('adds no entity for a percent spare either: percentage, mapped too, is guarded the same way (Ruling 82, T82-6)', () => {
+    const got = PERCENT_SPARES.map(([label, all]) => [label, detectedTypes(all).includes('percentage'), numbersIn(all)]);
+    expect(got).to.deep.equal(PERCENT_SPARES.map(([label]) => [label, true, []]));
+    for (const [, all] of PERCENT_SPARES) expectNoRequiredStateBacksTwoEntities(all);
+  });
+
   it('a second dimmer, blind, setpoint, volume or colour temperature in one device is no slider at the device root', () => {
     // Homematic's multi-channel actuators: at the device root the pattern's
-    // SET takes one channel's level and rejects the other's, so levelSlider
-    // never sees it (ChannelDetector.js:305-316, :618).
-    for (const role of ['level.dimmer', 'level.blind', 'level.temperature', 'level.volume', 'level.color.temperature']) {
-      const root = 'hm-rpc.0.NEQ0000001';
-      const all = objects(
-        device(root, 'Aktor'),
-        ...[1, 2].flatMap((n) => [
-          channel(`${root}.${n}`, `Aktor:${n}`),
-          state(`${root}.${n}.LEVEL`, { role, type: 'number', min: 0, max: 100, write: true }),
-        ]),
-      );
-      expect(detectedTypes(all), role).to.not.include('slider');
-      expect(numbersIn(all), role).to.deep.equal([]);
+    // SET takes one channel's level and rejects the other's, so neither
+    // levelSlider nor percentage ever sees it (ChannelDetector.js:305-316,
+    // :618) -- in percent as well (T82-6).
+    for (const unit of [undefined, '%']) {
+      for (const role of ['level.dimmer', 'level.blind', 'level.temperature', 'level.volume', 'level.color.temperature']) {
+        const root = 'hm-rpc.0.NEQ0000001';
+        const all = objects(
+          device(root, 'Aktor'),
+          ...[1, 2].flatMap((n) => [
+            channel(`${root}.${n}`, `Aktor:${n}`),
+            state(`${root}.${n}.LEVEL`, { role, type: 'number', min: 0, max: 100, write: true, ...(unit ? { unit } : {}) }),
+          ]),
+        );
+        expect(detectedTypes(all), `${role} ${unit}`).to.not.include.members(['slider']);
+        expect(detectedTypes(all), `${role} ${unit}`).to.not.include.members(['percentage']);
+        expect(numbersIn(all), `${role} ${unit}`).to.deep.equal([]);
+      }
     }
   });
 
@@ -1821,17 +1855,187 @@ describe('number, select and datetime (Task 13)', () => {
     expect(numbersIn(INSTALLATION)).to.deep.equal([]);
   });
 
-  it('a level in percent is the percentage type, tried just before levelSlider, and publishes nothing', () => {
+  it('a level in percent is the percentage type, tried just before levelSlider, and a number of its own (Ruling 82)', () => {
     // percentage's SET is levelSlider's with `unit: '%'` as a hard condition
     // (typePatterns.js:3331-3345), and it comes first, so a percent level is
-    // never a slider. Task 13 maps slider only (see the task-13 report).
+    // never a slider. Its bounds, declared or not, are a percent's 0..100.
     const PERCENT = 'alias.0.Lueftung.Stufe';
     const all = objects(
       channel(PERCENT, 'Lüftung'),
-      state(`${PERCENT}.SET`, { role: 'level', type: 'number', unit: '%', min: 0, max: 100, write: true }),
+      state(`${PERCENT}.SET`, { role: 'level', type: 'number', unit: '%', write: true }),
+      state(`${PERCENT}.ACTUAL`, { role: 'value', type: 'number', unit: '%', write: false }),
     );
     expect(detectedTypes(all)).to.deep.equal(['percentage']);
+    const runs = run(all, { [`${PERCENT}.SET`]: value(40), [`${PERCENT}.ACTUAL`]: value(38) });
+    expect(runs.map(({ device: detected }) => [detected.objectId, detected.detectorType, detected.domain])).to.deep.equal([
+      [PERCENT, 'percentage', 'number'],
+    ]);
+    // SET alone: the reading beside it is subscribed by nothing (T82-5).
+    expectRealChannels(all, runs[0]!.device, { set: `${PERCENT}.SET` });
+    const entity = runs[0]!.entity!;
+    expect(entity).to.include({ state: '40', available: true });
+    expect(entity.attributes).to.include({ friendly_name: 'Lüftung', min: 0, max: 100, step: 1, unit_of_measurement: '%' });
+    expect(entity.writable).to.deep.equal({ value: true });
+  });
+
+  it('a read-only percent level is a read-only number: its write flag is the object\'s own (T82-4)', () => {
+    // percentage skips its write check for its defaultRole `level`
+    // (ChannelDetector.js:99, :126-129), so the detection proves nothing.
+    const PERCENT = 'alias.0.Lueftung.Anzeige';
+    const all = objects(channel(PERCENT, 'Lüftung Anzeige'), state(`${PERCENT}.SET`, { role: 'level', type: 'number', unit: '%', write: false }));
+    const [result] = run(all, { [`${PERCENT}.SET`]: value(40) });
+    expect(result!.device).to.include({ detectorType: 'percentage', domain: 'number' });
+    expect(result!.device.channels.set!.write).to.equal(false);
+    expect(result!.entity!.writable).to.deep.equal({ value: false });
+  });
+
+  it("a slider without common.step takes Home Assistant's derived step; one whose step is no number stays read-only (Ruling 81)", () => {
+    const PUMP = 'alias.0.Pumpe.Drehzahl';
+    const tree = (step: unknown): IoObjects =>
+      objects(
+        channel(PUMP, 'Pumpe'),
+        state(`${PUMP}.SET`, { role: 'level', type: 'number', unit: 'rpm', min: 0, max: 3000, write: true, ...(step === undefined ? {} : { step }) }),
+      );
+    const values = { [`${PUMP}.SET`]: value(1500) };
+    const derived = run(tree(undefined), values)[0]!.entity!;
+    expect(derived.attributes).to.include({ min: 0, max: 3000, step: 1 });
+    expect(derived.writable).to.deep.equal({ value: true });
+    // A step declared but no number is the object's own and invalid, as the
+    // panel would take it (T81-2): never replaced by a derived one.
+    const malformed = run(tree('50'), values)[0]!.entity!;
+    expect(malformed.attributes).to.not.have.any.keys('min', 'max', 'step');
+    expect(malformed.writable).to.deep.equal({ value: false });
+  });
+
+  it('a write-only SET never written is unknown, available and editable: the panel can set its first value (Ruling 88)', () => {
+    const TIMER = 'alias.0.Licht.Nachlauf';
+    const all = objects(
+      channel(TIMER, 'Nachlauf'),
+      state(`${TIMER}.SET`, { role: 'level', type: 'number', unit: 's', min: 0, max: 600, read: false, write: true }),
+    );
+    const registry = new EntityRegistry({ onEntityChanged: () => undefined, onMembershipChanged: () => undefined }, 0);
+    registry.rebuild(detectDevices(all), {});
+    const entity = registry.byId('number.nachlauf')!;
+    expect(entity).to.include({ state: 'unknown', available: true });
+    expect(entity.attributes).to.include({ min: 0, max: 600, step: 1 });
+    expect(entity.writable).to.deep.equal({ value: true });
+  });
+
+  describe('a root with several adjustable levels publishes none of them (Ruling 86)', () => {
+    // The review's I1 tree, shaped after a Z-Wave node's Configuration channel
+    // (not checked against one adapter's objects). The detector finds one
+    // slider per root and picks it by tie-break (ChannelDetector.js:258-297,
+    // :571-574): published, it would be one arbitrary parameter under the
+    // channel's name, replaced by another once a parameter is added.
+    const NODE = 'zwave2.0.Node_005';
+    const parameter = (name: string, common: Record<string, unknown>): IoObject =>
+      state(`${NODE}.Configuration.${name}`, { role: 'level', type: 'number', step: 1, write: true, ...common });
+    const nodeSet = (...parameters: IoObject[]): IoObjects =>
+      objects(
+        device(NODE, 'Dimmer Küche'),
+        channel(`${NODE}.Multilevel_Switch`, 'Multilevel Switch'),
+        state(`${NODE}.Multilevel_Switch.targetValue`, { role: 'level.dimmer', type: 'number', min: 0, max: 99, write: true }),
+        channel(`${NODE}.Configuration`, 'Configuration'),
+        ...parameters,
+      );
+    const MIN_BRIGHTNESS = parameter('Minimum_Brightness', { min: 1, max: 98 });
+    const MAX_BRIGHTNESS = parameter('Maximum_Brightness', { min: 2, max: 99 });
+    const DIMMING_DURATION = parameter('Dimming_Duration', { min: 0, max: 127 });
+    const LIGHT: Array<[string, string]> = [[`${NODE}.Multilevel_Switch`, 'light']];
+    const published = (all: IoObjects, anchors: RootAnchors = {}): Array<[string, string]> =>
+      discoverDevices(all, 'hometiles.0', anchors).devices.map((detected) => [detected.objectId, detected.domain]);
+
+    it('the Configuration channel of three parameters publishes no number, then or after a fourth is added', () => {
+      const all = nodeSet(MIN_BRIGHTNESS, MAX_BRIGHTNESS, DIMMING_DURATION);
+      expect(detectedTypes(all)).to.include('slider');
+      expect(published(all)).to.deep.equal(LIGHT);
+      const { anchors } = discoverDevices(all, 'hometiles.0');
+      expect(published({ ...all, ...objects(parameter('Zeta_Param', { min: 0, max: 10 })) }, anchors)).to.deep.equal(LIGHT);
+    });
+
+    it('in percent too: two percent parameters publish no number (T82-2)', () => {
+      const all = nodeSet(parameter('Default_Level', { unit: '%' }), parameter('Night_Level', { unit: '%' }));
+      expect(detectedTypes(all)).to.include('percentage');
+      expect(published(all)).to.deep.equal(LIGHT);
+    });
+
+    it('nor does a slider beside a percentage in one root (probe D)', () => {
+      const all = nodeSet(DIMMING_DURATION, parameter('Default_Level', { unit: '%' }));
+      expect(detectedTypes(all)).to.include.members(['percentage', 'slider']);
+      expect(published(all)).to.deep.equal(LIGHT);
+    });
+
+    it('a root with exactly one parameter still publishes it, bounded or in percent', () => {
+      expect(published(nodeSet(DIMMING_DURATION))).to.deep.equal([[`${NODE}.Configuration`, 'number'], ...LIGHT]);
+      expect(published(nodeSet(parameter('Default_Level', { unit: '%' })))).to.deep.equal([[`${NODE}.Configuration`, 'number'], ...LIGHT]);
+    });
+
+    it("counts only the root's own levels: not one a deeper root claimed, nor another control's optional one", () => {
+      // The room's setpoint is its one level: the Konfig channel's run time
+      // is that channel's number, and the blind's tilt is the blind's own
+      // (an optional state no detection claims).
+      const ROOM_DEVICE = 'alias.0.Raum';
+      const all = objects(
+        device(ROOM_DEVICE, 'Raum'),
+        channel(`${ROOM_DEVICE}.Rollladen`, 'Rollladen'),
+        state(`${ROOM_DEVICE}.Rollladen.SET`, { role: 'level.blind', type: 'number', min: 0, max: 100, write: true }),
+        state(`${ROOM_DEVICE}.Rollladen.TILT_SET`, { role: 'level.tilt', type: 'number', min: 0, max: 100, write: true }),
+        channel(`${ROOM_DEVICE}.Konfig`, 'Konfig'),
+        state(`${ROOM_DEVICE}.Konfig.Laufzeit`, { role: 'level', type: 'number', unit: 's', min: 0, max: 255, write: true }),
+        state(`${ROOM_DEVICE}.Soll`, { role: 'level', type: 'number', unit: '°C', min: 15, max: 25, write: true }),
+      );
+      expect(published(all)).to.deep.equal([
+        [`${ROOM_DEVICE}.Konfig`, 'number'],
+        [`${ROOM_DEVICE}.Rollladen`, 'cover'],
+        [`${ROOM_DEVICE}.Soll`, 'number'],
+      ]);
+    });
+  });
+
+  it('a slider beside an unmapped control of its root is that control\'s leftover as well (M7 a)', () => {
+    // A guard that counted only mapped controls would publish the timer.
+    const FAN = 'alias.0.Bad.Luefter';
+    const all = objects(
+      channel(FAN, 'Lüfter'),
+      state(`${FAN}.MODE`, { role: 'level.mode.fan', type: 'number', write: true, states: { 0: 'auto', 1: 'low', 2: 'high' } }),
+      state(`${FAN}.TIMER`, { role: 'level', type: 'number', unit: 'min', min: 0, max: 120, write: true }),
+    );
+    expect(detectedTypes(all)).to.include.members(['fan', 'slider']);
     expect(detectDevices(all)).to.deep.equal([]);
+  });
+
+  it("a lone level in a sub-channel of its own is a number beside the device's control, which an override hides (Ruling 87)", () => {
+    // Probe A: a zigbee lamp with its transition time in a configuration
+    // channel. A tile appears only where one is placed; include=false hides it.
+    const LAMP_DEVICE = 'zigbee.0.lamp';
+    const probeA = objects(
+      device(LAMP_DEVICE, 'Lampe'),
+      state(`${LAMP_DEVICE}.state`, { role: 'switch.light', type: 'boolean', write: true }),
+      state(`${LAMP_DEVICE}.brightness`, { role: 'level.dimmer', type: 'number', unit: '%', min: 0, max: 100, write: true }),
+      channel(`${LAMP_DEVICE}.config`, 'Konfiguration'),
+      state(`${LAMP_DEVICE}.config.transition`, { role: 'level', type: 'number', unit: 's', min: 0, max: 10, write: true }),
+    );
+    const detected = detectDevices(probeA);
+    expect(detected.map((d) => [d.objectId, d.domain])).to.deep.equal([
+      [`${LAMP_DEVICE}.config`, 'number'],
+      [LAMP_DEVICE, 'light'],
+    ]);
+    const hidden = applyOverrides(detected, [{ objectId: `${LAMP_DEVICE}.config`, include: false }]);
+    expect(hidden.map((d) => d.objectId)).to.deep.equal([LAMP_DEVICE]);
+
+    // Probe C, the hm-rpc shape: the dimmer in channel 1, a ramp time alone in channel 2.
+    const HM = 'hm-rpc.0.PEQ0000002';
+    const probeC = objects(
+      device(HM, 'Dimmer'),
+      channel(`${HM}.1`, 'Dimmer:1'),
+      state(`${HM}.1.LEVEL`, { role: 'level.dimmer', type: 'number', unit: '%', min: 0, max: 100, write: true }),
+      channel(`${HM}.2`, 'Dimmer:2'),
+      state(`${HM}.2.RAMP_TIME`, { role: 'level', type: 'number', unit: 's', min: 0, max: 100, write: true }),
+    );
+    expect(detectDevices(probeC).map((d) => [d.objectId, d.domain])).to.deep.equal([
+      [`${HM}.1`, 'light'],
+      [`${HM}.2`, 'number'],
+    ]);
   });
 
   describe('select and datetime reach their synths only through a forced domain', () => {
@@ -1905,8 +2109,28 @@ describe('number, select and datetime (Task 13)', () => {
         expect(entity).to.include({ domain: 'datetime', state: text, available: true });
         expect(entity.attributes).to.include(kind);
         expect(entity.writable).to.deep.equal({ value: true });
+
+        // And through the registry, as main.ts builds it (M7 b).
+        const registry = new EntityRegistry({ onEntityChanged: () => undefined, onMembershipChanged: () => undefined }, 0);
+        expect(registry.rebuild(forced(all, 'datetime'), {}).entityIds).to.deep.equal({ [ROOT]: 'datetime.betriebsart' });
+        registry.applyStateChange(SET, value(text));
+        expect(registry.byId('datetime.betriebsart')).to.include({ domain: 'datetime', state: text, available: true });
+        expect(registry.byId('datetime.betriebsart')!.attributes).to.include(kind);
       });
     }
+
+    it('a detected device with neither SET nor a reading, forced into any editable domain, is no entity (M7 c)', () => {
+      // A media player's channels are its transport, volume and metadata.
+      for (const forcedDomain of ['number', 'select', 'datetime'] as const) {
+        const devices = applyOverrides(detectDevices(SONOS_SET), [{ objectId: SONOS, include: true, forcedDomain }]);
+        expect(devices.map((d) => [d.objectId, d.domain])).to.deep.equal([[SONOS, forcedDomain]]);
+        expect(synthesise(devices[0]!, `${forcedDomain}.wohnzimmer`, SONOS_VALUES), forcedDomain).to.equal(null);
+        const registry = new EntityRegistry({ onEntityChanged: () => undefined, onMembershipChanged: () => undefined }, 0);
+        const result = registry.rebuild(devices, {});
+        expect(result.skipped, forcedDomain).to.deep.equal([]);
+        expect(registry.all(), forcedDomain).to.deep.equal([]);
+      }
+    });
 
     it('no override can reach a writable enum or text that discovery publishes no device for', () => {
       // Evidence for the task-13 report: overrides re-domain detected devices

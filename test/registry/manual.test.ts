@@ -478,4 +478,88 @@ describe('registry/manual (Task 13b)', () => {
       expect(merged).to.deep.equal({ ...alone, [`manual:${ANWESEND}`]: 'binary_sensor.flur_melder_2' });
     });
   });
+
+  // Task 13 fix round 1: the editable synths' rules reach a manual entity
+  // through the same synths and the same channel builder.
+  describe('inherits the editable rules of Task 13 fix round 1', () => {
+    const STUFE = `${U}.Lueftung.Stufe`;
+    const NAECHSTER = `${U}.Wecker.Naechster`;
+    const EXTRA = objects(
+      ...USERDATA,
+      folder(`${U}.Lueftung`, 'Lüftung'),
+      // A percent helper as admin's object browser creates one: no bounds.
+      state(STUFE, { name: 'Lüftungsstufe', role: 'level', type: 'number', unit: '%', write: true }),
+      // A script's next alarm, in epoch milliseconds, and settable.
+      state(NAECHSTER, { name: 'Nächster Wecker', role: 'value.time', type: 'number', write: true }),
+    );
+    const device = (entry: ManualEntity): DeviceInput => {
+      const { devices, rejected } = manualDevices([entry], EXTRA, NS);
+      expect(rejected, JSON.stringify(rejected)).to.deep.equal([]);
+      return devices[0]!;
+    };
+
+    it("a number without common.step takes Home Assistant's derived step and is editable (Ruling 81)", () => {
+      const entity = entityOf(device({ stateId: VORLAUF, domain: 'number' }), 45)!;
+      expect(entity.attributes).to.include({ min: 20, max: 60, step: 1, unit_of_measurement: '°C' });
+      expect(entity.writable).to.deep.equal({ value: true });
+    });
+
+    it('a number whose object declares no write flag is writable, as ioBroker defaults it; write false stays read-only (Ruling 89)', () => {
+      // No pattern fills a manual channel's write flag, as detection's does
+      // (channelInput), so the synth's own rule decides: only write false is
+      // read-only, as for the dispatcher (Ruling 38).
+      const X = '0_userdata.0.P.x';
+      const silent = objects(state(X, { type: 'number', role: 'level', min: 5, max: 30, step: 0.5 }));
+      const [open] = manualDevices([{ stateId: X, domain: 'number' }], silent, NS).devices;
+      expect(open!.channels).to.deep.equal({ set: { objectId: X, role: 'level', type: 'number', min: 5, max: 30, step: 0.5 } });
+      expect(entityOf(open!, 12)!.writable).to.deep.equal({ value: true });
+
+      const closed = objects(state(X, { type: 'number', role: 'level', min: 5, max: 30, step: 0.5, write: false }));
+      const [locked] = manualDevices([{ stateId: X, domain: 'number' }], closed, NS).devices;
+      expect(entityOf(locked!, 12)!.writable).to.deep.equal({ value: false });
+    });
+
+    it('a percent number without bounds is 0..100 (Ruling 82)', () => {
+      const entity = entityOf(device({ stateId: STUFE, domain: 'number' }), 40)!;
+      expect(entity).to.include({ state: '40', available: true });
+      expect(entity.attributes).to.include({ friendly_name: 'Lüftungsstufe', min: 0, max: 100, step: 1, unit_of_measurement: '%' });
+      expect(entity.writable).to.deep.equal({ value: true });
+    });
+
+    describe('in a pinned host zone', () => {
+      let zone: string | undefined;
+      before(() => {
+        zone = process.env.TZ;
+        process.env.TZ = 'Europe/Berlin';
+      });
+      after(() => {
+        if (zone === undefined) delete process.env.TZ;
+        else process.env.TZ = zone;
+      });
+
+      it('an epoch-ms datetime shows the local date and time and is editable (Ruling 84)', () => {
+        const entity = entityOf(device({ stateId: NAECHSTER, domain: 'datetime' }), 1_758_600_000_000)!;
+        expect(entity).to.include({ domain: 'datetime', state: '2025-09-23 06:00:00', available: true });
+        expect(entity.attributes).to.include({ friendly_name: 'Nächster Wecker', has_date: true, has_time: true });
+        expect(entity.writable).to.deep.equal({ value: true });
+      });
+    });
+
+    it('a helper whose value is still null is unknown, available and editable, through the registry (Ruling 88)', () => {
+      // A new 0_userdata helper holds no value until something writes one.
+      const entries: ManualEntity[] = [
+        { stateId: VORLAUF, domain: 'number' },
+        { stateId: MODUS, domain: 'select' },
+        { stateId: NAECHSTER, domain: 'datetime' },
+      ];
+      const registry = new EntityRegistry(QUIET, 0);
+      const { entityIds } = registry.rebuild(manualDevices(entries, EXTRA, NS).devices, {});
+      for (const entry of entries) registry.applyStateChange(entry.stateId, value(null));
+      for (const entry of entries) {
+        const entity = registry.byId(entityIds[`manual:${entry.stateId}`]!)!;
+        expect(entity, entry.domain).to.include({ state: 'unknown', available: true });
+        expect(entity.writable, entry.domain).to.deep.equal({ value: true });
+      }
+    });
+  });
 });

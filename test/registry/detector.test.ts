@@ -2,6 +2,7 @@ import { expect } from 'chai';
 import {
   DETECTOR_TYPE_TO_DOMAIN,
   mapControlToDevice,
+  objectMeta,
   validStates,
   type DetectedControl,
   type ObjectMeta,
@@ -343,6 +344,35 @@ describe('registry/detector mapping', () => {
     expect(device?.domain).to.equal('number');
     expect(Object.keys(device!.channels)).to.deep.equal(['set']);
     expect(device!.channels.set!.objectId).to.equal('alias.0.pump.SET');
+  });
+
+  it('maps percentage to number as well, keeping its SET alone (Ruling 82)', () => {
+    // Its pattern key and Types value agree. Its ACTUAL, a live reading, is
+    // read by nothing (T82-5).
+    expect(DETECTOR_TYPE_TO_DOMAIN.percentage).to.equal('number');
+    const control: DetectedControl = {
+      type: 'percentage',
+      states: [
+        { id: 'alias.0.fan.SET', name: 'SET', write: true },
+        { id: 'alias.0.fan.ACTUAL', name: 'ACTUAL', write: false },
+        { id: 'alias.0.fan.UNREACH', name: 'UNREACH' },
+      ],
+    };
+    const device = mapControlToDevice('alias.0.fan', control, {});
+    expect(device?.domain).to.equal('number');
+    expect(Object.keys(device!.channels)).to.deep.equal(['set']);
+  });
+
+  it('reads a common.step that is present but no number as an invalid step, never an absent one (T81-2)', () => {
+    // An absent step is derived (Ruling 81); a declared one the panel could
+    // not use stays the object's, and invalid.
+    const step = (value: unknown): number | undefined =>
+      objectMeta('alias.0.x.SET', { type: 'state', common: { role: 'level', type: 'number', min: 0, max: 10, step: value } }).step;
+    expect(step(0.5)).to.equal(0.5);
+    expect(step(undefined)).to.equal(undefined);
+    expect(step(null)).to.equal(undefined);
+    expect(step('0.5')).to.be.NaN;
+    expect(step(true)).to.be.NaN;
   });
 
   it('carries common.step onto the channel beside min and max (Task 13)', () => {

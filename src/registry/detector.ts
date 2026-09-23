@@ -154,13 +154,41 @@ export const DETECTOR_TYPE_TO_DOMAIN: Record<string, Domain> = {
   media: 'media_player',
   // And again (Task 13): the pattern is keyed 'levelSlider', its Types value
   // is 'slider' (types.js:70). Its SET is any writable, bounded level.* number
-  // (typePatterns.js:3367-3381), the catch-all of adjustable values, so
-  // discoverDevices publishes a slider only as its root's one control of its
-  // own. `percentage`, the same SET with unit '%' required and tried just
-  // before it, stays unmapped. select and datetime have no detector type:
-  // they come from a user's forcedDomain only, never from this map.
+  // (typePatterns.js:3367-3381); `percentage`, tried just before it, is the
+  // same SET with unit '%' required and no bounds (:3331-3345), so every
+  // percent level is a percentage, never a slider (Ruling 82). Both are
+  // catch-alls of adjustable values: discoverDevices publishes one only as its
+  // root's one control of its own and one such level (LEVEL_CATCH_ALLS).
+  // select and datetime have no detector type: they come from a user's
+  // forcedDomain or a manual entity only, never from this map.
   slider: 'number',
+  percentage: 'number',
 };
+
+/**
+ * The catch-alls of adjustable values (Task 13): levelSlider's and
+ * percentage's SET take whatever writable level.* number a device's own
+ * patterns left at a root. Beside a control of the root's own, that is the
+ * control's leftover parameter -- a dimmer's RAMP_TIME, a thermostat's
+ * calibration offset. With several such levels at one root, the detector
+ * still reports one of each type and picks it by tie-break
+ * (ChannelDetector.js:258-297, :571-574), so it would be one arbitrary
+ * parameter, replaced by another as parameters come and go (Ruling 86).
+ */
+const LEVEL_CATCH_ALLS = ['slider', 'percentage'];
+
+/**
+ * An object levelSlider's or percentage's SET takes (typePatterns.js:3333-3345,
+ * :3369-3381; ChannelDetector.js:81-129): a level.* number, not a setting,
+ * writable -- the check is skipped for the patterns' defaultRole `level`
+ * (:99, :126-129) -- with numeric bounds, or in percent, which needs none.
+ */
+function adjustableLevel(info: ObjectMeta | undefined): boolean {
+  const role = info?.role ?? '';
+  if (info?.type !== 'number' || !/^level(\..*)?$/.test(role) || /^[^.]+\.setting\./.test(role)) return false;
+  if (info.write !== true && role !== 'level') return false;
+  return info.unit === '%' || (typeof info.min === 'number' && typeof info.max === 'number');
+}
 
 /**
  * A lamp can satisfy several lighting patterns at once. Without this the same
@@ -256,11 +284,12 @@ function channelName(controlType: string, state: DetectedChannel): string | null
   if (IGNORED_CHANNELS.has(upper)) return null;
   if (controlType === 'weatherCurrent') return CURRENT_WEATHER_CHANNELS[upper] ?? null;
   if (controlType === 'weatherForecast') return FORECAST_CHANNEL.test(upper) ? upper.toLowerCase() : null;
-  // A slider is its SET alone: the number shows and writes that one channel
-  // (synth/editable.ts's valueChannel). Its optional ON and ON_ACTUAL would
-  // be renamed set and actual below -- the boolean ON_ACTUAL ahead of the
-  // numeric ACTUAL -- and none of the three is read (Task 13).
-  if (controlType === 'slider') return upper === 'SET' ? 'set' : null;
+  // A slider or a percentage is its SET alone: the number shows and writes
+  // that one channel (synth/editable.ts's valueChannel). A slider's optional
+  // ON and ON_ACTUAL would be renamed set and actual below -- the boolean
+  // ON_ACTUAL ahead of the numeric ACTUAL -- and neither type's ACTUAL, a live
+  // reading, is read (Task 13, T82-5).
+  if (LEVEL_CATCH_ALLS.includes(controlType)) return upper === 'SET' ? 'set' : null;
 
   // The writable POWER channel, which every downstream module knows as `set`.
   // The detector spells it three different ways depending on the pattern, and
@@ -459,7 +488,9 @@ const DETECTED_OBJECT_TYPES = new Set(['state', 'channel', 'device', 'enum']);
 
 /**
  * What discovery reads of one object. A name is read only as text: a
- * translated one (an object of languages) is the id's last segment.
+ * translated one (an object of languages) is the id's last segment. A step
+ * that is present but no number is kept as NaN, an invalid step: an absent
+ * one is derived (Ruling 81), a declared one never replaced (T81-2).
  */
 export function objectMeta(id: string, obj: IoBrokerObject): ObjectMeta {
   const common = (obj.common ?? {}) as Record<string, unknown>;
@@ -470,7 +501,7 @@ export function objectMeta(id: string, obj: IoBrokerObject): ObjectMeta {
     type: typeof common.type === 'string' ? common.type : undefined,
     min: typeof common.min === 'number' ? common.min : undefined,
     max: typeof common.max === 'number' ? common.max : undefined,
-    step: typeof common.step === 'number' ? common.step : undefined,
+    step: typeof common.step === 'number' ? common.step : common.step === undefined || common.step === null ? undefined : Number.NaN,
     states: validStates(common.states, common.type),
     write: typeof common.write === 'boolean' ? common.write : undefined,
     icon: typeof common.icon === 'string' ? common.icon : undefined,
@@ -553,9 +584,10 @@ function requiredStates(control: DetectedControl): string[] {
  * `info` means nothing of its own: the states an earlier detection claimed are
  * taken out of it, and it goes when none of its own is left, or when the
  * root has a control of its own beside it -- not merely another root's
- * control seen again (Ruling 57). A slider, the catch-all of adjustable
- * values, likewise goes beside a control of the root's own, and so never
- * holds the root id (Task 13). Only state objects count: info's ACTUAL
+ * control seen again (Ruling 57). A slider or a percentage, the catch-alls of
+ * adjustable values, likewise goes beside a control of the root's own, and
+ * wherever the root holds several adjustable levels (Ruling 86); a dropped one
+ * never holds the root id (Task 13). Only state objects count: info's ACTUAL
  * matches any object below its root (ChannelDetector.js:35-37, no
  * objectType), and a channel must never become an entity's reading
  * (Ruling 52). The deepest root goes first, so each control comes from the
@@ -617,6 +649,18 @@ export function discoverDevices(
   const weatherViews: DeviceInput[] = [];
   const isView = (control: DetectedControl): boolean =>
     DETECTOR_TYPE_TO_DOMAIN[control.type] === 'weather' && requiredStates(control).some((id) => weatherHeld.has(id));
+  // The root's adjustable levels (Ruling 86): the states below it a slider or
+  // a percentage would take, less those a deeper root claimed and those
+  // another control of the root holds. The detector withholds all but one
+  // from the catch-all it reports (ChannelDetector.js:315, :328, :618), so
+  // they are counted here.
+  const stateIds = Object.keys(detectable).filter((id) => detectable[id]?.type === 'state');
+  const adjustableLevels = (rootId: string, controls: readonly DetectedControl[]): number => {
+    const held = new Set(
+      controls.filter((c) => !LEVEL_CATCH_ALLS.includes(c.type)).flatMap((c) => c.states.flatMap((state) => (state.id ? [state.id] : []))),
+    );
+    return stateIds.filter((id) => id.startsWith(`${rootId}.`) && !claimed.has(id) && !held.has(id) && adjustableLevel(meta[id])).length;
+  };
   for (const rootId of roots) {
     if (rootId.startsWith(`${ownNamespace}.`)) continue;
     // Only state objects count (Ruling 52), and the catch-all keeps only what
@@ -633,15 +677,16 @@ export function discoverDevices(
     }));
     // A control of the root's own requires a state no deeper root claimed;
     // any other detection is a deeper root's control seen again.
-    const ownBeside = (type: string): boolean =>
-      controls.some((c) => c.type !== 'info' && c.type !== type && requiredStates(c).some((id) => !claimed.has(id)));
+    const ownBeside = (...types: string[]): boolean =>
+      controls.some((c) => c.type !== 'info' && !types.includes(c.type) && requiredStates(c).some((id) => !claimed.has(id)));
     const typed = ownBeside('info');
-    // levelSlider's SET is any writable, bounded level.* number
-    // (typePatterns.js:3367-3381): the catch-all of adjustable values. Beside
-    // a control of the root's own it is that control's leftover parameter --
-    // a dimmer's RAMP_TIME, a thermostat's calibration offset, a lamp's
-    // transition time -- not a number of its own (Task 13).
-    const sliderBeside = ownBeside('slider');
+    // A slider or a percentage (LEVEL_CATCH_ALLS) goes beside a control of the
+    // root's own that is neither (Task 13), and wherever the root holds more
+    // than one adjustable level no deeper root claimed and no other control
+    // of the root holds (Ruling 86): a root of parameters publishes none.
+    const levelsDropped =
+      controls.some((c) => LEVEL_CATCH_ALLS.includes(c.type)) &&
+      (ownBeside(...LEVEL_CATCH_ALLS) || adjustableLevels(rootId, controls) > 1);
     const recorded = anchors[rootId];
     let holder = recorded === undefined ? undefined : controls.find((c) => requiredStates(c).includes(recorded));
     // Kept as recorded: if its control is gone the id goes to nobody.
@@ -657,10 +702,10 @@ export function discoverDevices(
       for (const id of required) claimed.add(id);
       const anchor = own ?? required[0];
 
-      // Such a slider is no device before it can hold the root id: sorted by
-      // how many states it matched (ChannelDetector.js:742-744), it may come
-      // ahead of the control it belongs to.
-      const device = control.type === 'slider' && sliderBeside ? null : mapControlToDevice(rootId, control, meta);
+      // Such a catch-all is no device before it can hold the root id: sorted
+      // by how many states it matched (ChannelDetector.js:742-744), it may
+      // come ahead of the control it belongs to.
+      const device = LEVEL_CATCH_ALLS.includes(control.type) && levelsDropped ? null : mapControlToDevice(rootId, control, meta);
       // A view is another root's source seen again: never this root's holder,
       // so the root's own control keeps its id (Task 11 round 1, M3).
       if (view) {

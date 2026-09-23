@@ -182,16 +182,19 @@ export function acceptsLabels(codec: ChannelCodec | undefined): boolean {
  * string must resolve to undefined rather than an empty label — the same rule
  * readNumber applies to the purely numeric channels. It sits here beside its
  * inverse, encodeChannelValue (Task 13; select reads and writes through both).
+ *
+ * The map's own keys only (Task 13 M3): plain indexing found "constructor",
+ * "toString" and "__proto__" in every map, and a function or an object is no
+ * label any payload can carry.
  */
 export function readEnum(device: DeviceInput, name: string, values: Values): string | undefined {
   const read = readChannel(device, name, values);
   if (!read || !isUsable(read.value)) return undefined;
   const raw = read.value.val;
   const states = read.channel.states;
-  if (states) {
-    const label = states[String(raw)];
-    if (label !== undefined) return label;
-  }
+  const key = String(raw);
+  const label = states && Object.hasOwn(states, key) ? states[key] : undefined;
+  if (label !== undefined) return label;
   if (typeof raw === 'string') {
     const text = raw.trim();
     return text ? text : undefined;

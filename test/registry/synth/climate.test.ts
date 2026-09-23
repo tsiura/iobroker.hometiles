@@ -212,6 +212,18 @@ describe('registry/synth/climate', () => {
     expect(e?.source.speed).to.equal('climate.0.speed');
   });
 
+  it('never decodes an Object.prototype member as a mode (Task 13 M3)', () => {
+    // readEnum found "constructor" in any states map by plain indexing: the
+    // function Object as hvac_mode, which no payload can carry.
+    for (const raw of ['constructor', 'toString', '__proto__']) {
+      const { device, values } = deviceWith({ MODE: numState(raw) });
+      device.channels.mode!.states = { 1: 'heat' };
+      const e = synthClimate(device, 'climate.test', values);
+      expect(e?.attributes.hvac_mode, raw).to.equal(raw);
+      expect(e?.state, raw).to.equal(raw);
+    }
+  });
+
   it('reads POWER and BOOST as on/off and records them writable', () => {
     // ACTUAL keeps this device valid under the firmware's acceptance rule
     // (M6 above); a POWER/BOOST-only device is covered by its own

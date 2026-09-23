@@ -161,7 +161,10 @@ describe('registry/entity-registry', () => {
   });
 
   it('makes an entity of a device forced into number, select or datetime (Task 13)', () => {
-    // A read-only temperature forced into each: shown, never editable.
+    // A temperature that declares no write flag, forced into each. As a
+    // number it has no bounds and as a select no states map, so neither is
+    // editable. As a datetime its number is an epoch date still to be set:
+    // editable, since only write false is read-only (Rulings 84, 88, 89).
     const { registry } = harness();
     const forced = (['number', 'select', 'datetime'] as const).map(
       (domain): DeviceInput => ({ ...TEMP, objectId: `zigbee.0.${domain}`, name: domain, domain }),
@@ -171,7 +174,7 @@ describe('registry/entity-registry', () => {
     expect(registry.all().map((entity) => [entity.entityId, entity.writable])).to.deep.equal([
       ['number.number', { value: false }],
       ['select.select', { value: false }],
-      ['datetime.datetime', { value: false }],
+      ['datetime.datetime', { value: true }],
     ]);
   });
 
