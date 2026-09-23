@@ -1,3 +1,4 @@
+import { usableNumber } from './climate';
 import { requireEntityId } from './commands';
 
 /**
@@ -90,4 +91,89 @@ export function parseHistoryRequest(payload: string): HistoryRequest | null {
   } catch {
     return null;
   }
+}
+
+/**
+ * The most values one numeric response carries: the firmware's largest
+ * request, kHistoryPoints24h (sensor_popup.cpp:52) -- the popup's 24-hour
+ * range and every tile graph ask for 24 h in 5-minute periods
+ * (sensor_popup.cpp:2557, tile_renderer.cpp:4673) -- and the hard cap of its
+ * editable path (sensor_popup.cpp:2288, :2342). 288 values of any width stay
+ * far inside the 32767 bytes the firmware copies out of a history message
+ * (mqtt_handlers.cpp:1496, :1836); a longer message is cut there and no
+ * longer parses.
+ */
+const MAX_NUMERIC_HISTORY_VALUES = 288;
+
+type HistorySample = { ts: number; val: unknown };
+
+/**
+ * Builds the `history/response` payload for a numeric graph request. `now`
+ * and every `ts` are epoch milliseconds, as ioBroker history stamps rows.
+ *
+ * No timestamps go on the wire: the array index is the time. Both firmware
+ * readers size the chart to the array (sensor_popup.cpp:2349, :2417;
+ * tile_renderer.cpp:4627), and the popup labels the axis from the panel's own
+ * clock, now - hours .. now (sensor_popup.cpp:616-643, :645-670). So there are
+ * always hours * 60 / period_minutes buckets (the firmware's own formula for
+ * `points`, mqtt_handlers.cpp:2393), oldest first, the last one ending at
+ * `now`; a shorter array would be stretched over the whole axis.
+ *
+ * A bucket's value is the mean of its numeric samples (the request asks for
+ * `"stat":"mean"`, mqtt_handlers.cpp:2419); a sample at exactly `now` is in
+ * the last bucket, a later one is not history. A bucket with no numeric sample
+ * is `null`, never 0 -- a non-numeric, blank or non-finite `val` counts as
+ * nothing. Both firmware readers take `null` as a gap (ArduinoJson,
+ * sensor_popup.cpp:383-384; the hand-rolled scanner, tile_renderer.cpp:4537-4541)
+ * and fill it: the last value carries forward, and a LEADING gap takes the
+ * first value after it (sensor_popup.cpp:2360-2381, tile_renderer.cpp:4573-4594).
+ * That back-fill would paint a later reading over the start of the window,
+ * so an empty first bucket takes the reading in effect when the window
+ * opened -- the latest sample before it, if that is a number.
+ *
+ * `entity_id`, `hours` and `period_minutes` are echoed verbatim -- the popup
+ * drops a response whose hours or period differ from its range
+ * (sensor_popup.cpp:2324-2329) -- and nothing else is emitted: `stat` and
+ * `points` are never read back. A range of fewer than 1 or more than 288
+ * buckets gets no values, the firmware's own "no history" answer
+ * (mqtt_handlers.cpp:306, rendered at sensor_popup.cpp:2343-2347).
+ */
+export function buildNumericHistoryResponse(
+  req: Extract<HistoryRequest, { kind: 'numeric' }>,
+  samples: readonly HistorySample[],
+  now: number,
+): string {
+  const { entityId, hours, periodMinutes } = req;
+  // Checked before dividing: -24 hours over -5 minutes is +288 buckets.
+  const count = periodMinutes > 0 ? Math.floor((hours * 60) / periodMinutes) : 0;
+  const values =
+    count >= 1 && count <= MAX_NUMERIC_HISTORY_VALUES ? bucketMeans(samples, now, periodMinutes * 60_000, count) : [];
+  return JSON.stringify({ entity_id: entityId, hours, period_minutes: periodMinutes, values });
+}
+
+function bucketMeans(
+  samples: readonly HistorySample[],
+  now: number,
+  periodMs: number,
+  count: number,
+): Array<number | null> {
+  const start = now - count * periodMs;
+  const buckets: number[][] = Array.from({ length: count }, () => []);
+  let carriedTs = -Infinity;
+  let carried: number | undefined;
+  for (const { ts, val } of samples) {
+    if (!Number.isFinite(ts) || ts > now) continue;
+    const value = usableNumber(val);
+    if (ts < start) {
+      if (ts >= carriedTs) {
+        carriedTs = ts;
+        carried = value;
+      }
+    } else if (value !== undefined) {
+      buckets[Math.min(Math.floor((ts - start) / periodMs), count - 1)]?.push(value);
+    }
+  }
+  const first = buckets[0];
+  if (first?.length === 0 && carried !== undefined) first.push(carried);
+  return buckets.map((bucket) => (bucket.length ? bucket.reduce((sum, v) => sum + v, 0) / bucket.length : null));
 }

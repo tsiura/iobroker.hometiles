@@ -131,7 +131,7 @@ export const ALLOWED_PRESET_MODES: ReadonlySet<string> = new Set([
  * synth/climate.ts's readNumber and synth/common.ts's numberToState, which
  * guard the identical trap on the ioBroker-reading side.
  */
-function usableNumber(value: unknown): number | undefined {
+export function usableNumber(value: unknown): number | undefined {
   if (typeof value === 'number') return Number.isFinite(value) ? value : undefined;
   if (typeof value === 'string') {
     const text = value.trim();
