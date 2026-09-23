@@ -57,7 +57,9 @@ void mqttPublishStateHistoryRequest(const char* entity_id, uint16_t hours = 24,
                                      uint16_t max_transitions = 48);
 ```
 Callers: `sensor_popup.cpp:2549` (binary), `:2552` (state), `:2557` (numeric,
-default args), `tile_renderer.cpp:4673` (numeric, for grid tile graphs).
+the active range's `cfg.hours`/`period_minutes`/`points`: 24/5/288 or
+168/60/168), `tile_renderer.cpp:4673` (numeric, the header defaults 24/5/288
+from `mqtt_handlers.h:47`, for grid tile graphs).
 
 ### 3.1 `mqttPublishHistoryRequest` — numeric graph history
 
@@ -183,8 +185,13 @@ which consumer you mean.
 
 ### 4.1 Numeric response (sensor-popup consumer: `apply_history_payload`, `sensor_popup.cpp:2263-2408+`)
 
-Parsed with `DynamicJsonDocument doc(24576)` (`sensor_popup.cpp:2269`); a
-`deserializeJson` error aborts silently after a log line (`:2271-2273`).
+Parsed with `DynamicJsonDocument doc(24576)` (`sensor_popup.cpp:2269`), but
+ArduinoJson 7.4.3 (the CI pin, `.github/workflows/firmware.yml:96`) ignores
+that capacity: `DynamicJsonDocument(size_t)` only stores the number and the
+document is elastic. The real ceiling is the handler's copy into
+`LARGE_BUF = 32768` (`mqtt_handlers.cpp:1496`), truncated at 32767 bytes
+(`mqtt_handlers.cpp:1836`); a longer payload is cut and then fails to parse.
+A `deserializeJson` error aborts silently after a log line (`:2271-2273`).
 
 Required/used top-level keys for the plain-numeric path (i.e. `doc["kind"]`
 is not `"binary"`/`"state"`, checked at `:2303-2313`):
@@ -220,7 +227,7 @@ Overflow: editable-number popups additionally hard-cap at 288 points and
 **drop the entire response** if exceeded (`:2342`: `if (ctx->editable && count > 288) return;`).
 Non-editable popups and tile graphs have no explicit array-length cap in this
 path (chart control is simply sized to `values.size()`), other than the
-outer 24576-byte / large-MQTT-buffer ceiling on the whole payload.
+32767-byte `LARGE_BUF` truncation of the whole payload (`mqtt_handlers.cpp:1836`).
 
 ### 4.2 Binary (`"kind":"binary"`) response — `apply_binary_history_payload`, `sensor_popup.cpp:1838-1985`
 
@@ -286,6 +293,15 @@ Activity/segments/palette/timeline data, then, only if
   response is dropped (`:2287-2289`) before the range-id check even runs.
 
 ## 5. Correlation — definitive answer
+
+> **Correction (found in Task 17):** the tile graph applies any numeric
+> response whose `entity_id` matches; it has no hours/period gate
+> (`tile_renderer.cpp:4498-4514`). A popup's 7-day response therefore also
+> overwrites a 24-hour tile graph of the same entity until that graph's next
+> refresh — firmware behaviour the adapter cannot change. It also means a
+> response the adapter should not send (for example an empty `values` array
+> answering a malformed request) clears that entity's tile graph whatever its
+> range.
 
 **There is no MQTT-level request/sequence id used anywhere except the
 editable-value range-switch guard in §4.4.** Every other consumer correlates
@@ -532,8 +548,8 @@ consume a numeric `values` array from the *same* response object.
 | State palette entries | 16 | `sensor_popup.cpp:62` | Whole palette discarded if exceeded or if any entry isn't a string |
 | Editable-number history points | 288 | `sensor_popup.cpp:2288, 2342` | Whole response dropped if exceeded |
 | Energy values per entry | 32 | `energy_data.h:7` | Extra values silently ignored (array read stops) |
-| Numeric/discrete history JSON document | 24576 bytes | `sensor_popup.cpp:2269` | `deserializeJson` fails, whole response dropped |
-| Energy response JSON document | 32768 bytes | `energy_data.cpp:202` | `deserializeJson` fails, whole response dropped |
+| Numeric/discrete history payload | 32767 bytes | `mqtt_handlers.cpp:1496, 1836` (the `doc(24576)` capacity at `sensor_popup.cpp:2269` is ignored by ArduinoJson 7.4.3) | Payload truncated, then `deserializeJson` fails; whole response dropped |
+| Energy response payload | 32767 bytes | `mqtt_handlers.cpp:1496, 1880` (the `doc(32768)` capacity at `energy_data.cpp:202` is ignored by ArduinoJson 7.4.3) | Payload truncated, then `deserializeJson` fails; whole response dropped |
 
 ## UNVERIFIED items (exact scope of what was and wasn't checked)
 
