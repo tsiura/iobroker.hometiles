@@ -182,11 +182,14 @@ const LEVEL_CATCH_ALLS = ['slider', 'percentage'];
  * :3369-3381; ChannelDetector.js:81-129): a level.* number, not a setting,
  * writable -- the check is skipped for the patterns' defaultRole `level`
  * (:99, :126-129) -- with numeric bounds, or in percent, which needs none.
+ * One that declares write false is nobody's adjustable level, though the
+ * bypass lets it in: a read-only mirror beside a writable SET would make the
+ * root one of several levels and hide both (Task 13 round 2, N1).
  */
 function adjustableLevel(info: ObjectMeta | undefined): boolean {
   const role = info?.role ?? '';
   if (info?.type !== 'number' || !/^level(\..*)?$/.test(role) || /^[^.]+\.setting\./.test(role)) return false;
-  if (info.write !== true && role !== 'level') return false;
+  if (info.write === false || (info.write !== true && role !== 'level')) return false;
   return info.unit === '%' || (typeof info.min === 'number' && typeof info.max === 'number');
 }
 
@@ -654,12 +657,33 @@ export function discoverDevices(
   // another control of the root holds. The detector withholds all but one
   // from the catch-all it reports (ChannelDetector.js:315, :328, :618), so
   // they are counted here.
-  const stateIds = Object.keys(detectable).filter((id) => detectable[id]?.type === 'state');
+  //
+  // Only the root's own descendants are read: sorted once, they are one run of
+  // the state ids, found by binary search as type-detector finds a root's
+  // objects (roleEnumUtils.js getObjectsBelowId). Reading every state for each
+  // root was O(roots x states), over 2 s for 2000 slider channels among 36k
+  // objects (Task 13 round 2, N2).
+  const stateIds = Object.keys(detectable)
+    .filter((id) => detectable[id]?.type === 'state')
+    .sort();
+  const statesBelow = (rootId: string): string[] => {
+    const prefix = `${rootId}.`;
+    let low = 0;
+    let high = stateIds.length;
+    while (low < high) {
+      const middle = (low + high) >>> 1;
+      if ((stateIds[middle] ?? '') < prefix) low = middle + 1;
+      else high = middle;
+    }
+    let end = low;
+    while (stateIds[end]?.startsWith(prefix)) end++;
+    return stateIds.slice(low, end);
+  };
   const adjustableLevels = (rootId: string, controls: readonly DetectedControl[]): number => {
     const held = new Set(
       controls.filter((c) => !LEVEL_CATCH_ALLS.includes(c.type)).flatMap((c) => c.states.flatMap((state) => (state.id ? [state.id] : []))),
     );
-    return stateIds.filter((id) => id.startsWith(`${rootId}.`) && !claimed.has(id) && !held.has(id) && adjustableLevel(meta[id])).length;
+    return statesBelow(rootId).filter((id) => !claimed.has(id) && !held.has(id) && adjustableLevel(meta[id])).length;
   };
   for (const rootId of roots) {
     if (rootId.startsWith(`${ownNamespace}.`)) continue;

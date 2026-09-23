@@ -1855,6 +1855,61 @@ describe('number, select and datetime (Task 13)', () => {
     expect(numbersIn(INSTALLATION)).to.deep.equal([]);
   });
 
+  it('a writable level beside its read-only mirror stays one number, in either sort order (Task 13 round 2, N1)', () => {
+    // A `level` that declares write false is no adjustable level: the
+    // detector's defaultRole bypass lets it into levelSlider's SET slot, but
+    // nothing can set it, so it must not make the root one of several levels.
+    // Which object the number carries is the detector's tie-break, the later
+    // id (ChannelDetector.js:258-297), as it was before Ruling 86 (f01f049).
+    const tree = (mirror: string): IoObjects =>
+      objects(
+        channel(FLOW, 'Vorlauf Soll'),
+        state(`${FLOW}.SET`, { role: 'level', type: 'number', unit: '°C', min: 20, max: 60, step: 0.5, write: true }),
+        state(`${FLOW}.${mirror}`, { role: 'level', type: 'number', unit: '°C', min: 20, max: 60, write: false }),
+      );
+    const numbers = (all: IoObjects, values: Record<string, SourceValue>): Array<[string, string | undefined, unknown]> =>
+      run(all, values).map(({ device: detected, entity }) => [detected.objectId, detected.channels.set?.objectId, entity?.writable]);
+    // The mirror sorts before SET: the number edits SET.
+    expect(numbers(tree('ACTUAL'), { [`${FLOW}.SET`]: value(45), [`${FLOW}.ACTUAL`]: value(44.5) })).to.deep.equal([
+      [FLOW, `${FLOW}.SET`, { value: true }],
+    ]);
+    // The mirror sorts after SET: the number shows the mirror and edits nothing.
+    expect(numbers(tree('VALUE'), { [`${FLOW}.SET`]: value(45), [`${FLOW}.VALUE`]: value(44.5) })).to.deep.equal([
+      [FLOW, `${FLOW}.VALUE`, { value: false }],
+    ]);
+  });
+
+  it("counts a root's adjustable levels among its own descendants, never every state per root (Task 13 round 2, N2)", () => {
+    // Every standalone slider root runs the count. Scanning every state of the
+    // installation for each root made discovery O(roots x states): 2000
+    // slider channels among 36k objects took over 2 s. Counted as prefix
+    // checks, deterministic: doubling the roots about doubles them, where the
+    // scan of every state quadruples them.
+    const sliders = (count: number): IoObjects =>
+      objects(
+        ...Array.from({ length: count }, (_, i) => [
+          channel(`alias.0.Regler.${i}`, `Regler ${i}`),
+          state(`alias.0.Regler.${i}.SET`, { role: 'level', type: 'number', min: 0, max: 100, write: true }),
+        ]).flat(),
+      );
+    const prefixChecks = (all: IoObjects): number => {
+      const startsWith = String.prototype.startsWith;
+      let checks = 0;
+      String.prototype.startsWith = function (this: string, search: string, position?: number): boolean {
+        checks++;
+        return startsWith.call(this, search, position);
+      };
+      try {
+        expect(discoverDevices(all, 'hometiles.0').devices).to.have.length(Object.keys(all).length / 2);
+      } finally {
+        String.prototype.startsWith = startsWith;
+      }
+      return checks;
+    };
+    const ratio = prefixChecks(sliders(400)) / prefixChecks(sliders(200));
+    expect(ratio).to.be.within(1.5, 2.5);
+  });
+
   it('a level in percent is the percentage type, tried just before levelSlider, and a number of its own (Ruling 82)', () => {
     // percentage's SET is levelSlider's with `unit: '%'` as a hard condition
     // (typePatterns.js:3331-3345), and it comes first, so a percent level is
@@ -1963,6 +2018,13 @@ describe('number, select and datetime (Task 13)', () => {
       const all = nodeSet(DIMMING_DURATION, parameter('Default_Level', { unit: '%' }));
       expect(detectedTypes(all)).to.include.members(['percentage', 'slider']);
       expect(published(all)).to.deep.equal(LIGHT);
+    });
+
+    it('counts a parameter that declares no write flag, as ioBroker defaults it writable (Ruling 89); only write false is none (round 2, N1)', () => {
+      const silent = state(`${NODE}.Configuration.Default_Level`, { role: 'level', type: 'number', min: 0, max: 99, step: 1 });
+      expect(published(nodeSet(DIMMING_DURATION, silent))).to.deep.equal(LIGHT);
+      const readOnly = parameter('Default_Level', { min: 0, max: 99, write: false });
+      expect(published(nodeSet(DIMMING_DURATION, readOnly))).to.deep.equal([[`${NODE}.Configuration`, 'number'], ...LIGHT]);
     });
 
     it('a root with exactly one parameter still publishes it, bounded or in percent', () => {
