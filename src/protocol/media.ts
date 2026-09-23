@@ -31,8 +31,53 @@ import type { VirtualEntity } from '../registry/types';
  * parsed afresh.
  */
 
-/** Free text last: the flat scanner takes the first quoted token equal to a key, value or not (json_scan.h:41-46). */
 const TEXT_KEYS = ['media_title', 'media_artist', 'media_album_name'] as const;
+
+/**
+ * Every key the panel looks up in a media payload, fallbacks included
+ * (tile_renderer.cpp:4283-4298, :4396-4399), and the one the entity cache
+ * searches for (tab_tiles_unified.cpp:402-403, :435-436).
+ */
+const PANEL_KEYS: ReadonlySet<string> = new Set([
+  'state',
+  'media_title',
+  'media_artist',
+  'media_album_name',
+  'app_name',
+  'source',
+  'media_channel',
+  'volume_level',
+  'volume',
+  'media_position',
+  'media_duration',
+  'is_volume_muted',
+  'muted',
+  'entity_picture',
+  'entity_picture_data',
+  'media_image_url',
+]);
+
+/**
+ * A string as a JSON token no lookup can take for a key (Ruling 65(2)). Every
+ * lookup searches the whole payload for the quoted name, value or key alike,
+ * and reads past the NEXT colon (strstr, tile_renderer.cpp:820-823;
+ * json_scan.h:41-55). So a title "volume" ahead of an artist "50" read as
+ * volume 50 for a player whose volume is read-only, and a title
+ * "entity_picture_data" had the artist decoded as cover pixels. A quote inside
+ * a string is therefore written ", which makes every quote in the payload
+ * a token's delimiter: a lookup can match only a whole token equal to the
+ * name, and a string equal to a name has its first letter escaped. The panel
+ * decodes \uXXXX (tile_renderer.cpp:998-1089) and shows the text unchanged.
+ * Nothing is sent as null: the string lookup takes the next quoted token as
+ * the value of a null (strchr(colon, '"'), :825).
+ */
+function text(value: string): string {
+  const inner = JSON.stringify(value)
+    .slice(1, -1)
+    .replace(/\\(u[0-9a-fA-F]{4}|.)/g, (escape, code: string) => (code === '"' ? '\\u0022' : escape));
+  const first = `\\u${value.charCodeAt(0).toString(16).padStart(4, '0')}`;
+  return PANEL_KEYS.has(value) ? `"${first}${inner.slice(1)}"` : `"${inner}"`;
+}
 
 const finite = (value: unknown): number | undefined =>
   typeof value === 'number' && Number.isFinite(value) ? value : undefined;
@@ -44,24 +89,23 @@ function coverUrl(value: unknown): string {
 
 export function buildMediaPayload(entity: VirtualEntity): string {
   const attrs = entity.attributes;
-  const body: Record<string, unknown> = { state: entity.state };
+  const fields = [`"state":${text(entity.state)}`];
 
   const volume = finite(attrs.volume_level);
-  if (volume !== undefined) body.volume_level = volume;
-  if (typeof attrs.is_volume_muted === 'boolean') body.is_volume_muted = attrs.is_volume_muted;
+  if (volume !== undefined) fields.push(`"volume_level":${volume}`);
+  if (typeof attrs.is_volume_muted === 'boolean') fields.push(`"is_volume_muted":${attrs.is_volume_muted}`);
 
   const position = finite(attrs.media_position);
   const duration = finite(attrs.media_duration);
   if (position !== undefined && duration !== undefined && duration > 0) {
-    body.media_position = position;
-    body.media_duration = duration;
+    fields.push(`"media_position":${position}`, `"media_duration":${duration}`);
   }
 
-  body.entity_picture = coverUrl(attrs.entity_picture);
+  fields.push(`"entity_picture":${text(coverUrl(attrs.entity_picture))}`);
 
   for (const key of TEXT_KEYS) {
-    const text = attrs[key];
-    if (typeof text === 'string' && text.trim()) body[key] = text.trim();
+    const value = attrs[key];
+    if (typeof value === 'string' && value.trim()) fields.push(`"${key}":${text(value.trim())}`);
   }
-  return JSON.stringify(body);
+  return `{${fields.join(',')}}`;
 }
