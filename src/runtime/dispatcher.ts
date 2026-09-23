@@ -437,12 +437,25 @@ export class Dispatcher {
       case 'media_set_volume': {
         // The mute icon sends volume_set too, never volume_mute: 0 to mute,
         // the last level it showed to unmute, with or without a slider
-        // (on_volume_mute_click, media_popup.cpp:517-530). So 0 mutes a player
-        // with a writable MUTE and keeps the user's level. Any other level is
-        // set and ends a mute: the panel shows it unmuted from then on
-        // (set_volume_widgets, :228-233). What cannot land is skipped out
+        // (on_volume_mute_click, media_popup.cpp:517-530). A slider released
+        // at 0 sends the identical bytes (:488-490), and the panel's own model
+        // counts a slider at 0 as muted (set_volume_widgets, :228-233), so it
+        // is treated as a mute too: 0 mutes a player with a writable MUTE and
+        // keeps the user's level. Any other level is set and ends a mute: the
+        // panel shows it unmuted from then on. What cannot land is skipped out
         // loud, the rest still lands (Ruling 54's precedent): refusing the
         // whole call would leave the icon unable to unmute at all.
+        //
+        // With no settable volume there is no slider (disabled, :483), so the
+        // icon sent this. The popup draws the absent volume as 0%
+        // (tile_renderer.cpp:4327), its muted look, so the icon nearly always
+        // sends its unmute level: it toggles the mute the player reports
+        // instead. Only an unknown mute takes the value as said.
+        if (!entity.writable?.volume && entity.writable?.mute) {
+          const muted = entity.attributes.is_volume_muted;
+          push('mute', typeof muted === 'boolean' ? !muted : call.value === 0);
+          break;
+        }
         if (call.value === 0 && entity.writable?.mute) {
           push('mute', true);
           break;

@@ -209,6 +209,25 @@ describe('registry/synth/media_player', () => {
       const e = entity({ state: playing, seek, duration: duration(391000, 'ms'), elapsed: elapsed(42000, 'ms') });
       expect(e.attributes).to.include({ media_position: 42, media_duration: 391 });
     });
+
+    it('takes SEEK as the percentage media.seek is only when it declares no unit or % (Ruling 67)', () => {
+      // A SEEK in a time unit would receive a percentage as if it were time,
+      // and is not converted: no seek bar, and nothing to command.
+      for (const [unit, max] of [
+        ['s', 100],
+        ['sec', 3600],
+        ['seconds', 3600],
+        ['ms', 3_600_000],
+      ] as const) {
+        const e = entity({ state: playing, seek: { ...seek, unit, max }, duration: duration(180), elapsed: elapsed(90) });
+        expect(e.attributes, unit).to.not.have.any.keys('media_position', 'media_duration');
+        expect(e.writable, unit).to.deep.equal({ seek: false, state: true });
+      }
+      for (const unit of [undefined, '', ' % ']) {
+        const e = entity({ state: playing, seek: { ...seek, unit }, duration: duration(180), elapsed: elapsed(90) });
+        expect(e.attributes, `unit ${JSON.stringify(unit)}`).to.include({ media_position: 90, media_duration: 180 });
+      }
+    });
   });
 
   it("carries every channel's codec in channelMeta, so a command can be scaled into the channel's range", () => {

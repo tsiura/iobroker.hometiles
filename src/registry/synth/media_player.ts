@@ -106,8 +106,9 @@ const TEXT_ATTRIBUTES = [
  * (media_popup.cpp:261-265, :483) and media_position+media_duration show a
  * draggable seek bar (:300-310, :501-502). So each is published only when the
  * command behind it can land -- `writable.volume` and `writable.seek`, from
- * the channel's own write flag and scalable bounds -- and a read-only volume
- * or position is left out rather than shown as a control that does nothing.
+ * the channel's own write flag and scalable bounds, and for SEEK a percentage
+ * unit -- and a read-only volume or position is left out rather than shown as
+ * a control that does nothing.
  * The transport buttons (previous, play_pause, next) are always drawn; no
  * payload key shapes them.
  */
@@ -152,9 +153,16 @@ export function synthMediaPlayer(device: DeviceInput, entityId: string, values: 
 
   // SEEK is a percentage (ioBroker's media.seek), so a seek to a position
   // needs the duration; the panel shows the bar only with both, and a
-  // positive duration.
+  // positive duration. Ruling 67: only a SEEK declaring no unit or % is that
+  // percentage. The SEEK pattern has no defaultUnit, and one declared in a
+  // time unit would take a percentage as time; it is not converted either
+  // (unit strings vary, and a wrong guess at ms is 1000 times off), so it
+  // gets no seek bar and nothing lands on it.
   const seek = device.channels.seek;
-  if (seek) writable.seek = seek.write === true && percentScale(seek) !== undefined;
+  if (seek) {
+    const unit = seek.unit?.trim();
+    writable.seek = seek.write === true && percentScale(seek) !== undefined && (!unit || unit === '%');
+  }
   if (writable.seek) {
     const duration = readSeconds(device, 'duration', values);
     const position = readSeconds(device, 'elapsed', values);

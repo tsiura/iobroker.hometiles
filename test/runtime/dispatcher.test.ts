@@ -1725,12 +1725,18 @@ describe('runtime/dispatcher', () => {
         ] as const) {
           expect(await send(playerOf({ state: PLAYING, volume: volume(10, min, max) }), volumeSet(0.35))).to.deep.equal({ ok: true, writes: 1 });
           expect(writes, `${min}..${max}`).to.deep.equal([['media.0.volume', landed]]);
+          // No MUTE channel, so nothing to unmute and nothing to warn about.
+          expect(warnings, `${min}..${max}`).to.deep.equal([]);
         }
       });
 
       it('refuses a volume command on a player with no volume channel', async () => {
         expect(await send(playerOf({ state: PLAYING }), volumeSet(0.5))).to.deep.equal(refused('no_writable_channel'));
         expect(writes).to.deep.equal([]);
+        expect(warnings).to.deep.equal([
+          '[Command] Skipping the volume of media_player.tv: the player has no volume channel',
+          '[Command] Rejected media_set_volume for media_player.tv: no_writable_channel',
+        ]);
       });
 
       it('refuses a level it does not advertise -- read-only, or bounds that cannot be scaled -- and says so', async () => {
@@ -1739,7 +1745,10 @@ describe('runtime/dispatcher', () => {
           expect(player.attributes.volume_level, 'not advertised').to.equal(undefined);
           expect(await send(player, volumeSet(0.5))).to.deep.equal(refused('no_writable_channel'));
           expect(writes).to.deep.equal([]);
-          expect(warnings.some((message) => message.includes('Skipping the volume of media_player.tv'))).to.equal(true);
+          expect(warnings).to.deep.equal([
+            '[Command] Skipping the volume of media_player.tv: volume takes no write or declares no usable range',
+            '[Command] Rejected media_set_volume for media_player.tv: no_writable_channel',
+          ]);
         }
       });
 
@@ -1752,6 +1761,7 @@ describe('runtime/dispatcher', () => {
         it('a mute press on a player with a MUTE channel mutes it and leaves the volume untouched', async () => {
           expect(await send(sonos(false), volumeSet(0))).to.deep.equal({ ok: true, writes: 1 });
           expect(writes).to.deep.equal([['media.0.mute', true]]);
+          expect(warnings).to.deep.equal([]);
         });
 
         it('the unmute press sets the level it carries and ends the mute', async () => {
@@ -1760,16 +1770,19 @@ describe('runtime/dispatcher', () => {
             ['media.0.volume', 25],
             ['media.0.mute', false],
           ]);
+          expect(warnings).to.deep.equal([]);
         });
 
         it('a level for a player that is not muted leaves MUTE alone; one whose mute is unknown is unmuted', async () => {
           await send(sonos(false), volumeSet(0.6));
           expect(writes).to.deep.equal([['media.0.volume', 60]]);
+          expect(warnings).to.deep.equal([]);
           await send(playerOf({ state: PLAYING, volume: volume(25), mute: { type: 'boolean', write: true } }), volumeSet(0.6));
           expect(writes, 'the panel shows it unmuted either way').to.deep.equal([
             ['media.0.volume', 60],
             ['media.0.mute', false],
           ]);
+          expect(warnings).to.deep.equal([]);
         });
 
         it('without a writable MUTE, a mute press sets the bottom of the volume range', async () => {
@@ -1779,27 +1792,52 @@ describe('runtime/dispatcher', () => {
           ]) {
             expect(await send(player, volumeSet(0))).to.deep.equal({ ok: true, writes: 1 });
             expect(writes).to.deep.equal([['media.0.volume', -80]]);
+            expect(warnings).to.deep.equal([]);
           }
         });
 
-        it('with no settable volume the icon still mutes and unmutes; the level alone is skipped, out loud', async () => {
-          const noLevel = (muted: boolean): VirtualEntity =>
-            playerOf({ state: PLAYING, volume: volume(25, 0, 100, false), mute: mute(muted) });
-          expect(await send(noLevel(true), volumeSet(0.35))).to.deep.equal({ ok: true, writes: 1 });
+        it('with no settable volume there is no slider, so the icon toggles the mute the player reports', async () => {
+          // The slider is disabled (media_popup.cpp:483), and the popup draws
+          // the absent volume as 0%, its muted look, so each press sends the
+          // icon's unmute level: 35% unless a level was ever shown (:524-529).
+          const noLevel = (muted?: boolean): VirtualEntity =>
+            playerOf({ state: PLAYING, volume: volume(25, 0, 100, false), mute: { type: 'boolean', write: true, value: muted } });
+          expect(await send(noLevel(false), volumeSet(0.35)), 'the first press').to.deep.equal({ ok: true, writes: 1 });
+          expect(writes, 'an unmuted player becomes muted').to.deep.equal([['media.0.mute', true]]);
+          expect(await send(noLevel(true), volumeSet(0.35)), 'the second press').to.deep.equal({ ok: true, writes: 1 });
+          expect(writes, 'unmutes it').to.deep.equal([['media.0.mute', false]]);
+          expect(warnings, 'nothing is skipped: the press meant the mute').to.deep.equal([]);
+          // A second press before the panel hears back sends 0 (it showed its
+          // own unmute): that toggles the mute as reported, too.
+          await send(noLevel(true), volumeSet(0));
           expect(writes).to.deep.equal([['media.0.mute', false]]);
-          expect(warnings.some((message) => message.includes('Skipping the volume of media_player.tv'))).to.equal(true);
-          expect(await send(noLevel(false), volumeSet(0))).to.deep.equal({ ok: true, writes: 1 });
+          // Only an unknown mute takes the value as said: 0 mutes, a level unmutes.
+          await send(noLevel(), volumeSet(0.35));
+          expect(writes).to.deep.equal([['media.0.mute', false]]);
+          await send(noLevel(), volumeSet(0));
           expect(writes).to.deep.equal([['media.0.mute', true]]);
-          // Neither the level nor an unmute has anything to do here.
-          expect(await send(noLevel(false), volumeSet(0.35))).to.deep.equal(refused('no_writable_channel'));
-          expect(writes).to.deep.equal([]);
+          // No volume channel at all is the same.
+          await send(playerOf({ state: PLAYING, mute: mute(false) }), volumeSet(0.35));
+          expect(writes).to.deep.equal([['media.0.mute', true]]);
+          expect(warnings).to.deep.equal([]);
         });
 
         it('a level lands on a muted player whose MUTE is read-only; the unmute is skipped, out loud', async () => {
           const player = playerOf({ state: PLAYING, volume: volume(25), mute: mute(true, false) });
           expect(await send(player, volumeSet(0.4))).to.deep.equal({ ok: true, writes: 1 });
           expect(writes).to.deep.equal([['media.0.volume', 40]]);
-          expect(warnings.some((message) => message.includes('Not unmuting media_player.tv'))).to.equal(true);
+          expect(warnings).to.deep.equal(['[Command] Not unmuting media_player.tv: mute takes no write']);
+        });
+
+        it('with neither a settable volume nor a writable MUTE, nothing lands, and both are said', async () => {
+          const player = playerOf({ state: PLAYING, volume: volume(25, 0, 100, false), mute: mute(true, false) });
+          expect(await send(player, volumeSet(0.35))).to.deep.equal(refused('no_writable_channel'));
+          expect(writes).to.deep.equal([]);
+          expect(warnings).to.deep.equal([
+            '[Command] Skipping the volume of media_player.tv: volume takes no write or declares no usable range',
+            '[Command] Not unmuting media_player.tv: mute takes no write',
+            '[Command] Rejected media_set_volume for media_player.tv: no_writable_channel',
+          ]);
         });
       });
     });
@@ -1838,6 +1876,21 @@ describe('runtime/dispatcher', () => {
         expect(player.attributes.media_duration, 'not advertised').to.equal(undefined);
         expect(await send(player, seekTo(90))).to.deep.equal(refused('no_writable_channel'));
         expect(writes).to.deep.equal([]);
+        expect(warnings).to.deep.equal(['[Command] Rejected media_seek for media_player.tv: no_writable_channel']);
+      });
+
+      it('writes nothing to a SEEK declared in a time unit, which publishes no seek bar (Ruling 67)', async () => {
+        // The review's probe, 90 s of 180 s: unit 's' took 50 and unit 'sec'
+        // over 0..3600 took 1800, both ok:true -- a percentage taken as time.
+        for (const [unit, max] of [
+          ['s', 100],
+          ['sec', 3600],
+        ] as const) {
+          const player = seekable(180, { type: 'number', min: 0, max, unit, write: true });
+          expect(player.attributes.media_duration, `${unit}: no seek bar`).to.equal(undefined);
+          expect(await send(player, seekTo(90)), unit).to.deep.equal(refused('no_writable_channel'));
+          expect(writes, unit).to.deep.equal([]);
+        }
       });
 
       it('refuses a position past the end, but takes the end of a track printed one decimal past it', async () => {
