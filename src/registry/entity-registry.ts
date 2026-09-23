@@ -21,10 +21,40 @@ export interface RebuildResult {
   skipped: Array<{ objectId: string; reason: string }>;
 }
 
+/** A playing media position as last published, and when: what the panel advances from. */
+interface Anchor {
+  position: number;
+  at: number;
+}
+
 interface Slot {
   device: DeviceInput;
   entity: VirtualEntity;
+  anchor?: Anchor;
 }
+
+/**
+ * Ruling 65(1). The panel stamps a media payload with the time it RECEIVES it
+ * and advances the position itself while playing (tile_renderer.cpp:4332,
+ * media_popup.cpp:289-296); it reads no media_position_updated_at. So a
+ * playing position within POSITION_TOLERANCE_S of where the panel already is
+ * is no change. Republishing each elapsed-time tick re-parsed every panel
+ * every second and, arriving before a device confirmed a command, undid the
+ * popup's optimistic play/pause, seek and volume (media_popup.cpp:410-416,
+ * :458-462).
+ *
+ * The retained state is refreshed by the first such tick REFRESH_MS after the
+ * last publish, since a panel subscribing later anchors to the retained
+ * position. Here, and not on a timer: a tick carries a position the device
+ * has just reported, where a timer would resend the last one, older by up to
+ * a tick interval (by minutes for a player that reports only on events), and
+ * pull every panel's seek bar back. Nor is it a publish path of its own: it
+ * leaves through onEntityChanged like any change, so main.ts's gates hold
+ * unchanged -- nothing before the first successful discovery (Ruling 56),
+ * nothing once unloading (Ruling 62 B, and dispose() stops every recompute).
+ */
+const POSITION_TOLERANCE_S = 2;
+const REFRESH_MS = 30_000;
 
 export class EntityRegistry {
   /** entityId -> slot */
@@ -41,6 +71,7 @@ export class EntityRegistry {
   constructor(
     private readonly events: RegistryEvents,
     private readonly coalesceMs: number,
+    private readonly now: () => number = Date.now,
   ) {}
 
   rebuild(devices: DeviceInput[], persistedIds: Record<string, string>): RebuildResult {
@@ -199,18 +230,45 @@ export class EntityRegistry {
     // which does not change between rebuilds. Guarded anyway for the type
     // checker, and because "no change" is the safe reading if it ever did.
     if (!next) return;
-    if (sameEntity(slot.entity, next)) {
+    const now = this.now();
+    if (sameEntity(slot.entity, next) || onTheExtrapolation(slot.entity, next, slot.anchor, now)) {
       // Nothing the panel sees changed, so nothing is published and
       // lastChanged stays -- but the raw values behind the view may have:
       // {3:'5'} decodes 3 and 5 alike, and a re-select must write the value
-      // the device holds now (channelMeta.current, Ruling 41).
+      // the device holds now (channelMeta.current, Ruling 41). The same holds
+      // for a position the panel is already showing (Ruling 65(1)).
       slot.entity = { ...next, lastChanged: slot.entity.lastChanged };
       return;
     }
 
     slot.entity = next;
+    const position = playingPosition(next);
+    slot.anchor = position === undefined ? undefined : { position, at: now };
     this.events.onEntityChanged(next);
   }
+}
+
+function playingPosition(entity: VirtualEntity): number | undefined {
+  const position = entity.attributes.media_position;
+  return entity.domain === 'media_player' && entity.state === 'playing' && typeof position === 'number' ? position : undefined;
+}
+
+/**
+ * `next` differs from `current` only by a position the panel already shows:
+ * still playing (an anchor exists only while the published entity plays),
+ * everything else equal, and the position within the tolerance of the
+ * published one advanced by the time since -- up to the duration, where the
+ * panel stops it (media_popup.cpp:294-295). Never once the last publish is
+ * REFRESH_MS old.
+ */
+function onTheExtrapolation(current: VirtualEntity, next: VirtualEntity, anchor: Anchor | undefined, now: number): boolean {
+  const position = playingPosition(next);
+  if (!anchor || position === undefined || now - anchor.at >= REFRESH_MS) return false;
+  const others = (entity: VirtualEntity): string => JSON.stringify({ ...entity.attributes, media_position: null });
+  if (others(current) !== others(next)) return false;
+  const shown = anchor.position + (now - anchor.at) / 1000;
+  const duration = next.attributes.media_duration;
+  return Math.abs(position - (typeof duration === 'number' ? Math.min(shown, duration) : shown)) <= POSITION_TOLERANCE_S;
 }
 
 /** lastChanged deliberately excluded: a repeated identical value is not a change. */

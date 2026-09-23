@@ -273,4 +273,121 @@ describe('registry/entity-registry', () => {
       expect(changed).to.have.length(0);
     });
   });
+
+  describe('a playing position the panel already shows is no change (Ruling 65(1))', () => {
+    // The panel stamps each media payload with the time it RECEIVES it and
+    // advances the position itself while playing (tile_renderer.cpp:4332,
+    // media_popup.cpp:289-296). Republishing every elapsed-time tick re-parsed
+    // every panel each second and undid its optimistic play/pause, seek and
+    // volume (media_popup.cpp:410-416, :458-462).
+    const PLAYER: DeviceInput = {
+      objectId: 'sonos.0.root.player',
+      name: 'Wohnzimmer',
+      detectorType: 'media',
+      domain: 'media_player',
+      channels: {
+        state: { objectId: 'player.state', type: 'boolean', write: true },
+        seek: { objectId: 'player.seek', type: 'number', min: 0, max: 100, write: true },
+        duration: { objectId: 'player.duration', type: 'number' },
+        elapsed: { objectId: 'player.elapsed', type: 'number' },
+        title: { objectId: 'player.title', type: 'string' },
+      },
+    };
+
+    /** A player published playing at 42 s of 391 s, on a clock the test moves. */
+    function playing() {
+      let now = NOW;
+      let position = 42;
+      const changed: VirtualEntity[] = [];
+      const registry = new EntityRegistry(
+        { onEntityChanged: (entity) => changed.push(entity), onMembershipChanged: () => undefined },
+        0,
+        () => now,
+      );
+      registry.rebuild([PLAYER], {});
+      const set = (name: string, val: unknown): void => registry.applyStateChange(`player.${name}`, value(val, now));
+      set('state', true);
+      set('duration', 391);
+      set('title', 'Hotel California');
+      set('elapsed', position);
+      changed.length = 0;
+      return {
+        registry,
+        changed,
+        set,
+        /** `seconds` later, the device reports its position `moved` seconds further. */
+        tick: (seconds = 1, moved = seconds): void => {
+          now += seconds * 1000;
+          position += moved;
+          set('elapsed', position);
+        },
+        seekTo: (to: number): void => {
+          position = to;
+          set('elapsed', to);
+        },
+      };
+    }
+
+    it('publishes a stream of one-second ticks once, not once per tick', () => {
+      const { tick, changed } = playing();
+      for (let i = 0; i < 29; i++) tick();
+      expect(changed).to.have.length(0);
+    });
+
+    it('refreshes the retained state with the first tick 30 s after the last publish, at the fresh position', () => {
+      const { tick, changed } = playing();
+      for (let i = 0; i < 35; i++) tick();
+      expect(changed.map((entity) => entity.attributes.media_position)).to.deep.equal([72]);
+    });
+
+    it('publishes a seek, a stall, a pause, a track change and a new duration at once', () => {
+      const { tick, set, seekTo, changed } = playing();
+      tick();
+      tick();
+      const published = (): number => changed.length;
+      seekTo(150);
+      expect(published(), 'a seek').to.equal(1);
+      tick();
+      expect(published(), 'the next tick, measured from the seek').to.equal(1);
+      // 4 s later only 1 s further: 3 s behind what the panel shows. (A value
+      // re-sent unchanged is no change at all, as before: a player that
+      // reports only on events would pull the bar back on every repeat.)
+      tick(4, 1);
+      expect(published(), 'a device 3 s behind the panel').to.equal(2);
+      set('state', false);
+      expect(published(), 'a pause').to.equal(3);
+      seekTo(200);
+      expect(published(), 'a seek while paused: the panel does not advance it').to.equal(4);
+      set('state', true);
+      expect(published(), 'play').to.equal(5);
+      set('title', 'Take It Easy');
+      expect(published(), 'a track change').to.equal(6);
+      set('duration', 211);
+      expect(published(), 'a new duration').to.equal(7);
+    });
+
+    it('tolerates a device up to 2 s ahead of the panel, not more', () => {
+      const { tick, changed } = playing();
+      tick(1, 3);
+      tick(1, 0.5);
+      expect(changed, '2 s, then 1.5 s ahead').to.have.length(0);
+      tick(1, 2);
+      expect(changed.map((entity) => entity.attributes.media_position), '2.5 s ahead').to.deep.equal([47.5]);
+    });
+
+    it('stops at the duration, as the panel does', () => {
+      const { tick, seekTo, changed } = playing();
+      seekTo(389);
+      // 390.9 of 391 s after 4 s: the panel shows 391, not 393.
+      tick(4, 1.9);
+      expect(changed.map((entity) => entity.attributes.media_position)).to.deep.equal([389]);
+    });
+
+    it('publishes nothing once disposed at unload, the refresh included', () => {
+      const { registry, tick, changed } = playing();
+      registry.dispose();
+      for (let i = 0; i < 35; i++) tick();
+      expect(changed).to.have.length(0);
+    });
+  });
 });
