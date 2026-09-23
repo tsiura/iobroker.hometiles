@@ -2,7 +2,7 @@ import { expect } from 'chai';
 import type { ManualEntity } from '../../src/config/options';
 import { discoverDevices } from '../../src/registry/detector';
 import { EntityRegistry } from '../../src/registry/entity-registry';
-import { manualDevices } from '../../src/registry/manual';
+import { listed, manualDevices } from '../../src/registry/manual';
 import { synthesise } from '../../src/registry/synth/index';
 import type { ChannelInput, DeviceInput, SourceValue, VirtualEntity } from '../../src/registry/types';
 import { Dispatcher } from '../../src/runtime/dispatcher';
@@ -35,7 +35,8 @@ const SOLL = `${U}.Heizung.Solltemperatur`;
 const VORLAUF = `${U}.Heizung.Vorlauf_Soll`;
 const MODUS = `${U}.Heizung.Modus`;
 const PROFIL = `${U}.Heizung.Profil`;
-const WECKZEIT = `${U}.Wecker.Weckzeit`;
+// Its last segment matches no translation of its name (m7a).
+const WECKZEIT = `${U}.Wecker.T1`;
 const WECKER = `${U}.Wecker.Aktiv`;
 const KLINGELTE = `${U}.Wecker.Zuletzt`;
 const ANWESEND = `${U}.Haus.Anwesend`;
@@ -155,11 +156,12 @@ describe('registry/manual (Task 13b)', () => {
     });
 
     it('datetime: a time text, named the way detection names an object whose name is translated', () => {
+      // The id's last segment, neither translation (objectMeta).
       const device = only({ stateId: WECKZEIT, domain: 'datetime' });
-      expect(device).to.deep.equal(manualDevice(WECKZEIT, 'Weckzeit', 'datetime', { set: { objectId: WECKZEIT, role: 'text', type: 'string', write: true } }));
+      expect(device).to.deep.equal(manualDevice(WECKZEIT, 'T1', 'datetime', { set: { objectId: WECKZEIT, role: 'text', type: 'string', write: true } }));
       const entity = entityOf(device, '06:45')!;
       expect(entity).to.include({ domain: 'datetime', state: '06:45', available: true });
-      expect(entity.attributes).to.include({ friendly_name: 'Weckzeit', has_date: false, has_time: true });
+      expect(entity.attributes).to.include({ friendly_name: 'T1', has_date: false, has_time: true });
       expect(entity.writable).to.deep.equal({ value: true });
     });
 
@@ -250,12 +252,12 @@ describe('registry/manual (Task 13b)', () => {
   });
 
   describe('writes', () => {
-    it('land where the dispatcher writes: set for a writable state, and never on a read-only one', async () => {
+    it('land where the dispatcher writes: set, for a writable state and one declaring no write flag (Ruling 38)', async () => {
       const { devices } = manualDevices(
         [
           { stateId: WECKER, domain: 'switch' },
           { stateId: NACHT, domain: 'scene' },
-          { stateId: ANWESEND, domain: 'switch', name: 'Anwesend' },
+          { stateId: RELAIS, domain: 'switch' },
         ],
         ALL,
         NS,
@@ -272,14 +274,11 @@ describe('registry/manual (Task 13b)', () => {
       );
       expect(await dispatcher.dispatch({ kind: 'turn_off', entityId: 'switch.wecker_aktiv' })).to.deep.equal({ ok: true, writes: 1 });
       expect(await dispatcher.dispatch({ kind: 'activate_scene', alias: 'nacht' })).to.deep.equal({ ok: true, writes: 1 });
-      expect(await dispatcher.dispatch({ kind: 'turn_on', entityId: 'switch.anwesend' })).to.deep.equal({
-        ok: false,
-        reason: 'no_writable_channel',
-        applied: 0,
-      });
+      expect(await dispatcher.dispatch({ kind: 'turn_on', entityId: 'switch.relais' })).to.deep.equal({ ok: true, writes: 1 });
       expect(writes).to.deep.equal([
         [WECKER, false],
         [NACHT, true],
+        [RELAIS, true],
       ]);
     });
   });
@@ -329,6 +328,20 @@ describe('registry/manual (Task 13b)', () => {
       ]);
     });
 
+    it('refuses a read-only state as a switch or a scene, whose every press would act on nothing (m3)', () => {
+      // One call each: a state listed twice is a duplicate.
+      expect(manualDevices([{ stateId: ANWESEND, domain: 'switch' }], ALL, NS)).to.deep.equal({
+        devices: [],
+        rejected: [{ stateId: ANWESEND, reason: 'switch cannot use a read-only state (write false); declare it as binary_sensor' }],
+      });
+      expect(manualDevices([{ stateId: ANWESEND, domain: 'scene' }], ALL, NS)).to.deep.equal({
+        devices: [],
+        rejected: [{ stateId: ANWESEND, reason: 'scene cannot use a read-only state (write false)' }],
+      });
+      // Only an explicit false: no write flag at all stays writable (Ruling 38).
+      expect(manualDevices([{ stateId: RELAIS, domain: 'scene' }], ALL, NS).rejected).to.deep.equal([]);
+    });
+
     it('keeps the first entry of a state listed twice, and reports each state once', () => {
       const { devices, rejected } = manualDevices(
         [
@@ -349,6 +362,25 @@ describe('registry/manual (Task 13b)', () => {
         { stateId: SOLL, reason: 'listed more than once; the first entry is used' },
         { stateId: ANWESEND, reason: '"light" is not a domain one state can serve (sensor, binary_sensor, switch, scene, number, select, datetime)' },
       ]);
+    });
+
+    it('reports a state listed twice once, at any scale (m6)', () => {
+      // Beyond the review's measured scale: 50,000 missing states, each
+      // listed twice. Scanning the reports for each duplicate took seconds.
+      const ids = Array.from({ length: 50_000 }, (_, i) => `${U}.Fehlt.S${i}`);
+      const entries: ManualEntity[] = [...ids, ...ids].map((stateId) => ({ stateId, domain: 'sensor' }));
+      const started = Date.now();
+      const { rejected } = manualDevices(entries, ALL, NS);
+      const elapsed = Date.now() - started;
+      expect(rejected).to.have.length(50_000);
+      expect(rejected[49_999]).to.deep.equal({ stateId: ids[49_999], reason: 'no such object' });
+      expect(elapsed, `${elapsed} ms`).to.be.below(1000);
+    });
+
+    it('lists at most 20 in a log line, then how many more (m6)', () => {
+      const items = Array.from({ length: 23 }, (_, i) => `${U}.Fehlt.S${i} (no such object)`);
+      expect(listed(items.slice(0, 20))).to.equal(items.slice(0, 20).join(', '));
+      expect(listed(items)).to.equal(`${items.slice(0, 20).join(', ')}, and 3 more`);
     });
   });
 
@@ -381,6 +413,30 @@ describe('registry/manual (Task 13b)', () => {
       const reordered = [...ENTRIES].reverse();
       expect(rebuild(new EntityRegistry(QUIET, 0), reordered, {})[`manual:${NOTIZ}`], 'without the stored ids').to.equal('sensor.haus');
       expect(rebuild(new EntityRegistry(QUIET, 0), reordered, restarted)).to.deep.equal(first);
+    });
+
+    it("follow the table's edits: a rename keeps the id, a new domain gives one in it, other rows leave it alone (m7b)", () => {
+      const soll: ManualEntity = { stateId: SOLL, domain: 'number', name: 'Soll' };
+      const notiz: ManualEntity = { stateId: NOTIZ, domain: 'sensor' };
+      const first = rebuild(new EntityRegistry(QUIET, 0), [soll, notiz], {});
+      expect(first).to.deep.equal({ [`manual:${SOLL}`]: 'number.soll', [`manual:${NOTIZ}`]: 'sensor.notiz' });
+
+      // Renamed: the tile keeps its id and shows the new name.
+      const registry = new EntityRegistry(QUIET, 0);
+      expect(rebuild(registry, [{ ...soll, name: 'Wohnzimmer' }, notiz], first)).to.deep.equal(first);
+      expect(registry.byId('number.soll')?.attributes.friendly_name).to.equal('Wohnzimmer');
+
+      // Another domain: an id in that domain, since the firmware routes by the prefix.
+      expect(rebuild(new EntityRegistry(QUIET, 0), [{ ...soll, domain: 'sensor' }, notiz], first)).to.deep.equal({
+        [`manual:${SOLL}`]: 'sensor.soll',
+        [`manual:${NOTIZ}`]: 'sensor.notiz',
+      });
+
+      // A row added -- listed first, and wanting the very same id -- or one
+      // removed: every other id stays.
+      const added = rebuild(new EntityRegistry(QUIET, 0), [{ stateId: VORLAUF, domain: 'number', name: 'Soll' }, soll, notiz], first);
+      expect(added).to.deep.equal({ ...first, [`manual:${VORLAUF}`]: 'number.soll_2' });
+      expect(rebuild(new EntityRegistry(QUIET, 0), [notiz], added)).to.deep.equal({ [`manual:${NOTIZ}`]: 'sensor.notiz' });
     });
   });
 
@@ -560,6 +616,95 @@ describe('registry/manual (Task 13b)', () => {
         expect(entity, entry.domain).to.include({ state: 'unknown', available: true });
         expect(entity.writable, entry.domain).to.deep.equal({ value: true });
       }
+    });
+  });
+
+  // Task 13b fix round 1, m2: an editable value the synth leaves read-only
+  // says why, so main.ts can name what the object lacks. The reasons follow
+  // the synths' own rules; a missing step is none since Ruling 81.
+  describe('says why a manual number, select or datetime is read-only (m2)', () => {
+    const SIXTY_FIVE = Object.fromEntries(Array.from({ length: 65 }, (_, i) => [String(i), `Stufe ${i}`]));
+    const cases: Array<[string, string, Record<string, unknown>, unknown, string | undefined]> = [
+      ['a number without min and max', 'number', { type: 'number', role: 'level', write: true }, 3, 'no min/max'],
+      ['a number with a min only', 'number', { type: 'number', role: 'level', min: 0, write: true }, 3, 'no min/max'],
+      ['a number whose min is not below its max', 'number', { type: 'number', role: 'level', min: 30, max: 5, write: true }, 3, 'min not below max'],
+      ['a percent number whose min is 100', 'number', { type: 'number', role: 'level', unit: '%', min: 100, write: true }, 3, 'min not below max'],
+      ['a number whose range is too wide', 'number', { type: 'number', role: 'level', min: -1e308, max: 1e308, write: true }, 3, 'range too wide'],
+      ['a number with step 0', 'number', { type: 'number', role: 'level', min: 0, max: 10, step: 0, write: true }, 3, 'invalid step'],
+      ['a number whose step is text', 'number', { type: 'number', role: 'level', min: 0, max: 10, step: '0.5', write: true }, 3, 'invalid step'],
+      ['a number that refuses writes', 'number', { type: 'number', role: 'value', min: 0, max: 10, write: false }, 3, 'write is false'],
+      ['a number without a step', 'number', { type: 'number', role: 'level', min: 0, max: 10, write: true }, 3, undefined],
+      ['a select without states', 'select', { type: 'string', role: 'text', write: true }, 'a', 'no states'],
+      ['a select of 65 states', 'select', { type: 'number', role: 'level.mode', states: SIXTY_FIVE, write: true }, 1, 'more than 64 states'],
+      ['a select with a label on two lines', 'select', { type: 'string', role: 'text', states: { a: 'Eins\nZwei' }, write: true }, 'a', 'an empty, over-long or multi-line state label'],
+      ['a select with one label twice', 'select', { type: 'number', role: 'level.mode', states: { 0: 'Aus', 1: 'aus' }, write: true }, 0, 'states that do not map one to one'],
+      ['a select that refuses writes', 'select', { type: 'number', role: 'value', states: { 0: 'Aus' }, write: false }, 0, 'write is false'],
+      ['a select with its states', 'select', { type: 'number', role: 'level.mode', states: { 0: 'Aus' }, write: true }, 0, undefined],
+      ['a text datetime with no value and no kind declared', 'datetime', { type: 'string', role: 'text', write: true }, null, 'no value, and no kind declared'],
+      ['a text datetime in a local format', 'datetime', { type: 'string', role: 'text', write: true }, '23.09.2026', 'a value that is no date or time'],
+      ['a number datetime that is no epoch-ms date', 'datetime', { type: 'number', role: 'value', write: true }, 42, 'a number that is no epoch-ms date'],
+      ['a datetime that refuses writes', 'datetime', { type: 'string', role: 'text', write: false }, '06:45', 'write is false'],
+      ["a datetime in the panel's grammar", 'datetime', { type: 'string', role: 'text', write: true }, '06:45', undefined],
+    ];
+    for (const [what, domain, common, raw, why] of cases) {
+      it(`${what}: ${why ?? 'editable'}`, () => {
+        const id = `${U}.Pruefung.Wert`;
+        const [device] = manualDevices([{ stateId: id, domain }], objects(state(id, { name: what, ...common })), NS).devices;
+        const entity = entityOf(device!, raw)!;
+        expect([entity.writable?.value, entity.readOnly]).to.deep.equal([why === undefined, why]);
+      });
+    }
+  });
+
+  describe('a declared datetime kind (Ruling 92)', () => {
+    const ALARM = `${U}.Wecker.Alarm`;
+    const NAECHSTER = `${U}.Wecker.Naechster`;
+    const tree = objects(
+      // A fresh text helper, as admin's object browser creates one: no value yet.
+      state(ALARM, { name: 'Alarm', role: 'text', type: 'string', write: true }),
+      state(NAECHSTER, { name: 'Nächster Wecker', role: 'value.time', type: 'number', write: true }),
+    );
+    const declared = (stateId: string, kind: 'date' | 'time' | 'datetime'): DeviceInput => {
+      const { devices, rejected } = manualDevices([{ stateId, domain: 'datetime', kind }], tree, NS);
+      expect(rejected).to.deep.equal([]);
+      return devices[0]!;
+    };
+    const shown = (entity: VirtualEntity): unknown[] => [entity.attributes.has_date, entity.attributes.has_time, entity.writable?.value, entity.readOnly];
+
+    it('makes a fresh null text helper editable as a time', () => {
+      const device = declared(ALARM, 'time');
+      expect(device).to.deep.equal({
+        ...manualDevice(ALARM, 'Alarm', 'datetime', { set: { objectId: ALARM, role: 'text', type: 'string', write: true } }),
+        kind: 'time',
+      });
+      const registry = new EntityRegistry(QUIET, 0);
+      const { entityIds } = registry.rebuild([device], {});
+      registry.applyStateChange(ALARM, value(null));
+      const entity = registry.byId(entityIds[`manual:${ALARM}`]!)!;
+      expect(entity).to.include({ domain: 'datetime', state: 'unknown', available: true });
+      expect(shown(entity)).to.deep.equal([false, true, true, undefined]);
+    });
+
+    it('stands in only while the value gives no kind: an empty text takes it, a value of another kind is read-only', () => {
+      const device = declared(ALARM, 'time');
+      expect(shown(entityOf(device, '')!)).to.deep.equal([false, true, true, undefined]);
+      expect(shown(entityOf(device, '06:45')!)).to.deep.equal([false, true, true, undefined]);
+      expect(shown(entityOf(device, '2026-12-24')!)).to.deep.equal([true, false, false, 'a date value, declared kind time']);
+      expect(shown(entityOf(device, '23.09.2026')!)).to.deep.equal([undefined, undefined, false, 'a value that is no date or time']);
+    });
+
+    it('an epoch number is a date and time: another declared kind leaves it read-only', () => {
+      expect(shown(entityOf(declared(NAECHSTER, 'datetime'), null)!)).to.deep.equal([true, true, true, undefined]);
+      expect(shown(entityOf(declared(NAECHSTER, 'time'), null)!)).to.deep.equal([
+        true,
+        true,
+        false,
+        'an epoch number is a date and time, declared kind time',
+      ]);
+    });
+
+    it("is a datetime's alone: an entry of another domain keeps none", () => {
+      expect(only({ stateId: SOLL, domain: 'number', kind: 'time' })).to.not.have.property('kind');
     });
   });
 });

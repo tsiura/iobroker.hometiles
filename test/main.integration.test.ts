@@ -134,13 +134,31 @@ const BAD_OBJECTS: Record<string, object> = {
  * only a manual entity reaches it (Task 13b).
  */
 const HELPER = '0_userdata.0.Heizung.Vorlauf';
+/**
+ * Editable helpers. The panel cannot edit three: a number with no min/max, a
+ * select with no states, a date in a local format -- a reason known only once
+ * the value is read. It can edit a bounded number, and a text helper that has
+ * no value yet but declares its kind (Ruling 92).
+ */
+const STUFE = '0_userdata.0.Heizung.Stufe';
+const MODUS = '0_userdata.0.Heizung.Modus';
+const SOLL = '0_userdata.0.Heizung.Soll';
+const DATUM = '0_userdata.0.Heizung.Datum';
+const ALARM = '0_userdata.0.Heizung.Alarm';
 const HELPER_OBJECTS: Record<string, object> = {
   '0_userdata.0.Heizung': { type: 'folder', common: { name: 'Heizung' } },
   [HELPER]: {
     type: 'state',
     common: { name: 'Vorlauf', role: 'value.temperature', type: 'number', unit: '°C', read: true, write: false },
   },
+  [STUFE]: { type: 'state', common: { name: 'Stufe', role: 'level', type: 'number', read: true, write: true } },
+  [MODUS]: { type: 'state', common: { name: 'Modus', role: 'text', type: 'string', read: true, write: true } },
+  [SOLL]: { type: 'state', common: { name: 'Soll', role: 'level', type: 'number', min: 15, max: 28, read: true, write: true } },
+  [DATUM]: { type: 'state', common: { name: 'Datum', role: 'text', type: 'string', read: true, write: true } },
+  [ALARM]: { type: 'state', common: { name: 'Alarm', role: 'text', type: 'string', read: true, write: true } },
 };
+/** More missing states than one warning lists (Task 13b round 1, m6). */
+const MISSING = Array.from({ length: 21 }, (_, index) => `0_userdata.0.Heizung.Fehlt_${index + 1}`);
 
 const FIXTURE_IDS = [
   ...Object.keys(SENSOR_OBJECTS),
@@ -443,9 +461,16 @@ if (process.env.HOMETILES_INTEGRATION === '1') {
             { stateId: `${SENSOR}.temperature`, domain: 'sensor', name: 'Balkon' },
             { stateId: HELPER, domain: 'number' },
             { stateId: '0_userdata.0.Heizung.Fehlt', domain: 'sensor' },
+            { stateId: STUFE, domain: 'number' },
+            { stateId: MODUS, domain: 'select' },
+            { stateId: SOLL, domain: 'number' },
+            { stateId: DATUM, domain: 'datetime' },
+            { stateId: ALARM, domain: 'datetime', kind: 'time' },
+            ...MISSING.map((stateId) => ({ stateId, domain: 'sensor' })),
           ]);
           await setObjects(harness, { ...SENSOR_OBJECTS, ...HELPER_OBJECTS });
           await harness.states.setStateAsync(HELPER, { val: 41.5, ack: true });
+          await harness.states.setStateAsync(DATUM, { val: '23.09.2026', ack: true });
           panel().on('message', (topic, payload) => {
             if (topic === 'ha/e2e/sensor/vorlauf/state') helperState.push(payload.toString());
           });
@@ -459,6 +484,11 @@ if (process.env.HOMETILES_INTEGRATION === '1') {
             [SENSOR]: 'sensor.balkon',
             [`manual:${SENSOR}.temperature`]: 'sensor.balkon_2',
             [`manual:${HELPER}`]: 'sensor.vorlauf',
+            [`manual:${STUFE}`]: 'number.stufe',
+            [`manual:${MODUS}`]: 'select.modus',
+            [`manual:${SOLL}`]: 'number.soll',
+            [`manual:${DATUM}`]: 'datetime.datum',
+            [`manual:${ALARM}`]: 'datetime.alarm',
           });
           await waitFor(harness, () => helperState.find((payload) => payload === '41.5'), "the helper's value");
         });
@@ -470,15 +500,28 @@ if (process.env.HOMETILES_INTEGRATION === '1') {
           await waitFor(harness, () => helperState.find((payload) => payload === '42'), 'the new value');
         });
 
-        it('names each entry left out once, in one warning, and logs no error', () => {
-          const own = logs.filter((log) => log.message.startsWith('hometiles.0 '));
-          const left = own.filter((log) => log.severity === 'warn' && log.message.includes('Manual entities left out'));
-          expect(left.map((log) => log.message.slice(log.message.indexOf('[Registry]')))).to.deep.equal([
+        /** The adapter's own warnings that contain `text`, from their `[Registry]` tag on. */
+        const warned = (text: string): string[] =>
+          logs
+            .filter((log) => log.message.startsWith('hometiles.0 ') && log.severity === 'warn' && log.message.includes(text))
+            .map((log) => log.message.slice(log.message.indexOf('[Registry]')));
+
+        it('names each entry left out once, the first 20 in one warning, and logs no error', () => {
+          const missing = MISSING.slice(0, 18).map((id) => `${id} (no such object)`);
+          expect(warned('Manual entities left out')).to.deep.equal([
             `[Registry] Manual entities left out: ${HELPER} (listed more than once; the first entry is used), ` +
-              '0_userdata.0.Heizung.Fehlt (no such object)',
+              `0_userdata.0.Heizung.Fehlt (no such object), ${missing.join(', ')}, and 3 more`,
           ]);
-          const errors = own.filter((log) => log.severity === 'error').map((log) => log.message);
+          const errors = logs.filter((log) => log.message.startsWith('hometiles.0 ') && log.severity === 'error').map((log) => log.message);
           expect(errors, errors.join('\n')).to.deep.equal([]);
+        });
+
+        it('names the manual editable values shown read-only, and what each lacks, in one warning (m2)', () => {
+          // The date's reason is its value's; the alarm is editable by its kind.
+          expect(warned('Manual entities shown read-only')).to.deep.equal([
+            `[Registry] Manual entities shown read-only: ${STUFE} (no min/max), ${MODUS} (no states), ` +
+              `${DATUM} (a value that is no date or time)`,
+          ]);
         });
       });
 

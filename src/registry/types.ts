@@ -66,6 +66,9 @@ export type ChannelCodec = Pick<ChannelInput, 'type' | 'states' | 'write' | 'min
   current?: unknown;
 };
 
+/** What a manual datetime's value holds (Ruling 92): Home Assistant's has_date and has_time. */
+export type DatetimeKind = 'date' | 'time' | 'datetime';
+
 /** A device as classified by the detector plus the admin's overrides, or declared by hand (Task 13b). */
 export interface DeviceInput {
   /**
@@ -84,6 +87,12 @@ export interface DeviceInput {
    */
   channels: Record<string, ChannelInput>;
   icon?: string;
+  /**
+   * A manual datetime's declared kind (Ruling 92), for a value that gives
+   * none: ioBroker has no has_date or has_time, so a fresh text helper, null
+   * until something writes it, would otherwise stay read-only.
+   */
+  kind?: DatetimeKind;
 }
 
 export interface VirtualEntity {
@@ -106,6 +115,13 @@ export interface VirtualEntity {
    * reporting success.
    */
   writable?: Record<string, boolean>;
+  /**
+   * Why an editable value (number, select, datetime) is not writable, in
+   * English: what the object lacks, such as "no min/max". Set exactly when
+   * `writable.value` is false, so main.ts can say why a manual entity's tile
+   * is read-only (Task 13b round 1, m2).
+   */
+  readOnly?: string;
   /**
    * Per-channel ChannelCodec (type, states, write flag, bounds, unit, current
    * raw value), keyed by the same channel names as

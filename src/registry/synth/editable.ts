@@ -1,4 +1,4 @@
-import type { ChannelInput, DeviceInput, Domain, VirtualEntity } from '../types';
+import type { ChannelInput, DatetimeKind, DeviceInput, Domain, VirtualEntity } from '../types';
 import { STATE_UNAVAILABLE, STATE_UNKNOWN } from '../types';
 import {
   baseEntity,
@@ -30,10 +30,15 @@ import {
  * (Ruling 89): ioBroker's default is writable, the dispatcher refuses only
  * that (Ruling 38), and a manual entity's channel has no pattern to fill a
  * silent flag in, as detection's has (channelInput).
+ *
+ * Each rule below yields why the value is read-only, in English, or nothing:
+ * `writable.value` is exactly "no reason", and `readOnly` carries the reason,
+ * which main.ts names for a manual entity (Task 13b round 1, m2).
  */
 
 /** Only an explicit `write: false` makes a channel read-only (Ruling 89). */
 const writes = (channel: ChannelInput): boolean => channel.write !== false;
+const READ_ONLY = 'write is false';
 
 /**
  * The one channel an editable entity shows and writes, decided once by which
@@ -87,7 +92,7 @@ function editableEntity(
   read: ValueRead,
   state: string,
   extra: Record<string, unknown>,
-  writable: boolean,
+  readOnly: string | undefined,
 ): VirtualEntity {
   const { source, channelMeta, lastChanged, friendly } = baseEntity(device, entityId, values);
   return {
@@ -98,7 +103,8 @@ function editableEntity(
     attributes: { ...friendly, ...extra },
     available: !read.bad,
     lastChanged,
-    writable: { value: writable },
+    writable: { value: readOnly === undefined },
+    ...(readOnly === undefined ? {} : { readOnly }),
     channelMeta,
   };
 }
@@ -134,23 +140,36 @@ function derivedStep(range: number): number {
  *   object's, even an invalid one, which leaves the number read-only (T81-2).
  * - `step` here is the one source of truth for the panel and for the value
  *   command; channelMeta keeps the step the object declares (T81-4).
+ *
+ * Without one, why not, in words.
  */
-function numberRange(channel: ChannelInput): { min: number; max: number; step: number } | undefined {
-  const bounds = channel.unit?.trim() === '%' ? percentScale(channel) : declaredRange(channel);
-  if (!bounds || !Number.isFinite(bounds.max - bounds.min)) return undefined;
+function numberRange(channel: ChannelInput): { min: number; max: number; step: number } | string {
+  const percent = channel.unit?.trim() === '%';
+  const bounds = percent ? percentScale(channel) : declaredRange(channel);
+  if (!bounds) return percent || (finite(channel.min) && finite(channel.max)) ? 'min not below max' : 'no min/max';
+  if (!Number.isFinite(bounds.max - bounds.min)) return 'range too wide';
   const step = channel.step ?? derivedStep(bounds.max - bounds.min);
-  return finite(step) && step > 0 ? { ...bounds, step } : undefined;
+  return finite(step) && step > 0 ? { ...bounds, step } : 'invalid step';
 }
+
+/** Why a channel of another type cannot hold the value the panel sends. */
+const notOfType = (channel: ChannelInput, types: string): string => `type ${channel.type ?? 'none'}, not ${types}`;
 
 export function synthNumber(device: DeviceInput, entityId: string, values: Values): VirtualEntity | null {
   const read = readValue(device, values);
   if (!read) return null;
   const range = numberRange(read.channel);
-  const extra: Record<string, unknown> = { ...range };
+  const extra: Record<string, unknown> = typeof range === 'string' ? {} : { ...range };
   const unit = read.channel.unit?.trim();
   if (unit) extra.unit_of_measurement = unit;
-  const writable = writes(read.channel) && read.channel.type === 'number' && range !== undefined;
-  return editableEntity('number', device, entityId, values, read, numberToState(read.raw), extra, writable);
+  const readOnly = !writes(read.channel)
+    ? READ_ONLY
+    : read.channel.type !== 'number'
+      ? notOfType(read.channel, 'number')
+      : typeof range === 'string'
+        ? range
+        : undefined;
+  return editableEntity('number', device, entityId, values, read, numberToState(read.raw), extra, readOnly);
 }
 
 /** contract §6/§8: 1 to 64 options (value_control.cpp:92), each 1 to 255 bytes (:97). */
@@ -178,20 +197,23 @@ const MAX_OPTION_BYTES = 255;
  *   confirmation in vain (value_control.cpp:329 compares exactly).
  *
  * A channel neither number- nor string-typed has no single native type to
- * write the raw value as, the rule climate's enumModes follows.
+ * write the raw value as, the rule climate's enumModes follows. Without a
+ * list, why not, in words.
  */
-function selectOptions(channel: ChannelInput): string[] | undefined {
+function selectOptions(channel: ChannelInput): string[] | string {
   const states = channel.states ?? {};
   const labels = Object.values(states);
-  if (channel.type !== 'number' && channel.type !== 'string') return undefined;
-  if (labels.length < 1 || labels.length > MAX_OPTIONS) return undefined;
+  if (channel.type !== 'number' && channel.type !== 'string') return notOfType(channel, 'number or string');
+  if (labels.length < 1) return 'no states';
+  if (labels.length > MAX_OPTIONS) return `more than ${MAX_OPTIONS} states`;
+  const shown = (label: string): boolean => !!label && Buffer.byteLength(label, 'utf8') <= MAX_OPTION_BYTES && !/[\r\n\0]/.test(label);
+  if (!labels.every(shown)) return 'an empty, over-long or multi-line state label';
   const codec = { type: channel.type, states };
-  const valid = labels.every((label) => {
-    if (!label || Buffer.byteLength(label, 'utf8') > MAX_OPTION_BYTES || /[\r\n\0]/.test(label)) return false;
+  const reversible = labels.every((label) => {
     const raw = encodeChannelValue(codec, label);
     return raw !== undefined && states[String(raw)] === label;
   });
-  return valid ? labels : undefined;
+  return reversible ? labels : 'states that do not map one to one';
 }
 
 /**
@@ -204,8 +226,8 @@ export function synthSelect(device: DeviceInput, entityId: string, values: Value
   if (!read) return null;
   const options = selectOptions(read.channel);
   const state = readEnum(device, read.name, values) ?? STATE_UNKNOWN;
-  const writable = writes(read.channel) && options !== undefined;
-  return editableEntity('select', device, entityId, values, read, state, options ? { options } : {}, writable);
+  const readOnly = !writes(read.channel) ? READ_ONLY : typeof options === 'string' ? options : undefined;
+  return editableEntity('select', device, entityId, values, read, state, typeof options === 'string' ? {} : { options }, readOnly);
 }
 
 /** Home Assistant's input_datetime flags, which name the panel's kind. */
@@ -214,7 +236,14 @@ export interface CalendarKind {
   has_time: boolean;
 }
 
-const DATE_TIME: CalendarKind = { has_date: true, has_time: true };
+/** The three kinds, by the names a manual entry declares them with (Ruling 92). */
+const KINDS: Readonly<Record<DatetimeKind, CalendarKind>> = {
+  date: { has_date: true, has_time: false },
+  time: { has_date: false, has_time: true },
+  datetime: { has_date: true, has_time: true },
+};
+const DATE_TIME = KINDS.datetime;
+const kindName = (kind: CalendarKind): DatetimeKind => (kind.has_date && kind.has_time ? 'datetime' : kind.has_date ? 'date' : 'time');
 
 /**
  * The panel's own grammar for a date, a time and both (contract §3,
@@ -222,8 +251,8 @@ const DATE_TIME: CalendarKind = { has_date: true, has_time: true };
  * 'T', then a time.
  */
 const CALENDAR_SHAPES: ReadonlyArray<[RegExp, CalendarKind]> = [
-  [/^(?<y>\d{4})-(?<mo>\d{1,2})-(?<d>\d{1,2})$/, { has_date: true, has_time: false }],
-  [/^(?<h>\d{1,2}):(?<mi>\d{1,2})(?::(?<s>\d{1,2}))?$/, { has_date: false, has_time: true }],
+  [/^(?<y>\d{4})-(?<mo>\d{1,2})-(?<d>\d{1,2})$/, KINDS.date],
+  [/^(?<h>\d{1,2}):(?<mi>\d{1,2})(?::(?<s>\d{1,2}))?$/, KINDS.time],
   [/^(?<y>\d{4})-(?<mo>\d{1,2})-(?<d>\d{1,2})[ T](?<h>\d{1,2}):(?<mi>\d{1,2})(?::(?<s>\d{1,2}))?$/, DATE_TIME],
 ];
 
@@ -287,20 +316,41 @@ export function epochToCalendar(raw: unknown): string | undefined {
  *   shape's. Any other text -- ISO with a zone, a local "23.09.2026" -- is
  *   shown raw, with no kind and read-only: the value command could not write
  *   the panel's answer back in that shape.
+ * - A manual entry's declared kind (Ruling 92) stands in for a text that
+ *   gives none, null or empty, so a fresh helper can be set at all. A value
+ *   of another kind than declared is read-only, and so is an epoch number
+ *   declared a date or a time alone: the value decides, never the entry.
  */
 export function synthDatetime(device: DeviceInput, entityId: string, values: Values): VirtualEntity | null {
   if (device.domain !== 'datetime') return null;
   const read = readValue(device, values);
   if (!read) return null;
   const { type } = read.channel;
+  const declared = device.kind;
   if (type === 'number') {
     const text = epochToCalendar(read.raw);
     // No value yet is a date still to be set (Ruling 88); a number that is no date is not.
-    const writable = writes(read.channel) && (!read.usable || text !== undefined);
-    return editableEntity('datetime', device, entityId, values, read, text ?? String(read.raw), { ...DATE_TIME }, writable);
+    const readOnly = !writes(read.channel)
+      ? READ_ONLY
+      : declared !== undefined && declared !== 'datetime'
+        ? `an epoch number is a date and time, declared kind ${declared}`
+        : read.usable && text === undefined
+          ? 'a number that is no epoch-ms date'
+          : undefined;
+    return editableEntity('datetime', device, entityId, values, read, text ?? String(read.raw), { ...DATE_TIME }, readOnly);
   }
   const text = read.usable ? String(read.raw).trim() : '';
-  const kind = typeof read.raw === 'string' ? calendarKind(text) : undefined;
-  const writable = writes(read.channel) && type === 'string' && kind !== undefined;
-  return editableEntity('datetime', device, entityId, values, read, text || STATE_UNKNOWN, { ...kind }, writable);
+  const kind = text ? (typeof read.raw === 'string' ? calendarKind(text) : undefined) : declared && KINDS[declared];
+  const readOnly = !writes(read.channel)
+    ? READ_ONLY
+    : type !== 'string'
+      ? notOfType(read.channel, 'string or number')
+      : !kind
+        ? text
+          ? 'a value that is no date or time'
+          : 'no value, and no kind declared'
+        : declared !== undefined && kindName(kind) !== declared
+          ? `a ${kindName(kind)} value, declared kind ${declared}`
+          : undefined;
+  return editableEntity('datetime', device, entityId, values, read, text || STATE_UNKNOWN, { ...kind }, readOnly);
 }

@@ -12,7 +12,7 @@ import {
 import { discoverDevices, type Discovery, type RootAnchors } from './registry/detector';
 import { parseStringMap } from './registry/entity-id';
 import { EntityRegistry } from './registry/entity-registry';
-import { manualDevices } from './registry/manual';
+import { listed, manualDevices } from './registry/manual';
 import { applyOverrides } from './registry/overrides';
 import { synthesise } from './registry/synth/index';
 import type { DeviceInput, SourceValue, VirtualEntity } from './registry/types';
@@ -326,7 +326,7 @@ class HomeTiles extends utils.Adapter {
     const manual = manualDevices(this.options.manualEntities, objects, this.namespace);
     if (manual.rejected.length > 0) {
       const rejected = manual.rejected.map(({ stateId, reason }) => `${stateId} (${reason})`);
-      this.log.warn(`[Registry] Manual entities left out: ${rejected.join(', ')}`);
+      this.log.warn(`[Registry] Manual entities left out: ${listed(rejected)}`);
     }
     // Overrides are for detected devices; a manual entity is already explicit
     // (Task 13b). After the detected ones, it never takes an id one of them
@@ -372,6 +372,16 @@ class HomeTiles extends utils.Adapter {
       this.log.warn(`[Registry] Could not read the value of ${unread.join(', ')}; unavailable until it changes`);
     }
     this.registry.flush();
+
+    // A manual number, select or datetime the panel cannot edit, and what its
+    // object lacks: the tile alone would never say (Task 13b round 1, m2). A
+    // datetime's case depends on its value, so this follows the seeding.
+    const readOnly = manual.devices.flatMap((device) => {
+      const why = this.registry.byId(result.entityIds[device.objectId] ?? '')?.readOnly;
+      const [state] = Object.values(device.channels);
+      return why === undefined || !state ? [] : [`${state.objectId} (${why})`];
+    });
+    if (readOnly.length > 0) this.log.warn(`[Registry] Manual entities shown read-only: ${listed(readOnly)}`);
 
     // Only a panel that was given a configuration is told an entity left it
     // (Ruling 56).

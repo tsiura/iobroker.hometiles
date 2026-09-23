@@ -1,3 +1,4 @@
+import { MAX_ENTITY_ID_LENGTH } from '../registry/entity-id';
 import { ALLOWED_PRESET_MODES } from './climate';
 
 export type ServiceCall =
@@ -49,12 +50,7 @@ export class CommandError extends Error {
 }
 
 const MAX_SCENE_ALIAS_LENGTH = 128;
-/**
- * Home Assistant entity ids are far shorter than this; the cap exists for the
- * same reason the scene alias has one. Every field crossing this boundary is
- * untrusted, so none of them may be unbounded.
- */
-const MAX_ENTITY_ID_LENGTH = 255;
+// MAX_ENTITY_ID_LENGTH is the registry's: every id it derives fits it (Task 13b round 1, m4).
 const ENTITY_ID_RE = /^[a-z_]+\.[a-z0-9_]+$/;
 
 function parseObject(raw: string): Record<string, unknown> {

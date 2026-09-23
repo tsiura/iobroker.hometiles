@@ -15,13 +15,31 @@ function sourceSlug(source: string): string {
   return slugify(tail);
 }
 
+/**
+ * The longest entity id a panel command may carry (protocol/commands.ts
+ * requireEntityId). Home Assistant's are far shorter; the cap exists because
+ * every field crossing that boundary is untrusted, so none may be unbounded.
+ */
+export const MAX_ENTITY_ID_LENGTH = 255;
+
+/** The longest suffix uniqueId appends, `_9999`. */
+const SUFFIX_ROOM = '_9999'.length;
+
+/**
+ * A new id, cut to leave room for any suffix, so that `<domain>.<slug>_<n>`
+ * stays one a command can address: a 300-character name made a 307-character
+ * id that refused every command (Task 13b round 1, m4). The cut never leaves
+ * a trailing separator. Only new ids pass here: a persisted one is kept as it
+ * is (resolveEntityIds' first pass).
+ */
 function uniqueId(base: string, taken: ReadonlySet<string>): string {
-  if (!taken.has(base)) return base;
+  const root = base.slice(0, MAX_ENTITY_ID_LENGTH - SUFFIX_ROOM).replace(/_+$/, '');
+  if (!taken.has(root)) return root;
   for (let suffix = 2; suffix < 10000; suffix++) {
-    const candidate = `${base}_${suffix}`;
+    const candidate = `${root}_${suffix}`;
     if (!taken.has(candidate)) return candidate;
   }
-  throw new Error(`cannot allocate an entity id for ${base}`);
+  throw new Error(`cannot allocate an entity id for ${root}`);
 }
 
 /** Derives an id from an OBJECT ID, whose last dot-separated segment is the name. */

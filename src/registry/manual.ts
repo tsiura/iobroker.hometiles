@@ -10,7 +10,8 @@ import type { DeviceInput, Domain } from './types';
  *   binary_sensor's.
  * - binary_sensor (toBoolState): a boolean, a number (0 is off), an on/off text.
  * - switch, scene: the dispatcher writes true and false raw, as a socket's and
- *   a button's SET take them (typePatterns.js: both Boolean).
+ *   a button's SET take them (typePatterns.js: both Boolean), so neither
+ *   takes a state whose write is false: every press would act on nothing.
  * - number (synthNumber): a number.
  * - select (selectOptions): a number's or a text's states map.
  * - datetime: a date or time text; an epoch-ms number is synthDatetime's to
@@ -52,7 +53,11 @@ function servable(
   // namespace out too.
   if (stateId.startsWith(`${ownNamespace}.`)) return "the adapter's own state";
   const info = objectMeta(stateId, obj);
-  return types.includes(info.type ?? 'mixed') ? info : `${domain} cannot use a state of type ${info.type ?? 'mixed (none declared)'}`;
+  if (!types.includes(info.type ?? 'mixed')) return `${domain} cannot use a state of type ${info.type ?? 'mixed (none declared)'}`;
+  // Only an explicit false (Ruling 38): no write flag at all stays writable.
+  if (info.write === false && domain === 'switch') return 'switch cannot use a read-only state (write false); declare it as binary_sensor';
+  if (info.write === false && domain === 'scene') return 'scene cannot use a read-only state (write false)';
+  return info;
 }
 
 /**
@@ -68,7 +73,8 @@ function servable(
  * root's further controls by their own state, and a manual entity on that
  * state must keep an id of its own (and its own persisted one) beside the
  * detected entity's. Entries are rejected, never thrown on: the first entry
- * of a state id decides, and a later one is reported once.
+ * of a state id decides, and a later one is reported once. A datetime keeps
+ * its declared kind (Ruling 92); no other domain has one.
  */
 export function manualDevices(
   entries: readonly ManualEntity[],
@@ -78,17 +84,23 @@ export function manualDevices(
   const devices: DeviceInput[] = [];
   const rejected: ManualDevices['rejected'] = [];
   const seen = new Set<string>();
-  for (const { stateId, domain, name } of entries) {
+  // Each state reported once, by one Set lookup: scanning the reports for
+  // every duplicate took half a second at 40,000 entries (m6).
+  const reported = new Set<string>();
+  const reject = (stateId: string, reason: string): void => {
+    if (reported.has(stateId)) return;
+    reported.add(stateId);
+    rejected.push({ stateId, reason });
+  };
+  for (const { stateId, domain, name, kind } of entries) {
     if (seen.has(stateId)) {
-      if (!rejected.some((entry) => entry.stateId === stateId)) {
-        rejected.push({ stateId, reason: 'listed more than once; the first entry is used' });
-      }
+      reject(stateId, 'listed more than once; the first entry is used');
       continue;
     }
     seen.add(stateId);
     const info = servable(stateId, domain, objects, ownNamespace);
     if (typeof info === 'string') {
-      rejected.push({ stateId, reason: info });
+      reject(stateId, info);
       continue;
     }
     const channel = channelInput(stateId, info);
@@ -101,7 +113,17 @@ export function manualDevices(
       channels: { [reads]: channel },
     };
     if (info.icon) device.icon = info.icon;
+    if (domain === 'datetime' && kind) device.kind = kind;
     devices.push(device);
   }
   return { devices, rejected };
+}
+
+/** How many entries one log line names (m6). */
+const LISTED = 20;
+
+/** Log items as one bounded line: the first 20, then how many more (m6). */
+export function listed(items: readonly string[]): string {
+  const more = items.length - LISTED;
+  return items.slice(0, LISTED).join(', ') + (more > 0 ? `, and ${more} more` : '');
 }

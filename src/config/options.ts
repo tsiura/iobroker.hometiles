@@ -1,3 +1,5 @@
+import type { DatetimeKind } from '../registry/types';
+
 export interface AdapterOptions {
   brokerHost: string;
   brokerPort: number;
@@ -25,7 +27,11 @@ export interface ManualEntity {
   /** Text as the admin stores it: manualDevices rejects anything but a domain one state can serve. */
   domain: string;
   name?: string;
+  /** A datetime's kind, for a value that gives none (Ruling 92); other domains ignore it. */
+  kind?: DatetimeKind;
 }
+
+const DATETIME_KINDS: readonly string[] = ['date', 'time', 'datetime'];
 
 export interface DeviceOverride {
   /**
@@ -119,14 +125,21 @@ function manualEntities(value: unknown, warnings: string[]): ManualEntity[] {
       warnings.push(`manualEntities entry ${index + 1} names no state id; ignoring it`);
       return;
     }
-    const where = `manualEntities entry ${index + 1} (${entry.stateId})`;
+    // No object picker leaves spaces around an id; a hand edit can (m5).
+    const stateId = entry.stateId.trim();
+    const where = `manualEntities entry ${index + 1} (${stateId})`;
     if (typeof entry.domain !== 'string') {
       warnings.push(`${where} names no domain; ignoring it`);
       return;
     }
-    const kept: ManualEntity = { stateId: entry.stateId, domain: entry.domain };
+    const kept: ManualEntity = { stateId, domain: entry.domain };
     if (typeof entry.name === 'string') kept.name = entry.name;
     else if (entry.name !== undefined && entry.name !== null) warnings.push(`${where} has a name that is not text; ignoring the name`);
+    // An empty kind is an admin select's "none"; a wrong one costs the kind, not the entry.
+    if (typeof entry.kind === 'string' && DATETIME_KINDS.includes(entry.kind)) kept.kind = entry.kind as DatetimeKind;
+    else if (entry.kind !== undefined && entry.kind !== null && entry.kind !== '') {
+      warnings.push(`${where} has a kind that is not date, time or datetime; ignoring the kind`);
+    }
     entries.push(kept);
   });
   return entries;

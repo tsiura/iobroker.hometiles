@@ -79,10 +79,12 @@ describe('config/options', () => {
         { domain: 'sensor' },
         { stateId: '   ', domain: 'sensor' },
         { stateId: 5, domain: 'sensor' },
-        { stateId: '0_userdata.0.Haus.Notiz', domain: 7 },
+        { stateId: ' 0_userdata.0.Haus.Notiz', domain: 7 },
         { stateId: '0_userdata.0.Wecker.Aktiv', domain: 'switch', name: 3 },
         { stateId: '0_userdata.0.Haus.Anwesend', domain: 'binary_sensor', name: null, extra: true },
         { stateId: '0_userdata.0.Haus.Licht', domain: 'light' },
+        // No picker leaves spaces around an id; a hand edit can (m5).
+        { stateId: '  0_userdata.0.Haus.Relais \t', domain: 'switch' },
       ],
     } as unknown as Partial<AdapterOptions>;
     const { options, warnings } = validateOptions(raw);
@@ -91,6 +93,7 @@ describe('config/options', () => {
       { stateId: '0_userdata.0.Wecker.Aktiv', domain: 'switch' },
       { stateId: '0_userdata.0.Haus.Anwesend', domain: 'binary_sensor' },
       { stateId: '0_userdata.0.Haus.Licht', domain: 'light' },
+      { stateId: '0_userdata.0.Haus.Relais', domain: 'switch' },
     ]);
     expect(warnings).to.deep.equal([
       'manualEntities entry 2 names no state id; ignoring it',
@@ -100,6 +103,31 @@ describe('config/options', () => {
       'manualEntities entry 6 names no state id; ignoring it',
       'manualEntities entry 7 (0_userdata.0.Haus.Notiz) names no domain; ignoring it',
       'manualEntities entry 8 (0_userdata.0.Wecker.Aktiv) has a name that is not text; ignoring the name',
+    ]);
+  });
+
+  it("keeps a datetime entry's kind when it is date, time or datetime, and drops any other with a warning, never the entry (Ruling 92)", () => {
+    const raw = {
+      manualEntities: [
+        { stateId: '0_userdata.0.Wecker.Alarm', domain: 'datetime', kind: 'time' },
+        { stateId: '0_userdata.0.Wecker.Tag', domain: 'datetime', kind: 'day' },
+        { stateId: '0_userdata.0.Wecker.Termin', domain: 'datetime', kind: 3 },
+        // An admin select's empty choice, or a cleared hand edit: no kind.
+        { stateId: '0_userdata.0.Wecker.Zuletzt', domain: 'datetime', kind: '' },
+        { stateId: '0_userdata.0.Wecker.Naechster', domain: 'datetime', kind: null },
+      ],
+    } as unknown as Partial<AdapterOptions>;
+    const { options, warnings } = validateOptions(raw);
+    expect(options.manualEntities).to.deep.equal([
+      { stateId: '0_userdata.0.Wecker.Alarm', domain: 'datetime', kind: 'time' },
+      { stateId: '0_userdata.0.Wecker.Tag', domain: 'datetime' },
+      { stateId: '0_userdata.0.Wecker.Termin', domain: 'datetime' },
+      { stateId: '0_userdata.0.Wecker.Zuletzt', domain: 'datetime' },
+      { stateId: '0_userdata.0.Wecker.Naechster', domain: 'datetime' },
+    ]);
+    expect(warnings).to.deep.equal([
+      'manualEntities entry 2 (0_userdata.0.Wecker.Tag) has a kind that is not date, time or datetime; ignoring the kind',
+      'manualEntities entry 3 (0_userdata.0.Wecker.Termin) has a kind that is not date, time or datetime; ignoring the kind',
     ]);
   });
 });

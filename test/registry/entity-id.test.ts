@@ -1,4 +1,5 @@
 import { expect } from 'chai';
+import { requireEntityId } from '../../src/protocol/commands';
 import { buildEntityId, parseStringMap, resolveEntityIds, slugify } from '../../src/registry/entity-id';
 import type { DeviceInput } from '../../src/registry/types';
 
@@ -119,6 +120,25 @@ describe('registry/entity-id', () => {
       { 'zigbee.0.abc.state': 'switch.flur', 'manual:zigbee.0.abc.state': 'switch.flur' },
     );
     expect(resolved).to.deep.equal({ 'zigbee.0.abc.state': 'switch.flur', 'manual:zigbee.0.abc.state': 'switch.flur_2' });
+  });
+
+  it('keeps a derived id within the 255 characters a command may carry, suffix included, and never cuts a stored one (m4)', () => {
+    // A 300-character name, detected or typed into a manual entry. The cut
+    // lands on a separator, which does not stay at the end.
+    const name = 'Zu '.repeat(100);
+    expect(name).to.have.length(300);
+    const resolved = resolveEntityIds([device('zigbee.0.a', name), device('zigbee.0.b', name)], {});
+    expect(resolved['zigbee.0.a']).to.equal(`switch.${'zu_'.repeat(80)}zu`);
+    expect(resolved['zigbee.0.b']).to.equal(`switch.${'zu_'.repeat(80)}zu_2`);
+    // Room for the longest suffix, `_9999`, and the command parser takes each.
+    expect(resolved['zigbee.0.a']!.length + '_9999'.length).to.be.at.most(255);
+    for (const id of Object.values(resolved)) expect(requireEntityId({ entity_id: id })).to.equal(id);
+    // No name: the object id's own tail, as long.
+    const tail = resolveEntityIds([device(`zigbee.0.${'x'.repeat(300)}`, '')], {});
+    expect(Object.values(tail)[0]).to.equal(`switch.${'x'.repeat(243)}`);
+    // A stored id is the panel's, and is kept as it is (the first pass).
+    const stored = `switch.${'x'.repeat(300)}`;
+    expect(resolveEntityIds([device('zigbee.0.a', name)], { 'zigbee.0.a': stored })).to.deep.equal({ 'zigbee.0.a': stored });
   });
 
   it('falls back to the object id tail when the device has no name', () => {
