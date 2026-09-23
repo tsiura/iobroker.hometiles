@@ -1,7 +1,7 @@
 import type { ServiceCall } from '../protocol/commands';
 import type { Domain, VirtualEntity } from '../registry/types';
 import { STATE_OFF, STATE_ON } from '../registry/types';
-import { encodeChannelValue, fromPercent, roleCodec, withinDeclaredRange } from '../registry/synth/common';
+import { encodeChannelValue, fromPercent, percentScale, roleCodec, withinDeclaredRange } from '../registry/synth/common';
 import type { Logger } from './mqtt-client';
 
 export type StateWriter = (objectId: string, value: unknown) => Promise<void>;
@@ -180,25 +180,28 @@ export class Dispatcher {
     };
 
     /**
-     * Ruling 49: every numeric command -- setpoint, humidity, cover position
-     * and tilt, light brightness -- goes through here. A panel percentage
-     * (position, tilt, brightness) is scaled into the channel's declared
-     * range, the same map the synth publishes with; any value outside a
-     * declared bound refuses the WHOLE call below, never clamped: clamping
-     * would write something other than what was asked and still report
-     * success.
+     * Ruling 49: every numeric command -- setpoint, humidity, colour
+     * temperature, cover position and tilt, light brightness -- goes through
+     * here. A panel percentage (position, tilt, brightness) must be 0..100 and
+     * is scaled into the channel's range, the same map the synth publishes
+     * with; an absolute value must lie inside the channel's declared bounds
+     * (Ruling 55's declaredBounds). Anything else refuses the WHOLE call
+     * below, never clamped: clamping would write something other than what
+     * was asked and still report success.
      */
     let outOfRange = false;
     const pushNumber = (channel: string | undefined, value: number, percent: boolean): void => {
       if (!channel) return;
       const codec = entity.channelMeta?.[channel];
-      const raw = percent ? fromPercent(value, codec) : value;
-      if (!withinDeclaredRange(raw, codec)) {
-        this.log.warn(`[Command] ${raw} is outside the declared range of ${channel} on ${entity.entityId}`);
+      if (percent ? value < 0 || value > 100 : !withinDeclaredRange(value, codec)) {
+        this.log.warn(`[Command] ${value} is outside the range of ${channel} on ${entity.entityId}`);
         outOfRange = true;
         return;
       }
-      push(channel, raw);
+      // A percentage channel whose bounds cannot be scaled is never
+      // advertised (Ruling 55), so nothing lands on it.
+      const raw = percent ? fromPercent(value, codec) : value;
+      if (raw !== undefined) push(channel, raw);
     };
     const pushRoleNumber = (role: string, channels: readonly string[], value: number, percent: boolean): void =>
       pushNumber(resolveChannel(role, channels), value, percent);
@@ -267,15 +270,30 @@ export class Dispatcher {
         // never both (see registry/synth/light.ts). Writing unconditionally
         // to 'dimmer' left a BRIGHTNESS-only bulb's slider with no channel to
         // write to at all.
+        //
+        // Ruling 54: a light whose level cannot take a brightness -- none,
+        // read-only, or bounds a percentage cannot scale over -- still takes
+        // "on", colour and CT. The panel draws a brightness slider for every
+        // colour mode, and both that slider and the power button send the
+        // brightness together with "on" (light_popup.cpp:1167-1180, and
+        // :1021-1038 via :1664-1684), so refusing the call would stop them
+        // switching the light on at all. v0.1's partial success instead: the
+        // brightness alone is skipped, out loud -- M3's defect was the silence.
         if (call.brightnessPct !== undefined) {
-          pushNumber(entity.source.dimmer ? 'dimmer' : 'brightness', call.brightnessPct, true);
+          const level = entity.source.dimmer ? 'dimmer' : entity.source.brightness ? 'brightness' : undefined;
+          const codec = level === undefined ? undefined : entity.channelMeta?.[level];
+          const skip = (why: string): void => this.log.warn(`[Command] Skipping the brightness of ${entity.entityId}: ${why}`);
+          if (level === undefined) skip('the light has no level channel');
+          else if (codec?.write === false) skip(`${level} is read-only`);
+          else if (!percentScale(codec)) skip(`${level} declares no usable range`);
+          else pushNumber(level, call.brightnessPct, true);
         }
         if (call.rgb) {
           push('red', call.rgb[0]);
           push('green', call.rgb[1]);
           push('blue', call.rgb[2]);
         }
-        if (call.kelvin !== undefined) push('temperature', call.kelvin);
+        if (call.kelvin !== undefined) pushNumber('temperature', call.kelvin, false);
         break;
       }
       case 'set_temperature':
@@ -360,8 +378,10 @@ export class Dispatcher {
     }
 
     // Nothing lands when any requested value was out of range: a range with
-    // one bound written, or "on" without the asked-for brightness, would
-    // report success for a command that did not happen as asked.
+    // one bound written, or "on" without the asked-for colour temperature,
+    // would report success for a command that did not happen as asked. (A
+    // brightness the light cannot take at all is a different case, skipped
+    // out loud above -- Ruling 54.)
     if (outOfRange) return { writes: [], failureReason: 'value_out_of_range' };
     return { writes, failureReason };
   }

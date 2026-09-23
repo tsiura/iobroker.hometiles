@@ -1,6 +1,6 @@
 import type { ChannelInput, DeviceInput, VirtualEntity } from '../types';
 import { STATE_OFF, STATE_ON, STATE_UNAVAILABLE, STATE_UNKNOWN } from '../types';
-import { baseEntity, isUsable, readChannel, toBoolState, toPercent, type Values } from './common';
+import { baseEntity, isUsable, percentScale, readChannel, toBoolState, toPercent, type Values } from './common';
 
 /**
  * The two steady Cover states this synth can derive on its own. blinds/
@@ -48,12 +48,24 @@ function readBool(device: DeviceInput, name: string, values: Values): boolean | 
 
 /**
  * A position channel's reading as the panel's percentage, in that channel's
- * OWN declared range (Ruling 49): raw 200 of a 0..255 blind is ~78%, never
- * 200, which the firmware would clamp to fully open.
+ * OWN declared range (Ruling 49): raw 200 of a 0..255 blind is 78%, never
+ * 200, which the firmware would clamp to fully open. None for a channel whose
+ * bounds cannot be scaled (Ruling 55).
+ *
+ * Published as the nearest WHOLE percent (round 2, N1): the firmware's
+ * read_int truncates a fraction (item.as<int>(), cover/renderer.cpp:57), so a
+ * write of 75% landing as raw 191 of 255 (74.9%) came back as 74 -- the 75%
+ * preset never highlighted -- and on most ranges positions drifted down by
+ * one. The state below is derived from this same number, so raw 1 of 255
+ * (0.4%) is 0% AND closed: the panel disables Close at 0 (cover_popup.cpp:
+ * 446-449), which is right for a closed cover and was wrong for one it called
+ * open.
  */
 function readPercent(device: DeviceInput, name: string, values: Values): number | undefined {
   const raw = readNumber(device, name, values);
-  return raw === undefined ? undefined : toPercent(raw, device.channels[name]);
+  const percent = raw === undefined ? undefined : toPercent(raw, device.channels[name]);
+  // `|| 0`: a raw value just below min rounds to -0, which must publish as 0.
+  return percent === undefined ? undefined : Math.round(percent) || 0;
 }
 
 /**
@@ -68,6 +80,15 @@ function readPosition(device: DeviceInput, actualName: string, setName: string, 
 
 function setWritable(writable: Record<string, boolean>, role: string, channel: ChannelInput | undefined): void {
   if (channel) writable[role] = channel.write === true;
+}
+
+/**
+ * A percentage control (position, tilt) is commandable only over bounds it
+ * can be scaled to (Ruling 55): equal or inverted ones would put up a slider
+ * that refuses almost everything, so the control is withheld instead.
+ */
+function setPercentWritable(writable: Record<string, boolean>, role: string, channel: ChannelInput | undefined): void {
+  if (channel) writable[role] = channel.write === true && percentScale(channel) !== undefined;
 }
 
 type SetChannelKind = 'position' | 'toggle' | 'neither';
@@ -195,11 +216,11 @@ export function synthCover(device: DeviceInput, entityId: string, values: Values
   const currentTilt = readPosition(device, 'tilt_actual', 'tilt_set', values);
   if (currentTilt !== undefined) attributes.current_tilt_position = currentTilt;
 
-  if (setKind === 'position') setWritable(writable, 'position', device.channels.set);
+  if (setKind === 'position') setPercentWritable(writable, 'position', device.channels.set);
   setWritable(writable, 'open', device.channels.open);
   setWritable(writable, 'close', device.channels.close);
   setWritable(writable, 'stop', device.channels.stop);
-  setWritable(writable, 'tilt_position', device.channels.tilt_set);
+  setPercentWritable(writable, 'tilt_position', device.channels.tilt_set);
   setWritable(writable, 'tilt_open', device.channels.tilt_open);
   setWritable(writable, 'tilt_close', device.channels.tilt_close);
   setWritable(writable, 'tilt_stop', device.channels.tilt_stop);

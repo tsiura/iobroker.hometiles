@@ -281,6 +281,18 @@ describe('registry/synth/climate', () => {
       expect(e?.available).to.equal(false);
       expect(e?.state).to.equal('unavailable');
     });
+
+    it('publishes nothing for equal or inverted bounds, which mean nothing for an absolute value (Ruling 55)', () => {
+      // Published, they would also trip the firmware's own fallback to 7..35
+      // (tile_renderer.cpp:2274-2277), while the dispatcher checked them.
+      for (const [min, max] of [
+        [20, 20],
+        [30, 5],
+      ]) {
+        const attributes = withSetpoints({ set: setpoint('set', min, max) })?.attributes;
+        expect(attributes, `${min}..${max}`).to.not.have.any.keys('min_temp', 'max_temp');
+      }
+    });
   });
 
   it('dispatches to synthClimate through synthesise, including its null result', () => {

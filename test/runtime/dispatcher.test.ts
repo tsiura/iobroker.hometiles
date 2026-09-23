@@ -965,6 +965,25 @@ describe('runtime/dispatcher', () => {
         expect(await d.dispatch({ kind: 'set_humidity', entityId: 'climate.ac', value: 55 })).to.deep.equal({ ok: true, writes: 1 });
         expect(writes).to.deep.equal([['zig.0.ac.humidity', 55]]);
       });
+
+      // Round 1 took these literally and refused (almost) every setpoint.
+      // Ruling 55: an equal or inverted pair means nothing for an absolute
+      // value, so it is neither published nor checked.
+      it('ignores equal or inverted setpoint bounds: nothing published, nothing refused (Ruling 55)', async () => {
+        for (const [min, max] of [
+          [20, 20],
+          [30, 5],
+        ] as const) {
+          const rt = thermostat({ set: setpoint('rt.0.set', min, max) });
+          expect(JSON.parse(buildClimatePayload(rt)), `${min}..${max}`).to.not.have.any.keys('min_temp', 'max_temp');
+          const d = new Dispatcher(lookup([rt]), write, silentLog);
+          writes = [];
+          expect(await d.dispatch({ kind: 'set_temperature', entityId: 'climate.rt', value: 21 }), `${min}..${max}`).to.deep.equal({
+            ok: true,
+            writes: 1,
+          });
+        }
+      });
     });
   });
 
@@ -1246,7 +1265,8 @@ describe('runtime/dispatcher', () => {
         { 'cover.0.set': at(200), 'cover.0.tilt_set': at(51) },
       );
       const published = JSON.parse(buildCoverPayload(wide)) as Record<string, unknown>;
-      expect(published).to.include({ current_position: (200 * 100) / 255, current_tilt_position: 20 });
+      // 78.43...% goes out as 78: the firmware would truncate it (round 2, N1).
+      expect(published).to.include({ current_position: 78, current_tilt_position: 20 });
       expect(await send(wide, 'set_cover_position', { position: 50 })).to.deep.equal({ ok: true, writes: 1 });
       expect(writes).to.deep.equal([['cover.0.set', 128]]);
       expect(await send(wide, 'set_cover_tilt_position', { tilt_position: 100 })).to.deep.equal({ ok: true, writes: 1 });
@@ -1258,21 +1278,75 @@ describe('runtime/dispatcher', () => {
       expect(writes).to.deep.equal([['cover.0.set', 37]]);
     });
 
-    it('refuses, never clamps, a position above a one-sided declared maximum', async () => {
-      // One bound is no range to scale over and none is invented, so the
-      // percentage passes through unscaled -- and 80 is above the maximum 50.
-      const capped = coverOf({ set: { ...level('set'), max: 50 } });
-      expect(await send(capped, 'set_cover_position', { position: 80 })).to.deep.equal({
-        ok: false,
-        reason: 'value_out_of_range',
-        applied: 0,
-      });
+    // Round 1 passed a one-sided range through unscaled, so this blind took
+    // 80% as raw 80 -- over its maximum -- and refused it. Ruling 55: a
+    // percentage's missing min is 0, so the range is 0..255 and 50% is 128.
+    it('scales a max-only 255 position from a floor of 0 (Ruling 55)', async () => {
+      const maxOnly = coverOf({ set: { ...level('set'), max: 255 } }, { 'cover.0.set': at(128) });
+      expect((JSON.parse(buildCoverPayload(maxOnly)) as Record<string, unknown>).current_position).to.equal(50);
+      expect(await send(maxOnly, 'set_cover_position', { position: 50 })).to.deep.equal({ ok: true, writes: 1 });
+      expect(writes).to.deep.equal([['cover.0.set', 128]]);
+    });
+
+    it('refuses a percentage outside 0..100 at the dispatcher itself, not only in the parser', async () => {
+      // The parser refuses one first (requirePercent); this pins the
+      // dispatcher's own check, which would otherwise scale 150% of 0..255
+      // to 383 and write it.
+      const wide = coverOf({ set: { ...level('set'), min: 0, max: 255 } });
+      const d = new Dispatcher(lookup([wide]), write, silentLog);
+      for (const value of [150, -1]) {
+        expect(await d.dispatch({ kind: 'set_cover_position', entityId: 'cover.test', value }), String(value)).to.deep.equal({
+          ok: false,
+          reason: 'value_out_of_range',
+          applied: 0,
+        });
+      }
       expect(writes).to.deep.equal([]);
-      expect(await send(capped, 'set_cover_position', { position: 40 })).to.deep.equal({ ok: true, writes: 1 });
+    });
+
+    it('withholds a position whose bounds are equal or inverted, and takes no command for it (Ruling 55)', async () => {
+      for (const bounds of [{ min: 40, max: 40 }, { min: 255, max: 0 }]) {
+        const odd = coverOf({ set: { ...level('set'), ...bounds } }, { 'cover.0.set': at(40) });
+        const features = (JSON.parse(buildCoverPayload(odd)) as { supported_features: number }).supported_features;
+        expect(features & 4, `${JSON.stringify(bounds)}: SET_POSITION`).to.equal(0);
+        expect(await send(odd, 'set_cover_position', { position: 50 }), JSON.stringify(bounds)).to.deep.equal({
+          ok: false,
+          reason: 'no_writable_channel',
+          applied: 0,
+        });
+        expect(writes).to.deep.equal([]);
+      }
+    });
+
+    // Round 2, N1: what the panel is shown for a position must be what it
+    // sent. Through the real dispatcher and the real synth, for every whole
+    // percent over a sweep of declared ranges -- including 0.1..0.3, whose
+    // 100% overshot max by float error before N2.
+    it('publishes back exactly the percent it wrote, for every percent over a sweep of ranges', async () => {
+      const mins = [0, 1, 10, -50, 0.1, 3.7];
+      const maxes = [0.3, 1, 10, 50, 99, 100, 101, 254, 255, 1000, 65535];
+      let ranges = 0;
+      for (const min of mins) {
+        for (const max of maxes.filter((candidate) => candidate > min)) {
+          ranges++;
+          const set = { ...level('set'), min, max };
+          const d = new Dispatcher(lookup([coverOf({ set })]), write, silentLog);
+          for (let percent = 0; percent <= 100; percent++) {
+            writes = [];
+            await d.dispatch({ kind: 'set_cover_position', entityId: 'cover.test', value: percent });
+            const landed = writes[0]?.[1];
+            expect(landed, `${min}..${max} at ${percent}%`).to.be.a('number');
+            const shown = coverOf({ set }, { 'cover.0.set': at(landed) }).attributes.current_position;
+            expect(shown, `${min}..${max} at ${percent}% (raw ${String(landed)})`).to.equal(percent);
+          }
+        }
+      }
+      expect(ranges, 'ranges swept').to.be.greaterThan(50);
     });
   });
 
   describe('lights: declared ranges and advertised controls (Task 8 round 1)', () => {
+    const at = (val: unknown): SourceValue => ({ val, ack: true, q: 0, ts: 1 });
     const power: ChannelInput = { objectId: 'l.0.on', type: 'boolean', write: true };
     const channel = (name: string, over: Partial<ChannelInput> = {}): ChannelInput => ({
       objectId: `l.0.${name}`,
@@ -1296,21 +1370,116 @@ describe('runtime/dispatcher', () => {
       }
     });
 
-    it('refuses the whole command, power included, when its brightness falls outside the declared range', async () => {
+    // Round 1 refused this whole command: a one-sided 60 passed 80% through
+    // unscaled. Ruling 55: the percentage's missing min is 0, so 80% of 0..60
+    // is 48, and it lands with the power.
+    it('scales a max-only brightness from a floor of 0 (Ruling 55)', async () => {
       const d = new Dispatcher(lookup([lightOf({ brightness: channel('level', { max: 60 }) })]), write, silentLog);
       expect(await d.dispatch({ kind: 'set_light', entityId: 'light.l', state: 'on', brightnessPct: 80 })).to.deep.equal({
-        ok: false,
-        reason: 'value_out_of_range',
-        applied: 0,
+        ok: true,
+        writes: 2,
       });
-      expect(writes).to.deep.equal([]);
+      expect(writes).to.deep.equal([
+        ['l.0.on', true],
+        ['l.0.level', 48],
+      ]);
+    });
+
+    // Ruling 54: the panel draws a brightness slider for any colour or CT
+    // mode, and both the slider and the power button send the brightness
+    // along with "on" (light_popup.cpp:1167-1180, :1021-1038). A light whose
+    // level cannot take it still switches on and takes its colour; the
+    // brightness is skipped out loud, never silently.
+    describe('a brightness the light cannot take (Ruling 54)', () => {
+      const cases: Array<[string, DeviceInput['channels'], string]> = [
+        ['no level at all', {}, 'no level channel'],
+        ['a read-only level', { dimmer: channel('level', { write: false }) }, 'read-only'],
+        ['a level with inverted bounds', { dimmer: channel('level', { min: 255, max: 0 }) }, 'no usable range'],
+      ];
+      const colour = { red: channel('r'), green: channel('g'), blue: channel('b') };
+
+      for (const [label, level, reason] of cases) {
+        it(`${label}: writes "on" and the colour, skips the brightness with a warning`, async () => {
+          const warnings: string[] = [];
+          const log = { ...silentLog, warn: (message: string): void => void warnings.push(message) };
+          const d = new Dispatcher(lookup([lightOf({ ...level, ...colour })]), write, log);
+          // The power button's own payload when switching on (light_popup.cpp:1664-1684).
+          const result = await d.dispatch({ kind: 'set_light', entityId: 'light.l', state: 'on', brightnessPct: 40, rgb: [1, 2, 3] });
+          expect(result).to.deep.equal({ ok: true, writes: 4 });
+          expect(writes).to.deep.equal([
+            ['l.0.on', true],
+            ['l.0.r', 1],
+            ['l.0.g', 2],
+            ['l.0.b', 3],
+          ]);
+          expect(warnings.filter((w) => w.includes('brightness') && w.includes(reason)), warnings.join(' | ')).to.have.length(1);
+        });
+      }
+
+      it('a brightness alone, with nothing else it could write, is still refused', async () => {
+        const d = new Dispatcher(lookup([lightOf({ ...colour })]), write, silentLog);
+        expect(await d.dispatch({ kind: 'set_light', entityId: 'light.l', brightnessPct: 40 })).to.deep.equal({
+          ok: false,
+          reason: 'no_writable_channel',
+          applied: 0,
+        });
+      });
+    });
+
+    it('refuses a colour temperature outside the light\'s declared range, the whole command with it', async () => {
+      const d = new Dispatcher(lookup([lightOf({ dimmer: channel('level'), temperature: channel('ct', { min: 2200, max: 6500 }) })]), write, silentLog);
+      for (const kelvin of [2100, 6600]) {
+        writes = [];
+        expect(await d.dispatch({ kind: 'set_light', entityId: 'light.l', state: 'on', kelvin }), `${kelvin}`).to.deep.equal({
+          ok: false,
+          reason: 'value_out_of_range',
+          applied: 0,
+        });
+        expect(writes, `${kelvin}`).to.deep.equal([]);
+      }
+      writes = [];
+      expect(await d.dispatch({ kind: 'set_light', entityId: 'light.l', state: 'on', kelvin: 2200 })).to.deep.equal({ ok: true, writes: 2 });
+      expect(writes).to.deep.equal([
+        ['l.0.on', true],
+        ['l.0.ct', 2200],
+      ]);
+    });
+
+    it('publishes back exactly the brightness percent it wrote, for every percent over a sweep of ranges (N1)', async () => {
+      for (const [min, max] of [
+        [0, 100],
+        [0, 254],
+        [0, 255],
+        [1, 254],
+        [0, 1],
+        [0.1, 0.3],
+        [0, 10],
+        [0, 65535],
+      ]) {
+        const light = lightOf({ dimmer: channel('level', { min, max }) });
+        const d = new Dispatcher(lookup([light]), write, silentLog);
+        for (let percent = 0; percent <= 100; percent++) {
+          writes = [];
+          await d.dispatch({ kind: 'set_light', entityId: 'light.l', brightnessPct: percent });
+          const landed = writes[0]?.[1];
+          const shown = synthLight(
+            { objectId: 'l.0', name: 'L', detectorType: 'dimmer', domain: 'light', channels: { dimmer: channel('level', { min, max }) } },
+            'light.l',
+            { 'l.0.level': at(landed) },
+          ).attributes.brightness_pct;
+          expect(shown, `${min}..${max} at ${percent}% (raw ${String(landed)})`).to.equal(percent);
+        }
+      }
     });
 
     // M3: every control the payload advertises must land. The panel draws a
     // brightness slider for "brightness" AND for every colour and colour-
     // temperature mode (HomeTiles tile_renderer.cpp:1446), and sends that
-    // slider as "on" plus the brightness (light_popup.cpp:1168-1180).
-    it('advertises no control whose command would be dropped', async () => {
+    // slider as "on" plus the brightness (light_popup.cpp:1168-1180). Since
+    // Ruling 54 (round 2) a colour or CT light without a commandable level
+    // keeps its colour controls, so that implied slider's brightness is
+    // skipped with a warning while its "on" lands -- never dropped silently.
+    it('advertises no control whose command is dropped silently', async () => {
       const fixtures: Array<[string, DeviceInput['channels']]> = [
         ['on/off only', {}],
         ['writable dimmer', { dimmer: channel('level') }],
@@ -1325,14 +1494,20 @@ describe('runtime/dispatcher', () => {
       for (const [label, channels] of fixtures) {
         const light = lightOf(channels);
         const modes = light.attributes.supported_color_modes as string[];
-        const d = new Dispatcher(lookup([light]), write, silentLog);
+        const warnings: string[] = [];
+        const d = new Dispatcher(lookup([light]), write, { ...silentLog, warn: (message: string): void => void warnings.push(message) });
         const landsOn = async (call: Omit<Extract<ServiceCall, { kind: 'set_light' }>, 'kind' | 'entityId'>, objectId: string) => {
           writes = [];
+          warnings.length = 0;
           await d.dispatch({ kind: 'set_light', entityId: 'light.l', ...call });
           return writes.some(([id]) => id === objectId);
         };
         if (modes.some((mode) => ['brightness', 'color_temp', 'rgb'].includes(mode))) {
-          expect(await landsOn({ state: 'on', brightnessPct: 40 }, 'l.0.level'), `${label}: the brightness slider`).to.equal(true);
+          const landed = await landsOn({ state: 'on', brightnessPct: 40 }, 'l.0.level');
+          if (modes.includes('brightness')) expect(landed, `${label}: the advertised brightness slider`).to.equal(true);
+          const warned = warnings.some((message) => message.includes('brightness'));
+          expect(landed || warned, `${label}: the brightness lands or is skipped out loud`).to.equal(true);
+          expect(writes, `${label}: the slider's "on" lands either way`).to.deep.include(['l.0.on', true]);
         }
         if (modes.includes('color_temp')) {
           expect(await landsOn({ state: 'on', kelvin: 3000 }, 'l.0.ct'), `${label}: the CT slider`).to.equal(true);

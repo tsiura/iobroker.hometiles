@@ -50,10 +50,6 @@ const MAX_SCENE_ALIAS_LENGTH = 128;
 const MAX_ENTITY_ID_LENGTH = 255;
 const ENTITY_ID_RE = /^[a-z_]+\.[a-z0-9_]+$/;
 
-function clamp(value: number, min: number, max: number): number {
-  return Math.min(max, Math.max(min, Math.round(value)));
-}
-
 function parseObject(raw: string): Record<string, unknown> {
   let parsed: unknown;
   try {
@@ -83,16 +79,20 @@ function requireNumber(value: unknown, code: string): number {
 }
 
 /**
- * A percentage as the firmware sends one: a whole number in 0..100
- * (mqttPublishLightCommand and mqttPublishCoverCommand both cap it). Outside
- * that it is refused, never clamped -- clamping another client's 150 wrote
- * 100 with ok:true (Task 8 round 1, M1b).
+ * A whole number as the firmware sends one, refused -- never clamped --
+ * outside min..max: clamping another client's 150 wrote 100 with ok:true
+ * (Task 8 round 1, M1b; rgb and kelvin in round 2).
  */
-function requirePercent(value: unknown, code: string): number {
-  const percent = Math.round(requireNumber(value, code));
-  if (percent < 0 || percent > 100) throw new CommandError(code);
+function requireWhole(value: unknown, code: string, min: number, max: number): number {
+  const whole = Math.round(requireNumber(value, code));
+  if (whole < min || whole > max) throw new CommandError(code);
   // `|| 0`: -0.4 rounds to -0, which must land as a plain 0.
-  return percent || 0;
+  return whole || 0;
+}
+
+/** A percentage: 0..100, as mqttPublishLightCommand and mqttPublishCoverCommand both cap it. */
+function requirePercent(value: unknown, code: string): number {
+  return requireWhole(value, code, 0, 100);
 }
 
 function requireMode(value: unknown, code: string): string {
@@ -150,12 +150,16 @@ export function parseLightCommand(raw: string): ServiceCall {
   if (hasRgb) {
     const rgb = payload.rgb_color;
     if (!Array.isArray(rgb) || rgb.length !== 3) throw new CommandError('invalid_rgb');
-    const [r, g, b] = rgb.map((component) => clamp(requireNumber(component, 'invalid_rgb'), 0, 255));
+    // The firmware sends uint8 components, so one outside 0..255 came from
+    // another client.
+    const [r, g, b] = rgb.map((component) => requireWhole(component, 'invalid_rgb', 0, 255));
     call.rgb = [r as number, g as number, b as number];
   }
 
   if (hasKelvin) {
-    call.kelvin = clamp(requireNumber(payload.color_temp_kelvin, 'invalid_kelvin'), 1000, 15000);
+    // A plausibility bound only: the dispatcher refuses a colour temperature
+    // outside the light's own declared range.
+    call.kelvin = requireWhole(payload.color_temp_kelvin, 'invalid_kelvin', 1000, 15000);
   }
 
   return call;

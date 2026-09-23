@@ -251,13 +251,59 @@ describe('registry/synth light and scene', () => {
       expect(modes({ dimmer: level(true), temperature: ct(true), ...rgb(true) })).to.deep.equal(['color_temp', 'rgb']);
     });
 
-    it('drops colour and colour temperature when the level cannot be commanded, since the panel dims every colour mode', () => {
-      // HomeTiles tile_renderer.cpp:1446: supports_brightness is set by any
-      // colour or colour-temperature mode, so each of these would draw a
-      // brightness slider whose value lands nowhere.
-      expect(modes({ dimmer: level(false), temperature: ct(true), ...rgb(true) })).to.deep.equal(['onoff']);
-      expect(modes({ temperature: ct(true) })).to.deep.equal(['onoff']);
-      expect(modes({ ...rgb(true) })).to.deep.equal(['onoff']);
+    // Round 1 withheld these too (the panel draws a brightness slider for any
+    // colour mode). Ruling 54 reverses that: a colour or CT control is
+    // advertised on its OWN writable channel -- an RGB strip without a dimmer
+    // keeps its colour -- and the dispatcher skips, with a warning, a
+    // brightness such a light cannot take.
+    it('keeps colour and colour temperature on their own writable channels, with or without a level (Ruling 54)', () => {
+      expect(modes({ dimmer: level(false), temperature: ct(true), ...rgb(true) })).to.deep.equal(['color_temp', 'rgb']);
+      expect(modes({ temperature: ct(true) })).to.deep.equal(['color_temp']);
+      expect(modes({ ...rgb(true) })).to.deep.equal(['rgb']);
+    });
+  });
+
+  // --- Task 8 round 2 ----------------------------------------------------
+
+  it('switches a dimmer-only light on from its RAW level being above 0, not from the scaled percentage (N4)', () => {
+    // 1..254 at raw 1 is 0% of its range, but the lamp is lit at its lowest step.
+    const lowest = synthLight(
+      { ...dimmer, channels: { dimmer: { objectId: 'hue.0.dim.level', type: 'number', min: 1, max: 254, write: true } } },
+      'light.esstisch',
+      { 'hue.0.dim.level': value(1) },
+    );
+    expect(lowest.state).to.equal('on');
+    expect(lowest.attributes.brightness_pct).to.equal(0);
+    const dark = synthLight(
+      { ...dimmer, channels: { dimmer: { objectId: 'hue.0.dim.level', type: 'number', min: 0, max: 254, write: true } } },
+      'light.esstisch',
+      { 'hue.0.dim.level': value(0) },
+    );
+    expect(dark.state).to.equal('off');
+  });
+
+  describe('a level a percentage cannot scale over (Ruling 55)', () => {
+    const lamp = (bounds: { min?: number; max?: number }, raw: number) =>
+      synthLight(
+        { ...dimmer, channels: { dimmer: { objectId: 'hue.0.dim.level', type: 'number', write: true, ...bounds } } },
+        'light.esstisch',
+        { 'hue.0.dim.level': value(raw) },
+      );
+
+    it('scales a max-only 255 dimmer from a floor of 0', () => {
+      const e = lamp({ max: 255 }, 128);
+      expect(e.attributes).to.include({ brightness_pct: 50, brightness: 128 });
+      expect(e.attributes.supported_color_modes).to.deep.equal(['brightness']);
+    });
+
+    it('withholds brightness, and publishes none, when the bounds are equal or inverted', () => {
+      for (const bounds of [{ min: 40, max: 40 }, { min: 255, max: 0 }]) {
+        const e = lamp(bounds, 40);
+        expect(e.attributes.supported_color_modes, JSON.stringify(bounds)).to.deep.equal(['onoff']);
+        expect(e.attributes, JSON.stringify(bounds)).to.not.have.any.keys('brightness', 'brightness_pct');
+        // Still read as lit from the raw level (N4).
+        expect(e.state, JSON.stringify(bounds)).to.equal('on');
+      }
     });
   });
 

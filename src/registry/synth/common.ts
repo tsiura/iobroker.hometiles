@@ -242,58 +242,76 @@ function coerce(type: ChannelCodec['type'], raw: unknown): number | boolean | st
   return type === 'string' ? String(raw) : raw;
 }
 
+type Bounds = Pick<ChannelCodec, 'min' | 'max'> | undefined;
+
+const finite = (value: number | undefined): number | undefined =>
+  typeof value === 'number' && Number.isFinite(value) ? value : undefined;
+
 /**
  * Ruling 49: the panel speaks percent for cover position/tilt and light
- * brightness; a channel speaks its own declared min..max. This one linear map
+ * brightness; a channel speaks its own declared min..max. One linear map
  * serves both directions, so what is published and what is written cannot
- * disagree. It scales only over a real two-sided range: a 0..100 channel is
- * the identity by construction, and one bound, equal or inverted bounds, or
- * none at all pass through unscaled -- a missing bound is never invented, and
- * there is never a zero span to divide by.
+ * disagree.
+ *
+ * Ruling 55: 0..100 is the panel's own scale, so a percentage channel's
+ * missing (or non-finite) min is 0 and its missing max is 100 -- a max-only
+ * 255 blind is 0..255. Equal or inverted bounds cannot be scaled at all:
+ * `undefined`, and the synth withholds the control rather than show one that
+ * refuses almost everything.
  */
-function percentRange(codec: Pick<ChannelCodec, 'min' | 'max'> | undefined): { min: number; max: number } | undefined {
-  const min = codec?.min;
-  const max = codec?.max;
-  if (typeof min !== 'number' || typeof max !== 'number' || !Number.isFinite(min) || !Number.isFinite(max)) return undefined;
-  return min < max && !(min === 0 && max === 100) ? { min, max } : undefined;
+export function percentScale(codec: Bounds): { min: number; max: number } | undefined {
+  const min = finite(codec?.min) ?? 0;
+  const max = finite(codec?.max) ?? 100;
+  return min < max ? { min, max } : undefined;
 }
 
 /**
- * A channel's raw value as the panel's percentage, exact. The panel's own
- * integer fields do the rounding: light.ts rounds brightness_pct, and the
- * firmware's read_int truncates a fractional cover position
- * (cover/renderer.cpp:50-58), as it always has for a 0..100 reading.
+ * A channel's raw value as the panel's percentage, exact -- the light needs
+ * the fraction for HA's 0..255 brightness. What the panel keeps is a whole
+ * percent, rounded by each synth (cover.ts's readPercent, light.ts's
+ * brightness_pct). A 0..100 channel is the identity by construction.
  */
-export function toPercent(raw: number, codec: Pick<ChannelCodec, 'min' | 'max'> | undefined): number {
-  const range = percentRange(codec);
-  return range ? ((raw - range.min) * 100) / (range.max - range.min) : raw;
+export function toPercent(raw: number, codec: Bounds): number | undefined {
+  const scale = percentScale(codec);
+  if (!scale) return undefined;
+  if (scale.min === 0 && scale.max === 100) return raw;
+  return ((raw - scale.min) * 100) / (scale.max - scale.min);
 }
 
 /**
- * The panel's percentage as a raw value for the channel. Rounded to a whole
- * number only when the declared range is whole and spans at least 100: an
- * integral device (0..255, 0..254) then keeps an integral value, and every
- * percent still lands on its own step. A fractional or narrower range (0..1,
- * a 0..10 V dimmer) keeps the exact value.
+ * The panel's percentage as a raw value for the channel. 0% and 100% are the
+ * declared endpoints exactly: 0% by arithmetic (min + 0 is min), 100% by
+ * construction, since 0.1 + 100 * 0.2 / 100 is 0.30000000000000004 -- above
+ * a 0.3 maximum (N2). In between, the value is rounded to a whole number only
+ * when the range is whole and spans at least 100: an integral device (0..255,
+ * 0..254) then keeps an integral value, and every percent still lands on its
+ * own step. A fractional or narrower range (0..1, a 0..10 V dimmer) keeps the
+ * exact value.
  */
-export function fromPercent(percent: number, codec: Pick<ChannelCodec, 'min' | 'max'> | undefined): number {
-  const range = percentRange(codec);
-  if (!range) return percent;
-  const raw = range.min + (percent * (range.max - range.min)) / 100;
-  return Number.isInteger(range.min) && Number.isInteger(range.max) && range.max - range.min >= 100 ? Math.round(raw) : raw;
+export function fromPercent(percent: number, codec: Bounds): number | undefined {
+  const scale = percentScale(codec);
+  if (!scale) return undefined;
+  if (percent === 100) return scale.max;
+  if (scale.min === 0 && scale.max === 100) return percent;
+  const raw = scale.min + (percent * (scale.max - scale.min)) / 100;
+  return Number.isInteger(scale.min) && Number.isInteger(scale.max) && scale.max - scale.min >= 100 ? Math.round(raw) : raw;
 }
 
 /**
- * Whether a value may be written to the channel (Ruling 49): each bound the
- * channel declares is enforced and none is invented. Equal or inverted bounds
- * are taken as declared, so they admit one value or none: a channel whose
- * metadata allows nothing takes nothing.
+ * An absolute channel's declared bounds -- a setpoint, a humidity, a colour
+ * temperature. Each finite bound counts on its own, and none is invented; an
+ * equal or inverted pair means nothing and is ignored whole (Ruling 55).
  */
-export function withinDeclaredRange(value: number, codec: Pick<ChannelCodec, 'min' | 'max'> | undefined): boolean {
-  const min = codec?.min;
-  const max = codec?.max;
-  if (typeof min === 'number' && Number.isFinite(min) && value < min) return false;
-  return !(typeof max === 'number' && Number.isFinite(max) && value > max);
+export function declaredBounds(codec: Bounds): { min?: number; max?: number } {
+  const min = finite(codec?.min);
+  const max = finite(codec?.max);
+  return min !== undefined && max !== undefined && min >= max ? {} : { min, max };
+}
+
+/** Whether an absolute value may be written to the channel: inside every bound declaredBounds keeps. */
+export function withinDeclaredRange(value: number, codec: Bounds): boolean {
+  const { min, max } = declaredBounds(codec);
+  return (min === undefined || value >= min) && (max === undefined || value <= max);
 }
 
 export const UNAVAILABLE = STATE_UNAVAILABLE;

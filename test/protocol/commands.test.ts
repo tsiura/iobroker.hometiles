@@ -52,13 +52,27 @@ describe('protocol/commands', () => {
     });
   });
 
-  it('clamps rgb components and kelvin at the boundary', () => {
-    // Task 8 round 1 took brightness out of this test: see the next one.
-    const call = parseLightCommand('{"entity_id":"light.d","brightness_pct":100,"rgb_color":[999,-4,90],"color_temp_kelvin":90000}');
-    expect(call).to.deep.equal({
+  // Round 2: this test pinned the clamp -- [999,-4,90] became [255,0,90] and
+  // 90000 K became 15000, each written with ok:true. The same defect class as
+  // M1b: out-of-range components and temperatures are refused, never clamped.
+  // The firmware never sends one (uint8 components; a colour temperature the
+  // popup clamps to the published range, light_popup.cpp:1598-1608).
+  it('refuses rgb components outside 0..255 and a colour temperature outside 1000..15000 K, rather than clamping them', () => {
+    for (const rgb of [[999, 0, 90], [0, -4, 90], [0, 0, 256]]) {
+      expect(() => parseLightCommand(JSON.stringify({ entity_id: 'light.d', rgb_color: rgb })), JSON.stringify(rgb)).to.throw(
+        CommandError,
+        'invalid_rgb',
+      );
+    }
+    for (const kelvin of [90000, 15001, 999]) {
+      expect(() => parseLightCommand(JSON.stringify({ entity_id: 'light.d', color_temp_kelvin: kelvin })), String(kelvin)).to.throw(
+        CommandError,
+        'invalid_kelvin',
+      );
+    }
+    expect(parseLightCommand('{"entity_id":"light.d","rgb_color":[255,0,89.6],"color_temp_kelvin":15000}')).to.deep.equal({
       kind: 'set_light',
       entityId: 'light.d',
-      brightnessPct: 100,
       rgb: [255, 0, 90],
       kelvin: 15000,
     });

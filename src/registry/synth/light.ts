@@ -1,6 +1,6 @@
 import type { ChannelInput, DeviceInput, VirtualEntity } from '../types';
 import { STATE_OFF, STATE_ON } from '../types';
-import { baseEntity, isUsable, readChannel, toBoolState, toPercent, UNAVAILABLE, type Values } from './common';
+import { baseEntity, isUsable, percentScale, readChannel, toBoolState, toPercent, UNAVAILABLE, type Values } from './common';
 
 /** The panel's 0..100 percent (a dimmer's declared range is scaled into it, Ruling 49) onto HA's 0..255. */
 function percentToHaBrightness(percent: number): number {
@@ -32,24 +32,19 @@ export function synthLight(device: DeviceInput, entityId: string, values: Values
   // and not read-only (Ruling 38 refuses a write to one) -- never from a
   // current value (Task 8 round 1, M3). The level is the channel the
   // dispatcher writes a brightness to: DIMMER when the device has one, else
-  // BRIGHTNESS.
+  // BRIGHTNESS; it must also have bounds a percentage can scale over
+  // (Ruling 55).
   const commandable = (channel: ChannelInput | undefined): boolean => channel !== undefined && channel.write !== false;
-  const hasDimmer = commandable(device.channels.dimmer ?? device.channels.brightness);
+  const level = device.channels.dimmer ?? device.channels.brightness;
+  const hasDimmer = commandable(level) && percentScale(level) !== undefined;
   // Colour is advertised ONLY when the three component channels exist, because
   // those are the only ones the dispatcher can write. rgbSingle, rgbwSingle and
   // cie carry colour on a single combined channel (rgb / rgbw / cie) that the
   // v0.1 command path has no encoder for; advertising them would put a colour
   // picker on the panel whose writes silently do nothing. Such a bulb still
   // works for on/off, brightness and colour temperature.
-  //
-  // Colour and colour temperature also need a commandable level: the panel
-  // draws a brightness slider for every colour and colour-temperature mode
-  // (HomeTiles tile_renderer.cpp:1446, "every color and color-temperature mode
-  // is also dimmable"), so without one each slider move would drop its
-  // brightness and still report success.
-  const hasRgb =
-    hasDimmer && commandable(device.channels.red) && commandable(device.channels.green) && commandable(device.channels.blue);
-  const hasCt = hasDimmer && commandable(device.channels.temperature);
+  const hasRgb = commandable(device.channels.red) && commandable(device.channels.green) && commandable(device.channels.blue);
+  const hasCt = commandable(device.channels.temperature);
 
   const modes: string[] = [];
   if (hasCt) modes.push('color_temp');
@@ -71,12 +66,10 @@ export function synthLight(device: DeviceInput, entityId: string, values: Values
   // hasDimmer above, and dispatcher.ts's matching write-side fallback). Each
   // is read in its own declared range (Ruling 49): a 0..254 dimmer at 127 is
   // 50%, not 100% clamped.
-  const levelPercent = (name: string): number | undefined => {
-    const raw = readNumber(device, name, values);
-    return raw === undefined ? undefined : toPercent(raw, device.channels[name]);
-  };
-  const dimmerPercent = levelPercent('dimmer') ?? levelPercent('brightness');
-  const anyUsable = Boolean(setRead && isUsable(setRead.value)) || dimmerPercent !== undefined;
+  const levelName = readNumber(device, 'dimmer', values) !== undefined ? 'dimmer' : 'brightness';
+  const levelRaw = readNumber(device, levelName, values);
+  const dimmerPercent = levelRaw === undefined ? undefined : toPercent(levelRaw, device.channels[levelName]);
+  const anyUsable = Boolean(setRead && isUsable(setRead.value)) || levelRaw !== undefined;
 
   if (!anyUsable) {
     return { entityId, domain: 'light', source, state: UNAVAILABLE, attributes, available: false, lastChanged, channelMeta };
@@ -86,8 +79,10 @@ export function synthLight(device: DeviceInput, entityId: string, values: Values
   if (setRead && isUsable(setRead.value)) {
     state = toBoolState(setRead.value.val);
   } else {
-    // No on/off channel at all: a non-zero dimmer is the only evidence of "on".
-    state = (dimmerPercent ?? 0) > 0 ? STATE_ON : STATE_OFF;
+    // No on/off channel at all: a non-zero dimmer is the only evidence of
+    // "on" -- its RAW value (round 2, N4): 1..254 at raw 1 is lit at its
+    // lowest step, although that is 0% of its range.
+    state = (levelRaw ?? 0) > 0 ? STATE_ON : STATE_OFF;
   }
 
   if (dimmerPercent !== undefined) {

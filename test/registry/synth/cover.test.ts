@@ -1,7 +1,7 @@
 import { expect } from 'chai';
 import { synthCover } from '../../../src/registry/synth/cover';
 import { synthesise } from '../../../src/registry/synth/index';
-import type { DeviceInput, SourceValue } from '../../../src/registry/types';
+import type { ChannelInput, DeviceInput, SourceValue } from '../../../src/registry/types';
 
 const NOW = 1_757_000_000_000;
 
@@ -423,7 +423,9 @@ describe('registry/synth/cover', () => {
       },
     };
     const fromSet = synthCover(device, 'cover.test', { 'cover.0.set': numState(200), 'cover.0.tilt_set': numState(51) });
-    expect(fromSet.attributes.current_position).to.equal((200 * 100) / 255);
+    // 78.43...%, published as the nearest whole percent (round 2, N1: the
+    // firmware would truncate the fraction).
+    expect(fromSet.attributes.current_position).to.equal(78);
     expect(fromSet.attributes.current_tilt_position).to.equal(20);
     expect(fromSet.channelMeta?.set).to.include({ min: 0, max: 255 });
     // ACTUAL wins, and is read in ITS own range, not SET's.
@@ -443,11 +445,74 @@ describe('registry/synth/cover', () => {
     expect(synthCover(device, 'cover.test', { 'cover.0.set': numState(11) }).state).to.equal('open');
   });
 
-  it('leaves a position exactly as it was read on a 0..100 channel, and on one that declares no range', () => {
+  it('publishes the whole percent the panel keeps, on a 0..100 channel and one that declares no range too', () => {
+    // Round 1 published 40.5 and 33.3 as read; the firmware's read_int
+    // TRUNCATES a fraction (item.as<int>(), cover/renderer.cpp:57), so they
+    // showed as 40 and 33. Round 2 (N1) rounds before publishing.
     const { device, values } = deviceWith({ SET: numState(40.5), TILT_SET: numState(33.3) });
     device.channels.set = { ...device.channels.set!, min: 0, max: 100 };
     const e = synthCover(device, 'cover.test', values);
-    expect(e.attributes.current_position).to.equal(40.5);
-    expect(e.attributes.current_tilt_position).to.equal(33.3);
+    expect(e.attributes.current_position).to.equal(41);
+    expect(e.attributes.current_tilt_position).to.equal(33);
+  });
+
+  // --- Task 8 round 2 ----------------------------------------------------
+
+  it('derives the state from the same whole percent it publishes, so the panel never disables Close on an open cover (N1)', () => {
+    // cover_popup.cpp:446-462 disables Close at position 0 and when the state
+    // is "closed". Raw 1 of 255 is 0.39%: published as 0 (truncated before,
+    // rounded now) while the state said "open", Close was disabled on a cover
+    // the panel called open. Position and state now come from one number.
+    const blind = (raw: number) =>
+      synthCover(
+        {
+          objectId: 'cover.0',
+          name: 'Cover',
+          detectorType: 'blind',
+          domain: 'cover',
+          channels: { set: { objectId: 'cover.0.set', type: 'number', write: true, min: 0, max: 255 } },
+        },
+        'cover.test',
+        { 'cover.0.set': numState(raw) },
+      );
+    expect(blind(1).attributes.current_position).to.equal(0);
+    expect(blind(1).state).to.equal('closed');
+    expect(blind(2).attributes.current_position).to.equal(1);
+    expect(blind(2).state).to.equal('open');
+    expect(blind(254).attributes.current_position).to.equal(100);
+    expect(blind(254).state).to.equal('open');
+  });
+
+  describe('bounds a percentage cannot scale over (Ruling 55)', () => {
+    const cover = (set: Partial<ChannelInput>, tilt: Partial<ChannelInput>, raw: number) =>
+      synthCover(
+        {
+          objectId: 'cover.0',
+          name: 'Cover',
+          detectorType: 'blind',
+          domain: 'cover',
+          channels: {
+            set: { objectId: 'cover.0.set', type: 'number', write: true, ...set },
+            tilt_set: { objectId: 'cover.0.tilt_set', type: 'number', write: true, ...tilt },
+          },
+        },
+        'cover.test',
+        { 'cover.0.set': numState(raw), 'cover.0.tilt_set': numState(raw) },
+      );
+
+    it('scales a max-only 255 from a floor of 0, and a min-only 10 to a ceiling of 100', () => {
+      const maxOnly = cover({ max: 255 }, { max: 255 }, 128);
+      expect(maxOnly.attributes).to.include({ current_position: 50, current_tilt_position: 50 });
+      expect(maxOnly.writable).to.include({ position: true, tilt_position: true });
+      expect(cover({ min: 10 }, { min: 10 }, 55).attributes).to.include({ current_position: 50 });
+    });
+
+    it('withholds position and tilt, and publishes no reading for them, when the bounds are equal or inverted', () => {
+      for (const bounds of [{ min: 40, max: 40 }, { min: 255, max: 0 }, { min: 150 }]) {
+        const e = cover(bounds, bounds, 40);
+        expect(e.writable, JSON.stringify(bounds)).to.include({ position: false, tilt_position: false });
+        expect(e.attributes, JSON.stringify(bounds)).to.not.have.any.keys('current_position', 'current_tilt_position');
+      }
+    });
   });
 });

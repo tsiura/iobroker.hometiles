@@ -3,6 +3,7 @@ import { STATE_UNAVAILABLE, STATE_UNKNOWN } from '../types';
 import {
   acceptsLabels,
   baseEntity,
+  declaredBounds,
   encodeChannelValue,
   isUsable,
   readChannel,
@@ -314,11 +315,16 @@ export function synthClimate(device: DeviceInput, entityId: string, values: Valu
   // Publishing that range keeps the two one set -- metadata again, so it
   // waits for `available` like the lists above. A range's two handles share
   // one min/max: the heating minimum and the cooling maximum. A bound the
-  // channel does not declare is left to the firmware, never invented.
+  // channel does not declare is left to the firmware, never invented; an
+  // equal or inverted pair means nothing and is ignored whole (declaredBounds,
+  // Ruling 55) -- it would also trip the firmware's own fallback to 7..35
+  // (tile_renderer.cpp:2274-2277).
   const low = hasPlainSet ? device.channels.set : (device.channels.set_heating ?? device.channels.set_cooling);
   const high = hasPlainSet ? device.channels.set : (device.channels.set_cooling ?? device.channels.set_heating);
-  if (typeof low?.min === 'number' && Number.isFinite(low.min)) attributes.min_temp = low.min;
-  if (typeof high?.max === 'number' && Number.isFinite(high.max)) attributes.max_temp = high.max;
+  const minTemp = declaredBounds(low).min;
+  const maxTemp = declaredBounds(high).max;
+  if (minTemp !== undefined) attributes.min_temp = minTemp;
+  if (maxTemp !== undefined) attributes.max_temp = maxTemp;
 
   return { entityId, domain: 'climate', source, state, attributes, available, lastChanged, writable, channelMeta };
 }

@@ -151,16 +151,34 @@ describe('registry/synth/common: encodeChannelValue', () => {
       }
     });
 
-    it('never invents a range: one bound, equal bounds, inverted or non-finite bounds all pass through unscaled', () => {
-      for (const codec of [range(0), range(undefined, 255), range(40, 40), range(255, 0), range(0, Number.POSITIVE_INFINITY), range(Number.NaN, 255)]) {
-        expect(toPercent(200, codec), JSON.stringify(codec)).to.equal(200);
-        expect(fromPercent(50, codec), JSON.stringify(codec)).to.equal(50);
+    // Ruling 55 (round 2) corrects round 1's "never invent a bound" for a
+    // percentage: 0..100 is the panel's own scale, the only sensible floor and
+    // ceiling, so a missing min is 0 and a missing max is 100. Equal or
+    // inverted bounds cannot be scaled at all, so the control is withheld.
+    it('takes a missing min as 0 and a missing max as 100, and cannot scale equal or inverted bounds (Ruling 55)', () => {
+      expect(fromPercent(50, range(undefined, 255))).to.equal(128);
+      expect(toPercent(255, range(undefined, 255))).to.equal(100);
+      expect(fromPercent(50, range(10))).to.equal(55);
+      expect(toPercent(55, range(10))).to.equal(50);
+      // A non-finite bound is no bound.
+      expect(fromPercent(50, range(Number.NaN, 255))).to.equal(128);
+      expect(fromPercent(50, range(0, Number.POSITIVE_INFINITY))).to.equal(50);
+      for (const codec of [range(40, 40), range(255, 0), range(150)]) {
+        expect(toPercent(200, codec), JSON.stringify(codec)).to.equal(undefined);
+        expect(fromPercent(50, codec), JSON.stringify(codec)).to.equal(undefined);
       }
     });
 
+    it('lands exactly on the declared endpoints at 0% and 100% (N2)', () => {
+      // 0.1 + 100 * 0.2 / 100 is 0.30000000000000004: above max, so 100% was refused.
+      expect(fromPercent(100, range(0.1, 0.3))).to.equal(0.3);
+      expect(fromPercent(0, range(0.1, 0.3))).to.equal(0.1);
+      expect(withinDeclaredRange(fromPercent(100, range(0.1, 0.3))!, range(0.1, 0.3))).to.equal(true);
+    });
+
     it('scales a 0..255 channel both ways: published exactly, written as the nearest whole number', () => {
-      // Publish: exact. The firmware's read_int truncates a fraction
-      // (cover/renderer.cpp:50-58), as it already does for a 0..100 reading.
+      // toPercent is exact: the light's HA brightness needs the fraction, and
+      // the cover synth rounds what it publishes (round 2, N1).
       expect(toPercent(200, range(0, 255))).to.equal((200 * 100) / 255);
       expect(toPercent(0, range(0, 255))).to.equal(0);
       expect(toPercent(255, range(0, 255))).to.equal(100);
@@ -184,7 +202,7 @@ describe('registry/synth/common: encodeChannelValue', () => {
       expect(toPercent(20, range(10, 30))).to.equal(50);
     });
 
-    it('checks each bound a channel declares, and invents none', () => {
+    it('checks each bound an absolute channel declares, and ignores an equal or inverted pair (Ruling 55)', () => {
       expect(withinDeclaredRange(30, range(5, 30))).to.equal(true);
       expect(withinDeclaredRange(30.5, range(5, 30))).to.equal(false);
       expect(withinDeclaredRange(4.9, range(5, 30))).to.equal(false);
@@ -194,10 +212,11 @@ describe('registry/synth/common: encodeChannelValue', () => {
       expect(withinDeclaredRange(31, range(undefined, 30))).to.equal(false);
       expect(withinDeclaredRange(1e9, range())).to.equal(true);
       expect(withinDeclaredRange(1e9, undefined)).to.equal(true);
-      // Taken literally: an equal pair admits one value, an inverted pair none.
-      expect(withinDeclaredRange(40, range(40, 40))).to.equal(true);
-      expect(withinDeclaredRange(41, range(40, 40))).to.equal(false);
-      expect(withinDeclaredRange(50, range(255, 0))).to.equal(false);
+      // Round 1 took an equal or inverted pair literally (one value, or none).
+      // Ruling 55: for an absolute value -- a setpoint, a humidity, a colour
+      // temperature -- such a pair means nothing, so it is ignored.
+      expect(withinDeclaredRange(41, range(40, 40))).to.equal(true);
+      expect(withinDeclaredRange(50, range(255, 0))).to.equal(true);
     });
   });
 
