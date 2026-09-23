@@ -3,6 +3,7 @@ import { synthBinarySensor } from './binary_sensor';
 import { synthClimate } from './climate';
 import type { Values } from './common';
 import { synthCover } from './cover';
+import { synthDatetime, synthNumber, synthSelect } from './editable';
 import { synthLight } from './light';
 import { synthMediaPlayer } from './media_player';
 import { synthScene } from './scene';
@@ -41,11 +42,10 @@ export function synthesise(device: DeviceInput, entityId: string, values: Values
     case 'weather':
       return synthWeather(device, entityId, values);
     case 'number':
+      return synthNumber(device, entityId, values);
     case 'select':
+      return synthSelect(device, entityId, values);
     case 'datetime':
-      // Later v0.2 tasks add the synth module for each of these. Throwing
-      // here is deliberate: a device the detector classified into one of
-      // these domains must not silently fall through to a wrong renderer.
-      throw new Error(`not implemented: ${device.domain}`);
+      return synthDatetime(device, entityId, values);
   }
 }

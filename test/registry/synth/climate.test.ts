@@ -239,6 +239,7 @@ describe('registry/synth/climate', () => {
       current: 1,
       min: undefined,
       max: undefined,
+      step: undefined,
       unit: undefined,
     });
   });

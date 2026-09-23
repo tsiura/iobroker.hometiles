@@ -232,7 +232,16 @@ describe('registry/synth/media_player', () => {
 
   it("carries every channel's codec in channelMeta, so a command can be scaled into the channel's range", () => {
     const e = entity({ state: playing, volume: { type: 'number', min: 0, max: 100, unit: '%', write: true, value: val(30) } });
-    expect(e.channelMeta?.volume).to.deep.equal({ type: 'number', states: undefined, write: true, current: 30, min: 0, max: 100, unit: '%' });
+    expect(e.channelMeta?.volume).to.deep.equal({
+      type: 'number',
+      states: undefined,
+      write: true,
+      current: 30,
+      min: 0,
+      max: 100,
+      step: undefined,
+      unit: '%',
+    });
     expect(e.channelMeta?.state).to.include({ type: 'boolean', write: true, current: true });
   });
 

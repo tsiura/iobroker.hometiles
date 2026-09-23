@@ -31,6 +31,7 @@ export interface ObjectMeta {
   type?: string;
   min?: number;
   max?: number;
+  step?: number;
   states?: Record<string, string>;
   write?: boolean;
   icon?: string;
@@ -151,6 +152,14 @@ export const DETECTOR_TYPE_TO_DOMAIN: Record<string, Domain> = {
   // The same trap: the pattern is keyed 'mediaPlayer', its Types value is
   // 'media' (types.js: Types["media"] = "media").
   media: 'media_player',
+  // And again (Task 13): the pattern is keyed 'levelSlider', its Types value
+  // is 'slider' (types.js:70). Its SET is any writable, bounded level.* number
+  // (typePatterns.js:3367-3381), the catch-all of adjustable values, so
+  // discoverDevices publishes a slider only as its root's one control of its
+  // own. `percentage`, the same SET with unit '%' required and tried just
+  // before it, stays unmapped. select and datetime have no detector type:
+  // they come from a user's forcedDomain only, never from this map.
+  slider: 'number',
 };
 
 /**
@@ -247,6 +256,11 @@ function channelName(controlType: string, state: DetectedChannel): string | null
   if (IGNORED_CHANNELS.has(upper)) return null;
   if (controlType === 'weatherCurrent') return CURRENT_WEATHER_CHANNELS[upper] ?? null;
   if (controlType === 'weatherForecast') return FORECAST_CHANNEL.test(upper) ? upper.toLowerCase() : null;
+  // A slider is its SET alone: the number shows and writes that one channel
+  // (synth/editable.ts's valueChannel). Its optional ON and ON_ACTUAL would
+  // be renamed set and actual below -- the boolean ON_ACTUAL ahead of the
+  // numeric ACTUAL -- and none of the three is read (Task 13).
+  if (controlType === 'slider') return upper === 'SET' ? 'set' : null;
 
   // The writable POWER channel, which every downstream module knows as `set`.
   // The detector spells it three different ways depending on the pattern, and
@@ -337,6 +351,7 @@ export function mapControlToDevice(
     if (info?.type) channel.type = info.type as ChannelInput['type'];
     if (info?.min !== undefined) channel.min = info.min;
     if (info?.max !== undefined) channel.max = info.max;
+    if (info?.step !== undefined) channel.step = info.step;
     if (info?.states) channel.states = info.states;
     // The object's own common.write first (Ruling 35): the detector skips its
     // write check for an object carrying the pattern's defaultRole, so a
@@ -437,6 +452,7 @@ function objectMeta(id: string, obj: IoBrokerObject): ObjectMeta {
     type: typeof common.type === 'string' ? common.type : undefined,
     min: typeof common.min === 'number' ? common.min : undefined,
     max: typeof common.max === 'number' ? common.max : undefined,
+    step: typeof common.step === 'number' ? common.step : undefined,
     states: validStates(common.states, common.type),
     write: typeof common.write === 'boolean' ? common.write : undefined,
     icon: typeof common.icon === 'string' ? common.icon : undefined,
@@ -519,7 +535,9 @@ function requiredStates(control: DetectedControl): string[] {
  * `info` means nothing of its own: the states an earlier detection claimed are
  * taken out of it, and it goes when none of its own is left, or when the
  * root has a control of its own beside it -- not merely another root's
- * control seen again (Ruling 57). Only state objects count: info's ACTUAL
+ * control seen again (Ruling 57). A slider, the catch-all of adjustable
+ * values, likewise goes beside a control of the root's own, and so never
+ * holds the root id (Task 13). Only state objects count: info's ACTUAL
  * matches any object below its root (ChannelDetector.js:35-37, no
  * objectType), and a channel must never become an entity's reading
  * (Ruling 52). The deepest root goes first, so each control comes from the
@@ -597,7 +615,15 @@ export function discoverDevices(
     }));
     // A control of the root's own requires a state no deeper root claimed;
     // any other detection is a deeper root's control seen again.
-    const typed = controls.some((c) => c.type !== 'info' && requiredStates(c).some((id) => !claimed.has(id)));
+    const ownBeside = (type: string): boolean =>
+      controls.some((c) => c.type !== 'info' && c.type !== type && requiredStates(c).some((id) => !claimed.has(id)));
+    const typed = ownBeside('info');
+    // levelSlider's SET is any writable, bounded level.* number
+    // (typePatterns.js:3367-3381): the catch-all of adjustable values. Beside
+    // a control of the root's own it is that control's leftover parameter --
+    // a dimmer's RAMP_TIME, a thermostat's calibration offset, a lamp's
+    // transition time -- not a number of its own (Task 13).
+    const sliderBeside = ownBeside('slider');
     const recorded = anchors[rootId];
     let holder = recorded === undefined ? undefined : controls.find((c) => requiredStates(c).includes(recorded));
     // Kept as recorded: if its control is gone the id goes to nobody.
@@ -613,7 +639,10 @@ export function discoverDevices(
       for (const id of required) claimed.add(id);
       const anchor = own ?? required[0];
 
-      const device = mapControlToDevice(rootId, control, meta);
+      // Such a slider is no device before it can hold the root id: sorted by
+      // how many states it matched (ChannelDetector.js:742-744), it may come
+      // ahead of the control it belongs to.
+      const device = control.type === 'slider' && sliderBeside ? null : mapControlToDevice(rootId, control, meta);
       // A view is another root's source seen again: never this root's holder,
       // so the root's own control keeps its id (Task 11 round 1, M3).
       if (view) {

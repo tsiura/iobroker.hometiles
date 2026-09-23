@@ -7,6 +7,7 @@ import {
   encodeChannelValue,
   isUsable,
   readChannel,
+  readEnum,
   roleCodec,
   toBoolState,
   type Values,
@@ -53,31 +54,6 @@ function readNumber(device: DeviceInput, name: string, values: Values): number |
   if (!text) return undefined;
   const numeric = Number(text);
   return Number.isFinite(numeric) ? numeric : undefined;
-}
-
-/**
- * Reads a channel that carries a named state (MODE, WORKING_MODE, SPEED, the
- * numeric SWING): decodes through the channel's own ioBroker `states` map
- * when the admin configured one, otherwise falls back to the raw value. type-
- * detector declares these channels as Number-or-String, so a blank string
- * must resolve to undefined rather than an empty label — the same rule
- * readNumber applies to the purely numeric channels.
- */
-function readEnum(device: DeviceInput, name: string, values: Values): string | undefined {
-  const read = readChannel(device, name, values);
-  if (!read || !isUsable(read.value)) return undefined;
-  const raw = read.value.val;
-  const states = read.channel.states;
-  if (states) {
-    const label = states[String(raw)];
-    if (label !== undefined) return label;
-  }
-  if (typeof raw === 'string') {
-    const text = raw.trim();
-    return text ? text : undefined;
-  }
-  if (typeof raw === 'number') return Number.isFinite(raw) ? String(raw) : undefined;
-  return undefined;
 }
 
 /** Reads a boolean-ish channel (POWER, BOOST, the boolean SWING toggle) as on/off. */

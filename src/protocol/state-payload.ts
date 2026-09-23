@@ -24,11 +24,14 @@ type PayloadShape = 'bare' | 'json' | 'none';
  *   literal "unavailable", and tiles_update_sensor_by_entity consumes the raw
  *   payload for TILE_SENSOR, TILE_SWITCH and TILE_BINARY_SENSOR.
  * - json: sync_local_device_entities publishes {"state":"on","brightness_pct":N}.
- * - none: a scene has no state; the panel only ever fires it.
+ * - none: a scene has no state; the panel only ever fires it. Nor does an
+ *   editable value (number, select, datetime) have one here: the panel reads
+ *   it from the `control` leaf, in the /control schema
+ *   (docs/contract-editable.md §3), which Task 14 builds. The generic JSON
+ *   loop below must never publish one on `state` (Task 13).
  *
- * climate, cover, media_player, weather, number, select and datetime all
- * publish JSON: docs/contract-climate-cover.md, docs/contract-media-weather.md
- * and docs/contract-editable.md (the `/control` payload).
+ * climate, cover, media_player and weather publish JSON:
+ * docs/contract-climate-cover.md and docs/contract-media-weather.md.
  */
 function payloadShape(domain: Domain): PayloadShape {
   switch (domain) {
@@ -41,11 +44,11 @@ function payloadShape(domain: Domain): PayloadShape {
     case 'cover':
     case 'media_player':
     case 'weather':
+      return 'json';
+    case 'scene':
     case 'number':
     case 'select':
     case 'datetime':
-      return 'json';
-    case 'scene':
       return 'none';
   }
 }

@@ -119,7 +119,8 @@ export function baseEntity(
     // write: Ruling 38, for every domain. current: Ruling 41; a value the
     // decoders would not use (isUsable) is no current value either. min/max:
     // the declared range commands are scaled into and checked against
-    // (Ruling 49). unit: what a colour temperature is stored in (Ruling 59).
+    // (Ruling 49). step: the interval a number is set in (Task 13). unit:
+    // what a colour temperature is stored in (Ruling 59).
     channelMeta[name] = {
       type: channel.type,
       states: channel.states,
@@ -127,6 +128,7 @@ export function baseEntity(
       current: isUsable(value) ? value.val : undefined,
       min: channel.min,
       max: channel.max,
+      step: channel.step,
       unit: channel.unit,
     };
     if (value && value.ts > lastChanged) lastChanged = value.ts;
@@ -173,7 +175,33 @@ export function acceptsLabels(codec: ChannelCodec | undefined): boolean {
 }
 
 /**
- * The exact inverse of readEnum (synth/climate.ts) and toBoolState (above):
+ * Reads a channel that carries a named state (MODE, WORKING_MODE, SPEED, the
+ * numeric SWING, a select's value): decodes through the channel's own ioBroker
+ * `states` map when the admin configured one, otherwise falls back to the raw
+ * value. type-detector declares these channels as Number-or-String, so a blank
+ * string must resolve to undefined rather than an empty label — the same rule
+ * readNumber applies to the purely numeric channels. It sits here beside its
+ * inverse, encodeChannelValue (Task 13; select reads and writes through both).
+ */
+export function readEnum(device: DeviceInput, name: string, values: Values): string | undefined {
+  const read = readChannel(device, name, values);
+  if (!read || !isUsable(read.value)) return undefined;
+  const raw = read.value.val;
+  const states = read.channel.states;
+  if (states) {
+    const label = states[String(raw)];
+    if (label !== undefined) return label;
+  }
+  if (typeof raw === 'string') {
+    const text = raw.trim();
+    return text ? text : undefined;
+  }
+  if (typeof raw === 'number') return Number.isFinite(raw) ? String(raw) : undefined;
+  return undefined;
+}
+
+/**
+ * The exact inverse of readEnum and toBoolState (both above):
  * those decode a raw ioBroker value into an HA-style display label; this
  * turns a label back into the raw value a write actually needs. Writing a
  * decoded label back to ioBroker verbatim -- e.g. the string "heat" into a

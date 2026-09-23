@@ -84,10 +84,12 @@ const CORRUPT_ENUM_OBJECTS: Record<string, object> = {
 
 /**
  * One bad object each, beside the good sensor: a role that is not text (the
- * type-detector threw on it), a device a hand-edited override forces into a
- * domain with no synth yet (synthesise threw on it), and an alias whose target
- * id is malformed (js-controller rejects reading it, adapter.js
- * _getForeignState). Each used to stop the whole discovery.
+ * type-detector threw on it) and an alias whose target id is malformed
+ * (js-controller rejects reading it, adapter.js _getForeignState). Each used
+ * to stop the whole discovery. FORCED was the third: a hand-edited override
+ * forcing it into a domain with no synth yet made synthesise throw. Since
+ * Task 13 every domain has a synth, so it is an entity now, and no longer
+ * left out.
  */
 const BAD_ROLE = 'zigbee.0.00158d0004c0ffee';
 const FORCED = 'zigbee.0.00158d0004f0rced';
@@ -376,8 +378,9 @@ if (process.env.HOMETILES_INTEGRATION === '1') {
           const warnings = logs.filter((log) => log.severity === 'warn').map((log) => log.message);
           const named = (text: string): boolean => warnings.some((message) => message.includes('[Registry]') && message.includes(text));
           expect(named(`${BAD_ROLE}.status`), warnings.join('\n')).to.equal(true);
-          expect(named(`${FORCED} (not implemented: number)`), warnings.join('\n')).to.equal(true);
           expect(named(`${BAD_ALIAS}.ACTUAL`), warnings.join('\n')).to.equal(true);
+          // Task 13: the device forced into number is an entity, not left out.
+          expect(named(FORCED), warnings.join('\n')).to.equal(false);
         });
       });
 

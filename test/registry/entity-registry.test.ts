@@ -142,14 +142,37 @@ describe('registry/entity-registry', () => {
   });
 
   it('leaves out a device no entity can be made of, names it, and keeps every other (Ruling 62)', () => {
-    // A hand-edited forcedDomain of a domain with no synth yet reaches
-    // synthesise, which throws: that failed the whole discovery, retried
-    // forever, with a log naming no object.
+    // A device synthesise throws on failed the whole discovery, retried
+    // forever, with a log naming no object. Until Task 13 a hand-edited
+    // forcedDomain of a domain with no synth did that; every domain has one
+    // now, so a corrupt device stands in for whatever throws next.
     const { registry } = harness();
-    const station: DeviceInput = { ...TEMP, objectId: 'zigbee.0.station', name: 'Station', domain: 'number' };
+    const station = {
+      ...TEMP,
+      objectId: 'zigbee.0.station',
+      name: 'Station',
+      get channels(): DeviceInput['channels'] {
+        throw new Error('corrupt device');
+      },
+    } as DeviceInput;
     const result = registry.rebuild([station, TEMP], {});
-    expect(result.skipped).to.deep.equal([{ objectId: 'zigbee.0.station', reason: 'not implemented: number' }]);
+    expect(result.skipped).to.deep.equal([{ objectId: 'zigbee.0.station', reason: 'corrupt device' }]);
     expect(registry.all().map((entity) => entity.entityId)).to.deep.equal(['sensor.wohnzimmer']);
+  });
+
+  it('makes an entity of a device forced into number, select or datetime (Task 13)', () => {
+    // A read-only temperature forced into each: shown, never editable.
+    const { registry } = harness();
+    const forced = (['number', 'select', 'datetime'] as const).map(
+      (domain): DeviceInput => ({ ...TEMP, objectId: `zigbee.0.${domain}`, name: domain, domain }),
+    );
+    const result = registry.rebuild(forced, {});
+    expect(result.skipped).to.deep.equal([]);
+    expect(registry.all().map((entity) => [entity.entityId, entity.writable])).to.deep.equal([
+      ['number.number', { value: false }],
+      ['select.select', { value: false }],
+      ['datetime.datetime', { value: false }],
+    ]);
   });
 
   it('asks again for every source an attempt did not get to read (Ruling 60(3))', () => {

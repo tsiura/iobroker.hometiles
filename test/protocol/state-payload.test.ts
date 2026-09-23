@@ -161,7 +161,8 @@ describe('protocol/state-payload', () => {
   });
 
   it('keeps every other domain on the state leaf', () => {
-    for (const domain of DOMAINS.filter((d) => d !== 'weather' && d !== 'scene')) {
+    const none = ['weather', 'scene', 'number', 'select', 'datetime'];
+    for (const domain of DOMAINS.filter((d) => !none.includes(d))) {
       expect(buildStatePublish('ha/statestream', entity({ entityId: `${domain}.t`, domain, state: 'on' }))!.topic, domain).to.equal(
         `ha/statestream/${domain}/t/state`,
       );
@@ -170,6 +171,14 @@ describe('protocol/state-payload', () => {
 
   it('publishes nothing for a scene', () => {
     expect(buildStatePublish('ha/statestream', entity({ entityId: 'scene.n', domain: 'scene' }))).to.equal(null);
+  });
+
+  it('publishes nothing on the state leaf for an editable value (Task 13)', () => {
+    // The panel reads number, select and datetime from `control` only, in the
+    // /control schema (contract-editable.md §3) that Task 14 builds.
+    for (const domain of ['number', 'select', 'datetime'] as const) {
+      expect(buildStatePublish('ha/statestream', entity({ entityId: `${domain}.t`, domain, state: '1' })), domain).to.equal(null);
+    }
   });
 
   it('clears a retained entity with an empty retained payload', () => {
@@ -203,9 +212,12 @@ describe('protocol/state-payload', () => {
       cover: 'json',
       media_player: 'json',
       weather: 'json',
-      number: 'json',
-      select: 'json',
-      datetime: 'json',
+      // Task 13 makes these entities real. Their value travels on the
+      // `control` leaf in the /control schema (contract-editable.md §3,
+      // Task 14), never through the generic JSON loop on `state`.
+      number: 'none',
+      select: 'none',
+      datetime: 'none',
     });
   });
 });

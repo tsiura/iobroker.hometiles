@@ -90,8 +90,8 @@ export class EntityRegistry {
       // synthClimate can find nothing usable behind a device (a later ^6
       // type-detector minor or a domain override; see there); synthesise
       // returns null rather than a hollow entity, and that device gets no
-      // slot and no channel subscriptions. A domain with no synth yet throws
-      // (a hand-edited forcedDomain): that device alone is left out.
+      // slot and no channel subscriptions. A synth that throws on a device
+      // leaves that device alone out (Ruling 62).
       let entity: VirtualEntity | null;
       try {
         entity = synthesise(device, entityId, this.valuesFor(device));

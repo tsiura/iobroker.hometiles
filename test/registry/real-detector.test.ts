@@ -1,8 +1,11 @@
 import { expect } from 'chai';
 import { parseLightCommand, parseMediaCommand, type ServiceCall } from '../../src/protocol/commands';
 import { buildStatePublish } from '../../src/protocol/state-payload';
-import { discoverDevices } from '../../src/registry/detector';
+import { createIoBrokerDetector, discoverDevices } from '../../src/registry/detector';
 import { EntityRegistry } from '../../src/registry/entity-registry';
+import { applyOverrides } from '../../src/registry/overrides';
+import { encodeChannelValue } from '../../src/registry/synth/common';
+import { synthDatetime, valueChannel } from '../../src/registry/synth/editable';
 import { synthesise } from '../../src/registry/synth/index';
 import type { DeviceInput, SourceValue, VirtualEntity } from '../../src/registry/types';
 import { Dispatcher } from '../../src/runtime/dispatcher';
@@ -16,7 +19,7 @@ import { Dispatcher } from '../../src/runtime/dispatcher';
  * (Task 5c, Rulings 34/35; Task 5d).
  */
 
-type IoType = 'device' | 'channel' | 'state' | 'enum';
+type IoType = 'device' | 'channel' | 'state' | 'enum' | 'folder';
 interface IoObject {
   _id: string;
   type: IoType;
@@ -1622,5 +1625,314 @@ describe('discovery orchestration (Task 5d)', () => {
     expect(ignored).to.deep.equal(['enum.functions.kaputt']);
     // The valid "Licht" enum still makes the switch actuator a lamp.
     expect(devices.map((detected) => [detected.objectId, detected.domain])).to.deep.equal([[LAMP, 'light']]);
+  });
+});
+
+// ---- Task 13: number, select and datetime ----
+
+/**
+ * Every control type the REAL detector reports below each root, mapped or
+ * not. Discovery drops what it does not publish, so this is what shows that a
+ * tree holds a slider detection even when no number comes of it.
+ */
+function detectedTypes(all: IoObjects): string[] {
+  const detector = createIoBrokerDetector(all);
+  return Object.keys(all)
+    .filter((id) => all[id]?.type === 'channel' || all[id]?.type === 'device')
+    .flatMap((root) => detector.detect(root).map((control) => control.type));
+}
+
+const numbersIn = (all: IoObjects): string[] =>
+  detectDevices(all)
+    .filter((detected) => detected.domain === 'number')
+    .map((detected) => detected.objectId);
+
+// A standalone level slider as a user builds one in alias.0 for a heat pump's
+// flow-temperature setpoint: a channel of its own, a SET in levelSlider's own
+// default role `level` with declared bounds and step, the reading beside it.
+const FLOW = 'alias.0.Heizung.Vorlauf';
+const FLOW_SET = objects(
+  channel(FLOW, 'Vorlauf Soll'),
+  state(`${FLOW}.SET`, { role: 'level', type: 'number', unit: '°C', min: 20, max: 60, step: 0.5, write: true }),
+  state(`${FLOW}.ACTUAL`, { role: 'value', type: 'number', unit: '°C', min: 20, max: 60, write: false }),
+);
+
+// A Homematic dimmer actuator (HM-LC-Dim1T-Pl-3) laid out the hm-rpc way:
+// device, maintenance channel 0, dimmer channel 1, datapoints named the
+// hm-rega way. RAMP_TIME and ON_TIME are write-only FLOATs bounded by the
+// paramset, 0..85825945 s. They carry the plainest writable-number role,
+// `level`: whatever level.* role an adapter gives a writable, bounded number,
+// levelSlider's SET (/^level(\..*)?$/) matches it. The worst case for the
+// slider mapping: one of them published as a number beside the lamp.
+const DIM = 'hm-rpc.0.LEQ0123456';
+const dim1 = (datapoint: string, common: Record<string, unknown>): IoObject =>
+  state(`${DIM}.1.${datapoint}`, { name: `Dimmer Flur:1.${datapoint}`, ...common });
+const DIM_SET = objects(
+  device(DIM, 'Dimmer Flur'),
+  channel(`${DIM}.0`, 'Dimmer Flur:0'),
+  state(`${DIM}.0.UNREACH`, { role: 'indicator.unreach', type: 'boolean', write: false }),
+  channel(`${DIM}.1`, 'Dimmer Flur:1'),
+  dim1('LEVEL', { role: 'level.dimmer', type: 'number', unit: '%', min: 0, max: 100, write: true }),
+  dim1('OLD_LEVEL', { role: 'button', type: 'boolean', read: false, write: true }),
+  dim1('ON_TIME', { role: 'level', type: 'number', unit: 's', min: 0, max: 85825945, read: false, write: true }),
+  dim1('RAMP_TIME', { role: 'level', type: 'number', unit: 's', min: 0, max: 85825945, read: false, write: true }),
+  dim1('WORKING', { role: 'indicator.working', type: 'boolean', write: false }),
+);
+
+// A zigbee2mqtt radiator thermostat, flat under its device: setpoint, room
+// temperature, its calibration offset -- a second writable, bounded number,
+// in the same plainest role -- and its mode as text with a states map.
+const TRV = 'zigbee2mqtt.0.0x84fd27fffe0a1b2c';
+const TRV_SET = objects(
+  device(TRV, 'Heizkörper Bad'),
+  state(`${TRV}.occupied_heating_setpoint`, {
+    role: 'level.temperature',
+    type: 'number',
+    unit: '°C',
+    min: 5,
+    max: 35,
+    step: 0.5,
+    write: true,
+  }),
+  state(`${TRV}.local_temperature`, { role: 'value.temperature', type: 'number', unit: '°C', write: false }),
+  state(`${TRV}.local_temperature_calibration`, {
+    role: 'level',
+    type: 'number',
+    unit: '°C',
+    min: -12.8,
+    max: 12.7,
+    step: 0.1,
+    write: true,
+  }),
+  state(`${TRV}.system_mode`, { role: 'state', type: 'string', write: true, states: { off: 'off', heat: 'heat', auto: 'auto' } }),
+);
+
+// Existing trees, each given one writable, bounded `level` beside its control.
+const withLevel = (all: IoObjects, id: string, common: Record<string, unknown>): IoObjects => ({
+  ...all,
+  ...objects(state(id, { role: 'level', type: 'number', write: true, ...common })),
+});
+const HUE_TRANSITION = withLevel(HUE_SET, `${HUE}.transitiontime`, { min: 0, max: 65535 });
+const BLIND_RUNNING = withLevel(BLIND_SET, `${BLIND}.RUNNING_TIME`, { unit: 's', min: 0, max: 255 });
+// A plain `level` would compete for mediaPlayer's own VOLUME (/^level(\.volume)?$/)
+// and lose to level.volume, so the bass carries a role of its own.
+const SONOS_BASS = withLevel(SONOS_SET, `${SONOS}.bass`, { role: 'level.bass', min: -10, max: 10 });
+
+describe('number, select and datetime (Task 13)', () => {
+  it('a standalone level slider becomes exactly one number, with its declared range, step and unit', () => {
+    const runs = run(FLOW_SET, { [`${FLOW}.SET`]: value(45), [`${FLOW}.ACTUAL`]: value(43.5) });
+    expect(runs.map(({ device: detected }) => [detected.objectId, detected.detectorType, detected.domain])).to.deep.equal([
+      [FLOW, 'slider', 'number'],
+    ]);
+    expectRealChannels(FLOW_SET, runs[0]!.device, { set: `${FLOW}.SET` });
+    const entity = runs[0]!.entity!;
+    // The value the panel edits is SET's, not the reading's.
+    expect(entity).to.include({ domain: 'number', state: '45', available: true });
+    expect(entity.attributes).to.include({ friendly_name: 'Vorlauf Soll', min: 20, max: 60, step: 0.5, unit_of_measurement: '°C' });
+    expect(entity.writable).to.deep.equal({ value: true });
+    expect(entity.channelMeta?.set).to.include({ type: 'number', write: true, min: 20, max: 60, step: 0.5, current: 45 });
+    // Nothing on the /state leaf: the panel reads an editable value from
+    // /control only (contract-editable.md §3), which Task 14 builds.
+    expect(runs[0]!.payload).to.equal(undefined);
+  });
+
+  it('adds no entity to dimmer, blind, thermostat, media and colour-temperature trees', () => {
+    const trees: Array<[string, IoObjects, boolean]> = [
+      // label, tree, whether the detector reports a slider in it
+      ['a Homematic dimmer with RAMP_TIME and ON_TIME', DIM_SET, true],
+      ['an alias dimmer', ESS_SET, false],
+      ['a Hue CT lamp', HUE_SET, false],
+      ['a Hue CT lamp with a transition time', HUE_TRANSITION, true],
+      ['a zigbee2mqtt bulb, CT in mireds', Z2M_SET, false],
+      ['an ioBroker.zigbee bulb', ZIGBEE_SET, false],
+      ['a blind', BLIND_SET, false],
+      ['a blind with a running time', BLIND_RUNNING, true],
+      ['a Homematic radiator thermostat, MANU_MODE a second level.temperature', RT_SET, false],
+      ['a zigbee2mqtt radiator thermostat with a calibration offset', TRV_SET, true],
+      ['an air conditioner', AC_SET, false],
+      ['a thermostat below a room channel', WOHN_SET, false],
+      ['a Sonos player', SONOS_SET, false],
+      ['a Sonos player with a bass level', SONOS_BASS, true],
+      ['a squeezebox player', SQUEEZE_SET, false],
+      ['a Chromecast, volume 0..1', CAST_SET, false],
+    ];
+    const got = trees.map(([label, all]) => [label, detectedTypes(all).includes('slider'), numbersIn(all)]);
+    expect(got).to.deep.equal(trees.map(([label, , holdsSlider]) => [label, holdsSlider, []]));
+    for (const [, all] of trees) expectNoRequiredStateBacksTwoEntities(all);
+  });
+
+  it('a second dimmer, blind, setpoint, volume or colour temperature in one device is no slider at the device root', () => {
+    // Homematic's multi-channel actuators: at the device root the pattern's
+    // SET takes one channel's level and rejects the other's, so levelSlider
+    // never sees it (ChannelDetector.js:305-316, :618).
+    for (const role of ['level.dimmer', 'level.blind', 'level.temperature', 'level.volume', 'level.color.temperature']) {
+      const root = 'hm-rpc.0.NEQ0000001';
+      const all = objects(
+        device(root, 'Aktor'),
+        ...[1, 2].flatMap((n) => [
+          channel(`${root}.${n}`, `Aktor:${n}`),
+          state(`${root}.${n}.LEVEL`, { role, type: 'number', min: 0, max: 100, write: true }),
+        ]),
+      );
+      expect(detectedTypes(all), role).to.not.include('slider');
+      expect(numbersIn(all), role).to.deep.equal([]);
+    }
+  });
+
+  it('a slider beside a control of its root never holds the root id, even sorted ahead of it', () => {
+    // The detector sorts by matched states (ChannelDetector.js:742-744): the
+    // slider's three come before the reset button's one.
+    const VALVE = 'alias.0.Heizung.Ventil';
+    const all = objects(
+      channel(VALVE, 'Ventil'),
+      state(`${VALVE}.SET`, { role: 'level', type: 'number', min: 0, max: 100, write: true }),
+      state(`${VALVE}.ACTUAL`, { role: 'value', type: 'number', min: 0, max: 100, write: false }),
+      state(`${VALVE}.WORKING`, { role: 'indicator.working', type: 'boolean', write: false }),
+      state(`${VALVE}.RESET`, { role: 'button', type: 'boolean', read: false, write: true }),
+    );
+    expect(detectedTypes(all)).to.deep.equal(['slider', 'button']);
+    const { devices, anchors } = discoverDevices(all, 'hometiles.0');
+    expect(devices.map((detected) => [detected.objectId, detected.name, detected.domain])).to.deep.equal([[VALVE, 'Ventil', 'scene']]);
+    expect(anchors[VALVE]).to.equal(`${VALVE}.RESET`);
+  });
+
+  it("a slider beside only a deeper root's control seen again, or leftover readings, is a number of its own", () => {
+    // The room's own setpoint beside its light channel and a note: the
+    // dimmer at the room root is the light channel's, seen again, and the
+    // note is the catch-all's -- neither is a control of the room's own.
+    const ROOM_DEVICE = 'alias.0.Wohnzimmer';
+    const all = objects(
+      device(ROOM_DEVICE, 'Wohnzimmer'),
+      channel(`${ROOM_DEVICE}.Licht`, 'Licht'),
+      state(`${ROOM_DEVICE}.Licht.SET`, { role: 'level.dimmer', type: 'number', unit: '%', min: 0, max: 100, write: true }),
+      state(`${ROOM_DEVICE}.Licht.ON_SET`, { role: 'switch.light', type: 'boolean', write: true }),
+      state(`${ROOM_DEVICE}.Soll`, { role: 'level', type: 'number', unit: '°C', min: 15, max: 25, step: 0.5, write: true }),
+      state(`${ROOM_DEVICE}.Hinweis`, { role: 'text', type: 'string', write: false }),
+    );
+    expect(detectDevices(all).map((detected) => [detected.objectId, detected.detectorType, detected.domain])).to.deep.equal([
+      [`${ROOM_DEVICE}.Licht`, 'dimmer', 'light'],
+      // Keyed by its own state: the room's id went to its first control, the
+      // light seen again (Ruling 45, as the Shelly relay above).
+      [`${ROOM_DEVICE}.Soll`, 'slider', 'number'],
+    ]);
+  });
+
+  it('across the whole installation, publishes no number', () => {
+    expect(numbersIn(INSTALLATION)).to.deep.equal([]);
+  });
+
+  it('a level in percent is the percentage type, tried just before levelSlider, and publishes nothing', () => {
+    // percentage's SET is levelSlider's with `unit: '%'` as a hard condition
+    // (typePatterns.js:3331-3345), and it comes first, so a percent level is
+    // never a slider. Task 13 maps slider only (see the task-13 report).
+    const PERCENT = 'alias.0.Lueftung.Stufe';
+    const all = objects(
+      channel(PERCENT, 'Lüftung'),
+      state(`${PERCENT}.SET`, { role: 'level', type: 'number', unit: '%', min: 0, max: 100, write: true }),
+    );
+    expect(detectedTypes(all)).to.deep.equal(['percentage']);
+    expect(detectDevices(all)).to.deep.equal([]);
+  });
+
+  describe('select and datetime reach their synths only through a forced domain', () => {
+    const ROOT = 'alias.0.Heizung.Betriebsart';
+    const SET = `${ROOT}.SET`;
+    const tree = (common: Record<string, unknown>): IoObjects =>
+      objects(channel(ROOT, 'Betriebsart'), state(SET, { write: true, ...common }));
+    const forced = (all: IoObjects, forcedDomain: string): DeviceInput[] =>
+      applyOverrides(detectDevices(all), [{ objectId: ROOT, include: true, forcedDomain }]);
+
+    for (const [label, common, detectedAs, raw, shown, ecoRaw] of [
+      [
+        'a bounded numeric mode, detected as a slider',
+        { role: 'level.mode', type: 'number', min: 0, max: 2, states: { 0: 'Aus', 1: 'Eco', 2: 'Komfort' } },
+        ['slider', 'number'],
+        2,
+        'Komfort',
+        1,
+      ],
+      [
+        'a numeric mode without bounds, its states an array, detected as a reading',
+        { role: 'level.mode', type: 'number', states: ['Aus', 'Eco', 'Komfort'] },
+        ['info', 'sensor'],
+        2,
+        'Komfort',
+        1,
+      ],
+      [
+        'a text mode with a states map, detected as a reading',
+        { role: 'state', type: 'string', states: { off: 'Aus', eco: 'Eco', comfort: 'Komfort' } },
+        ['info', 'sensor'],
+        'comfort',
+        'Komfort',
+        'eco',
+      ],
+    ] as const) {
+      it(`select: ${label}`, () => {
+        const all = tree(common);
+        const values = { [SET]: value(raw) };
+        expect(detectDevices(all).map((detected) => [detected.detectorType, detected.domain])).to.deep.equal([detectedAs]);
+
+        const [device] = forced(all, 'select');
+        const entity = synthesise(device!, 'select.betriebsart', values)!;
+        expect(entity).to.include({ domain: 'select', state: shown, available: true });
+        expect(entity.attributes.options).to.deep.equal(['Aus', 'Eco', 'Komfort']);
+        expect(entity.writable).to.deep.equal({ value: true });
+        // Task 15's reverse mapping: the option string the panel sends, back
+        // to the raw value, through the entity's own channelMeta.
+        expect(encodeChannelValue(entity.channelMeta?.[valueChannel(entity.source)!], 'Eco')).to.equal(ecoRaw);
+
+        const registry = new EntityRegistry({ onEntityChanged: () => undefined, onMembershipChanged: () => undefined }, 0);
+        expect(registry.rebuild(forced(all, 'select'), {}).entityIds).to.deep.equal({ [ROOT]: 'select.betriebsart' });
+      });
+    }
+
+    for (const [text, role, kind] of [
+      ['06:45', 'state', { has_date: false, has_time: true }],
+      ['2026-12-24', 'date', { has_date: true, has_time: false }],
+      ['2026-12-24 18:00:00', 'text', { has_date: true, has_time: true }],
+    ] as const) {
+      it(`datetime: a writable "${text}" is a reading to detection, and a datetime only once forced`, () => {
+        const all = tree({ role, type: 'string' });
+        const values = { [SET]: value(text) };
+        const [detected] = detectDevices(all);
+        expect([detected!.detectorType, detected!.domain]).to.deep.equal(['info', 'sensor']);
+        // Never inferred: the synth refuses the device detection alone made.
+        expect(synthDatetime(detected!, 'datetime.betriebsart', values)).to.equal(null);
+        expect(synthesise(detected!, 'sensor.betriebsart', values)?.state).to.equal(text);
+
+        const entity = synthesise(forced(all, 'datetime')[0]!, 'datetime.betriebsart', values)!;
+        expect(entity).to.include({ domain: 'datetime', state: text, available: true });
+        expect(entity.attributes).to.include(kind);
+        expect(entity.writable).to.deep.equal({ value: true });
+      });
+    }
+
+    it('no override can reach a writable enum or text that discovery publishes no device for', () => {
+      // Evidence for the task-13 report: overrides re-domain detected devices
+      // only (overrides.ts), so each of these shapes has no path to select or
+      // datetime.
+      // 1. Beside a control of its root's own, the catch-all reading goes
+      //    (Ruling 57): the radiator thermostat's system_mode.
+      expect(backedBy(run(TRV_SET), `${TRV}.system_mode`)).to.deep.equal([]);
+      // 2. A root's catch-all is one device, its first reading: the second
+      //    writable text below the same channel has none.
+      const two = objects(
+        channel(ROOT, 'Betriebsart'),
+        state(`${ROOT}.A`, { role: 'state', type: 'string', write: true, states: { a: 'A' } }),
+        state(`${ROOT}.B`, { role: 'state', type: 'string', write: true, states: { b: 'B' } }),
+      );
+      expect(backedBy(run(two), `${ROOT}.A`)).to.deep.equal([ROOT]);
+      expect(backedBy(run(two), `${ROOT}.B`)).to.deep.equal([]);
+      // 3. No channel or device above it: 0_userdata.0 states and folders are no root.
+      const userdata = objects(
+        state('0_userdata.0.Weckzeit', { role: 'state', type: 'string', write: true }),
+        { _id: '0_userdata.0.Haus', type: 'folder', common: { name: 'Haus' }, native: {} },
+        state('0_userdata.0.Haus.Modus', { role: 'state', type: 'string', write: true, states: { a: 'A', b: 'B' } }),
+      );
+      expect(detectDevices(userdata)).to.deep.equal([]);
+      // 4. An unmapped detection holds it: a fan's mode (FANCOIL_SET's fan).
+      expect(backedBy(run(FANCOIL_SET), `${FANCOIL}.fan`)).to.deep.equal([]);
+    });
   });
 });

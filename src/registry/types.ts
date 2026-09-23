@@ -44,6 +44,8 @@ export interface ChannelInput {
   type?: 'boolean' | 'number' | 'string' | 'mixed';
   min?: number;
   max?: number;
+  /** common.step: the interval a numeric value is set in (Task 13's number). */
+  step?: number;
   states?: Record<string, string>;
   write?: boolean;
 }
@@ -57,9 +59,12 @@ export interface ChannelInput {
  * channel's newest usable raw value, so re-selecting the current value writes
  * exactly that value (Ruling 41). `min`/`max` are the declared bounds a
  * percentage is scaled over (Ruling 49), and `unit` tells a colour temperature
- * in mireds from one in kelvin (Ruling 59).
+ * in mireds from one in kelvin (Ruling 59). `step` is the declared interval a
+ * number is set in (Task 13).
  */
-export type ChannelCodec = Pick<ChannelInput, 'type' | 'states' | 'write' | 'min' | 'max' | 'unit'> & { current?: unknown };
+export type ChannelCodec = Pick<ChannelInput, 'type' | 'states' | 'write' | 'min' | 'max' | 'step' | 'unit'> & {
+  current?: unknown;
+};
 
 /** A device as classified by the detector plus the admin's overrides. */
 export interface DeviceInput {

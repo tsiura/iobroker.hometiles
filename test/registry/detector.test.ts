@@ -313,6 +313,46 @@ describe('registry/detector mapping', () => {
     expect(DETECTOR_TYPE_TO_DOMAIN.mediaPlayer).to.equal(undefined);
   });
 
+  it('maps the Types value slider, not the pattern key levelSlider, to number (Task 13)', () => {
+    // The same trap a third time: typePatterns.js keys the pattern
+    // 'levelSlider', DetectedControl.type carries its Types value 'slider'
+    // (types.js:70).
+    expect(DETECTOR_TYPE_TO_DOMAIN.slider).to.equal('number');
+    expect(DETECTOR_TYPE_TO_DOMAIN.levelSlider).to.equal(undefined);
+  });
+
+  it('never maps a detector type to select or datetime: both come only from a forced domain (Task 13)', () => {
+    expect(Object.values(DETECTOR_TYPE_TO_DOMAIN)).to.not.include('select');
+    expect(Object.values(DETECTOR_TYPE_TO_DOMAIN)).to.not.include('datetime');
+  });
+
+  it("keeps a slider's SET alone: the number shows and writes that one channel (Task 13)", () => {
+    // Its ON would be renamed `set` and its boolean ON_ACTUAL `actual`, ahead
+    // of the numeric ACTUAL -- none of which the number reads.
+    const control: DetectedControl = {
+      type: 'slider',
+      states: [
+        { id: 'alias.0.pump.SET', name: 'SET', write: true },
+        { id: 'alias.0.pump.ON', name: 'ON', write: true },
+        { id: 'alias.0.pump.ON_ACTUAL', name: 'ON_ACTUAL', write: false },
+        { id: 'alias.0.pump.ACTUAL', name: 'ACTUAL', write: false },
+        { id: 'alias.0.pump.UNREACH', name: 'UNREACH' },
+      ],
+    };
+    const device = mapControlToDevice('alias.0.pump', control, {});
+    expect(device?.domain).to.equal('number');
+    expect(Object.keys(device!.channels)).to.deep.equal(['set']);
+    expect(device!.channels.set!.objectId).to.equal('alias.0.pump.SET');
+  });
+
+  it('carries common.step onto the channel beside min and max (Task 13)', () => {
+    const meta: Record<string, ObjectMeta> = {
+      'alias.0.flow.SET': { name: 'Soll', role: 'level', type: 'number', min: 20, max: 60, step: 0.5, write: true },
+    };
+    const control: DetectedControl = { type: 'slider', states: [{ id: 'alias.0.flow.SET', name: 'SET', write: true }] };
+    expect(mapControlToDevice('alias.0.flow', control, meta)?.channels.set).to.include({ min: 20, max: 60, step: 0.5 });
+  });
+
   describe('a control carrying two COVERs, which type-detector 6.0.1 never returns: the role decides', () => {
     // typePatterns.js declares COVER twice: /^media\.cover(\.big)?$/ (defaultRole
     // media.cover), then /^media\.cover(\..*)$/. 6.0.1 returns one COVER only

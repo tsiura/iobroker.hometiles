@@ -233,6 +233,7 @@ describe('registry/synth/cover', () => {
       current: 40,
       min: undefined,
       max: undefined,
+      step: undefined,
       unit: undefined,
     });
   });
@@ -248,6 +249,7 @@ describe('registry/synth/cover', () => {
       current: true,
       min: undefined,
       max: undefined,
+      step: undefined,
       unit: undefined,
     });
   });
