@@ -65,14 +65,15 @@ function forecastDays(device: DeviceInput, values: Values): Array<Record<string,
 }
 
 /**
- * weatherCurrent (ACTUAL, ICON, WEATHER) and weatherForecast (TEMP and the
- * day channels), as detector.ts keeps them -- one source's two detections
- * already combined into one device there. Read-only: there is no weather
- * command, so no role is writable.
+ * weatherCurrent (ACTUAL, WEATHER and its ICON as `current_icon`) and
+ * weatherForecast (TEMP and the day channels), as detector.ts keeps them --
+ * one source's two detections already combined into one device there.
+ * Read-only: there is no weather command, so no role is writable.
  *
  * Current conditions: the temperature from ACTUAL, else from the forecast's
- * TEMP, and the text from WEATHER, else the forecast's day-0 STATE -- one
- * channel each, never the other one's value when the chosen has none.
+ * TEMP, the text from WEATHER, else the forecast's day-0 STATE, and the icon
+ * from `current_icon`, else day 0's ICON -- one channel each, never the other
+ * one's value when the chosen has none.
  * `forecast` exists only for a source with a forecast (its TEMP_MIN/TEMP_MAX),
  * so current conditions alone never read as a day.
  *
@@ -94,7 +95,7 @@ export function synthWeather(device: DeviceInput, entityId: string, values: Valu
   if (temperature) putNumber(attributes, 'temperature', device, temperature, values);
   const text = readRaw(device, ['weather', 'state'].find((name) => device.channels[name]), values);
   if (text !== undefined) attributes.weather_state = text;
-  const icon = readRaw(device, 'icon', values);
+  const icon = readRaw(device, ['current_icon', 'icon'].find((name) => device.channels[name]), values);
   if (icon !== undefined) attributes.weather_icon = icon;
 
   const forecast = hasForecast ? forecastDays(device, values) : undefined;

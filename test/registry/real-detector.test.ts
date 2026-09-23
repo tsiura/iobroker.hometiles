@@ -1435,9 +1435,11 @@ describe('discovery orchestration (Task 5d)', () => {
       // first; its ICON nobody claimed, so it is not a repeat.
       [STATION, 'weatherCurrent'],
     ]);
+    // The current conditions' ICON is `current_icon`, apart from a
+    // forecast's day-0 ICON (Task 11 round 1).
     expectRealChannels(WEATHER_SET, runs[1]!.device, {
       actual: `${STATION}.outside.temperature`,
-      icon: `${STATION}.icon`,
+      current_icon: `${STATION}.icon`,
     });
     // Task 11: the composite is the station's weather, current conditions only.
     expect(runs[1]!.entity).to.include({ domain: 'weather', state: 'unknown', available: true });

@@ -64,11 +64,13 @@ describe('registry/synth/weather', () => {
 
   it('combines weatherCurrent and weatherForecast into one entity', () => {
     // The channels discovery gives one source: the current conditions'
-    // ACTUAL and WEATHER beside the forecast's own (detector.ts).
+    // ACTUAL, WEATHER and ICON (named current_icon) beside the forecast's own
+    // (detector.ts).
     const e = entity(
       weather({
         actual: { role: 'value.temperature', type: 'number', unit: '°C', value: val(18.6) },
         weather: { role: 'weather.state', type: 'string', value: val('Leichter Regen') },
+        current_icon: { role: 'weather.icon', type: 'string', value: val('https://icons.example/now.png') },
         ...day(0),
         ...day(1),
       }),
@@ -76,6 +78,7 @@ describe('registry/synth/weather', () => {
     expect(e.attributes.temperature).to.be.a('number');
     expect(e.attributes.temperature).to.equal(18.6);
     expect(e.attributes.weather_state).to.equal('Leichter Regen');
+    expect(e.attributes.weather_icon).to.equal('https://icons.example/now.png');
     expect(e.attributes.forecast).to.be.an('array').with.lengthOf(2);
   });
 
@@ -207,7 +210,7 @@ describe('registry/synth/weather', () => {
         weather(
           {
             actual: { role: 'value.temperature', type: 'number', unit: '°C', value: val(7.5) },
-            icon: { role: 'weather.icon', type: 'string', value: val('rain') },
+            current_icon: { role: 'weather.icon', type: 'string', value: val('rain') },
           },
           'weatherCurrent',
         ),
@@ -269,6 +272,18 @@ describe('registry/synth/weather', () => {
       expect(silent.attributes).to.not.have.property('weather_state');
     });
 
+    it("takes the icon from the current conditions' own ICON, else the forecast's day 0, whose day keeps its own", () => {
+      // Round 1, I1: beside the current text and temperature, today's
+      // forecast icon showed OpenWeatherMap's "Leichter Regen" as clear sky.
+      const both = weather({ current_icon: { role: 'weather.icon', type: 'string', value: val('https://icons.example/now.png') }, ...day(0) });
+      expect(entity(both).attributes.weather_icon).to.equal('https://icons.example/now.png');
+      expect(forecastOf(both)[0]!.weather_icon).to.equal('https://icons.example/0.png');
+      expect(entity(forecastWithDays(0)).attributes.weather_icon).to.equal('https://icons.example/0.png');
+      // One channel: a current icon without a value is no icon yet, never day 0's.
+      const silent = entity(weather({ current_icon: { role: 'weather.icon', type: 'string' }, ...day(0) }));
+      expect(silent.attributes).to.not.have.property('weather_icon');
+    });
+
     it('reads a value-role ACTUAL as a temperature only when its unit is one', () => {
       const celsius = entity(weather({ actual: { role: 'value', type: 'number', unit: '°C', value: val(12) } }, 'weatherCurrent'));
       expect(celsius.attributes.temperature).to.equal(12);
@@ -277,7 +292,7 @@ describe('registry/synth/weather', () => {
       const symbol = weather(
         {
           actual: { role: 'value', type: 'number', value: val(3) },
-          icon: { role: 'weather.icon', type: 'string', value: val('/daswetter.admin/icons/weather/gallery1/png/64x64/3.png') },
+          current_icon: { role: 'weather.icon', type: 'string', value: val('/daswetter.admin/icons/weather/gallery1/png/64x64/3.png') },
         },
         'weatherCurrent',
       );
@@ -772,6 +787,36 @@ const DASWETTER_VALUES: Record<string, SourceValue> = {
   ),
 };
 
+// A weather device a user builds from aliases: today under a plain
+// weather.icon role, tomorrow under `.forecast.1`, and the current conditions
+// in a channel of their own, whose name the test varies.
+const WETTER = 'alias.0.Wetter';
+const aliasWeather = (now: string): IoObjects =>
+  ioObjects([
+    ioDevice(WETTER, 'Wetter'),
+    ioChannel(`${WETTER}.Heute`, 'Heute'),
+    ioState(`${WETTER}.Heute.icon`, 'weather.icon', 'string'),
+    ioState(`${WETTER}.Heute.min`, 'value.temperature.min.forecast.0', 'number', '°C'),
+    ioState(`${WETTER}.Heute.max`, 'value.temperature.max.forecast.0', 'number', '°C'),
+    ioChannel(`${WETTER}.Morgen`, 'Morgen'),
+    ioState(`${WETTER}.Morgen.icon`, 'weather.icon.forecast.1', 'string'),
+    ioState(`${WETTER}.Morgen.min`, 'value.temperature.min.forecast.1', 'number', '°C'),
+    ioState(`${WETTER}.Morgen.max`, 'value.temperature.max.forecast.1', 'number', '°C'),
+    ioChannel(`${WETTER}.${now}`, now),
+    ioState(`${WETTER}.${now}.temperature`, 'value.temperature', 'number', '°C'),
+    ioState(`${WETTER}.${now}.icon`, 'weather.icon', 'string'),
+  ]);
+const aliasValues = (now: string): Record<string, SourceValue> => ({
+  [`${WETTER}.Heute.icon`]: val('sun'),
+  [`${WETTER}.Heute.min`]: val(8),
+  [`${WETTER}.Heute.max`]: val(18),
+  [`${WETTER}.Morgen.icon`]: val('rain'),
+  [`${WETTER}.Morgen.min`]: val(9),
+  [`${WETTER}.Morgen.max`]: val(15),
+  [`${WETTER}.${now}.temperature`]: val(12.5),
+  [`${WETTER}.${now}.icon`]: val('cloud'),
+});
+
 interface Run {
   device: DeviceInput;
   entity: VirtualEntity | null;
@@ -788,15 +833,13 @@ const only = (runs: Run[], objectId: string): Run => {
   return found;
 };
 
-/** Discovery's own invariants hold with weather in the tree: stable ids, and no identifying state behind two entities. */
+/** Discovery's own invariants hold with weather in the tree: stable devices, and no identifying state behind two entities. */
 function expectStableDiscovery(all: IoObjects): void {
-  const ids = (objects: IoObjects): Record<string, string> =>
-    new EntityRegistry({ onEntityChanged: () => undefined, onMembershipChanged: () => undefined }, 0).rebuild(
-      discoverDevices(objects, 'hometiles.0').devices,
-      {},
-    ).entityIds;
-  expect(ids(Object.fromEntries(Object.entries(all).reverse())), 'reversing the object order').to.deep.equal(ids(all));
   const { devices, anchors } = discoverDevices(all, 'hometiles.0');
+  // Whole devices, every day's channels included -- not only their ids.
+  const reversed = discoverDevices(Object.fromEntries(Object.entries(all).reverse()), 'hometiles.0');
+  expect(reversed.devices, 'reversing the object order').to.deep.equal(devices);
+  expect(reversed.anchors, 'reversing the object order').to.deep.equal(anchors);
   // A restart reads the anchors the first run recorded, the merged-away
   // current conditions' root among them: the same devices come back.
   const restart = discoverDevices(all, 'hometiles.0', anchors);
@@ -821,14 +864,30 @@ describe('weather with the real type-detector (Task 11)', () => {
       // conditions. Neither may become an entity of its own.
       expect(weatherIds(runs)).to.deep.equal([`${OWM}.day0`]);
       const owm = only(runs, `${OWM}.day0`);
+      // The current icon beside the current text, day 0's in its own day.
       expect(owm.entity!.attributes).to.include({
         friendly_name: 'Actual weather or forecast',
         temperature: 18.6,
         temperature_unit: '°C',
         weather_state: 'Leichter Regen',
-        weather_icon: 'https://openweathermap.org/img/w/01d.png',
+        weather_icon: 'https://openweathermap.org/img/w/10d.png',
       });
       expect(forecast(owm)).to.have.lengthOf(6);
+      expect(forecast(owm)[0]!.weather_icon).to.equal('https://openweathermap.org/img/w/01d.png');
+      // Every channel of the current conditions survives the merge, the
+      // icon both detections call ICON included.
+      expect(owm.device.channels).to.deep.include({
+        actual: { objectId: `${OWM}.current.temperature`, role: 'value.temperature', unit: '°C', type: 'number', write: false },
+        weather: { objectId: `${OWM}.current.state`, role: 'weather.state', type: 'string', write: false },
+        current_icon: { objectId: `${OWM}.current.icon`, role: 'weather.icon', type: 'string', write: false },
+      });
+    });
+
+    it('leaves the forecast device root to no view: it anchors no state its day0 channel anchors', () => {
+      // Round 1, M3: the device root's forecast is a view of day0's; as the
+      // root's holder it recorded day0's own anchor state a second time.
+      const { anchors } = discoverDevices(OPENWEATHERMAP, 'hometiles.0');
+      expect(anchors[OWM]).to.be.a('string').and.not.equal(anchors[`${OWM}.day0`]);
     });
 
     it("keeps the adapter's dates as they are: weekday names, since its real date is a number the pattern's DATE (a string) cannot bind", () => {
@@ -847,7 +906,13 @@ describe('weather with the real type-detector (Task 11)', () => {
       const runs = runAll(WEATHERUNDERGROUND, WEATHERUNDERGROUND_VALUES);
       expect(weatherIds(runs)).to.deep.equal([`${WU}.0d`]);
       const wu = only(runs, `${WU}.0d`);
-      expect(wu.entity!.attributes).to.include({ temperature: 16.2, temperature_unit: '°C', weather_state: 'Mostly Cloudy' });
+      expect(wu.entity!.attributes).to.include({
+        temperature: 16.2,
+        temperature_unit: '°C',
+        weather_state: 'Mostly Cloudy',
+        weather_icon: 'https://icons.wxug.com/i/c/k/mostlycloudy.gif',
+      });
+      expect(forecast(wu)[0]!.weather_icon).to.equal('https://icons.wxug.com/i/c/k/0.gif');
       expect(forecast(wu).map((entry) => entry.date)).to.deep.equal([
         '2026-09-23',
         '2026-09-24',
@@ -857,6 +922,13 @@ describe('weather with the real type-detector (Task 11)', () => {
         '2026-09-28',
       ]);
       expect(forecast(wu)[2]).to.include({ templow: 9, temperature: 19, precipitation_probability: 10, weather_icon: 'https://icons.wxug.com/i/c/k/2.gif' });
+    });
+
+    it("leaves the forecast device's root id to its own catch-all, not to the forecast seen again there", () => {
+      // Round 1, M3: the view held the root, so the catch-all was re-keyed
+      // by its own state (…_uv) and lost the id it had before Task 11.
+      const catchAll = discoverDevices(WEATHERUNDERGROUND, 'hometiles.0').devices.find((detected) => detected.objectId === WU);
+      expect(catchAll).to.include({ detectorType: 'info', name: 'Forecast for next 4 days days and current conditions' });
     });
 
     it('keeps discovery stable', () => expectStableDiscovery(WEATHERUNDERGROUND));
@@ -945,9 +1017,34 @@ describe('weather with the real type-detector (Task 11)', () => {
     it("publishes nothing mixing an hour's icon and temperature with a day's low: the location's forecast is no source of its own", () => {
       const runs = runAll(DASWETTER, DASWETTER_VALUES);
       expect(runs.filter((run) => run.device.detectorType === 'weatherForecast').map((run) => run.device.objectId)).to.not.include(DW);
+      // Being no source, it holds no root either: the location root's id
+      // stays with the location's own catch-all, as before Task 11. With the
+      // forecast taken for the location's own, the catch-all loses the id.
+      expect(runs.find((run) => run.device.objectId === DW)?.device).to.include({ detectorType: 'info', name: 'location' });
     });
 
     it('keeps discovery stable', () => expectStableDiscovery(DASWETTER));
+  });
+
+  describe("a user's alias weather device", () => {
+    // Round 1, M2 (the reviewer's tree): the device root sees today, tomorrow
+    // and the current conditions as one forecast. Its ICON is whichever
+    // weather.icon has the later id -- today's or the current channel's --
+    // so the current channel's NAME decided whether the forecast merged.
+    for (const now of ['Jetzt', 'Aktuell']) {
+      it(`is ONE entity, today and tomorrow and the current conditions, with the current channel named "${now}"`, () => {
+        const runs = runAll(aliasWeather(now), aliasValues(now));
+        expect(weatherIds(runs)).to.deep.equal([`${WETTER}.Heute`]);
+        const wetter = only(runs, `${WETTER}.Heute`);
+        expect(wetter.entity!.attributes).to.include({ temperature: 12.5, temperature_unit: '°C', weather_icon: 'cloud' });
+        expect(forecast(wetter)).to.deep.equal([
+          { weather_icon: 'sun', temperature: 18, temperature_unit: '°C', templow: 8, templow_unit: '°C' },
+          { weather_icon: 'rain', temperature: 15, temperature_unit: '°C', templow: 9, templow_unit: '°C' },
+        ]);
+      });
+
+      it(`keeps discovery stable with the current channel named "${now}"`, () => expectStableDiscovery(aliasWeather(now)));
+    }
   });
 
   it('the real synth carries channelMeta with each unit (Ruling 23)', () => {
