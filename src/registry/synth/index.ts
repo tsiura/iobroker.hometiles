@@ -11,9 +11,10 @@ import { synthSwitch } from './switch';
 export type { Values } from './common';
 
 /**
- * VirtualEntity | null: climate is the first domain that can legitimately
- * detect a device with nothing usable behind it at all (thermostat has no
- * required channel; see synthClimate). Returning null here means no hollow
+ * VirtualEntity | null: climate is the first domain whose synth can find
+ * nothing usable behind a device (type-detector 6.0.1 requires a setpoint,
+ * but a later ^6 minor or a domain override need not; see synthClimate).
+ * Returning null here means no hollow
  * entity is ever registered, rather than one that reports "unavailable"
  * forever.
  */

@@ -25,11 +25,13 @@ import {
  * the firmware discards -- not a climate entity in the wire-format sense,
  * whatever ioBroker calls it (review round 1, M6).
  *
- * thermostat has NO required channel at all (docs/contract-iobroker-types.md)
- * and airCondition requires only MODE, so a detected device may have none of
- * these configured either; returning null here rather than an entity with
- * nothing behind it is the same defence as before, just drawn at the
- * boundary the firmware actually enforces.
+ * type-detector 6.0.1 detects neither climate type without a setpoint
+ * (thermostat requires one of SET/SET_HEATING/SET_COOLING, airCondition that
+ * plus MODE; docs/contract-iobroker-types.md), but the dependency is ^6.0.1
+ * and a later minor could relax that, and a domain override can make any
+ * device climate. So a device may still have none of these configured;
+ * returning null here rather than an entity with nothing behind it is the
+ * same defence as before, just drawn at the boundary the firmware enforces.
  */
 const VALIDITY_CHANNELS = ['set', 'set_heating', 'set_cooling', 'actual', 'humidity', 'mode', 'working_mode'] as const;
 
@@ -142,13 +144,14 @@ function enumModes(role: string, channel: ChannelInput | undefined, names: reado
 }
 
 export function synthClimate(device: DeviceInput, entityId: string, values: Values): VirtualEntity | null {
-  // The trap: thermostat has no required channel and airCondition requires
-  // only MODE, so a detected device may have nothing among the roles below.
-  // Returning null here — rather than an "unavailable" entity — means no
-  // hollow tile is ever registered for it. Narrowed to VALIDITY_CHANNELS
-  // (review round 1, M6): a device exposing only SPEED/SPEED_LEVEL/SWING/
-  // SWING_TOGGLE/POWER/BOOST would previously have synthesised anyway, then
-  // published a payload the firmware always rejects as invalid.
+  // The trap: type-detector 6.0.1 requires a setpoint for both climate types,
+  // but a later ^6 minor or a domain override need not, so a device may have
+  // nothing among the roles below. Returning null here — rather than an
+  // "unavailable" entity — means no hollow tile is ever registered for it.
+  // Narrowed to VALIDITY_CHANNELS (review round 1, M6): a device exposing
+  // only SPEED/SPEED_LEVEL/SWING/SWING_TOGGLE/POWER/BOOST would previously
+  // have synthesised anyway, then published a payload the firmware always
+  // rejects as invalid.
   if (!VALIDITY_CHANNELS.some((name) => device.channels[name])) return null;
 
   // channelMeta is passed through unchanged from baseEntity, not computed

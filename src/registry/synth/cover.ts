@@ -123,10 +123,10 @@ function setChannelKind(device: DeviceInput): SetChannelKind | undefined {
  * holding a stray NaN (toBoolState treats a NaN number as truthy, NaN !==
  * 0) can never produce a fabricated state.
  *
- * Unlike climate's thermostat (no required channel at all) and airCondition
- * (MODE only), every detector pattern in this domain has a real required
- * channel, so a naturally-detected `cover`-domain DeviceInput is always
- * structurally synthesisable -- mapControlToDevice already returns null
+ * Like climate's thermostat (one of SET/SET_HEATING/SET_COOLING) and
+ * airCondition (that plus MODE), every detector pattern in this domain has a
+ * real required channel, so a naturally-detected `cover`-domain DeviceInput
+ * is always structurally synthesisable -- mapControlToDevice already returns null
  * before this point for a control left with zero channels after
  * IGNORED_CHANNELS filtering (none of SET/STOP/OPEN/CLOSE are ignored), and
  * none of the three patterns can match with only optional channels present.

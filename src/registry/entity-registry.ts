@@ -48,9 +48,10 @@ export class EntityRegistry {
       const entityId = entityIds[device.objectId];
       if (!entityId) continue;
 
-      // climate can detect a device with nothing usable behind it at all
-      // (see synthClimate); synthesise returns null rather than a hollow
-      // entity, and that device gets no slot and no channel subscriptions.
+      // synthClimate can find nothing usable behind a device (a later ^6
+      // type-detector minor or a domain override; see there); synthesise
+      // returns null rather than a hollow entity, and that device gets no
+      // slot and no channel subscriptions.
       const entity = synthesise(device, entityId, this.valuesFor(device));
       if (!entity) continue;
       nextSlots.set(entityId, { device, entity });

@@ -24,8 +24,8 @@ Everything else may be absent, and absent must not be confused with zero.
 
 | Type | Required | Notable optional |
 | --- | --- | --- |
-| `thermostat` | **none** | `SET` `SET_HEATING` `SET_COOLING` `ACTUAL` `HUMIDITY` `BOOST` `POWER` `PARTY` `MODE` `VALVE` `WORKING_MODE` `WINDOW` |
-| `airCondition` | `MODE` | `SET` `ACTUAL` `HUMIDITY` `SPEED` `SPEED_LEVEL` `SWING` (×2) `AIRFLOW_DIRECTION` `BOOST` `POWER` |
+| `thermostat` | one of `SET` `SET_HEATING` `SET_COOLING` | `ACTUAL` `HUMIDITY` `BOOST` `POWER` `PARTY` `MODE` `VALVE` `WORKING_MODE` `WINDOW` |
+| `airCondition` | `MODE`, and one of `SET` `SET_HEATING` `SET_COOLING` | `ACTUAL` `HUMIDITY` `SPEED` `SPEED_LEVEL` `SWING` (×2) `AIRFLOW_DIRECTION` `BOOST` `POWER` |
 | `blinds` | `SET` | `ACTUAL` `STOP` `OPEN` `CLOSE` `TILT_SET` `TILT_ACTUAL` `TILT_STOP` `TILT_OPEN` `TILT_CLOSE` `DIRECTION` |
 | `blindButtons` | `STOP` `OPEN` `CLOSE` | `TILT_*`, `DIRECTION` |
 | `gate` | `SET` | `ACTUAL` `STOP` `OPENED` `CLOSED` |
@@ -35,14 +35,21 @@ Everything else may be absent, and absent must not be confused with zero.
 | `weatherCurrent` | `ACTUAL` `ICON` | `PRECIPITATION_CHANCE` `PRESSURE` `HUMIDITY` `UV` `WEATHER` `WIND_*` `REAL_FEEL_TEMPERATURE` |
 | `weatherForecast` | `ICON` `TEMP_MIN` `TEMP_MAX` | day-indexed channels, below |
 
-## `thermostat` has no required channel at all
+## Both climate types require a setpoint
 
-This is the most dangerous entry in the table. A device can be detected as a
-thermostat while exposing neither `SET` nor `ACTUAL`. The climate synth must
-therefore treat a missing `SET` as read-only and refuse to advertise a
-setpoint control, the same way v0.1 learned to refuse a light command when no
-writable channel exists. Reporting success for a write that went nowhere is
-the bug class this project has already hit three times.
+An earlier version of this section said `thermostat` has no required channel
+at all. That is false for 6.0.1: `SET`, `SET_HEATING` and `SET_COOLING` share
+`requiredOneOf: 'setpoint'` (typePatterns.js:1874, :44, :55), `airCondition`
+adds `MODE` with `required: true` (:1750), and ChannelDetector enforces both
+(ChannelDetector.js:479-500, :580-611). A naturally detected climate device
+therefore always carries a setpoint.
+
+The climate synth still treats a missing setpoint as read-only and refuses to
+advertise a setpoint control, the same way v0.1 learned to refuse a light
+command when no writable channel exists: the dependency is `^6.0.1`, a later
+minor could relax the rule, and a domain override can make any device
+climate. Reporting success for a write that went nowhere is the bug class
+this project has already hit three times.
 
 `SET_HEATING` and `SET_COOLING` are separate from `SET`: a dual-setpoint
 thermostat may expose those two and no `SET`.

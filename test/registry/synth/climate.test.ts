@@ -65,7 +65,8 @@ function airConditionWithBothSwings(): { device: DeviceInput; values: Record<str
 
 describe('registry/synth/climate', () => {
   it('returns null for a thermostat with no readable or writable channel', () => {
-    // thermostat has NO required channels, so this is reachable, not theoretical
+    // type-detector 6.0.1 requires a setpoint, but a later ^6 minor or a
+    // domain override need not, so synthClimate must still refuse this
     expect(synth({})).to.equal(null);
   });
 
