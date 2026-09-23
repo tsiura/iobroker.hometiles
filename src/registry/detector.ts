@@ -348,3 +348,59 @@ export function createIoBrokerDetector(objects: Record<string, unknown>): Detect
     },
   };
 }
+
+/** The part of an ioBroker object discovery reads. */
+export interface IoBrokerObject {
+  type: string;
+  common?: unknown;
+}
+
+/** The object types that take part in detection. */
+const DETECTED_OBJECT_TYPES = new Set(['state', 'channel', 'device']);
+
+function objectMeta(id: string, obj: IoBrokerObject): ObjectMeta {
+  const common = (obj.common ?? {}) as Record<string, unknown>;
+  return {
+    name: typeof common.name === 'string' ? common.name : id.split('.').pop() ?? id,
+    role: typeof common.role === 'string' ? common.role : undefined,
+    unit: typeof common.unit === 'string' ? common.unit : undefined,
+    type: typeof common.type === 'string' ? common.type : undefined,
+    min: typeof common.min === 'number' ? common.min : undefined,
+    max: typeof common.max === 'number' ? common.max : undefined,
+    states: validStates(common.states, common.type),
+    write: typeof common.write === 'boolean' ? common.write : undefined,
+    icon: typeof common.icon === 'string' ? common.icon : undefined,
+  };
+}
+
+/**
+ * Discovery minus the adapter I/O: the ioBroker objects main.ts fetched in,
+ * the detected devices out. main.ts and the real-detector suite both call
+ * this, so the suite tests the production loop rather than a copy of it.
+ * Nothing inside `ownNamespace` is detected: the panel objects are not
+ * devices to publish back to the panels.
+ */
+export function discoverDevices(objects: Readonly<Record<string, IoBrokerObject>>, ownNamespace: string): DeviceInput[] {
+  const detectable: Record<string, IoBrokerObject> = {};
+  const meta: Record<string, ObjectMeta> = {};
+  for (const [id, obj] of Object.entries(objects)) {
+    if (!DETECTED_OBJECT_TYPES.has(obj.type)) continue;
+    detectable[id] = obj;
+    meta[id] = objectMeta(id, obj);
+  }
+  const rootsOf = (type: string): string[] => Object.keys(detectable).filter((id) => detectable[id]?.type === type);
+
+  const detector = createIoBrokerDetector(detectable);
+  const result: DeviceInput[] = [];
+  const seen = new Set<string>();
+  for (const rootId of [...rootsOf('device'), ...rootsOf('channel')]) {
+    if (rootId.startsWith(`${ownNamespace}.`)) continue;
+    for (const control of detector.detect(rootId)) {
+      const device = mapControlToDevice(rootId, control, meta);
+      if (!device || seen.has(device.objectId)) continue;
+      seen.add(device.objectId);
+      result.push(device);
+    }
+  }
+  return result;
+}

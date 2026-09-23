@@ -1,7 +1,7 @@
 import { expect } from 'chai';
 import type { ServiceCall } from '../../src/protocol/commands';
 import { buildStatePublish } from '../../src/protocol/state-payload';
-import { createIoBrokerDetector, mapControlToDevice, validStates, type ObjectMeta } from '../../src/registry/detector';
+import { discoverDevices } from '../../src/registry/detector';
 import { EntityRegistry } from '../../src/registry/entity-registry';
 import { synthesise } from '../../src/registry/synth/index';
 import type { DeviceInput, SourceValue, VirtualEntity } from '../../src/registry/types';
@@ -9,11 +9,11 @@ import { Dispatcher } from '../../src/runtime/dispatcher';
 
 /*
  * Every other test hand-builds the detector's output. This suite feeds
- * ioBroker objects, shaped the way real adapters publish them, through the
- * REAL @iobroker/type-detector (via the production createIoBrokerDetector,
- * which owns the exact detect() options), then mapControlToDevice, the real
- * synth, the real payload builder and, where a behaviour is about writes, the
- * real Dispatcher (Task 5c, Rulings 34/35).
+ * ioBroker objects, shaped the way real adapters publish them, through
+ * discoverDevices -- the production discovery loop main.ts calls, driving the
+ * REAL @iobroker/type-detector -- then the real synth, the real payload
+ * builder and, where a behaviour is about writes, the real Dispatcher
+ * (Task 5c, Rulings 34/35; Task 5d).
  */
 
 type IoType = 'device' | 'channel' | 'state';
@@ -35,47 +35,7 @@ const state = (id: string, common: Record<string, unknown>): IoObject => ({
 });
 const objects = (...list: IoObject[]): IoObjects => Object.fromEntries(list.map((obj) => [obj._id, obj]));
 const value = (val: unknown, ack = true): SourceValue => ({ val, ack, q: 0, ts: 1_758_000_000_000 });
-
-/**
- * main.ts's detectDevices (src/main.ts:266-303) minus the adapter I/O: the
- * same state/channel/device objects, the same ObjectMeta from common.*, the
- * production detector, device roots before channel roots, first mapped
- * control per root.
- */
-function detectDevices(all: IoObjects): DeviceInput[] {
-  const byType = (type: IoType): IoObjects =>
-    Object.fromEntries(Object.entries(all).filter(([, obj]) => obj.type === type));
-  const devices = byType('device');
-  const channels = byType('channel');
-  const detector = createIoBrokerDetector({ ...byType('state'), ...channels, ...devices });
-  const meta: Record<string, ObjectMeta> = {};
-  for (const [id, obj] of Object.entries(all)) {
-    const common = obj.common;
-    meta[id] = {
-      name: typeof common.name === 'string' ? common.name : id.split('.').pop() ?? id,
-      role: typeof common.role === 'string' ? common.role : undefined,
-      unit: typeof common.unit === 'string' ? common.unit : undefined,
-      type: typeof common.type === 'string' ? common.type : undefined,
-      min: typeof common.min === 'number' ? common.min : undefined,
-      max: typeof common.max === 'number' ? common.max : undefined,
-      states: validStates(common.states, common.type),
-      write: typeof common.write === 'boolean' ? common.write : undefined,
-      icon: typeof common.icon === 'string' ? common.icon : undefined,
-    };
-  }
-  const result: DeviceInput[] = [];
-  const seen = new Set<string>();
-  for (const rootId of [...Object.keys(devices), ...Object.keys(channels)]) {
-    if (rootId.startsWith('hometiles.0.')) continue;
-    for (const control of detector.detect(rootId)) {
-      const mapped = mapControlToDevice(rootId, control, meta);
-      if (!mapped || seen.has(mapped.objectId)) continue;
-      seen.add(mapped.objectId);
-      result.push(mapped);
-    }
-  }
-  return result;
-}
+const detectDevices = (all: IoObjects): DeviceInput[] => discoverDevices(all, 'hometiles.0');
 
 interface Run {
   device: DeviceInput;

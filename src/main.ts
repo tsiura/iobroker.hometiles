@@ -9,7 +9,7 @@ import {
   PANEL_SETTING_LEAVES,
   stateTopic,
 } from './protocol/topics';
-import { createIoBrokerDetector, mapControlToDevice, validStates, type ObjectMeta } from './registry/detector';
+import { discoverDevices } from './registry/detector';
 import { EntityRegistry } from './registry/entity-registry';
 import { applyOverrides } from './registry/overrides';
 import { synthesise } from './registry/synth/index';
@@ -267,39 +267,7 @@ class HomeTiles extends utils.Adapter {
     const objects = (await this.getForeignObjectsAsync('*', 'state')) as Record<string, ioBroker.Object>;
     const channels = (await this.getForeignObjectsAsync('*', 'channel')) as Record<string, ioBroker.Object>;
     const devices = (await this.getForeignObjectsAsync('*', 'device')) as Record<string, ioBroker.Object>;
-    const all: Record<string, ioBroker.Object> = { ...objects, ...channels, ...devices };
-
-    const detector = createIoBrokerDetector(all as unknown as Record<string, unknown>);
-    const meta: Record<string, ObjectMeta> = {};
-    for (const [id, obj] of Object.entries(all)) {
-      const common = (obj.common ?? {}) as Record<string, unknown>;
-      meta[id] = {
-        name: typeof common.name === 'string' ? common.name : id.split('.').pop() ?? id,
-        role: typeof common.role === 'string' ? common.role : undefined,
-        unit: typeof common.unit === 'string' ? common.unit : undefined,
-        type: typeof common.type === 'string' ? common.type : undefined,
-        min: typeof common.min === 'number' ? common.min : undefined,
-        max: typeof common.max === 'number' ? common.max : undefined,
-        states: validStates(common.states, common.type),
-        write: typeof common.write === 'boolean' ? common.write : undefined,
-        icon: typeof common.icon === 'string' ? common.icon : undefined,
-      };
-    }
-
-    const result: DeviceInput[] = [];
-    const seen = new Set<string>();
-    for (const rootId of [...Object.keys(devices), ...Object.keys(channels)]) {
-      // Never detect inside our own namespace: the panel objects are not
-      // devices to publish back to the panels.
-      if (rootId.startsWith(`${this.namespace}.`)) continue;
-      for (const control of detector.detect(rootId)) {
-        const device = mapControlToDevice(rootId, control, meta);
-        if (!device || seen.has(device.objectId)) continue;
-        seen.add(device.objectId);
-        result.push(device);
-      }
-    }
-    return result;
+    return discoverDevices({ ...objects, ...channels, ...devices }, this.namespace);
   }
 
   private publishEntity(entity: VirtualEntity): void {
