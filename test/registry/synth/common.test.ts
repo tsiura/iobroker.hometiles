@@ -57,19 +57,72 @@ describe('registry/synth/common: encodeChannelValue', () => {
     expect(typeof encoded).to.equal('string');
   });
 
-  // Ruling 36: readEnum emits a raw number OUTSIDE its states map as its own
-  // number-string ("50"), and that is exactly what the lone fallback option
-  // sends back. Refusing it left a dead button; carrying it back is a no-op
-  // write of the current value.
-  it('carries a label outside the states map back as its own number, on a number channel only', () => {
-    const codec: ChannelCodec = { type: 'number', states: { '0': 'AUS', '100': 'MAX' } };
-    const encoded = encodeChannelValue(codec, '50');
+  // Ruling 36, narrowed by Ruling 41 (Task 8): readEnum emits a raw number
+  // OUTSIDE its states map as its own number-string ("50"), and that is
+  // exactly what the lone fallback option sends back -- a re-select of the
+  // CURRENT value, which writes the current value. Any other out-of-map
+  // number is refused again: the cmnd topic is a trust boundary, and Ruling
+  // 36 alone let any MQTT client write any finite number into a mapped channel.
+  it('carries a label outside the states map back only when it re-selects the current value (Rulings 36/41)', () => {
+    const codec: ChannelCodec = { type: 'number', states: { '0': 'AUS', '100': 'MAX' }, current: 50 };
+    const encoded = encodeChannelValue(codec, '50', '50');
     expect(encoded).to.equal(50);
     expect(typeof encoded).to.equal('number');
+    // Not the current value, or no current value known: refused.
+    expect(encodeChannelValue(codec, '60', '50')).to.equal(undefined);
+    expect(encodeChannelValue({ type: 'number', states: { '0': 'AUS', '100': 'MAX' } }, '50')).to.equal(undefined);
     for (const label of ['', '   ', 'NaN', 'Infinity', 'turbo']) {
-      expect(encodeChannelValue(codec, label), label).to.equal(undefined);
+      expect(encodeChannelValue(codec, label, '50'), label).to.equal(undefined);
     }
     expect(encodeChannelValue({ type: 'string', states: { AUTO: 'Auto' } }, 'eco')).to.equal(undefined);
+  });
+
+  // Ruling 41: re-selecting the current value writes the current value. The
+  // codec carries the channel's current raw value (baseEntity); the caller
+  // passes the role's current DECODED value -- what the panel shows.
+  describe('re-selecting the current value (Ruling 41)', () => {
+    it('writes a current value outside the map before any map reversal: {B1:"Boost"} at "BOOST"', () => {
+      // The reversal alone resolves "boost" to the OTHER entry, B1.
+      expect(encodeChannelValue({ type: 'string', states: { B1: 'Boost' }, current: 'BOOST' }, 'boost', 'BOOST')).to.equal('BOOST');
+      // Selecting the entry itself, or with no current value known, still reverses.
+      expect(encodeChannelValue({ type: 'string', states: { B1: 'Boost' } }, 'boost')).to.equal('B1');
+    });
+
+    it('writes whichever raw value the re-selected label was decoded from: {3:"5"} at 5, or at 3', () => {
+      expect(encodeChannelValue({ type: 'number', states: { '3': '5' }, current: 5 }, '5', '5')).to.equal(5);
+      expect(encodeChannelValue({ type: 'number', states: { '3': '5' }, current: 3 }, '5', '5')).to.equal(3);
+    });
+
+    it('refuses any other number into a mapped number channel: 7 into a SPEED mapped 0..3', () => {
+      const codec: ChannelCodec = { type: 'number', states: { '0': 'AUTO', '1': 'LOW', '2': 'MEDIUM', '3': 'HIGH' }, current: 1 };
+      expect(encodeChannelValue(codec, '7', 'LOW')).to.equal(undefined);
+      expect(encodeChannelValue(codec, 'high', 'LOW')).to.equal(3);
+      expect(encodeChannelValue(codec, 'low', 'LOW')).to.equal(1);
+    });
+
+    it('coerces the current value to the channel type, and refuses one that cannot be', () => {
+      expect(encodeChannelValue({ type: 'number', states: { '0': 'AUS' }, current: '50' }, '50', '50')).to.equal(50);
+      expect(encodeChannelValue({ type: 'string', states: { A: 'Auto' }, current: 7 }, '7', '7')).to.equal('7');
+      expect(encodeChannelValue({ type: 'number', states: { '0': 'AUS' }, current: 'abc' }, 'abc', 'abc')).to.equal(undefined);
+    });
+
+    it('leaves a current value the map decoded to the map, unambiguous only', () => {
+      // {1:"High",2:"HIGH"} at 2 shows "HIGH": the map produced it, so the
+      // map reverses it, and two matching keys are still refused.
+      expect(encodeChannelValue({ type: 'number', states: { '1': 'High', '2': 'HIGH' }, current: 2 }, 'high', 'HIGH')).to.equal(
+        undefined,
+      );
+    });
+
+    it('re-selects a SPEED_LEVEL whose decoder never consulted its map, so the dead-button fix holds', () => {
+      // synthClimate reads SPEED_LEVEL with readNumber, not readEnum: at 100
+      // the panel shows "100", although the map labels 100 "MAX".
+      expect(encodeChannelValue({ type: 'number', states: { '0': 'AUS', '100': 'MAX' }, current: 100 }, '100', '100')).to.equal(100);
+    });
+
+    it('leaves an unmapped number channel accepting any finite number, as before', () => {
+      expect(encodeChannelValue({ type: 'number', current: 42 }, '43', '42')).to.equal(43);
+    });
   });
 
   it('round-trips the boolean swing toggle (true/false <-> the decoder\'s own "on"/"off")', () => {
@@ -185,10 +238,11 @@ describe('registry/synth/common: encodeChannelValue', () => {
     expect(() => encodeChannelValue(codec, 'heat')).to.not.throw();
     expect(encodeChannelValue(codec, 'heat')).to.equal(1);
     // The non-string entry can never match anything, string or not: "5"
-    // never resolves to its key 2. On a number channel it is simply a label
-    // outside the map, carried back as its own number (Ruling 36).
+    // never resolves to its key 2. It is simply a label outside the map, and
+    // not the current value, so it is refused (Ruling 41 narrowed Ruling 36's
+    // number fallback to the current value).
     expect(() => encodeChannelValue(codec, '5')).to.not.throw();
-    expect(encodeChannelValue(codec, '5')).to.equal(5);
+    expect(encodeChannelValue(codec, '5')).to.equal(undefined);
   });
 
   // Fix-round 3, finding 6: feed REAL decoder output into the encoder,
@@ -233,7 +287,9 @@ describe('registry/synth/common: encodeChannelValue', () => {
       const decoded = e?.attributes.fan_mode;
       expect(decoded, 'readEnum emits the out-of-map raw value as its own number-string').to.equal('4');
 
-      const encoded = encodeChannelValue(e?.channelMeta?.speed, decoded as string);
+      // Ruling 41: this is a re-select of the current value, so the encoder
+      // is told what the panel shows (the dispatcher passes the attribute).
+      const encoded = encodeChannelValue(e?.channelMeta?.speed, decoded as string, e?.attributes.fan_mode);
       expect(encoded).to.equal(4);
       expect(typeof encoded).to.equal('number');
     });

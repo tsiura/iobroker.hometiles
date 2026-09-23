@@ -19,7 +19,20 @@ export type ServiceCall =
   | { kind: 'set_fan_mode'; entityId: string; mode: string }
   | { kind: 'set_preset_mode'; entityId: string; mode: string }
   | { kind: 'set_swing_mode'; entityId: string; mode: string }
-  | { kind: 'set_swing_horizontal_mode'; entityId: string; on: boolean };
+  | { kind: 'set_swing_horizontal_mode'; entityId: string; on: boolean }
+  | {
+      kind:
+        | 'open_cover'
+        | 'close_cover'
+        | 'stop_cover'
+        | 'open_cover_tilt'
+        | 'close_cover_tilt'
+        | 'stop_cover_tilt'
+        | 'toggle_cover'
+        | 'toggle_cover_tilt';
+      entityId: string;
+    }
+  | { kind: 'set_cover_position' | 'set_cover_tilt_position'; entityId: string; value: number };
 
 export class CommandError extends Error {
   constructor(public readonly code: string) {
@@ -205,7 +218,51 @@ export function parseClimateCommand(raw: string): ServiceCall {
   }
 }
 
-export function parseCommand(leaf: 'light' | 'switch' | 'scene' | 'climate', raw: string): ServiceCall {
+/**
+ * All ten cover commands share one topic, cmnd/cover, discriminated by a
+ * "command" field -- exactly the firmware's fixed allow-list
+ * (mqttPublishCoverCommand, mqtt_handlers.cpp:2268-2271; see
+ * docs/contract-climate-cover.md, Cover "Outbound commands"). Positions are
+ * clamped to 0..100 as the firmware's own publisher does (:2290-2291).
+ */
+export function parseCoverCommand(raw: string): ServiceCall {
+  const payload = parseObject(raw);
+  const entityId = requireEntityId(payload);
+  const command = typeof payload.command === 'string' ? payload.command : '';
+
+  switch (command) {
+    case 'set_cover_position':
+      return {
+        kind: 'set_cover_position',
+        entityId,
+        value: clamp(requireNumber(payload.position, 'invalid_position'), 0, 100),
+      };
+    case 'set_cover_tilt_position':
+      return {
+        kind: 'set_cover_tilt_position',
+        entityId,
+        value: clamp(requireNumber(payload.tilt_position, 'invalid_tilt_position'), 0, 100),
+      };
+    case 'open_cover':
+    case 'close_cover':
+    case 'stop_cover':
+    case 'open_cover_tilt':
+    case 'close_cover_tilt':
+    case 'stop_cover_tilt':
+    // Uncalled: no UI in this firmware sends it (allow-list only, :2271).
+    case 'toggle_cover_tilt':
+      return { kind: command, entityId };
+    case 'toggle':
+      // Uncalled too (allow-list only, :2270). HA's cover.toggle: open or
+      // close by the current state -- not switch/light's toggle, so it gets
+      // its own kind, which also keeps this topic from reaching a switch.
+      return { kind: 'toggle_cover', entityId };
+    default:
+      throw new CommandError('unsupported_cover_command');
+  }
+}
+
+export function parseCommand(leaf: 'light' | 'switch' | 'scene' | 'climate' | 'cover', raw: string): ServiceCall {
   switch (leaf) {
     case 'light':
       return parseLightCommand(raw);
@@ -215,6 +272,8 @@ export function parseCommand(leaf: 'light' | 'switch' | 'scene' | 'climate', raw
       return parseSceneCommand(raw);
     case 'climate':
       return parseClimateCommand(raw);
+    case 'cover':
+      return parseCoverCommand(raw);
     default: {
       // The union makes this unreachable at compile time, and the `never`
       // binding keeps that guarantee if a leaf is added. The throw covers the

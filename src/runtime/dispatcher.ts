@@ -33,12 +33,11 @@ const ALLOWED_CALLS: Record<Domain, ReadonlySet<CallKind>> = {
   scene: new Set<CallKind>(['activate_scene']),
   sensor: new Set<CallKind>(),
   binary_sensor: new Set<CallKind>(),
-  // v0.2 domains: no ServiceCall variant exists for any of these yet (see
-  // protocol/commands.ts), so nothing can be allowed through. An empty set
-  // routes a call for one of these domains into the existing, already-logged
-  // "call_not_allowed_for_domain" rejection below rather than throwing out of
-  // a static table — loud and explicit, not a silent fallthrough. Later tasks
-  // add each domain's ServiceCall kind here as it gains real commands.
+  // v0.2 domains without commands yet keep an empty set: a call for one of
+  // them goes into the existing, already-logged "call_not_allowed_for_domain"
+  // rejection below rather than throwing out of a static table — loud and
+  // explicit, not a silent fallthrough. Each task adds its domain's
+  // ServiceCall kinds here as it gains real commands.
   climate: new Set<CallKind>([
     'set_temperature',
     'set_humidity',
@@ -48,7 +47,19 @@ const ALLOWED_CALLS: Record<Domain, ReadonlySet<CallKind>> = {
     'set_swing_mode',
     'set_swing_horizontal_mode',
   ]),
-  cover: new Set<CallKind>(),
+  // The firmware's ten allow-listed cover commands (mqtt_handlers.cpp:2268-2271).
+  cover: new Set<CallKind>([
+    'open_cover',
+    'close_cover',
+    'stop_cover',
+    'set_cover_position',
+    'open_cover_tilt',
+    'close_cover_tilt',
+    'stop_cover_tilt',
+    'set_cover_tilt_position',
+    'toggle_cover',
+    'toggle_cover_tilt',
+  ]),
   media_player: new Set<CallKind>(),
   weather: new Set<CallKind>(),
   number: new Set<CallKind>(),
@@ -90,10 +101,10 @@ export class Dispatcher {
       // exists and is writable, but the value could not be encoded for it"
       // (fix-round 3, fold-in 2) -- the two are different problems to debug,
       // and collapsing them into one reason claimed a channel was missing
-      // when it was really the value that didn't fit it.
+      // when it was really the value that didn't fit it. A cover toggle adds
+      // a third: its direction depends on a state nobody knows.
       const reason = failureReason ?? 'no_writable_channel';
-      const detail = failureReason ? 'could not encode the value for any channel' : 'no writable channel';
-      this.log.warn(`[Command] Rejected ${call.kind} for ${entity.entityId}: ${detail}`);
+      this.log.warn(`[Command] Rejected ${call.kind} for ${entity.entityId}: ${reason}`);
       return { ok: false, reason, applied: 0 };
     }
 
@@ -125,17 +136,27 @@ export class Dispatcher {
     // [channelName, objectId, value] — the channel name is carried so a failure
     // can say which capability did not apply.
     const writes: Array<[string, string, unknown]> = [];
-    // Set only by pushEncoded, and only consulted by dispatch() when `writes`
-    // ends up empty — every climate command below calls pushEncoded at most
-    // once per plan(), so there is no ordering ambiguity between an earlier
-    // success and a later encode failure to worry about.
+    // Set only by pushEncoded and the two cover toggles, and only consulted by
+    // dispatch() when `writes` ends up empty — every command below sets it at
+    // most once per plan(), so there is no ordering ambiguity between an
+    // earlier success and a later failure to worry about.
     let failureReason: string | undefined;
     const push = (channel: string, value: unknown): void => {
       const objectId = entity.source[channel];
-      if (objectId) writes.push([channel, objectId, value]);
+      if (!objectId) return;
+      // Ruling 38: every write passes here, so this one guard covers every
+      // domain -- v0.1's switch, light and scene wrote read-only objects
+      // (e.g. a KNX status with common.write false) and reported success.
+      // Only an explicit false refuses: undefined means the object and its
+      // pattern are both silent, and stays writable as before.
+      if (entity.channelMeta?.[channel]?.write === false) {
+        this.log.warn(`[Command] Not writing ${channel} of ${entity.entityId}: ${objectId} is read-only`);
+        return;
+      }
+      writes.push([channel, objectId, value]);
     };
 
-    // Climate-only: a role (e.g. "setpoint") is writable per entity.writable
+    // Climate and cover: a role (e.g. "setpoint") is writable per entity.writable
     // — set by the registry, never re-derived here — but is not pinned to one
     // fixed channel name. A single setpoint is ordinarily SET, but a
     // dual-setpoint device exposing only one side of SET_HEATING/SET_COOLING
@@ -166,17 +187,32 @@ export class Dispatcher {
      * registry captured none -- the same function synthClimate advertises
      * with, so what the panel is offered and what lands here cannot differ
      * (Ruling 36).
+     *
+     * The role's attribute is its current decoded value, what the panel
+     * shows: re-selecting it writes the channel's current raw value, which
+     * the codec carries (Ruling 41).
      */
     const pushEncoded = (role: string, channels: readonly string[], label: string): void => {
       const channel = resolveChannel(role, channels);
       if (!channel) return;
-      const value = encodeChannelValue(roleCodec(role, entity.channelMeta?.[channel]), label);
+      const value = encodeChannelValue(roleCodec(role, entity.channelMeta?.[channel]), label, entity.attributes[role]);
       if (value === undefined) {
         this.log.warn(`[Command] Cannot encode "${label}" for ${entity.entityId} on channel ${channel}`);
         failureReason = 'cannot_encode_value';
         return;
       }
       push(channel, value);
+    };
+
+    // Cover (synth/cover.ts): a boolean SET is a gate-style toggle, itself the
+    // open/close command -- true opens, false closes. The synth records that
+    // type even for an untyped SET, and grants the open/close roles from SET
+    // in exactly that case; every other cover opens and closes by pressing its
+    // OPEN/CLOSE buttons. Position and tilt never share a channel.
+    const openClose = (open: boolean): void => {
+      const role = open ? 'open' : 'close';
+      if (entity.channelMeta?.set?.type === 'boolean') pushRole(role, ['set'], open);
+      else pushRole(role, [role], true);
     };
 
     switch (call.kind) {
@@ -245,6 +281,51 @@ export class Dispatcher {
         // fixed pattern type -- roleCodec).
         pushEncoded('swing_horizontal_mode', ['swing_toggle'], call.on ? STATE_ON : STATE_OFF);
         break;
+      // Each cover command writes only through the `writable` role its
+      // supported_features bit is derived from (protocol/cover.ts), so a bit
+      // is set exactly when its command can land.
+      case 'open_cover':
+        openClose(true);
+        break;
+      case 'close_cover':
+        openClose(false);
+        break;
+      case 'stop_cover':
+        pushRole('stop', ['stop'], true);
+        break;
+      case 'set_cover_position':
+        pushRole('position', ['set'], call.value);
+        break;
+      case 'open_cover_tilt':
+        pushRole('tilt_open', ['tilt_open'], true);
+        break;
+      case 'close_cover_tilt':
+        pushRole('tilt_close', ['tilt_close'], true);
+        break;
+      case 'stop_cover_tilt':
+        pushRole('tilt_stop', ['tilt_stop'], true);
+        break;
+      case 'set_cover_tilt_position':
+        pushRole('tilt_position', ['tilt_set'], call.value);
+        break;
+      // toggle_cover and toggle_cover_tilt have no caller anywhere in the
+      // firmware (allow-list only, mqtt_handlers.cpp:2270-2271), so there is
+      // no UI to go looking for. A closed cover opens and an open one closes;
+      // a tilt at 0 opens and any other closes (Home Assistant's rule from
+      // general knowledge, UNVERIFIED against its source). With the state
+      // unknown there is no right direction to move a gate or a blind in, so
+      // that is refused rather than guessed.
+      case 'toggle_cover':
+        if (entity.state === 'closed' || entity.state === 'open') openClose(entity.state === 'closed');
+        else failureReason = 'state_unknown';
+        break;
+      case 'toggle_cover_tilt': {
+        const tilt = entity.attributes.current_tilt_position;
+        if (typeof tilt !== 'number') failureReason = 'state_unknown';
+        else if (tilt === 0) pushRole('tilt_open', ['tilt_open'], true);
+        else pushRole('tilt_close', ['tilt_close'], true);
+        break;
+      }
     }
 
     return { writes, failureReason };

@@ -3,6 +3,7 @@ import {
   CommandError,
   parseClimateCommand,
   parseCommand,
+  parseCoverCommand,
   parseLightCommand,
   parseSceneCommand,
   parseSwitchCommand,
@@ -267,5 +268,86 @@ describe('protocol/commands', () => {
     expect(
       parseCommand('climate', '{"entity_id":"climate.hall","command":"set_hvac_mode","hvac_mode":"cool"}').kind,
     ).to.equal('set_hvac_mode');
+  });
+
+  // Cover: one topic, a "command" field, and the firmware's fixed ten-string
+  // allow-list (mqttPublishCoverCommand, mqtt_handlers.cpp:2268-2271).
+  describe('cover', () => {
+    const cover = (fields: Record<string, unknown>): string => JSON.stringify({ entity_id: 'cover.blind', ...fields });
+
+    it('parses seven of the eight payload-free commands to a kind of the same name', () => {
+      for (const command of [
+        'open_cover',
+        'close_cover',
+        'stop_cover',
+        'open_cover_tilt',
+        'close_cover_tilt',
+        'stop_cover_tilt',
+        'toggle_cover_tilt',
+      ]) {
+        expect(parseCoverCommand(cover({ command })), command).to.deep.equal({ kind: command, entityId: 'cover.blind' });
+      }
+    });
+
+    it("parses the firmware's plain 'toggle' as toggle_cover, distinct from switch/light's toggle", () => {
+      // Same string as the switch domain's toggle, different meaning: a cover
+      // toggles by its open/closed state. A distinct kind keeps cmnd/cover
+      // from ever reaching a switch or light (ALLOWED_CALLS).
+      expect(parseCoverCommand(cover({ command: 'toggle' }))).to.deep.equal({ kind: 'toggle_cover', entityId: 'cover.blind' });
+    });
+
+    it('parses set_cover_position from "position" and set_cover_tilt_position from "tilt_position"', () => {
+      expect(parseCoverCommand(cover({ command: 'set_cover_position', position: 40 }))).to.deep.equal({
+        kind: 'set_cover_position',
+        entityId: 'cover.blind',
+        value: 40,
+      });
+      expect(parseCoverCommand(cover({ command: 'set_cover_tilt_position', tilt_position: 75 }))).to.deep.equal({
+        kind: 'set_cover_tilt_position',
+        entityId: 'cover.blind',
+        value: 75,
+      });
+    });
+
+    it('keeps a legitimate zero and clamps to 0..100 like the firmware publisher does', () => {
+      // mqtt_handlers.cpp:2290-2291 clamps before formatting an integer.
+      const position = (value: unknown): unknown =>
+        (parseCoverCommand(cover({ command: 'set_cover_position', position: value })) as { value: number }).value;
+      expect(position(0)).to.equal(0);
+      expect(position(-5)).to.equal(0);
+      expect(position(150)).to.equal(100);
+      expect(position(33.6)).to.equal(34);
+    });
+
+    it('rejects a missing, blank or non-numeric position rather than writing zero', () => {
+      for (const value of [undefined, '', '50', null, 'abc', Number.NaN]) {
+        expect(() => parseCoverCommand(cover({ command: 'set_cover_position', position: value })), String(value)).to.throw(
+          CommandError,
+          'invalid_position',
+        );
+        expect(() => parseCoverCommand(cover({ command: 'set_cover_tilt_position', tilt_position: value })), String(value)).to.throw(
+          CommandError,
+          'invalid_tilt_position',
+        );
+      }
+      // Each command reads only its own key.
+      expect(() => parseCoverCommand(cover({ command: 'set_cover_tilt_position', position: 50 }))).to.throw(CommandError);
+    });
+
+    it('rejects a command outside the allow-list, including case variants', () => {
+      for (const command of ['bogus', 'OPEN_COVER', 'set_temperature', 'turn_on', '', 7]) {
+        expect(() => parseCoverCommand(cover({ command })), String(command)).to.throw(CommandError, 'unsupported_cover_command');
+      }
+      expect(() => parseCoverCommand(cover({}))).to.throw(CommandError, 'unsupported_cover_command');
+    });
+
+    it('rejects a payload with no valid entity_id', () => {
+      expect(() => parseCoverCommand('{"command":"open_cover"}')).to.throw(CommandError, 'missing_entity_id');
+      expect(() => parseCoverCommand('{"entity_id":"blind","command":"open_cover"}')).to.throw(CommandError, 'invalid_entity_id');
+    });
+
+    it('dispatches the cover leaf through parseCommand', () => {
+      expect(parseCommand('cover', cover({ command: 'stop_cover' })).kind).to.equal('stop_cover');
+    });
   });
 });

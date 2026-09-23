@@ -8,7 +8,9 @@ import { baseEntity, type Values } from './common';
  * remains pressable, and no state is ever published for it.
  */
 export function synthScene(device: DeviceInput, entityId: string, values: Values): VirtualEntity {
-  const { source, lastChanged, friendly } = baseEntity(device, entityId, values);
+  // channelMeta carries each channel's write flag: the dispatcher refuses a
+  // read-only one (Ruling 38).
+  const { source, channelMeta, lastChanged, friendly } = baseEntity(device, entityId, values);
   return {
     entityId,
     domain: 'scene',
@@ -17,5 +19,6 @@ export function synthScene(device: DeviceInput, entityId: string, values: Values
     attributes: { ...friendly },
     available: true,
     lastChanged,
+    channelMeta,
   };
 }

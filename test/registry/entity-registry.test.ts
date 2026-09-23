@@ -2,6 +2,7 @@ import { expect } from 'chai';
 import { mapControlToDevice, type DetectedControl } from '../../src/registry/detector';
 import { EntityRegistry } from '../../src/registry/entity-registry';
 import type { DeviceInput, SourceValue, VirtualEntity } from '../../src/registry/types';
+import { Dispatcher } from '../../src/runtime/dispatcher';
 
 const NOW = 1_757_000_000_000;
 const value = (val: unknown, ts = NOW): SourceValue => ({ val, ack: true, q: 0, ts });
@@ -192,5 +193,34 @@ describe('registry/entity-registry', () => {
     expect(registry.all()).to.deep.equal([]);
     expect(registry.byId('sensor.wohnzimmer')).to.equal(undefined);
     expect(registry.byId('switch.kaffee')).to.equal(undefined);
+  });
+
+  it('keeps the raw value behind an unchanged view current, so re-selecting it writes that value (Ruling 41)', async () => {
+    // {3:'5'} decodes 3 and 5 alike: the panel sees "5" either way, so there
+    // is nothing to re-publish -- but the value a re-select writes back is the
+    // one the device holds NOW. A registry that kept the entity from before
+    // the change would write 3 into a device sitting at 5.
+    const AC: DeviceInput = {
+      objectId: 'ac.0',
+      name: 'Klima',
+      detectorType: 'airCondition',
+      domain: 'climate',
+      channels: { mode: { objectId: 'ac.0.mode', type: 'number', write: true, states: { '3': '5' } } },
+    };
+    const { registry, changed } = harness();
+    const entityId = registry.rebuild([AC], {}).entityIds['ac.0']!;
+    registry.applyStateChange('ac.0.mode', value(3));
+    const shown = registry.byId(entityId)!;
+    changed.length = 0;
+
+    registry.applyStateChange('ac.0.mode', value(5, NOW + 1000));
+    expect(changed, 'nothing the panel sees changed').to.have.length(0);
+    expect(registry.byId(entityId)!.lastChanged, 'an unseen change is not a change').to.equal(shown.lastChanged);
+
+    const writes: Array<[string, unknown]> = [];
+    const silentLog = { info: () => undefined, warn: () => undefined, error: () => undefined, debug: () => undefined };
+    const dispatcher = new Dispatcher(registry, async (objectId, val) => void writes.push([objectId, val]), silentLog);
+    expect(await dispatcher.dispatch({ kind: 'set_hvac_mode', entityId, mode: '5' })).to.deep.equal({ ok: true, writes: 1 });
+    expect(writes).to.deep.equal([['ac.0.mode', 5]]);
   });
 });

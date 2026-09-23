@@ -229,7 +229,8 @@ describe('registry/synth/climate', () => {
     device.channels.mode = { objectId: 'climate.0.mode', write: true, type: 'number', states: { '1': 'heat' } };
     values['climate.0.mode'] = numState(1);
     const e = synthClimate(device, 'climate.test', values);
-    expect(e?.channelMeta?.mode).to.deep.equal({ type: 'number', states: { '1': 'heat' } });
+    // Task 8: `write` (Ruling 38) and the current raw value (Ruling 41) ride along.
+    expect(e?.channelMeta?.mode).to.deep.equal({ type: 'number', states: { '1': 'heat' }, write: true, current: 1 });
   });
 
   it('dispatches to synthClimate through synthesise, including its null result', () => {

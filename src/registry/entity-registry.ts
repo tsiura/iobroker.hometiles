@@ -174,7 +174,14 @@ export class EntityRegistry {
     // which does not change between rebuilds. Guarded anyway for the type
     // checker, and because "no change" is the safe reading if it ever did.
     if (!next) return;
-    if (sameEntity(slot.entity, next)) return;
+    if (sameEntity(slot.entity, next)) {
+      // Nothing the panel sees changed, so nothing is published and
+      // lastChanged stays -- but the raw values behind the view may have:
+      // {3:'5'} decodes 3 and 5 alike, and a re-select must write the value
+      // the device holds now (channelMeta.current, Ruling 41).
+      slot.entity = { ...next, lastChanged: slot.entity.lastChanged };
+      return;
+    }
 
     slot.entity = next;
     this.events.onEntityChanged(next);

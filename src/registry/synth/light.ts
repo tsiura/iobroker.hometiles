@@ -23,7 +23,9 @@ function readNumber(device: DeviceInput, name: string, values: Values): number |
 }
 
 export function synthLight(device: DeviceInput, entityId: string, values: Values): VirtualEntity {
-  const { source, lastChanged, friendly } = baseEntity(device, entityId, values);
+  // channelMeta carries each channel's write flag: the dispatcher refuses a
+  // read-only one (Ruling 38).
+  const { source, channelMeta, lastChanged, friendly } = baseEntity(device, entityId, values);
   const attributes: Record<string, unknown> = { ...friendly };
 
   // Colour modes come only from channels that exist. Never from a current value.
@@ -60,7 +62,7 @@ export function synthLight(device: DeviceInput, entityId: string, values: Values
   const anyUsable = Boolean(setRead && isUsable(setRead.value)) || dimmerPercent !== undefined;
 
   if (!anyUsable) {
-    return { entityId, domain: 'light', source, state: UNAVAILABLE, attributes, available: false, lastChanged };
+    return { entityId, domain: 'light', source, state: UNAVAILABLE, attributes, available: false, lastChanged, channelMeta };
   }
 
   let state: string;
@@ -94,5 +96,5 @@ export function synthLight(device: DeviceInput, entityId: string, values: Values
   else if (hasCt && attributes.color_temp_kelvin !== undefined) attributes.color_mode = 'color_temp';
   else attributes.color_mode = modes[0];
 
-  return { entityId, domain: 'light', source, state, attributes, available: true, lastChanged };
+  return { entityId, domain: 'light', source, state, attributes, available: true, lastChanged, channelMeta };
 }

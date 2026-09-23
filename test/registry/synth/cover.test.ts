@@ -223,14 +223,15 @@ describe('registry/synth/cover', () => {
     device.channels.set = { objectId: 'cover.0.set', write: true, type: 'number' };
     values['cover.0.set'] = numState(40);
     const e = synthCover(device, 'cover.test', values);
-    expect(e.channelMeta?.set).to.deep.equal({ type: 'number', states: undefined });
+    // Task 8: `write` (Ruling 38) and the current raw value (Ruling 41) ride along.
+    expect(e.channelMeta?.set).to.deep.equal({ type: 'number', states: undefined, write: true, current: 40 });
   });
 
   it("carries gate's boolean SET type through channelMeta, distinct from blind's number", () => {
     const { device, values } = gateDevice(numState(true));
     device.channels.set = { objectId: 'gate.0.set', write: true, type: 'boolean' };
     const e = synthCover(device, 'gate.test', values);
-    expect(e.channelMeta?.set).to.deep.equal({ type: 'boolean', states: undefined });
+    expect(e.channelMeta?.set).to.deep.equal({ type: 'boolean', states: undefined, write: true, current: true });
   });
 
   it('dispatches to synthCover through synthesise', () => {
@@ -334,5 +335,59 @@ describe('registry/synth/cover', () => {
     const values = { 'gate.0.opened': numState(true), 'gate.0.closed': numState(false) };
     const e = synthCover(device, 'gate.test', values);
     expect(e.state).to.equal('open');
+  });
+
+  // --- Task 8 ----------------------------------------------------------
+
+  it('grants a string- or mixed-typed SET neither a position nor open/close, whatever the detectorType (Ruling 32)', () => {
+    // Such a SET used to fall to the detectorType fallback: a position on a
+    // blind, a toggle on a gate. Task 7 derives supported_features from
+    // `writable`, so that advertised a slider (or open/close buttons) that
+    // would write a number (or a boolean) into a string channel.
+    for (const type of ['string', 'mixed'] as const) {
+      for (const detectorType of ['blind', 'gate']) {
+        const device: DeviceInput = {
+          objectId: 'odd.0',
+          name: 'Odd',
+          detectorType,
+          domain: 'cover',
+          channels: {
+            set: { objectId: 'odd.0.set', write: true, type },
+            stop: { objectId: 'odd.0.stop', write: true, type: 'boolean' },
+          },
+        };
+        const e = synthCover(device, 'cover.odd', { 'odd.0.set': numState('true') });
+        expect(e.writable, `${type} SET, ${detectorType}`).to.deep.equal({ stop: true });
+        // Nor read back as a toggle: a gate's fallback turned "true" into 'open'.
+        expect(e.state, `${type} SET, ${detectorType}`).to.equal('unavailable');
+      }
+    }
+  });
+
+  it("records an untyped SET's decided kind as its channelMeta type, so the dispatcher writes what the synth advertised", () => {
+    // gate's pattern guarantees a boolean SET, blind's a number (Ruling 28's
+    // fallback). The dispatcher tells the two apart by this type alone.
+    const gate = gateDevice();
+    expect(synthCover(gate.device, 'gate.test', gate.values).channelMeta?.set?.type).to.equal('boolean');
+    const blind = deviceWith({ SET: numState(40) });
+    expect(synthCover(blind.device, 'cover.test', blind.values).channelMeta?.set?.type).to.equal('number');
+  });
+
+  it('carries each channel\'s write flag and current value into channelMeta, write undefined included (Rulings 38/41)', () => {
+    const device: DeviceInput = {
+      objectId: 'cover.0',
+      name: 'Cover',
+      detectorType: 'blind',
+      domain: 'cover',
+      channels: {
+        set: { objectId: 'cover.0.set', type: 'number', write: false },
+        stop: { objectId: 'cover.0.stop', type: 'boolean' },
+      },
+    };
+    // A bad-quality reading is not a current value, exactly as the decoders treat it.
+    const e = synthCover(device, 'cover.test', { 'cover.0.set': numState(30), 'cover.0.stop': numState(false, 1) });
+    expect(e.channelMeta?.set).to.include({ write: false, current: 30 });
+    expect(e.channelMeta?.stop?.write).to.equal(undefined);
+    expect(e.channelMeta?.stop?.current).to.equal(undefined);
   });
 });

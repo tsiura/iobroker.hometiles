@@ -23,7 +23,7 @@ export interface PanelTransport {
 }
 
 /** Command leaves this adapter implements. Everything else is deliberately not subscribed. */
-const COMMAND_LEAVES = ['light', 'switch', 'scene', 'climate'] as const;
+const COMMAND_LEAVES = ['light', 'switch', 'scene', 'climate', 'cover'] as const;
 type CommandLeaf = (typeof COMMAND_LEAVES)[number];
 
 export class PanelSession {

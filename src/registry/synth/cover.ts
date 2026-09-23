@@ -60,7 +60,7 @@ function setWritable(writable: Record<string, boolean>, role: string, channel: C
   if (channel) writable[role] = channel.write === true;
 }
 
-type SetChannelKind = 'position' | 'toggle';
+type SetChannelKind = 'position' | 'toggle' | 'neither';
 
 /**
  * Ruling 28 (task 6 fix round 1). Decides whether the SET channel is a
@@ -84,12 +84,19 @@ type SetChannelKind = 'position' | 'toggle';
  * channels already use. blindButtons never reaches the fallback at all: it
  * has no SET channel, so this returns undefined before detectorType is
  * even consulted.
+ *
+ * Ruling 32 (Task 8): a string- or mixed-typed SET is real metadata too, and
+ * it says the channel is neither: writing a number (a position) or a boolean
+ * (a toggle) into it would be the wrong type with ok:true. Such a SET is
+ * writable as neither, so it advertises nothing (protocol/cover.ts derives
+ * supported_features from `writable`) and nothing can be dispatched to it.
  */
 function setChannelKind(device: DeviceInput): SetChannelKind | undefined {
   const channel = device.channels.set;
   if (!channel) return undefined;
   if (channel.type === 'boolean') return 'toggle';
   if (channel.type === 'number') return 'position';
+  if (channel.type !== undefined) return 'neither';
   return device.detectorType === 'gate' ? 'toggle' : 'position';
 }
 
@@ -158,6 +165,12 @@ export function synthCover(device: DeviceInput, entityId: string, values: Values
   const { source, channelMeta, lastChanged, friendly } = baseEntity(device, entityId, values);
   const attributes: Record<string, unknown> = { ...friendly };
   const writable: Record<string, boolean> = {};
+
+  // The dispatcher tells a toggle SET (itself the open/close command) from
+  // any other by this type alone, so an untyped SET records the kind decided
+  // above -- the type its pattern guarantees, as roleCodec does for climate.
+  const setMeta = channelMeta.set;
+  if (setMeta && setMeta.type === undefined) setMeta.type = setKind === 'toggle' ? 'boolean' : 'number';
 
   // current_position/current_tilt_position: undefined stays undefined,
   // never defaulted to 0, and read the same way regardless of setKind -- a

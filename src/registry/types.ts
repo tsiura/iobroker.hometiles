@@ -52,9 +52,12 @@ export interface ChannelInput {
  * The subset of a channel's metadata an encoder needs to reverse a decoded
  * display label back into the raw value a write actually needs -- see
  * synth/common.ts's encodeChannelValue, the exact inverse of readEnum/
- * toBoolState.
+ * toBoolState. `write` is the object's own write flag: the dispatcher never
+ * writes a channel whose flag is exactly false (Ruling 38). `current` is the
+ * channel's newest usable raw value, so re-selecting the current value writes
+ * exactly that value (Ruling 41).
  */
-export type ChannelCodec = Pick<ChannelInput, 'type' | 'states'>;
+export type ChannelCodec = Pick<ChannelInput, 'type' | 'states' | 'write'> & { current?: unknown };
 
 /** A device as classified by the detector plus the admin's overrides. */
 export interface DeviceInput {
@@ -92,7 +95,8 @@ export interface VirtualEntity {
    */
   writable?: Record<string, boolean>;
   /**
-   * Per-channel type/states metadata, keyed by the same channel names as
+   * Per-channel ChannelCodec (type, states, write flag, current raw value),
+   * keyed by the same channel names as
    * `source` (NOT by role, unlike `writable`). Lets a command dispatcher
    * reverse a decoded display label back into the raw value a write needs
    * (synth/common.ts's encodeChannelValue) instead of writing the label

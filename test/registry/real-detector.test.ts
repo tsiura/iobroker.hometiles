@@ -443,6 +443,14 @@ describe('real type-detector end to end (Task 5c)', () => {
       expect(result.device.channels.set!.write).to.equal(false);
       expect(result.payload).to.equal('off');
     });
+
+    it('Ruling 38: turn_on at that read-only status is refused, with nothing written', async () => {
+      // The repro that was ok:true and written before Task 8.
+      const result = runFor(run(KNX_SET, { [`${KNX}.Status`]: value(false) }), KNX);
+      const { result: outcome, writes } = await dispatch(result.entity!, { kind: 'turn_on', entityId: result.entity!.entityId });
+      expect(outcome).to.deep.equal({ ok: false, reason: 'no_writable_channel', applied: 0 });
+      expect(writes).to.deep.equal([]);
+    });
   });
 
   describe('light', () => {
@@ -667,6 +675,30 @@ describe('real type-detector end to end (Task 5c)', () => {
       expectRealChannels(GARAGE_SET, result.device, { set: `${GARAGE}.SET` });
       expect(result.device.channels.set!.write).to.equal(true);
       expect(json(result).supported_features).to.equal(1 | 2);
+    });
+
+    it('Task 8: a real blind and a real gate take exactly the commands they advertise, on the right objects', async () => {
+      const blind = runFor(run(BLIND_SET, { [`${BLIND}.ACTUAL`]: value(40) }), BLIND).entity!;
+      const gate = runFor(run(GATE_SET, { [`${GATE}.SET`]: value(true) }), GATE).entity!;
+      const entityId = 'cover.under_test';
+      const cases: Array<[string, VirtualEntity, ServiceCall, Array<[string, unknown]>]> = [
+        ['blind', blind, { kind: 'open_cover', entityId }, [[`${BLIND}.OPEN`, true]]],
+        ['blind', blind, { kind: 'close_cover', entityId }, [[`${BLIND}.CLOSE`, true]]],
+        ['blind', blind, { kind: 'stop_cover', entityId }, [[`${BLIND}.STOP`, true]]],
+        ['blind', blind, { kind: 'set_cover_position', entityId, value: 25 }, [[`${BLIND}.SET`, 25]]],
+        ['blind', blind, { kind: 'open_cover_tilt', entityId }, []],
+        ['gate', gate, { kind: 'open_cover', entityId }, [[`${GATE}.SET`, true]]],
+        ['gate', gate, { kind: 'close_cover', entityId }, [[`${GATE}.SET`, false]]],
+        ['gate', gate, { kind: 'stop_cover', entityId }, [[`${GATE}.STOP`, true]]],
+        ['gate', gate, { kind: 'set_cover_position', entityId, value: 25 }, []],
+        // Open (SET true), so the toggle closes it.
+        ['gate', gate, { kind: 'toggle_cover', entityId }, [[`${GATE}.SET`, false]]],
+      ];
+      for (const [label, entity, call, landed] of cases) {
+        const { result: outcome, writes } = await dispatch(entity, call);
+        expect(outcome.ok, `${label} ${call.kind}`).to.equal(landed.length > 0);
+        expect(writes, `${label} ${call.kind}`).to.deep.equal(landed);
+      }
     });
   });
 

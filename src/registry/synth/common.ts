@@ -66,8 +66,15 @@ export function baseEntity(
   let lastChanged = 0;
   for (const [name, channel] of Object.entries(device.channels)) {
     source[name] = channel.objectId;
-    channelMeta[name] = { type: channel.type, states: channel.states };
     const value = values[channel.objectId];
+    // write: Ruling 38, for every domain. current: Ruling 41; a value the
+    // decoders would not use (isUsable) is no current value either.
+    channelMeta[name] = {
+      type: channel.type,
+      states: channel.states,
+      write: channel.write,
+      current: isUsable(value) ? value.val : undefined,
+    };
     if (value && value.ts > lastChanged) lastChanged = value.ts;
   }
   const friendly: Record<string, unknown> = { friendly_name: device.name || entityId };
@@ -96,7 +103,7 @@ const ROLE_FALLBACK_TYPE: Readonly<Record<string, ChannelCodec['type']>> = {
 
 export function roleCodec(role: string, codec: ChannelCodec | undefined): ChannelCodec | undefined {
   const fallback = ROLE_FALLBACK_TYPE[role];
-  return codec?.type === undefined && fallback ? { type: fallback, states: codec?.states } : codec;
+  return codec?.type === undefined && fallback ? { ...codec, type: fallback } : codec;
 }
 
 /**
@@ -128,8 +135,21 @@ export function acceptsLabels(codec: ChannelCodec | undefined): boolean {
  * upper-case defaultStates, "HIGH") comes back from a real panel already
  * lower-cased. An exact-case-only reversal would refuse the type-detector's
  * own default labels on every real round trip.
+ *
+ * Ruling 41: re-selecting the current value writes the current value.
+ * `currentLabel` is the role's current DECODED value -- what the panel shows,
+ * and what its lone fallback option sends back -- and `codec.current` the raw
+ * value it came from. When the label is that decoded value and the map did
+ * not produce it (the raw value lies outside the map, or its decoder never
+ * read the map: synthClimate reads SPEED_LEVEL with readNumber), the raw
+ * value itself is written, coerced to the channel type, before any map
+ * reversal. Everything else must reverse through the map to exactly one key.
  */
-export function encodeChannelValue(codec: ChannelCodec | undefined, label: string): number | boolean | string | undefined {
+export function encodeChannelValue(
+  codec: ChannelCodec | undefined,
+  label: string,
+  currentLabel?: unknown,
+): number | boolean | string | undefined {
   // Boolean is checked FIRST and never consults a states map at all, because
   // the decoder it must invert -- toBoolState -- never reads one either: it
   // always emits exactly STATE_ON/STATE_OFF regardless of what states the
@@ -152,6 +172,19 @@ export function encodeChannelValue(codec: ChannelCodec | undefined, label: strin
 
   if (!acceptsLabels(codec)) return undefined;
 
+  const wanted = label.trim().toLowerCase();
+  const current = codec?.current;
+  if (
+    current !== undefined &&
+    typeof currentLabel === 'string' &&
+    currentLabel.trim().toLowerCase() === wanted &&
+    codec?.states?.[String(current)] !== currentLabel
+  ) {
+    // Before the reversal, which would resolve {B1:'Boost'} at "BOOST" to
+    // the OTHER entry's key B1, and {3:'5'} at 5 to 3.
+    return coerce(codec?.type, current);
+  }
+
   let raw = label;
   const entries = codec?.states ? Object.entries(codec.states) : [];
   if (entries.length > 0) {
@@ -172,38 +205,39 @@ export function encodeChannelValue(codec: ChannelCodec | undefined, label: strin
     // (fix-round 3, fold-in 3) -- main.ts's detectDevices now validates
     // common.states so a real device should never produce one, but a states
     // map built any other way (a test, a future caller) still cannot throw.
-    const wanted = label.trim().toLowerCase();
     const matches = entries.filter(
       ([, candidate]) => typeof candidate === 'string' && candidate.trim().toLowerCase() === wanted,
     );
-    if (matches.length > 1) return undefined;
+    // A label outside the map is refused on every channel type. Ruling 36
+    // let a number channel coerce one instead, so the panel's lone fallback
+    // option (an out-of-map current value, e.g. "50") was no dead button;
+    // Ruling 41 keeps that through the current-value branch above and closes
+    // the rest: any MQTT client could write 7 into a SPEED mapped 0..3.
     const [onlyMatch] = matches;
-    if (onlyMatch) raw = onlyMatch[0];
-    // Ruling 36: a label outside the map is refused, except on a number
-    // channel. There readEnum emits an out-of-map raw value as its own
-    // number-string, which the panel's lone fallback option sends back, so
-    // coercing it below completes the inverse (a no-op write of the current
-    // value, not a dead button). Blank and non-finite still refuse.
-    else if (codec?.type !== 'number') return undefined;
+    if (!onlyMatch || matches.length > 1) return undefined;
+    raw = onlyMatch[0];
   }
 
-  switch (codec?.type) {
-    case 'number': {
-      // Number('') and Number('NaN') are both non-encodable for different
-      // reasons ('' is 0 and finite -- the exact trap this project has hit
-      // before; 'NaN' parses to a real NaN) -- both must refuse, neither may
-      // fall through as 0.
-      const text = raw.trim();
-      if (!text) return undefined;
-      const numeric = Number(text);
-      return Number.isFinite(numeric) ? numeric : undefined;
-    }
-    default:
-      // 'string', 'mixed' or no captured type: reachable only through a
-      // states map (Ruling 33), so `raw` is the key the label reversed to --
-      // the channel's own internal value.
-      return raw;
+  // 'string', 'mixed' or no captured type is reachable only through a states
+  // map (Ruling 33) or the current value, so `raw` is the channel's own value.
+  return coerce(codec?.type, raw);
+}
+
+/** A raw value as a channel of this type holds it, or undefined when it cannot be one. */
+function coerce(type: ChannelCodec['type'], raw: unknown): number | boolean | string | undefined {
+  if (typeof raw !== 'number' && typeof raw !== 'string' && typeof raw !== 'boolean') return undefined;
+  if (type === 'number') {
+    // Number('') and Number('NaN') are both non-encodable for different
+    // reasons ('' is 0 and finite -- the exact trap this project has hit
+    // before; 'NaN' parses to a real NaN) -- both must refuse, neither may
+    // fall through as 0.
+    const text = String(raw).trim();
+    if (!text) return undefined;
+    const numeric = Number(text);
+    return Number.isFinite(numeric) ? numeric : undefined;
   }
+  // 'mixed' and untyped have no single native type: the value stays as it is.
+  return type === 'string' ? String(raw) : raw;
 }
 
 export const UNAVAILABLE = STATE_UNAVAILABLE;

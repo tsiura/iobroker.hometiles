@@ -74,15 +74,38 @@ describe('runtime/panel-session', () => {
   });
 
   it('does not subscribe to domains this adapter does not implement yet', async () => {
-    // climate moved out of this list once Task 5 gave it real commands;
-    // cover/media_player/camera still have no ServiceCall kinds at all
-    // (dispatcher.ts's ALLOWED_CALLS), so subscribing would only let
-    // malformed/unhandled traffic reach the session for nothing.
+    // climate (Task 5) and cover (Task 8) moved out of this list once they
+    // gained real commands; media_player/camera still have no ServiceCall
+    // kinds at all (dispatcher.ts's ALLOWED_CALLS), so subscribing would only
+    // let malformed/unhandled traffic reach the session for nothing.
     const { session, subscribed } = harness();
     await session.start();
-    expect(subscribed).to.not.include('hometiles/cmnd/cover');
     expect(subscribed).to.not.include('hometiles/cmnd/media');
     expect(subscribed).to.not.include('hometiles/cmnd/camera');
+  });
+
+  it('subscribes to cmnd/cover and routes a real cover command to the dispatcher (Task 8)', async () => {
+    // The leaf is the firmware's COVER_CMND descriptor, "cover"
+    // (mqtt_topics.cpp:14), not the domain name by coincidence.
+    const { session, subscribed, writes, registryEntities } = harness();
+    registryEntities.set(
+      'cover.blind',
+      entity({
+        entityId: 'cover.blind',
+        domain: 'cover',
+        state: 'open',
+        source: { set: 'zig.0.blind.level' },
+        writable: { position: true },
+        channelMeta: { set: { type: 'number' } },
+      }),
+    );
+    await session.start();
+    expect(subscribed).to.include('hometiles/cmnd/cover');
+    await session.handleMessage(
+      'hometiles/cmnd/cover',
+      '{"entity_id":"cover.blind","command":"set_cover_position","position":30}',
+    );
+    expect(writes).to.deep.equal([['zig.0.blind.level', 30]]);
   });
 
   it('publishes the configuration retained to the apply topic', () => {

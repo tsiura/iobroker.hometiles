@@ -1,9 +1,14 @@
 import { expect } from 'chai';
 import { buildClimatePayload } from '../../src/protocol/climate';
-import { parseClimateCommand, type ServiceCall } from '../../src/protocol/commands';
+import { parseClimateCommand, parseCoverCommand, type ServiceCall } from '../../src/protocol/commands';
+import { buildCoverPayload } from '../../src/protocol/cover';
 import { synthClimate } from '../../src/registry/synth/climate';
+import { synthCover } from '../../src/registry/synth/cover';
+import { synthLight } from '../../src/registry/synth/light';
+import { synthScene } from '../../src/registry/synth/scene';
+import { synthSwitch } from '../../src/registry/synth/switch';
 import { Dispatcher, type EntityLookup } from '../../src/runtime/dispatcher';
-import type { DeviceInput, SourceValue, VirtualEntity } from '../../src/registry/types';
+import type { ChannelInput, DeviceInput, SourceValue, VirtualEntity } from '../../src/registry/types';
 
 function entity(over: Partial<VirtualEntity>): VirtualEntity {
   return {
@@ -205,6 +210,72 @@ describe('runtime/dispatcher', () => {
     const result = await d.dispatch({ kind: 'set_light', entityId: 'light.d', state: 'on', brightnessPct: 42 });
     expect(result).to.deep.equal({ ok: false, reason: 'write_failed', applied: 1 });
     expect(writes).to.deep.equal([['hue.0.d.on', true]]);
+  });
+
+  // Ruling 38: the v0.1 switch, light and scene paths never read a channel's
+  // write flag, so a read-only object (e.g. a KNX switch status, common.write
+  // false) was written and reported ok:true. Entities come from the REAL
+  // synths, so the flag has to travel DeviceInput -> baseEntity -> channelMeta.
+  describe('read-only channels (Ruling 38)', () => {
+    const at = (val: unknown): SourceValue => ({ val, ack: true, q: 0, ts: 1 });
+    const onOff = (objectId: string, write?: boolean): ChannelInput => ({ objectId, type: 'boolean', write });
+    const device = (objectId: string, domain: DeviceInput['domain'], channels: DeviceInput['channels']): DeviceInput => ({
+      objectId,
+      name: objectId,
+      detectorType: domain,
+      domain,
+      channels,
+    });
+
+    it('a read-only switch, light and scene each refuse their "on" command with nothing written', async () => {
+      const sw = synthSwitch(device('knx.0.sw', 'switch', { set: onOff('knx.0.sw.status', false) }), 'switch.ro', {
+        'knx.0.sw.status': at(false),
+      });
+      const light = synthLight(device('knx.0.li', 'light', { set: onOff('knx.0.li.status', false) }), 'light.ro', {
+        'knx.0.li.status': at(false),
+      });
+      // A scene has no "turn_on": activate_scene is its only command (ALLOWED_CALLS).
+      const scene = synthScene(device('hm.0.key', 'scene', { set: onOff('hm.0.key.PRESS', false) }), 'scene.ro', {});
+      const d = new Dispatcher(lookup([sw, light, scene], { ro: 'scene.ro' }), write, silentLog);
+      const calls: ServiceCall[] = [
+        { kind: 'turn_on', entityId: 'switch.ro' },
+        { kind: 'turn_off', entityId: 'switch.ro' },
+        { kind: 'toggle', entityId: 'switch.ro' },
+        { kind: 'turn_on', entityId: 'light.ro' },
+        { kind: 'set_light', entityId: 'light.ro', state: 'on' },
+        { kind: 'activate_scene', alias: 'ro' },
+      ];
+      for (const call of calls) {
+        expect(await d.dispatch(call), JSON.stringify(call)).to.deep.equal({
+          ok: false,
+          reason: 'no_writable_channel',
+          applied: 0,
+        });
+      }
+      expect(writes).to.deep.equal([]);
+    });
+
+    it('still writes a channel whose write flag is undefined (object and pattern both silent)', async () => {
+      const sw = synthSwitch(device('x.0.sw', 'switch', { set: onOff('x.0.sw.on') }), 'switch.silent', {});
+      const d = new Dispatcher(lookup([sw]), write, silentLog);
+      expect(await d.dispatch({ kind: 'turn_on', entityId: 'switch.silent' })).to.deep.equal({ ok: true, writes: 1 });
+      expect(writes).to.deep.equal([['x.0.sw.on', true]]);
+    });
+
+    it('skips only the read-only channel of a multi-channel light command and writes the rest', async () => {
+      const light = synthLight(
+        device('x.0.li', 'light', {
+          set: onOff('x.0.li.on', true),
+          dimmer: { objectId: 'x.0.li.level', type: 'number', write: false },
+        }),
+        'light.half',
+        {},
+      );
+      const d = new Dispatcher(lookup([light]), write, silentLog);
+      const result = await d.dispatch({ kind: 'set_light', entityId: 'light.half', state: 'on', brightnessPct: 40 });
+      expect(result).to.deep.equal({ ok: true, writes: 1 });
+      expect(writes).to.deep.equal([['x.0.li.on', true]]);
+    });
   });
 
   describe('climate', () => {
@@ -713,6 +784,343 @@ describe('runtime/dispatcher', () => {
           expect(typeof tap.landed[0]?.[1]).to.equal('number');
         });
       });
+    });
+
+    // Ruling 41: re-selecting the current value writes the current value.
+    // The encoder used to know nothing about the role's current value, so
+    // Ruling 36's out-of-map fallback took ANY finite number from any MQTT
+    // client, and a current value outside the map whose text equals another
+    // entry's label reversed to that other entry. Real synth -> real parser
+    // -> dispatcher, as the panel would drive it.
+    describe('re-selecting the current value (Ruling 41)', () => {
+      const at = (val: unknown): SourceValue => ({ val, ack: true, q: 0, ts: 1 });
+      const airCondition = (channels: DeviceInput['channels']): DeviceInput => ({
+        objectId: 'ac.0',
+        name: 'AC',
+        detectorType: 'airCondition',
+        domain: 'climate',
+        channels,
+      });
+      // A SPEED mapped 0..3, currently at 1 ("LOW").
+      const FAN = airCondition({
+        mode: { objectId: 'ac.0.mode', type: 'number', write: true },
+        speed: { objectId: 'ac.0.speed', type: 'number', write: true, states: { '0': 'AUTO', '1': 'LOW', '2': 'MEDIUM', '3': 'HIGH' } },
+      });
+
+      async function send(device: DeviceInput, values: Record<string, SourceValue>, payload: Record<string, unknown>) {
+        const entity = synthClimate(device, 'climate.ac', values)!;
+        writes = [];
+        const d = new Dispatcher(lookup([entity]), write, silentLog);
+        return d.dispatch(parseClimateCommand(JSON.stringify({ entity_id: 'climate.ac', ...payload })));
+      }
+
+      it('refuses 7 into a SPEED mapped 0..3: an arbitrary number is not the current value', async () => {
+        const result = await send(FAN, { 'ac.0.speed': at(1) }, { command: 'set_fan_mode', fan_mode: '7' });
+        expect(result).to.deep.equal({ ok: false, reason: 'cannot_encode_value', applied: 0 });
+        expect(writes).to.deep.equal([]);
+      });
+
+      it('still reverses a mapped label on the same channel', async () => {
+        const result = await send(FAN, { 'ac.0.speed': at(1) }, { command: 'set_fan_mode', fan_mode: 'high' });
+        expect(result).to.deep.equal({ ok: true, writes: 1 });
+        expect(writes).to.deep.equal([['ac.0.speed', 3]]);
+      });
+
+      it('re-selecting {B1:"Boost"} at "BOOST" writes "BOOST", not the other entry\'s key "B1"', async () => {
+        const mode: ChannelInput = { objectId: 'ac.0.mode', type: 'string', write: true, states: { B1: 'Boost' } };
+        const result = await send(airCondition({ mode }), { 'ac.0.mode': at('BOOST') }, {
+          command: 'set_hvac_mode',
+          hvac_mode: 'boost',
+        });
+        expect(result).to.deep.equal({ ok: true, writes: 1 });
+        expect(writes).to.deep.equal([['ac.0.mode', 'BOOST']]);
+      });
+
+      it('re-selecting "5" on {3:"5"} writes whichever raw value the device holds, 5 or 3', async () => {
+        const mode: ChannelInput = { objectId: 'ac.0.mode', type: 'number', write: true, states: { '3': '5' } };
+        for (const raw of [5, 3]) {
+          const result = await send(airCondition({ mode }), { 'ac.0.mode': at(raw) }, { command: 'set_hvac_mode', hvac_mode: '5' });
+          expect(result, `at ${raw}`).to.deep.equal({ ok: true, writes: 1 });
+          expect(writes, `at ${raw}`).to.deep.equal([['ac.0.mode', raw]]);
+        }
+      });
+
+      it('a SPEED_LEVEL at a value its map labels still re-selects: the panel shows the number, not the label', async () => {
+        // The dead-button fix Ruling 41 keeps: synthClimate decodes SPEED_LEVEL
+        // with readNumber, so at 100 the lone option is "100", never "MAX".
+        const level: ChannelInput = { objectId: 'ac.0.speed_level', type: 'number', write: true, states: { '0': 'AUS', '100': 'MAX' } };
+        const device = airCondition({ mode: { objectId: 'ac.0.mode', type: 'number', write: true }, speed_level: level });
+        const result = await send(device, { 'ac.0.speed_level': at(100) }, { command: 'set_fan_mode', fan_mode: '100' });
+        expect(result).to.deep.equal({ ok: true, writes: 1 });
+        expect(writes).to.deep.equal([['ac.0.speed_level', 100]]);
+      });
+    });
+  });
+
+  // Task 8. docs/contract-climate-cover.md: one topic, cmnd/cover, ten
+  // allow-listed commands. Entities come from the REAL synthCover and every
+  // command is the panel's own bytes through the REAL parser.
+  describe('cover', () => {
+    const at = (val: unknown): SourceValue => ({ val, ack: true, q: 0, ts: 1 });
+    const button = (name: string): ChannelInput => ({ objectId: `cover.0.${name}`, type: 'boolean', write: true });
+    const level = (name: string): ChannelInput => ({ objectId: `cover.0.${name}`, type: 'number', write: true });
+    const coverOf = (channels: DeviceInput['channels'], values: Record<string, SourceValue> = {}, detectorType = 'blind') =>
+      synthCover({ objectId: 'cover.0', name: 'Cover', detectorType, domain: 'cover', channels }, 'cover.test', values);
+
+    // type-detector 6.0.1 typePatterns.js: blinds (SET level.blind number,
+    // OPEN/CLOSE/STOP buttons), blindButtons (OPEN/CLOSE/STOP only), gate
+    // (SET switch.gate BOOLEAN, STOP), and the four TILT_* states.
+    const BLIND = { set: level('set'), open: button('open'), close: button('close'), stop: button('stop') };
+    const BLIND_BUTTONS = { open: button('open'), close: button('close'), stop: button('stop') };
+    const GATE = { set: button('set'), stop: button('stop') };
+    const TILT = {
+      tilt_set: level('tilt_set'),
+      tilt_open: button('tilt_open'),
+      tilt_close: button('tilt_close'),
+      tilt_stop: button('tilt_stop'),
+    };
+
+    async function send(entity: VirtualEntity, command: string, extra: Record<string, unknown> = {}) {
+      writes = [];
+      const d = new Dispatcher(lookup([entity]), write, silentLog);
+      return d.dispatch(parseCoverCommand(JSON.stringify({ entity_id: entity.entityId, command, ...extra })));
+    }
+
+    it('refuses set_cover_position on a device with no position channel', async () => {
+      const result = await send(coverOf(BLIND_BUTTONS, {}, 'blindButtons'), 'set_cover_position', { position: 50 });
+      expect(result).to.deep.equal({ ok: false, reason: 'no_writable_channel', applied: 0 });
+      expect(writes).to.deep.equal([]);
+    });
+
+    it('treats tilt commands as independent of position commands', async () => {
+      const tiltOnly = coverOf(TILT);
+      expect(await send(tiltOnly, 'set_cover_tilt_position', { tilt_position: 90 })).to.deep.equal({ ok: true, writes: 1 });
+      expect(writes).to.deep.equal([['cover.0.tilt_set', 90]]);
+      for (const [command, extra] of [
+        ['open_cover', {}],
+        ['close_cover', {}],
+        ['stop_cover', {}],
+        ['set_cover_position', { position: 90 }],
+      ] as const) {
+        expect((await send(tiltOnly, command, extra)).ok, `${command} on a tilt-only cover`).to.equal(false);
+      }
+
+      const positionOnly = coverOf({ set: level('set') });
+      expect(await send(positionOnly, 'set_cover_position', { position: 90 })).to.deep.equal({ ok: true, writes: 1 });
+      for (const [command, extra] of [
+        ['open_cover_tilt', {}],
+        ['close_cover_tilt', {}],
+        ['stop_cover_tilt', {}],
+        ['set_cover_tilt_position', { tilt_position: 90 }],
+      ] as const) {
+        expect((await send(positionOnly, command, extra)).ok, `${command} on a position-only cover`).to.equal(false);
+      }
+    });
+
+    it("writes a blind's position into its numeric SET as a number", async () => {
+      expect(await send(coverOf(BLIND), 'set_cover_position', { position: 30 })).to.deep.equal({ ok: true, writes: 1 });
+      expect(writes).to.deep.equal([['cover.0.set', 30]]);
+      expect(typeof writes[0]?.[1]).to.equal('number');
+    });
+
+    it('opens, closes and stops a blind by pressing its OPEN, CLOSE and STOP buttons', async () => {
+      const blind = coverOf(BLIND);
+      for (const [command, objectId] of [
+        ['open_cover', 'cover.0.open'],
+        ['close_cover', 'cover.0.close'],
+        ['stop_cover', 'cover.0.stop'],
+      ] as const) {
+        expect(await send(blind, command), command).to.deep.equal({ ok: true, writes: 1 });
+        expect(writes, command).to.deep.equal([[objectId, true]]);
+      }
+    });
+
+    it("opens and closes a gate by writing true and false to its boolean SET, and refuses a position", async () => {
+      const gate = coverOf(GATE, {}, 'gate');
+      expect(await send(gate, 'open_cover')).to.deep.equal({ ok: true, writes: 1 });
+      expect(writes).to.deep.equal([['cover.0.set', true]]);
+      expect(await send(gate, 'close_cover')).to.deep.equal({ ok: true, writes: 1 });
+      expect(writes).to.deep.equal([['cover.0.set', false]]);
+      expect(await send(gate, 'stop_cover')).to.deep.equal({ ok: true, writes: 1 });
+      expect(writes).to.deep.equal([['cover.0.stop', true]]);
+      expect(await send(gate, 'set_cover_position', { position: 50 })).to.deep.equal({
+        ok: false,
+        reason: 'no_writable_channel',
+        applied: 0,
+      });
+      expect(writes).to.deep.equal([]);
+    });
+
+    it('treats an untyped gate SET as the boolean toggle its pattern guarantees', async () => {
+      const gate = coverOf({ set: { objectId: 'cover.0.set', write: true } }, {}, 'gate');
+      await send(gate, 'open_cover');
+      expect(writes).to.deep.equal([['cover.0.set', true]]);
+      await send(gate, 'close_cover');
+      expect(writes).to.deep.equal([['cover.0.set', false]]);
+      // An untyped blind SET stays a position, and never a toggle.
+      const blind = coverOf({ set: { objectId: 'cover.0.set', write: true } });
+      expect(await send(blind, 'set_cover_position', { position: 20 })).to.deep.equal({ ok: true, writes: 1 });
+      expect(writes).to.deep.equal([['cover.0.set', 20]]);
+      expect((await send(blind, 'open_cover')).ok).to.equal(false);
+    });
+
+    it('drives the four tilt channels', async () => {
+      const tilt = coverOf(TILT);
+      for (const [command, extra, landed] of [
+        ['open_cover_tilt', {}, ['cover.0.tilt_open', true]],
+        ['close_cover_tilt', {}, ['cover.0.tilt_close', true]],
+        ['stop_cover_tilt', {}, ['cover.0.tilt_stop', true]],
+        ['set_cover_tilt_position', { tilt_position: 45 }, ['cover.0.tilt_set', 45]],
+      ] as const) {
+        expect(await send(tilt, command, extra), command).to.deep.equal({ ok: true, writes: 1 });
+        expect(writes, command).to.deep.equal([landed]);
+      }
+    });
+
+    it('refuses every command on a cover whose channels are all read-only', async () => {
+      const readOnly = Object.fromEntries(
+        Object.entries({ ...BLIND, ...TILT }).map(([name, channel]) => [name, { ...channel, write: false }]),
+      );
+      const blind = coverOf(readOnly, { 'cover.0.set': at(0), 'cover.0.tilt_set': at(0) });
+      for (const [command, extra] of [
+        ['open_cover', {}],
+        ['close_cover', {}],
+        ['stop_cover', {}],
+        ['set_cover_position', { position: 10 }],
+        ['open_cover_tilt', {}],
+        ['close_cover_tilt', {}],
+        ['stop_cover_tilt', {}],
+        ['set_cover_tilt_position', { tilt_position: 10 }],
+        ['toggle', {}],
+        ['toggle_cover_tilt', {}],
+      ] as const) {
+        expect((await send(blind, command, extra)).ok, command).to.equal(false);
+        expect(writes, command).to.deep.equal([]);
+      }
+    });
+
+    // Neither has a caller anywhere in the firmware (allow-list only,
+    // mqtt_handlers.cpp:2270-2271); implemented because the firmware
+    // validates them as part of the contract.
+    describe('toggle and toggle_cover_tilt', () => {
+      it('toggle opens a closed cover and closes an open one', async () => {
+        await send(coverOf(BLIND, { 'cover.0.set': at(0) }), 'toggle');
+        expect(writes).to.deep.equal([['cover.0.open', true]]);
+        await send(coverOf(BLIND, { 'cover.0.set': at(70) }), 'toggle');
+        expect(writes).to.deep.equal([['cover.0.close', true]]);
+        await send(coverOf(GATE, { 'cover.0.set': at(false) }, 'gate'), 'toggle');
+        expect(writes).to.deep.equal([['cover.0.set', true]]);
+        await send(coverOf(GATE, { 'cover.0.set': at(true) }, 'gate'), 'toggle');
+        expect(writes).to.deep.equal([['cover.0.set', false]]);
+      });
+
+      it('toggle refuses a cover whose state is unknown rather than guess a direction', async () => {
+        // No reading at all, and tilt known but open/closed not derivable.
+        for (const entity of [coverOf(BLIND), coverOf({ ...BLIND, ...TILT }, { 'cover.0.tilt_set': at(30) })]) {
+          expect(await send(entity, 'toggle'), entity.state).to.deep.equal({ ok: false, reason: 'state_unknown', applied: 0 });
+          expect(writes).to.deep.equal([]);
+        }
+      });
+
+      it('toggle refuses when the direction it needs cannot be commanded', async () => {
+        const noOpenButton = coverOf({ set: level('set'), close: button('close') }, { 'cover.0.set': at(0) });
+        expect(await send(noOpenButton, 'toggle')).to.deep.equal({ ok: false, reason: 'no_writable_channel', applied: 0 });
+      });
+
+      it('toggle_cover_tilt opens a tilt at 0 and closes any other', async () => {
+        await send(coverOf(TILT, { 'cover.0.tilt_set': at(0) }), 'toggle_cover_tilt');
+        expect(writes).to.deep.equal([['cover.0.tilt_open', true]]);
+        await send(coverOf(TILT, { 'cover.0.tilt_set': at(40) }), 'toggle_cover_tilt');
+        expect(writes).to.deep.equal([['cover.0.tilt_close', true]]);
+      });
+
+      it('toggle_cover_tilt refuses an unknown tilt position', async () => {
+        expect(await send(coverOf(TILT), 'toggle_cover_tilt')).to.deep.equal({ ok: false, reason: 'state_unknown', applied: 0 });
+        expect(writes).to.deep.equal([]);
+      });
+    });
+
+    it('Ruling 32: a string- or mixed-typed SET advertises neither a position nor a toggle, and every SET command is refused', async () => {
+      for (const type of ['string', 'mixed'] as const) {
+        for (const detectorType of ['blind', 'gate']) {
+          const label = `${type} SET on a ${detectorType}`;
+          const entity = coverOf({ set: { objectId: 'cover.0.set', type, write: true } }, { 'cover.0.set': at('40') }, detectorType);
+          const features = (JSON.parse(buildCoverPayload(entity)) as { supported_features: number }).supported_features;
+          expect(features & (1 | 2 | 4), `${label}: OPEN|CLOSE|SET_POSITION`).to.equal(0);
+          for (const [command, extra] of [
+            ['open_cover', {}],
+            ['close_cover', {}],
+            ['set_cover_position', { position: 50 }],
+            ['toggle', {}],
+          ] as const) {
+            expect((await send(entity, command, extra)).ok, `${label}: ${command}`).to.equal(false);
+            expect(writes, `${label}: ${command}`).to.deep.equal([]);
+          }
+        }
+      }
+    });
+
+    // What supported_features advertises (protocol/cover.ts, from `writable`)
+    // and what the dispatcher accepts must be ONE set: a set bit whose command
+    // is refused is a dead button, a clear bit whose command lands is a
+    // control the panel was told does not exist. Each single-channel device
+    // carries exactly one bit, so the matrix is diagonal and a swap of any two
+    // commands or bits fails it.
+    it('accepts a command exactly when its supported_features bit is set', async () => {
+      const BIT_COMMANDS: ReadonlyArray<[bit: number, command: string, extra: Record<string, unknown>]> = [
+        [1, 'open_cover', {}],
+        [2, 'close_cover', {}],
+        [4, 'set_cover_position', { position: 30 }],
+        [8, 'stop_cover', {}],
+        [16, 'open_cover_tilt', {}],
+        [32, 'close_cover_tilt', {}],
+        [64, 'stop_cover_tilt', {}],
+        [128, 'set_cover_tilt_position', { tilt_position: 60 }],
+      ];
+      const readOnly = (channels: DeviceInput['channels']): DeviceInput['channels'] =>
+        Object.fromEntries(Object.entries(channels).map(([name, channel]) => [name, { ...channel, write: false }]));
+      const devices: ReadonlyArray<[label: string, entity: VirtualEntity, mask: number]> = [
+        ['OPEN button only', coverOf({ open: button('open') }), 1],
+        ['CLOSE button only', coverOf({ close: button('close') }), 2],
+        ['numeric SET only', coverOf({ set: level('set') }), 4],
+        ['STOP button only', coverOf({ stop: button('stop') }), 8],
+        ['TILT_OPEN only', coverOf({ tilt_open: button('tilt_open') }), 16],
+        ['TILT_CLOSE only', coverOf({ tilt_close: button('tilt_close') }), 32],
+        ['TILT_STOP only', coverOf({ tilt_stop: button('tilt_stop') }), 64],
+        ['numeric TILT_SET only', coverOf({ tilt_set: level('tilt_set') }), 128],
+        ['gate', coverOf(GATE, {}, 'gate'), 1 | 2 | 8],
+        ['blindButtons', coverOf(BLIND_BUTTONS, {}, 'blindButtons'), 1 | 2 | 8],
+        ['blind with tilt', coverOf({ ...BLIND, ...TILT }), 255],
+        ['every channel read-only', coverOf(readOnly({ ...BLIND, ...TILT })), 0],
+        ['string SET', coverOf({ set: { objectId: 'cover.0.set', type: 'string', write: true } }), 0],
+        ['mixed SET', coverOf({ set: { objectId: 'cover.0.set', type: 'mixed', write: true } }, {}, 'gate'), 0],
+      ];
+      for (const [label, entity, mask] of devices) {
+        const features = (JSON.parse(buildCoverPayload(entity)) as { supported_features: number }).supported_features;
+        expect(features, `${label}: supported_features`).to.equal(mask);
+        for (const [bit, command, extra] of BIT_COMMANDS) {
+          const result = await send(entity, command, extra);
+          expect(result.ok, `${label}: ${command} with bit ${bit} ${features & bit ? 'set' : 'clear'}`).to.equal(
+            (features & bit) !== 0,
+          );
+          expect(writes.length, `${label}: ${command}`).to.equal(result.ok ? 1 : 0);
+        }
+      }
+    });
+
+    it('refuses a cover command aimed at a switch, and a switch command aimed at a cover', async () => {
+      const d = new Dispatcher(lookup([SWITCH, coverOf(BLIND)]), write, silentLog);
+      expect(await d.dispatch({ kind: 'open_cover', entityId: 'switch.k' })).to.deep.equal({
+        ok: false,
+        reason: 'call_not_allowed_for_domain',
+        applied: 0,
+      });
+      expect(await d.dispatch({ kind: 'toggle', entityId: 'cover.test' })).to.deep.equal({
+        ok: false,
+        reason: 'call_not_allowed_for_domain',
+        applied: 0,
+      });
+      expect(writes).to.deep.equal([]);
     });
   });
 });

@@ -2,7 +2,9 @@ import type { DeviceInput, VirtualEntity } from '../types';
 import { baseEntity, isUsable, readChannel, toBoolState, UNAVAILABLE, type Values } from './common';
 
 export function synthSwitch(device: DeviceInput, entityId: string, values: Values): VirtualEntity {
-  const { source, lastChanged, friendly } = baseEntity(device, entityId, values);
+  // channelMeta carries each channel's write flag: the dispatcher refuses a
+  // read-only one (Ruling 38).
+  const { source, channelMeta, lastChanged, friendly } = baseEntity(device, entityId, values);
   const actual = readChannel(device, 'actual', values);
   const set = readChannel(device, 'set', values);
   // ACTUAL is real feedback and wins over the last command written to SET.
@@ -14,7 +16,7 @@ export function synthSwitch(device: DeviceInput, entityId: string, values: Value
   attributes.assumed_state = !actual && !(set?.value?.ack ?? false);
 
   if (!read || !isUsable(read.value)) {
-    return { entityId, domain: 'switch', source, state: UNAVAILABLE, attributes, available: false, lastChanged };
+    return { entityId, domain: 'switch', source, state: UNAVAILABLE, attributes, available: false, lastChanged, channelMeta };
   }
 
   return {
@@ -25,5 +27,6 @@ export function synthSwitch(device: DeviceInput, entityId: string, values: Value
     attributes,
     available: true,
     lastChanged,
+    channelMeta,
   };
 }
