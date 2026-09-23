@@ -47,6 +47,49 @@ export function normaliseTopic(value: string | undefined, fallback: string): str
   return collapsed || fallback;
 }
 
+type TextOption = 'brokerHost' | 'brokerUser' | 'brokerPassword' | 'clientId' | 'baseTopic' | 'haPrefix';
+
+/**
+ * Admin stores text here, but the instance config is hand-editable: one
+ * number made .trim() throw in onReady on every start, a crash loop
+ * (Ruling 58 A). Anything but text is replaced by the default, with a
+ * warning that never repeats the value (it may be the password).
+ */
+function text(raw: Partial<AdapterOptions>, key: TextOption, warnings: string[]): string | undefined {
+  const value: unknown = raw[key];
+  if (value === undefined || value === null || typeof value === 'string') return value ?? undefined;
+  warnings.push(`${key} is not text but ${Array.isArray(value) ? 'a list' : `a ${typeof value}`}; using the default`);
+  return undefined;
+}
+
+/**
+ * Overrides as a hand edit may leave them: applyOverrides looks up each
+ * objectId and trims each name, so an entry that is no object failed every
+ * discovery, and with it every panel's configuration (Ruling 58 A).
+ */
+function deviceOverrides(value: unknown, warnings: string[]): DeviceOverride[] {
+  if (value === undefined || value === null) return [];
+  if (!Array.isArray(value)) {
+    warnings.push('deviceOverrides is not a list; ignoring every override');
+    return [];
+  }
+  const overrides: DeviceOverride[] = [];
+  value.forEach((entry: unknown, index) => {
+    const override = entry as Partial<DeviceOverride> | null;
+    if (typeof override !== 'object' || override === null || typeof override.objectId !== 'string') {
+      warnings.push(`deviceOverrides entry ${index + 1} names no object id; ignoring it`);
+      return;
+    }
+    const kept = { ...override } as DeviceOverride;
+    if (typeof (kept.name ?? '') !== 'string') {
+      warnings.push(`deviceOverrides entry ${index + 1} (${kept.objectId}) has a name that is not text; ignoring the name`);
+      delete kept.name;
+    }
+    overrides.push(kept);
+  });
+  return overrides;
+}
+
 function clamp(value: number, min: number, max: number): number {
   if (!Number.isFinite(value)) return min;
   return Math.min(max, Math.max(min, Math.round(value)));
@@ -55,10 +98,12 @@ function clamp(value: number, min: number, max: number): number {
 export function validateOptions(raw: Partial<AdapterOptions>): {
   options: AdapterOptions;
   errors: string[];
+  warnings: string[];
 } {
   const errors: string[] = [];
-  const baseTopic = normaliseTopic(raw.baseTopic, DEFAULTS.baseTopic);
-  const haPrefix = normaliseTopic(raw.haPrefix, DEFAULTS.haPrefix);
+  const warnings: string[] = [];
+  const baseTopic = normaliseTopic(text(raw, 'baseTopic', warnings), DEFAULTS.baseTopic);
+  const haPrefix = normaliseTopic(text(raw, 'haPrefix', warnings), DEFAULTS.haPrefix);
 
   if (/[+#]/.test(baseTopic)) errors.push('baseTopic must not contain MQTT wildcards');
   if (/[+#]/.test(haPrefix)) errors.push('haPrefix must not contain MQTT wildcards');
@@ -69,19 +114,19 @@ export function validateOptions(raw: Partial<AdapterOptions>): {
   }
 
   const options: AdapterOptions = {
-    brokerHost: (raw.brokerHost ?? DEFAULTS.brokerHost).trim() || DEFAULTS.brokerHost,
+    brokerHost: (text(raw, 'brokerHost', warnings) ?? DEFAULTS.brokerHost).trim() || DEFAULTS.brokerHost,
     brokerPort: clamp(brokerPort, 1, 65535),
     brokerTls: raw.brokerTls ?? DEFAULTS.brokerTls,
-    brokerUser: raw.brokerUser ?? DEFAULTS.brokerUser,
-    brokerPassword: raw.brokerPassword ?? DEFAULTS.brokerPassword,
-    clientId: (raw.clientId ?? DEFAULTS.clientId).trim() || DEFAULTS.clientId,
+    brokerUser: text(raw, 'brokerUser', warnings) ?? DEFAULTS.brokerUser,
+    brokerPassword: text(raw, 'brokerPassword', warnings) ?? DEFAULTS.brokerPassword,
+    clientId: (text(raw, 'clientId', warnings) ?? DEFAULTS.clientId).trim() || DEFAULTS.clientId,
     baseTopic,
     haPrefix,
     coalesceMs: clamp(raw.coalesceMs ?? DEFAULTS.coalesceMs, 0, 5000),
     maxPublishQueue: clamp(raw.maxPublishQueue ?? DEFAULTS.maxPublishQueue, 100, 100000),
     protocolTrace: raw.protocolTrace ?? DEFAULTS.protocolTrace,
-    deviceOverrides: raw.deviceOverrides ?? [],
+    deviceOverrides: deviceOverrides(raw.deviceOverrides, warnings),
   };
 
-  return { options, errors };
+  return { options, errors, warnings };
 }

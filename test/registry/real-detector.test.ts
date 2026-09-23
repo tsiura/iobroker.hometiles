@@ -1123,4 +1123,19 @@ describe('discovery orchestration (Task 5d)', () => {
     );
     expect(() => discoverDevices(broken, 'hometiles.0')).to.throw(`the objects below ${BALKON}`);
   });
+
+  it('(Ruling 58 D) a function enum whose members are no list is left out, and only it', () => {
+    // The detector calls members.includes on every function enum for every
+    // root (ChannelDetector.js:150): one hand-corrupted enum failed them all.
+    const corrupt: IoObject = {
+      _id: 'enum.functions.kaputt',
+      type: 'enum',
+      common: { name: 'Kaputt', members: { length: 1 } },
+      native: {},
+    };
+    const { devices, ignored } = discoverDevices({ ...LAMP_SET, ...objects(corrupt) }, 'hometiles.0');
+    expect(ignored).to.deep.equal(['enum.functions.kaputt']);
+    // The valid "Licht" enum still makes the switch actuator a lamp.
+    expect(devices.map((detected) => [detected.objectId, detected.domain])).to.deep.equal([[LAMP, 'light']]);
+  });
 });

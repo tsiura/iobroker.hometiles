@@ -391,6 +391,8 @@ export interface Discovery {
   devices: DeviceInput[];
   /** To be persisted and passed back into the next discovery. */
   anchors: RootAnchors;
+  /** Function enums left out: members that are no list make the detector throw. */
+  ignored: string[];
 }
 
 /** Ancestors before descendants would let an outer root take a nested root's controls. */
@@ -473,8 +475,17 @@ export function discoverDevices(
 ): Discovery {
   const detectable: Record<string, IoBrokerObject> = {};
   const meta: Record<string, ObjectMeta> = {};
+  const ignored: string[] = [];
   for (const [id, obj] of Object.entries(objects)) {
     if (!DETECTED_OBJECT_TYPES.has(obj.type)) continue;
+    // The detector calls members.includes on every function enum for each
+    // state it tests (ChannelDetector.js:150): one enum whose members are no
+    // list failed every root. Without it only enum-based detection suffers
+    // (Ruling 58 D).
+    if (obj.type === 'enum' && !Array.isArray((obj.common as { members?: unknown } | null | undefined)?.members)) {
+      ignored.push(id);
+      continue;
+    }
     detectable[id] = obj;
     meta[id] = objectMeta(id, obj);
   }
@@ -529,5 +540,5 @@ export function discoverDevices(
       devices.push(device);
     }
   }
-  return { devices, anchors: nextAnchors };
+  return { devices, anchors: nextAnchors, ignored };
 }

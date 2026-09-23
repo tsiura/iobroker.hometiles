@@ -61,8 +61,9 @@ class HomeTiles extends utils.Adapter {
   }
 
   private async onReady(): Promise<void> {
-    const { options, errors } = validateOptions(this.config as unknown as Partial<AdapterOptions>);
+    const { options, errors, warnings } = validateOptions(this.config as unknown as Partial<AdapterOptions>);
     for (const error of errors) this.log.error(`[Config] ${error}`);
+    for (const warning of warnings) this.log.warn(`[Config] ${warning}`);
     this.options = options;
 
     await this.setState('info.connection', false, true);
@@ -290,7 +291,13 @@ class HomeTiles extends utils.Adapter {
   // ---- Registry ----
 
   private async rebuildRegistry(): Promise<void> {
-    const { devices: detected, anchors } = await this.detectDevices();
+    const { devices: detected, anchors, ignored } = await this.detectDevices();
+    if (ignored.length > 0) {
+      this.log.warn(
+        `[Registry] Function enums left out, their members are not a list: ${ignored.join(', ')}. ` +
+          'Devices typed only through them are published by their own roles until they are repaired',
+      );
+    }
     this.devices = applyOverrides(detected, (this.options.deviceOverrides ?? []) as DeviceOverride[]);
     this.rootAnchors = anchors;
     await this.saveJsonMap(ROOT_ANCHOR_STATE, 'Root anchors: the state each root id stays with', anchors);
@@ -321,12 +328,32 @@ class HomeTiles extends utils.Adapter {
   }
 
   private async detectDevices(): Promise<Discovery> {
-    const objects = (await this.getForeignObjectsAsync('*', 'state')) as Record<string, ioBroker.Object>;
-    const channels = (await this.getForeignObjectsAsync('*', 'channel')) as Record<string, ioBroker.Object>;
-    const devices = (await this.getForeignObjectsAsync('*', 'device')) as Record<string, ioBroker.Object>;
-    // The detector reads function enums from the same map (a lamp in "Licht").
-    const enums = (await this.getForeignObjectsAsync('enum.functions.*', 'enum')) as Record<string, ioBroker.Object>;
-    return discoverDevices({ ...objects, ...channels, ...devices, ...enums }, this.namespace, this.rootAnchors);
+    const objects = {
+      ...(await this.objectsOfType('state')),
+      ...(await this.objectsOfType('channel')),
+      ...(await this.objectsOfType('device')),
+      // The detector reads function enums from the same map (a lamp in "Licht").
+      ...(await this.objectsOfType('enum', 'enum.functions.')),
+    };
+    return discoverDevices(objects, this.namespace, this.rootAnchors);
+  }
+
+  /**
+   * Every object of one type, read through the object view. Not through
+   * getForeignObjects: that also resolves each object's enums, which
+   * discovery never uses and which throws on one hand-corrupted enum
+   * (js-controller adapter.js _getForeignObjects), failing every discovery
+   * (Ruling 58 D).
+   */
+  private async objectsOfType(
+    type: 'state' | 'channel' | 'device' | 'enum',
+    prefix?: string,
+  ): Promise<Record<string, ioBroker.Object>> {
+    const range = prefix ? { startkey: prefix, endkey: `${prefix}\u9999` } : {};
+    const { rows } = await this.getObjectViewAsync('system', type, range);
+    const objects: Record<string, ioBroker.Object> = {};
+    for (const row of rows) if (row.value) objects[row.id] = row.value;
+    return objects;
   }
 
   private publishEntity(entity: VirtualEntity): void {
@@ -350,12 +377,19 @@ class HomeTiles extends utils.Adapter {
     await this.setState('info.panels', sessions.length, true);
   }
 
-  /** A stored map is validated before use: it is a hand-editable state (Ruling 51). */
+  /**
+   * A stored map is validated before use: it is a hand-editable state
+   * (Ruling 51). A rejected value goes into the log, the only copy left once
+   * the next save overwrites it (Ruling 58 C).
+   */
   private async loadJsonMap(id: string): Promise<Record<string, string>> {
     const state = await this.getStateAsync(id);
     if (state?.val === null || state?.val === undefined) return {};
     const map = parseStringMap(state.val);
-    if (!map) this.log.warn(`[Registry] Stored ${id} is not a JSON object of strings, starting from scratch`);
+    if (!map) {
+      const held = typeof state.val === 'string' ? state.val : JSON.stringify(state.val);
+      this.log.warn(`[Registry] Stored ${id} is not a JSON object of strings, starting from scratch. It held: ${held}`);
+    }
     return map ?? {};
   }
 
@@ -370,11 +404,24 @@ class HomeTiles extends utils.Adapter {
 
   // ---- Admin messages ----
 
+  /**
+   * A failing admin request is answered with its error: thrown, it was an
+   * unhandled rejection, and that stops the adapter (Ruling 58 E).
+   */
   private async onMessage(message: ioBroker.Message): Promise<void> {
     const reply = (payload: unknown): void => {
       if (message.callback) this.sendTo(message.from, message.command, payload, message.callback);
     };
+    try {
+      await this.answer(message, reply);
+    } catch (error) {
+      const reason = error instanceof Error ? error.message : String(error);
+      this.log.error(`[Admin] ${message.command} failed: ${reason}`);
+      reply({ error: reason });
+    }
+  }
 
+  private async answer(message: ioBroker.Message, reply: (payload: unknown) => void): Promise<void> {
     switch (message.command) {
       case 'listDetected': {
         const { devices: detected } = await this.detectDevices();

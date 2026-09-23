@@ -2,7 +2,7 @@ import Aedes from 'aedes';
 import { expect } from 'chai';
 import { tests, type IntegrationTestHarness } from '@iobroker/testing';
 import mqtt, { type MqttClient } from 'mqtt';
-import { createServer } from 'node:net';
+import { createServer, type Server } from 'node:net';
 import path from 'node:path';
 
 /** A log line as js-controller forwards it (js-controller-common-db logger.js). */
@@ -70,7 +70,8 @@ const SENSOR_OBJECTS: Record<string, object> = {
 
 /**
  * A switch actuator and a hand-corrupted function enum whose members are no
- * list: the detector itself throws on it, inside discovery.
+ * list: getForeignObjects (js-controller adapter.js:2754) and the detector
+ * (ChannelDetector.js:150) both throw on it.
  */
 const CORRUPT_ENUM_OBJECTS: Record<string, object> = {
   'knx.0.Licht.Flur': { type: 'channel', common: { name: 'Flurlicht' } },
@@ -124,24 +125,28 @@ if (process.env.HOMETILES_INTEGRATION === '1') {
         });
       });
 
-      suite('a hand-edited id store (Ruling 51)', (getHarness) => {
+      suite('a hand-edited id store and option (Rulings 51, 58)', (getHarness) => {
         withCleanFixtures(getHarness);
 
-        it('starts normally, warns about each store, and writes both back valid', async function () {
+        it('starts normally, warns about each, and writes both stores back valid', async function () {
           this.timeout(120000);
           const harness = getHarness();
           const logs = await captureLogs(harness);
+          // A number where text belongs made validateOptions throw in onReady.
+          await harness.changeAdapterConfig('hometiles', { native: { clientId: 42 } });
           await setObjects(harness, SENSOR_OBJECTS);
           // JSON null used to throw inside discovery; a non-string id would
           // throw in resolveEntityIds. Both stopped the adapter from starting.
-          await harness.states.setStateAsync('hometiles.0.info.rootAnchors', { val: 'null', ack: true });
-          await harness.states.setStateAsync('hometiles.0.info.entityIds', { val: `{"${SENSOR}":5}`, ack: true });
+          const rejected = { 'info.rootAnchors': 'null', 'info.entityIds': `{"${SENSOR}":5}` };
+          for (const [id, val] of Object.entries(rejected)) await harness.states.setStateAsync(`hometiles.0.${id}`, { val, ack: true });
           await harness.startAdapterAndWait();
           await waitFor(harness, () => ready(logs), 'onReady to finish');
 
           const warnings = logs.filter((log) => log.severity === 'warn').map((log) => log.message);
-          for (const id of ['info.rootAnchors', 'info.entityIds']) {
-            expect(warnings.some((message) => message.includes(id)), warnings.join('\n')).to.equal(true);
+          expect(warnings.some((message) => message.includes('[Config] clientId ')), warnings.join('\n')).to.equal(true);
+          // Each rejected value is in the log before the first save overwrites it.
+          for (const [id, val] of Object.entries(rejected)) {
+            expect(warnings.some((message) => message.includes(id) && message.endsWith(`It held: ${val}`)), warnings.join('\n')).to.equal(true);
           }
           const stored = async (id: string): Promise<unknown> =>
             JSON.parse(String((await harness.states.getStateAsync(`hometiles.0.${id}`))?.val));
@@ -151,12 +156,16 @@ if (process.env.HOMETILES_INTEGRATION === '1') {
         });
       });
 
-      suite('an error while discovering devices (Ruling 51)', (getHarness) => {
+      suite('a corrupt function enum (Ruling 58 D)', (getHarness) => {
         withCleanFixtures(getHarness);
         const port = 18851;
-        const broker = new Aedes();
-        const server = createServer(broker.handle);
+        // Created in the hook: a broker's timers would keep a --grep run
+        // that skips this suite from ever exiting.
+        let broker: Aedes;
+        let server: Server;
         before((done) => {
+          broker = new Aedes();
+          server = createServer(broker.handle);
           server.listen(port, done);
         });
         after((done) => {
@@ -164,7 +173,7 @@ if (process.env.HOMETILES_INTEGRATION === '1') {
           broker.close();
         });
 
-        it('is logged as an error, and the adapter still connects to MQTT', async function () {
+        it('is left out with a warning, and discovery still publishes every device', async function () {
           this.timeout(120000);
           const harness = getHarness();
           const logs = await captureLogs(harness);
@@ -174,19 +183,27 @@ if (process.env.HOMETILES_INTEGRATION === '1') {
           await harness.startAdapterAndWait(true);
           await waitFor(harness, () => ready(logs), 'onReady to finish');
 
-          const errors = logs.filter((log) => log.severity === 'error').map((log) => log.message);
-          expect(errors.some((message) => message.includes('members.includes is not a function')), errors.join('\n')).to.equal(true);
+          const own = logs.filter((log) => log.message.startsWith('hometiles.0 '));
+          const warnings = own.filter((log) => log.severity === 'warn').map((log) => log.message);
+          expect(warnings.some((message) => message.includes('enum.functions.licht')), warnings.join('\n')).to.equal(true);
+          const errors = own.filter((log) => log.severity === 'error').map((log) => log.message);
+          expect(errors, errors.join('\n')).to.deep.equal([]);
+          // Without its only function enum the lamp is a socket, but it is there.
+          const ids = JSON.parse(String((await harness.states.getStateAsync('hometiles.0.info.entityIds'))?.val));
+          expect(ids).to.deep.equal({ 'knx.0.Licht.Flur': 'switch.flurlicht' });
         });
       });
 
       suite('a discovery that fails, then recovers (Ruling 56)', (getHarness) => {
         withCleanFixtures(getHarness);
         const port = 18852;
-        const broker = new Aedes();
-        const server = createServer(broker.handle);
+        let broker: Aedes;
+        let server: Server;
         let panel: MqttClient;
         const applies: string[] = [];
         before(async () => {
+          broker = new Aedes();
+          server = createServer(broker.handle);
           await new Promise<void>((resolve) => server.listen(port, resolve));
           panel = await mqtt.connectAsync(`mqtt://127.0.0.1:${port}`);
           await panel.publishAsync(APPLY_TOPIC, LAST_GOOD_APPLY, { retain: true });
@@ -221,6 +238,20 @@ if (process.env.HOMETILES_INTEGRATION === '1') {
           // prune the panel's tile bindings and save that to flash.
           await new Promise((resolve) => setTimeout(resolve, 1000));
           expect(applies).to.deep.equal([LAST_GOOD_APPLY]);
+        });
+
+        it('answers an admin request with the error meanwhile, and keeps running (Ruling 58 E)', async function () {
+          this.timeout(120000);
+          const harness = getHarness();
+          await harness.enableSendTo();
+          let answer: { error?: string } | undefined;
+          harness.sendTo('hometiles.0', 'listDetected', {}, (reply: unknown) => {
+            answer = reply as { error?: string };
+          });
+          await waitFor(harness, () => answer, 'the answer to listDetected');
+          expect(answer?.error).to.include(`the objects below ${SENSOR}`);
+          await new Promise((resolve) => setTimeout(resolve, 1000));
+          expect(harness.didAdapterStop(), 'the adapter keeps running').to.equal(false);
         });
 
         it('publishes the normal apply once a retry succeeds', async function () {
