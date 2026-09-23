@@ -108,7 +108,9 @@ export const DETECTOR_TYPE_TO_DOMAIN: Record<string, Domain> = {
   humidity: 'sensor',
   illuminance: 'sensor',
   pressure: 'sensor',
-  weatherCurrent: 'sensor',
+  // One source's two detections become one weather device in discoverDevices.
+  weatherCurrent: 'weather',
+  weatherForecast: 'weather',
   info: 'sensor',
   window: 'binary_sensor',
   windowTilt: 'binary_sensor',
@@ -221,6 +223,20 @@ const IGNORED_CHANNELS = new Set([
 ]);
 
 /**
+ * The weather channels synth/weather.ts reads, and no others: the panel shows
+ * no wind, pressure, humidity, sun or chart (docs/contract-media-weather.md),
+ * so those would only be subscriptions. A day index starts at 1: `%d` states
+ * also match day 0's roles, so the detector names a second day-0 object ICON0
+ * beside ICON -- the one it ranked lower, or the same object again from its
+ * parent search -- and a `%d` role without an index becomes
+ * TIME_SUNRISEundefined (ChannelDetector.js cleanState).
+ */
+const WEATHER_CHANNELS: Readonly<Record<string, RegExp>> = {
+  weatherCurrent: /^(ACTUAL|ICON|WEATHER)$/,
+  weatherForecast: /^(TEMP|(ICON|STATE|DATE|TEMP_MIN|TEMP_MAX|PRECIPITATION|PRECIPITATION_CHANCE)([1-9]\d*)?)$/,
+};
+
+/**
  * A dimmer's own SET is the level, and its power channel arrives as ON_SET or
  * ON_ACTUAL. Renaming here means every downstream module can rely on one set of
  * channel names regardless of the detector type.
@@ -228,6 +244,8 @@ const IGNORED_CHANNELS = new Set([
 function channelName(controlType: string, state: DetectedChannel): string | null {
   const upper = state.name.toUpperCase();
   if (IGNORED_CHANNELS.has(upper)) return null;
+  const weather = WEATHER_CHANNELS[controlType];
+  if (weather) return weather.test(upper) ? upper.toLowerCase() : null;
 
   // The writable POWER channel, which every downstream module knows as `set`.
   // The detector spells it three different ways depending on the pattern, and
@@ -494,7 +512,9 @@ function requiredStates(control: DetectedControl): string[] {
  * detection requires (required/requiredOneOf: what makes it that type at
  * all). A detection is that control seen again only when an earlier one
  * already claimed EVERY state it requires; one that needs a state nobody
- * claimed is a composite and is kept (Ruling 46). The catch-all `info`
+ * claimed is a composite and is kept (Ruling 46) -- except weather, where
+ * sharing ANY required state with a kept weather device makes a detection a
+ * view of that source (mergeWeatherSources). The catch-all `info`
  * means nothing of its own: the states an earlier detection claimed are
  * taken out of it, and it goes when none of its own is left, or when the
  * root has a control of its own beside it -- not merely another root's
@@ -554,6 +574,10 @@ export function discoverDevices(
   const claimed = new Set<string>();
   const devices: DeviceInput[] = [];
   const nextAnchors: RootAnchors = {};
+  // The states kept weather devices require, and the weather detections that
+  // share one (mergeWeatherSources).
+  const weatherHeld = new Set<string>();
+  const weatherViews: Array<{ device: DeviceInput; required: string[] }> = [];
   for (const rootId of roots) {
     if (rootId.startsWith(`${ownNamespace}.`)) continue;
     // Only state objects count (Ruling 52), and the catch-all keeps only what
@@ -593,6 +617,10 @@ export function discoverDevices(
         device.objectId = anchor;
         device.name = controlName(device.name, meta[anchor]?.name, anchor);
       }
+      if (device?.domain === 'weather' && required.some((id) => weatherHeld.has(id))) {
+        weatherViews.push({ device, required });
+        continue;
+      }
       // `info` is the catch-all: tried last (the final pattern in
       // typePatterns.js) and sorted last (ChannelDetector.js:722-729), it
       // holds only what the root's other detections left (:226, :336-361).
@@ -600,8 +628,43 @@ export function discoverDevices(
       // that control's leftovers as a sensor in its place. Beside a deeper
       // root's control seen again, what it holds is the root's own values.
       if (!device || !own || (control.type === 'info' && typed)) continue;
+      if (device.domain === 'weather') for (const id of required) weatherHeld.add(id);
       devices.push(device);
     }
   }
+  mergeWeatherSources(devices, weatherViews);
   return { devices, anchors: nextAnchors, ignored, badRoles };
+}
+
+/**
+ * One weather entity per source (Task 11). An outer root detects a forecast
+ * again, and sometimes MORE of it: OpenWeatherMap's and Weather Underground's
+ * forecast device sees days 1..5 (reachable from no channel of their own) and
+ * the current temperature beside the day0 channel's forecast, whose required
+ * states discovery claimed first. So a weather detection sharing a required
+ * state with a kept weather device is no source of its own but a view: the
+ * kept device that reads every state it requires gains the channels only the
+ * view has, and a view no one device covers (DasWetter's location root: an
+ * hour's icon and temperature beside a day's low) is dropped. Current conditions
+ * whose temperature a forecast reads (its TEMP) are that forecast's own: it
+ * gains their channels, and they are no entity apart. A name both have stays
+ * the kept device's -- a forecast's ICON is its day 0's -- and nothing is
+ * re-keyed: the kept device keeps its id and anchor (Ruling 45).
+ */
+function mergeWeatherSources(devices: DeviceInput[], views: ReadonlyArray<{ device: DeviceInput; required: string[] }>): void {
+  const reads = (device: DeviceInput, id: string | undefined): boolean =>
+    Object.values(device.channels).some((channel) => channel.objectId === id);
+  const gain = (into: DeviceInput, from: DeviceInput): void => {
+    for (const [name, channel] of Object.entries(from.channels)) into.channels[name] ??= channel;
+  };
+  for (const view of views) {
+    const into = devices.find((d) => d.domain === 'weather' && view.required.every((id) => reads(d, id)));
+    if (into) gain(into, view.device);
+  }
+  for (const current of devices.filter((d) => d.detectorType === 'weatherCurrent')) {
+    const into = devices.find((d) => d.detectorType === 'weatherForecast' && reads(d, current.channels.actual?.objectId));
+    if (!into) continue;
+    gain(into, current);
+    devices.splice(devices.indexOf(current), 1);
+  }
 }

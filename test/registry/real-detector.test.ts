@@ -1439,6 +1439,14 @@ describe('discovery orchestration (Task 5d)', () => {
       actual: `${STATION}.outside.temperature`,
       icon: `${STATION}.icon`,
     });
+    // Task 11: the composite is the station's weather, current conditions only.
+    expect(runs[1]!.entity).to.include({ domain: 'weather', state: 'unknown', available: true });
+    expect(runs[1]!.entity!.attributes).to.deep.equal({
+      friendly_name: 'Wetterstation',
+      temperature: 7.5,
+      temperature_unit: '°C',
+      weather_icon: 'rain',
+    });
     expectNoRequiredStateBacksTwoEntities(WEATHER_SET);
   });
 

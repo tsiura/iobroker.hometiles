@@ -352,7 +352,7 @@ if (process.env.HOMETILES_INTEGRATION === '1') {
             native: {
               brokerHost: '127.0.0.1',
               brokerPort: port,
-              deviceOverrides: [{ objectId: FORCED, forcedDomain: 'weather' }],
+              deviceOverrides: [{ objectId: FORCED, forcedDomain: 'number' }],
             },
           });
           await setObjects(harness, { ...SENSOR_OBJECTS, ...BAD_OBJECTS });
@@ -376,7 +376,7 @@ if (process.env.HOMETILES_INTEGRATION === '1') {
           const warnings = logs.filter((log) => log.severity === 'warn').map((log) => log.message);
           const named = (text: string): boolean => warnings.some((message) => message.includes('[Registry]') && message.includes(text));
           expect(named(`${BAD_ROLE}.status`), warnings.join('\n')).to.equal(true);
-          expect(named(`${FORCED} (not implemented: weather)`), warnings.join('\n')).to.equal(true);
+          expect(named(`${FORCED} (not implemented: number)`), warnings.join('\n')).to.equal(true);
           expect(named(`${BAD_ALIAS}.ACTUAL`), warnings.join('\n')).to.equal(true);
         });
       });

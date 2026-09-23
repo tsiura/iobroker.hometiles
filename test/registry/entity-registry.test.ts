@@ -146,9 +146,9 @@ describe('registry/entity-registry', () => {
     // synthesise, which throws: that failed the whole discovery, retried
     // forever, with a log naming no object.
     const { registry } = harness();
-    const station: DeviceInput = { ...TEMP, objectId: 'zigbee.0.station', name: 'Station', domain: 'weather' };
+    const station: DeviceInput = { ...TEMP, objectId: 'zigbee.0.station', name: 'Station', domain: 'number' };
     const result = registry.rebuild([station, TEMP], {});
-    expect(result.skipped).to.deep.equal([{ objectId: 'zigbee.0.station', reason: 'not implemented: weather' }]);
+    expect(result.skipped).to.deep.equal([{ objectId: 'zigbee.0.station', reason: 'not implemented: number' }]);
     expect(registry.all().map((entity) => entity.entityId)).to.deep.equal(['sensor.wohnzimmer']);
   });
 

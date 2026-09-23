@@ -8,6 +8,7 @@ import { synthMediaPlayer } from './media_player';
 import { synthScene } from './scene';
 import { synthSensor } from './sensor';
 import { synthSwitch } from './switch';
+import { synthWeather } from './weather';
 
 export type { Values } from './common';
 
@@ -38,6 +39,7 @@ export function synthesise(device: DeviceInput, entityId: string, values: Values
     case 'media_player':
       return synthMediaPlayer(device, entityId, values);
     case 'weather':
+      return synthWeather(device, entityId, values);
     case 'number':
     case 'select':
     case 'datetime':
