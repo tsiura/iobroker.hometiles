@@ -387,6 +387,73 @@ const WEATHER_SET = objects(
   state(`${STATION}.outside.temperature`, { role: 'value.temperature', type: 'number', unit: '°C', write: false }),
 );
 
+// An alias room: a channel holding a CO2 channel (no pattern but the
+// catch-all info reads a value.co2 alone) and, optionally, a light channel.
+// The room root sees both inner channels, the channel objects included
+// (Ruling 52).
+const ROOM = 'alias.0.Wohnzimmer';
+const roomSet = (withLight: boolean, room = ROOM): IoObjects =>
+  objects(
+    channel(room, room.split('.').pop()!),
+    channel(`${room}.CO2`, 'CO2'),
+    state(`${room}.CO2.ACTUAL`, { role: 'value.co2', type: 'number', unit: 'ppm', write: false }),
+    ...(withLight
+      ? [channel(`${room}.Licht`, 'Licht'), state(`${room}.Licht.SET`, { role: 'switch.light', type: 'boolean', write: true })]
+      : []),
+  );
+
+// A hallway alias channel with one value of its own and a sub-channel that
+// holds nothing (yet): no pattern but info reads the value, and the empty
+// channel object sorts before it.
+const HALL = 'alias.0.Flur';
+const HALL_SET = objects(
+  channel(HALL, 'Flur'),
+  channel(`${HALL}.Bewegungsmelder`, 'Bewegungsmelder'),
+  state(`${HALL}.co2`, { role: 'value.co2', type: 'number', unit: 'ppm', write: false }),
+);
+
+// A kitchen alias channel holding a CO2 channel and a value of its own: the
+// kitchen's catch-all info spans the CO2 reading and its own value.
+const KITCHEN = 'alias.0.Kueche';
+const KITCHEN_SET = objects(
+  channel(KITCHEN, 'Küche'),
+  channel(`${KITCHEN}.CO2`, 'CO2 Küche'),
+  state(`${KITCHEN}.CO2.ACTUAL`, { role: 'value.co2', type: 'number', unit: 'ppm', write: false }),
+  state(`${KITCHEN}.Hinweis`, { role: 'text', type: 'string', write: false }),
+);
+
+// A bathroom sensor whose pressure state's own name starts with the root's
+// name, but as a longer word.
+const BATH = 'zigbee.0.00158d0004b5d6e7';
+const BATH_SET = objects(
+  device(BATH, 'Bad'),
+  state(`${BATH}.temperature`, { name: 'Temperatur', role: 'value.temperature', type: 'number', unit: '°C', write: false }),
+  state(`${BATH}.pressure`, { name: 'Badezimmer Luftdruck', role: 'value.pressure', type: 'number', unit: 'hPa', write: false }),
+);
+
+// An alias channel whose temperature later gains a setpoint: the new
+// thermostat lists the old temperature as its optional ACTUAL.
+const HEATER = 'alias.0.Buero.Heizung';
+const heaterSet = (withSetpoint: boolean): IoObjects =>
+  objects(
+    channel(HEATER, 'Heizung Büro'),
+    state(`${HEATER}.ACTUAL`, { role: 'value.temperature', type: 'number', unit: '°C', write: false }),
+    ...(withSetpoint ? [state(`${HEATER}.SET`, { role: 'level.temperature', type: 'number', unit: '°C', write: true })] : []),
+  );
+
+// A cooling-only climate alias that later gains, then loses, a heating
+// setpoint: one thermostat throughout, requiring SET_COOLING throughout.
+const DUAL = 'alias.0.Keller.Klima';
+const dualSet = (withHeating: boolean): IoObjects =>
+  objects(
+    channel(DUAL, 'Klima Keller'),
+    state(`${DUAL}.ACTUAL`, { role: 'value.temperature', type: 'number', unit: '°C', write: false }),
+    state(`${DUAL}.SET_COOLING`, { role: 'level.temperature.cooling', type: 'number', unit: '°C', write: true }),
+    ...(withHeating
+      ? [state(`${DUAL}.SET_HEATING`, { role: 'level.temperature.heating', type: 'number', unit: '°C', write: true })]
+      : []),
+  );
+
 const INSTALLATION: IoObjects = Object.assign(
   {},
   PROBE,
@@ -412,6 +479,9 @@ const INSTALLATION: IoObjects = Object.assign(
   DWD_SET,
   NESTED_SET,
   WEATHER_SET,
+  // Info-only: in INSTALLATION alias.0.Wohnzimmer also holds AC and BLIND.
+  roomSet(false, 'alias.0.Arbeitszimmer'),
+  BATH_SET,
 );
 
 /** Every detected device one of whose channels is this state object. */
@@ -943,5 +1013,69 @@ describe('discovery orchestration (Task 5d)', () => {
       icon: `${STATION}.icon`,
     });
     expectNoRequiredStateBacksTwoEntities(WEATHER_SET);
+  });
+
+  it('(Ruling 52) an alias room that loses its light keeps sensor.co2 on the CO2 state', () => {
+    const first = discoverDevices(roomSet(true), 'hometiles.0');
+    const before = new EntityRegistry({ onEntityChanged: () => undefined, onMembershipChanged: () => undefined }, 0);
+    const { entityIds } = before.rebuild(first.devices, {});
+    expect(entityIds[`${ROOM}.CO2`]).to.equal('sensor.co2');
+
+    // The light removed, a restart: the room's recorded control is gone, and
+    // its catch-all info (over the CO2 state the CO2 channel already holds,
+    // and the channel objects) must not take the CO2 channel's place.
+    const second = discoverDevices(roomSet(false), 'hometiles.0', first.anchors);
+    expect(second.devices.map(({ objectId }) => objectId)).to.deep.equal([`${ROOM}.CO2`]);
+    const after = new EntityRegistry({ onEntityChanged: () => undefined, onMembershipChanged: () => undefined }, 0);
+    after.rebuild(second.devices, entityIds);
+    after.applyStateChange(`${ROOM}.CO2.ACTUAL`, value(612));
+    after.flush();
+    expect(after.byId('sensor.co2')!.source).to.deep.equal({ actual: `${ROOM}.CO2.ACTUAL` });
+    expect(after.byId('sensor.co2')!.state).to.equal('612');
+  });
+
+  it('(Ruling 52) an info-only room publishes no entity backed by a channel object', () => {
+    // info's ACTUAL matches any object below its root (ChannelDetector.js:
+    // 35-37), so at the room it bound the CO2 channel object itself.
+    expect(discoverDevices(roomSet(false), 'hometiles.0').devices.map(({ objectId }) => objectId)).to.deep.equal([`${ROOM}.CO2`]);
+  });
+
+  it('(Ruling 52) a channel object never becomes an entity reading', () => {
+    const [hall, ...rest] = run(HALL_SET, { [`${HALL}.co2`]: value(540) });
+    expect(rest).to.deep.equal([]);
+    expectRealChannels(HALL_SET, hall!.device, { actual: `${HALL}.co2` });
+    expect(hall!.payload).to.equal('540');
+  });
+
+  it('(Ruling 52) a catch-all that spans a state another control holds is a repeat', () => {
+    // The kitchen's info reads the CO2 channel's state as well as its own
+    // note: publishing it would show the CO2 reading twice, once as "Küche".
+    expect(run(KITCHEN_SET).map(({ device: detected }) => detected.objectId)).to.deep.equal([`${KITCHEN}.CO2`]);
+  });
+
+  it("strips the root's name from a state name only as a whole word", () => {
+    expect(run(BATH_SET).map(({ device: detected }) => detected.name)).to.deep.equal(['Bad', 'Bad Badezimmer Luftdruck']);
+  });
+
+  it('(Ruling 45) a control that lists the recorded state only as optional does not take the root id', () => {
+    const first = discoverDevices(heaterSet(false), 'hometiles.0');
+    expect(first.anchors[HEATER]).to.equal(`${HEATER}.ACTUAL`);
+    // The new thermostat requires SET and merely reads ACTUAL: it is not the
+    // temperature sensor the root id was given to.
+    const second = discoverDevices(heaterSet(true), 'hometiles.0', first.anchors);
+    expect(second.devices.map(({ objectId, domain }) => [objectId, domain])).to.deep.equal([[`${HEATER}.SET`, 'climate']]);
+    expect(second.anchors[HEATER]).to.equal(`${HEATER}.ACTUAL`);
+  });
+
+  it('(Ruling 45) the recorded state does not drift within its control', () => {
+    const first = discoverDevices(dualSet(false), 'hometiles.0');
+    expect(first.anchors[DUAL]).to.equal(`${DUAL}.SET_COOLING`);
+    // SET_HEATING now comes first among the states the thermostat requires;
+    // the record stays on SET_COOLING, so removing SET_HEATING again loses
+    // nothing.
+    const second = discoverDevices(dualSet(true), 'hometiles.0', first.anchors);
+    expect(second.anchors[DUAL]).to.equal(`${DUAL}.SET_COOLING`);
+    const third = discoverDevices(dualSet(false), 'hometiles.0', second.anchors);
+    expect(third.devices.map(({ objectId }) => objectId)).to.deep.equal([DUAL]);
   });
 });
