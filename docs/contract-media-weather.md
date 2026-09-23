@@ -333,20 +333,38 @@ topic construction table above. Payload `{"entity_id":"<id>"}`
 (`mqtt_handlers.cpp:2515-2529`). Sent only as a cold-cache bootstrap from the
 popup; see the trace above for exactly when.
 
+The adapter subscribes this topic per panel. It answers `{"entity_id":"weather.x"}`, for a weather entity it
+pushed to that panel, by publishing that entity's payload again, retained, on
+`<ha_prefix>/weather/<object_id>/weather`. There is no response topic.
+
+It ignores malformed JSON, any other id, and a repeat within 1 s of the last answer
+(`src/runtime/panel-session.ts`). The Bridge, given no `entity_id`, re-publishes every weather entity
+(`__init__.py:2991-2995`); the adapter ignores such a request.
+
 ### Current-conditions payload
 
-Parsed independently but almost identically by the compact tile
-(`update_weather_tile_state`, `tile_renderer.cpp:2530-2649`) and the popup
-header (`apply_weather_header`, `weather_popup.cpp:2493-2584`):
+Parsed independently by the compact tile (`update_weather_tile_state`, `tile_renderer.cpp:2530-2649`) and the
+popup header (`apply_weather_header`, `weather_popup.cpp:2493-2586`). Every lookup is a first-substring match of
+`"key"` over the WHOLE payload, `forecast` entries and string values included (`json_scan.h:41-47`,
+`tile_renderer.cpp:804-805`), followed by the value after the next colon. The tile's string reader treats `""`
+as absent (`tile_renderer.cpp:813-815`). The popup's (`json_scan.h:64-87`) returns `""` as present. Both render
+it as no value.
 
-| Key | Type | Absent means |
-| --- | --- | --- |
-| `state` and/or `condition` | string | No condition text/icon derivable from condition |
-| `icon` | string (`mdi:xxx` or bare) | Icon derived from `condition` via a lookup table instead |
-| `temperature` | number **or numeric string** (comma-decimal tolerated, e.g. `"21,5"`) | Tile/popup show literal `"--"`, never `0` |
-| `temperature_unit`, or `units.temperature` (object form preferred if `units` object present) | string | Unit omitted from the formatted value |
-| `precipitation_unit`, or `units.precipitation` | string | Defaults to `"mm"` |
-| `name` | string | Location label falls back to the tile's configured title, then `"--"` |
+| Key | Type | Absent means | `""` means |
+| --- | --- | --- | --- |
+| `state`, `condition` | string | With no `forecast`: no condition text and no derived icon. With a `forecast`: day 0's `condition` is read as the current one (tile `:2552-2554`, popup `:1046-1049`). | No text and no icon on both (`i18n.cpp:1732`; tile `:2588-2593`; popup `:1054-1059`, `:2542-2543`). |
+| `icon` | string | The icon comes from the current condition, unless any `forecast` entry has `icon`: that one is then read as the current icon. | — |
+| `temperature` | number or numeric string (comma decimal tolerated) | With no `forecast`: `--`, never 0. With a `forecast`: day 0's `temperature`, its HIGH, is shown as the current temperature. | `--` on both (`json_scan.h:124-133`; tile `:924-936`, `:2600`; popup `:480-491`, `:2546`). |
+| `temperature_unit`, or `units.temperature` (the object is preferred when present) | string | Tile header: no unit. Popup header: the previous payload's unit (`:2515-2516`). Forecast columns on both: `°C` (`tile_renderer.cpp:961-963`, `weather_popup.cpp:537-542`). | — |
+| `precipitation_unit`, or `units.precipitation` | string | Popup: the previous payload's unit, else `mm` (`:2517-2522`). The tile does not read it. | — |
+| `name` | string | The tile's own title always wins. `name` is read only when that title is empty (popup: or `--`). With neither, `--` is shown (tile `:2636-2647`, popup `:2571-2582`). | — |
+
+Sender rule:
+
+- Put every current key before `forecast`.
+- While a `forecast` follows, always send `state`, `condition` and `temperature`, as `""` when unknown.
+- Send no `icon` and no `units` object anywhere. A `units` object's `temperature` is found by the
+  current-temperature lookup when it precedes the top-level key.
 
 **Key-priority asymmetry (verified, not a guess):** the compact tile tries
 `state` **before** `condition` (`tile_renderer.cpp:2552-2554`), while the
@@ -355,9 +373,13 @@ popup's `resolve_weather_visual_fields` tries `condition`, then a short key
 (`weather_popup.cpp:1040-1060`). A dead-code function
 `extract_weather_condition_field` (`weather_popup.cpp:1027-1032`, `state`
 before `condition` before `"c"`) exists but is never called from anywhere in
-the file — ignore it. Practical recommendation for a sender: always populate
-`condition` with a canonical value; `state` alone is sufficient for the tile
-but only a last-resort fallback for the popup.
+the file — ignore it.
+
+Send the same value in `state` and `condition`, both before `forecast`.
+
+- The popup's strict reader counts `"condition":""` as present, so it skips `c`, and then falls back to `state`
+  (`weather_popup.cpp:1054-1059`).
+- The tile's lenient reader skips an empty `state` and reads `condition` (`tile_renderer.cpp:2552-2554`).
 
 Canonical condition strings recognized by `weather_icon_from_condition`
 (`weather_popup.cpp:1004-1024`), 15 values, matching the array size declared
@@ -369,14 +391,30 @@ unrecognized condition string still displays as text (via
 `i18n::weather_condition_label`) but resolves to no icon unless an explicit
 `icon` key is also given.
 
+A forecast entry's condition text is never displayed. Each day keeps only the icon of one of the 15 conditions
+(`tile_renderer.cpp:2692`, `:2702-2704`; `ForecastData`, `weather_popup.cpp:223-236`). So the adapter sends a
+day's `condition` only when it is one of the 15, and no day text at all: a `]` in one would cut the tile's
+array (see below), and a text equal to a key such as `templow` would capture that day's lookup.
+
 ### Daily forecast (`forecast` array)
 
 Present on both the tile (up to `WEATHER_FORECAST_MAX=8` slots,
 `types/weather/widgets.h:19`, visible count via `weather_forecast_count(span_w)`:
 span 1→1, 2→2, 3→4, 4→5, 5→6, ≥6→8 days, `widgets.h:28-39`) and the popup
 (fixed `kCols=7`, `weather_popup.cpp:36`). Parsing:
-`tile_renderer.cpp:2651-2734` (tile), `weather_popup.cpp:2602-2696` (popup) —
-logic is functionally identical between the two.
+`tile_renderer.cpp:2651-2734` (tile), `weather_popup.cpp:2602-2696` (popup).
+
+The two readers differ:
+
+- The tile ends the array at the first `]` after `"forecast"`, even inside a string (`tile_renderer.cpp:846-857`).
+  A `]` in any entry's text therefore drops that day and every later day from the tile.
+- The popup walks the array string-aware (`json_scan.h:139-168`, from `weather_popup.cpp:2602-2615`) and reads
+  at most `kCols`=7 entries (`:2614`).
+- The tile's fallback slot skips slots with `has_data` (`tile_renderer.cpp:2717`). The popup's skips slots that
+  have a `date_local` (`weather_popup.cpp:2662`).
+
+An entry's keys are read from that entry's own substring (`tile_renderer.cpp:2679`, `weather_popup.cpp:1269`),
+so an entry may omit any key.
 
 Per-entry keys:
 
@@ -385,7 +423,7 @@ Per-entry keys:
 | `temperature` | number/numeric-string | Day's **high** |
 | `templow`, else `temperature_low`, else `temp_low`, else `low` | number/numeric-string | First present wins; day's **low** |
 | `condition`, `icon` | string | Same fallback rule as current conditions |
-| `datetime` (ISO 8601) and/or `date_local` (`YYYY-MM-DD`) | string | `date_local` wins if both present; otherwise the first 10 characters of `datetime` are used as the date |
+| `datetime` (ISO 8601) and/or `date_local` (`YYYY-MM-DD`) | string | `date_local` sets the slot, and in the popup also the weekday (`weather_popup.cpp:2639-2645`). The tile takes the weekday label from `datetime` whenever `datetime` is present (`tile_renderer.cpp:2696-2697`, used at `:2746-2753`), so a UTC `datetime` can label a day with the previous weekday. Send `date_local` only, as a `YYYY-MM-DD` date in the panel's zone. |
 | `precipitation`, `precipitation_probability` | number/numeric-string | Popup-only (7-day precip bars); the compact tile does not read these |
 
 **Day-slot assignment is date-based, not positional.** Each entry's date is
@@ -394,10 +432,31 @@ offset (`iso_date_day_offset`), and the entry is placed into that offset's
 slot (0 = today) — entries can arrive in any order. An entry whose date is
 missing or does not resolve to a valid in-range offset is instead placed
 into the first still-empty slot in **arrival order**
-(`tile_renderer.cpp:2709-2721`, `weather_popup.cpp:2654-2668`) — so a sender
-that omits dates still fills the days left-to-right, just without correct
-weekday labels, and mixing dated and undated entries can produce
-out-of-order results.
+(`tile_renderer.cpp:2709-2721`, `weather_popup.cpp:2654-2668`).
+
+Undated entries fill the slots from the left. With a set clock, slot i is labelled today+i
+(`tile_renderer.cpp:2741-2753`, `weather_popup.cpp:2686-2695`). So an undated list whose first entry is tomorrow
+shows tomorrow as today.
+
+A dated entry for a past day, or for a day beyond the visible columns, is not dropped. It takes the first free
+slot, and the tile always labels slot 0 "today" (`tile_renderer.cpp:2710-2721`, `:2747-2748`).
+
+A mixed set misorders, so the adapter dates every entry or none (Ruling 74). `date_local` must be in the panel's
+zone. The adapter uses the ioBroker host's zone, so the host's `TZ` must be the panels' zone.
+
+**Time zone (known limitation, review M3).** The adapter converts each dated instant — DasWetter's UTC
+midnight, AccuWeather's offset time, OpenWeatherMap's epoch milliseconds — to a `YYYY-MM-DD` in the ioBroker
+host's own zone, and the panel places that date against its own local today. The two must be the same zone. A
+host with no `TZ` set (for example a container running in UTC) serving panels in Berlin sends the 24th's
+DasWetter forecast (`2026-09-23T22:00:00.000Z`) as `2026-09-23`, and the panel shows it under today: the whole
+row shifts left by one day.
+
+**OpenWeatherMap's dates (Ruling 79(a)).** ioBroker.openweathermap 2.0.0 gives each forecast day three states of
+role `date.forecast.N`: the epoch-ms number `date`, and the weekday names `day` and `day_short`
+(`io-package.json` instanceObjects). The type-detector's `DATE` takes a string only, so it binds a weekday name,
+which is no date. Discovery therefore dates each day by the number beside it (same parent, same role), and the
+adapter sends it as `date_local`. After today's last 3-hour slot, the adapter's day 0 is tomorrow, and it is
+now placed under tomorrow instead of today.
 
 **Aggregation the firmware expects the sender to have already done:** the
 parser has no concept of a forecast "type" (`daily` vs `hourly` vs
@@ -414,6 +473,16 @@ does no min/max aggregation. A sender publishing raw partial-day/hourly
 values into the `forecast` array instead of pre-aggregated full-day extrema
 will make the tile display a partial reading as if it were the day's true
 high/low.
+
+The adapter sends each provider's own daily maximum and minimum unchanged (Ruling 72). ioBroker.openweathermap
+2.0.0 builds day 0 from today's remaining 3-hour slots only (`build/main.js:216-239`, `:331-360`). Its day-0
+high and low are therefore partial later in the day, which is the symptom described above. The adapter cannot
+correct it.
+
+**Known limitation (Ruling 79(b)).** OpenWeatherMap's day 0 covers only the rest of today, and the panel shows
+it as given. At 20:00, when today's remaining slots are 14 °C and 11 °C, the panel shows today as 14°/11° on a
+day whose high was 24 °C. This is the provider's own definition of day 0 (its own VIS widgets show the same).
+The adapter neither fills it from the current reading nor aggregates hours.
 
 ### Hourly forecast (`forecast_hourly` array, popup only)
 
@@ -457,11 +526,30 @@ key present) is discarded entirely and does not count toward the 168 cap
 
 - **Flat-JSON assumption.** All extraction (`json_scan.h`, the
   `extract_json_*` families) is plain substring/offset scanning, not a real
-  parser. The header comment (`json_scan.h:29-32`) states this is
-  deliberate: "the payloads are flat, so a key name cannot collide with a
-  nested object member." Do not nest a key with the same name as a top-level
-  key anywhere in the payload (e.g. inside a custom extension object) — it
-  will be found by the flat scanner regardless of nesting depth.
+  parser. The header comment (`json_scan.h:29-32`) assumes flat payloads. Weather is not flat and cannot be:
+  each `forecast` entry must carry `temperature`, the only key for the day's high (`tile_renderer.cpp:2686`,
+  `weather_popup.cpp:2626`), and `condition`.
+
+  A lookup matches the first `"key"` anywhere, including a nested member or a string VALUE equal to the key, and
+  reads past the next colon. The rules that follow:
+
+  - current keys come before `forecast`;
+  - use the `""` placeholders from the current-conditions table;
+  - send no `icon` and no `units` anywhere;
+  - send no string value equal to a key the panel reads. A friendly name `icon` hides the tile's icon, and a name
+    `temperature_unit` with no declared unit becomes the tile's unit.
+
+  `\uXXXX`-escaping such a value does not help for weather. Neither reader decodes a condition, and the popup
+  decodes only `°`/`°` (to `°`), `\/`, `\"` and `\\`, in `name` and in units
+  (`weather_popup.cpp:443-450`).
+
+  The adapter treats a name, or an unmapped current text, equal to any key the panel looks up over the whole
+  payload as absent: `state`, `condition`, `c`, `icon`, `i`, `temperature`, `units`, `temperature_unit`,
+  `precipitation_unit`, `name`, `forecast` and `forecast_hourly` (tile `tile_renderer.cpp:2552-2570`, `:2641`,
+  `:2667`; popup `weather_popup.cpp:1029-1059`, `:2501-2511`, `:2576`, `:2602`, `:2700`), and
+  `entity_picture_data`. The entity cache looks that key up in every JSON payload it stores, and appends an old
+  payload's tail from it onward to a new payload that lacks it (`tab_tiles_unified.cpp:398-416`, `:435-436`).
+  The name is then omitted, so the tile's title or `--` shows. The text follows the `""` rule.
 - **No retained-flag awareness.** Confirmed via the PubSubClient callback
   signature (`network_manager.cpp:602`, 3 parameters, no retained flag): the
   firmware cannot tell a retained message from a live one for either domain.
@@ -478,6 +566,11 @@ key present) is discarded entirely and does not count toward the 168 cap
   HA `unavailable` weather entity would actually produce, since HA drops
   numeric attributes entirely when unavailable) already correctly shows
   `"--"` rather than `0` per the generic absent-number handling above.
+
+  This adapter never sends `unavailable` or `unknown`. An unavailable weather entity goes out as `{"name":…}`
+  alone. Both readers render that as `--`, with no icon and no condition text, and the forecast is emptied
+  (`tile_renderer.cpp:2663-2669`; `weather_popup.cpp:2599-2603`). The Bridge's `"state":"unavailable"` would show
+  the untranslated English word on tiles wider than one column and in the popup header (`i18n.cpp:1744-1748`).
 
 ## UNVERIFIED
 
@@ -502,18 +595,10 @@ key present) is discarded entirely and does not count toward the 168 cap
   contract itself since topic names never collide across these checks, but
   is flagged for completeness since exact dispatch order was not
   independently confirmed end-to-end.
-- **Whether the real HomeTiles-Bridge (the reference sender, a separate
-  repository) actually publishes `forecast`/`forecast_hourly` with
-  MQTT `retain=true`.** The firmware side does not care (see "no
-  retained-flag awareness" above), but this document cannot confirm the
-  Bridge's actual publish flags since `HomeTiles-Bridge` source was not in
-  the set of files this task authorized reading.
-- **Full behavior of `hometiles_json::valueOffset` when the same key name
-  legitimately appears twice in one payload** (e.g., once at top level and
-  once inside a nested `units` object with a different intended value) was
-  reasoned about from the code (`json_scan.h:33-60`, first plain-text match
-  wins, scans start-to-end) but not exercised against a real ambiguous
-  payload; the weather code avoids this by first extracting the `units`
-  substring and re-scanning only within it before falling back to a
-  top-level `temperature_unit` key, which sidesteps the ambiguity in
-  practice.
+
+Resolved since (Task 12 review):
+
+- **Retained.** The Bridge publishes weather retained (`__init__.py:3833-3843`; the callers at `:1745`, `:2988`
+  and `:2995` pass `retain=True`, and `:3801` uses the default `True`).
+- **Duplicate keys.** `valueOffset` takes the first match anywhere, values included. See the flat-JSON note
+  under "Cross-cutting notes".
