@@ -330,6 +330,27 @@ const LAMP_SET = objects(
   functionEnum('enum.functions.licht', 'Licht', [LAMP]),
 );
 
+// A DWD weather warning exactly as ioBroker.dwd declares it (io-package.json
+// instanceObjects): the detector's `warning` pattern requires LEVEL.
+const DWD = 'dwd.0.warning';
+const DWD_SET = objects(
+  channel(DWD, '', { role: 'forecast' }),
+  state(`${DWD}.begin`, { role: 'value.time', type: 'number', write: false }),
+  state(`${DWD}.end`, { role: 'value.time', type: 'number', write: false }),
+  state(`${DWD}.severity`, { role: 'value.severity', type: 'number', write: false, states: { 0: 'None', 1: 'Minor', 2: 'Moderate', 3: 'Severe', 4: 'Extreme' } }),
+  state(`${DWD}.level`, {
+    role: 'value.warning',
+    type: 'number',
+    write: false,
+    states: { 1: 'Preliminary info', 2: 'Minor', 3: 'Moderate', 4: 'Severe', 5: 'Extreme' },
+  }),
+  state(`${DWD}.type`, { role: 'weather.type', type: 'number', write: false }),
+  state(`${DWD}.text`, { role: 'weather.title.short', type: 'string', write: false }),
+  state(`${DWD}.headline`, { role: 'weather.title', type: 'string', write: false }),
+  state(`${DWD}.description`, { role: 'weather.state', type: 'string', write: false }),
+  state(`${DWD}.map`, { role: 'weather.chart.url', type: 'string', write: false }),
+);
+
 const INSTALLATION: IoObjects = Object.assign(
   {},
   PROBE,
@@ -352,6 +373,7 @@ const INSTALLATION: IoObjects = Object.assign(
   SCO_SET,
   SHELLY_SET,
   LAMP_SET,
+  DWD_SET,
 );
 
 /** Every detected device one of whose channels is this state object. */
@@ -737,7 +759,11 @@ describe('discovery orchestration (Task 5d)', () => {
   });
 
   it('(c) an Aqara multisensor keeps temperature (with its humidity) and pressure', () => {
-    const runs = run(AQARA_SET);
+    const runs = run(AQARA_SET, {
+      [`${AQARA}.temperature`]: value(21.5),
+      [`${AQARA}.humidity`]: value(48),
+      [`${AQARA}.pressure`]: value(1013),
+    });
     expect(runs.map(({ device: detected }) => [detected.objectId, detected.detectorType])).to.deep.equal([
       [AQARA, 'temperature'],
       // A root's further controls are keyed by the state that anchors them.
@@ -745,11 +771,23 @@ describe('discovery orchestration (Task 5d)', () => {
     ]);
     expectRealChannels(AQARA_SET, runs[0]!.device, { actual: `${AQARA}.temperature`, second: `${AQARA}.humidity` });
     expectRealChannels(AQARA_SET, runs[1]!.device, { pressure: `${AQARA}.pressure` });
+    // Kept is not enough: each one publishes its own reading.
+    expect(runs.map((r) => r.payload)).to.deep.equal(['21.5', '1013']);
+    expect(runs[1]!.entity!.attributes).to.include({ device_class: 'pressure', unit_of_measurement: 'hPa' });
 
     // Two entities, not two devices collapsed under one key in the registry.
     const registry = new EntityRegistry({ onEntityChanged: () => undefined, onMembershipChanged: () => undefined }, 0);
     registry.rebuild(detectDevices(AQARA_SET), {});
     expect(registry.all().map((entity) => entity.attributes.device_class)).to.have.members(['temperature', 'pressure']);
+  });
+
+  it('(c) a DWD warning publishes its level: on while a warning is active, off without one', () => {
+    const warning = (level: number): Run => runFor(run(DWD_SET, { [`${DWD}.level`]: value(level) }), DWD);
+    const active = warning(3);
+    expect(active.device).to.include({ detectorType: 'warning', domain: 'binary_sensor' });
+    expect(active.entity!.attributes.device_class).to.equal('problem');
+    expect(active.payload).to.equal('on');
+    expect(warning(0).payload).to.equal('off');
   });
 
   it('(d) a fan-coil whose control the adapter does not map is not published as a sensor', () => {

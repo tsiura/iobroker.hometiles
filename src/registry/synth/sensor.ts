@@ -25,8 +25,10 @@ export function synthSensor(device: DeviceInput, entityId: string, values: Value
   // readChannel returns a non-null wrapper for any CONFIGURED channel even
   // when its value is null, so `readChannel(actual) ?? readChannel(set)`
   // never falls through. Matches switch.ts's pattern: prefer ACTUAL only when
-  // it is actually usable, otherwise fall back to SET.
-  const actual = readChannel(device, 'actual', values);
+  // it is actually usable, otherwise fall back to SET. `pressure` is the
+  // reading of the one mapped sensor type whose required state is not ACTUAL
+  // (typePatterns.js pressure: PRESSURE).
+  const actual = readChannel(device, 'actual', values) ?? readChannel(device, 'pressure', values);
   const set = readChannel(device, 'set', values);
   const read = actual && isUsable(actual.value) ? actual : set;
 

@@ -18,8 +18,10 @@ export function synthBinarySensor(device: DeviceInput, entityId: string, values:
   // readChannel returns a non-null wrapper for any CONFIGURED channel even
   // when its value is null, so `readChannel(actual) ?? readChannel(set)`
   // never falls through. Matches switch.ts's pattern: prefer ACTUAL only when
-  // it is actually usable, otherwise fall back to SET.
-  const actual = readChannel(device, 'actual', values);
+  // it is actually usable, otherwise fall back to SET. `level` is the reading
+  // of the one mapped binary type whose required state is not ACTUAL
+  // (typePatterns.js warning: LEVEL).
+  const actual = readChannel(device, 'actual', values) ?? readChannel(device, 'level', values);
   const set = readChannel(device, 'set', values);
   const read = actual && isUsable(actual.value) ? actual : set;
 
