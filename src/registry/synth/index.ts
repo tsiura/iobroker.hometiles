@@ -4,6 +4,7 @@ import { synthClimate } from './climate';
 import type { Values } from './common';
 import { synthCover } from './cover';
 import { synthLight } from './light';
+import { synthMediaPlayer } from './media_player';
 import { synthScene } from './scene';
 import { synthSensor } from './sensor';
 import { synthSwitch } from './switch';
@@ -35,6 +36,7 @@ export function synthesise(device: DeviceInput, entityId: string, values: Values
     case 'cover':
       return synthCover(device, entityId, values);
     case 'media_player':
+      return synthMediaPlayer(device, entityId, values);
     case 'weather':
     case 'number':
     case 'select':

@@ -51,6 +51,55 @@ export function numberToState(raw: unknown): string {
   return String(numeric);
 }
 
+/**
+ * A numeric channel's reading. Number('') and Number('  ') are both 0 and
+ * finite, so a blank reading resolves to undefined ("unknown"), never a
+ * confident zero. String(true)/String(false) are "true"/"false", and Number of
+ * either is NaN, so a boolean channel's value is refused too -- load-bearing
+ * for cover's toggle-kind SET (synth/cover.ts's setChannelKind).
+ */
+export function readNumber(device: DeviceInput, name: string, values: Values): number | undefined {
+  const read = readChannel(device, name, values);
+  if (!read || !isUsable(read.value)) return undefined;
+  const raw = read.value.val;
+  if (typeof raw === 'number') return Number.isFinite(raw) ? raw : undefined;
+  const text = String(raw).trim();
+  if (!text) return undefined;
+  const numeric = Number(text);
+  return Number.isFinite(numeric) ? numeric : undefined;
+}
+
+/** Reads a boolean-shaped channel as a real tri-state -- never a guessed default. */
+export function readBool(device: DeviceInput, name: string, values: Values): boolean | undefined {
+  const read = readChannel(device, name, values);
+  if (!read || !isUsable(read.value)) return undefined;
+  const state = toBoolState(read.value.val);
+  if (state === STATE_ON) return true;
+  if (state === STATE_OFF) return false;
+  return undefined;
+}
+
+/**
+ * A channel's reading as the panel's percentage, in that channel's OWN
+ * declared range (Ruling 49): raw 200 of a 0..255 blind is 78%, never 200,
+ * which the firmware would clamp to fully open. None for a channel whose
+ * bounds cannot be scaled (Ruling 55).
+ *
+ * The nearest WHOLE percent (Task 7 round 2, N1): the cover firmware's
+ * read_int truncates a fraction (item.as<int>(), cover/renderer.cpp:57), so a
+ * write of 75% landing as raw 191 of 255 (74.9%) came back as 74 -- the 75%
+ * preset never highlighted -- and on most ranges positions drifted down by
+ * one. Clamped to 0..100 (Ruling 59.4): a 1..100 blind reporting raw 0 is -1%
+ * of its range, which published position -1 -- "open" -- for a cover the
+ * panel draws shut.
+ */
+export function readPercent(device: DeviceInput, name: string, values: Values): number | undefined {
+  const raw = readNumber(device, name, values);
+  const percent = raw === undefined ? undefined : toPercent(raw, device.channels[name]);
+  // Math.max also turns the -0 of a reading just below min into a plain 0.
+  return percent === undefined ? undefined : Math.min(100, Math.max(0, Math.round(percent)));
+}
+
 export function baseEntity(
   device: DeviceInput,
   entityId: string,

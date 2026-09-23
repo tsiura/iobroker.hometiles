@@ -1,6 +1,6 @@
 import type { ChannelInput, DeviceInput, VirtualEntity } from '../types';
-import { STATE_OFF, STATE_ON, STATE_UNAVAILABLE, STATE_UNKNOWN } from '../types';
-import { baseEntity, isUsable, percentScale, readChannel, toBoolState, toPercent, type Values } from './common';
+import { STATE_UNAVAILABLE, STATE_UNKNOWN } from '../types';
+import { baseEntity, percentScale, readBool, readPercent, type Values } from './common';
 
 /**
  * The two steady Cover states this synth can derive on its own. blinds/
@@ -16,68 +16,16 @@ const STATE_OPEN = 'open';
 const STATE_CLOSED = 'closed';
 
 /**
- * Reads a numeric channel safely. Number('') and Number('  ') are both 0
- * and finite, so a blank reading must resolve to undefined ("unknown"),
- * never a confident zero-percent (fully closed) position. Also -- load-
- * bearing for a toggle-kind SET, see setChannelKind below -- String(true)/
- * String(false) are "true"/"false", and Number(...) of either is NaN, so
- * this same guard rejects a boolean channel's value without any
- * detectorType branching. Mirrors climate.ts's readNumber, which guards the
- * identical blank trap.
- */
-function readNumber(device: DeviceInput, name: string, values: Values): number | undefined {
-  const read = readChannel(device, name, values);
-  if (!read || !isUsable(read.value)) return undefined;
-  const raw = read.value.val;
-  if (typeof raw === 'number') return Number.isFinite(raw) ? raw : undefined;
-  const text = String(raw).trim();
-  if (!text) return undefined;
-  const numeric = Number(text);
-  return Number.isFinite(numeric) ? numeric : undefined;
-}
-
-/** Reads a boolean-shaped channel as a real tri-state -- never a guessed default. */
-function readBool(device: DeviceInput, name: string, values: Values): boolean | undefined {
-  const read = readChannel(device, name, values);
-  if (!read || !isUsable(read.value)) return undefined;
-  const state = toBoolState(read.value.val);
-  if (state === STATE_ON) return true;
-  if (state === STATE_OFF) return false;
-  return undefined;
-}
-
-/**
- * A position channel's reading as the panel's percentage, in that channel's
- * OWN declared range (Ruling 49): raw 200 of a 0..255 blind is 78%, never
- * 200, which the firmware would clamp to fully open. None for a channel whose
- * bounds cannot be scaled (Ruling 55).
- *
- * Published as the nearest WHOLE percent (round 2, N1): the firmware's
- * read_int truncates a fraction (item.as<int>(), cover/renderer.cpp:57), so a
- * write of 75% landing as raw 191 of 255 (74.9%) came back as 74 -- the 75%
- * preset never highlighted -- and on most ranges positions drifted down by
- * one. The state below is derived from this same number, so raw 1 of 255
- * (0.4%) is 0% AND closed: the panel disables Close at 0 (cover_popup.cpp:
- * 446-449), which is right for a closed cover and was wrong for one it called
- * open.
- *
- * Clamped to 0..100 BEFORE that state is derived (Ruling 59.4): a 1..100
- * blind reporting raw 0 is -1% of its range, which published position -1 --
- * "open" -- for a cover the panel draws shut. Below its range reads as 0 and
- * closed, above as 100 and open.
- */
-function readPercent(device: DeviceInput, name: string, values: Values): number | undefined {
-  const raw = readNumber(device, name, values);
-  const percent = raw === undefined ? undefined : toPercent(raw, device.channels[name]);
-  // Math.max also turns the -0 of a reading just below min into a plain 0.
-  return percent === undefined ? undefined : Math.min(100, Math.max(0, Math.round(percent)));
-}
-
-/**
  * Position, preferring live feedback over the last commanded target -- the
  * same precedence switch.ts and light.ts already use for their own
  * ACTUAL/SET pairs ("ACTUAL is real feedback and wins over the last command
  * written to SET").
+ *
+ * readPercent (common.ts) yields a whole percent clamped to 0..100, and the
+ * state below is derived from this same number: raw 1 of 255 (0.4%) is 0%
+ * AND closed, since the panel disables Close at 0 (cover_popup.cpp:446-449),
+ * which is right for a closed cover and was wrong for one it called open.
+ * Below its range reads as 0 and closed, above as 100 and open.
  */
 function readPosition(device: DeviceInput, actualName: string, setName: string, values: Values): number | undefined {
   return readPercent(device, actualName, values) ?? readPercent(device, setName, values);

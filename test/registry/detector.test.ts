@@ -305,6 +305,76 @@ describe('registry/detector mapping', () => {
     expect(Object.keys(device!.channels)).to.deep.equal(['actual']);
   });
 
+  it('maps the Types value media, not the pattern key mediaPlayer, to media_player', () => {
+    // docs/contract-iobroker-types.md's trap again: the pattern is keyed
+    // 'mediaPlayer', DetectedControl.type carries its Types value 'media'
+    // (types.js: Types["media"] = "media").
+    expect(DETECTOR_TYPE_TO_DOMAIN.media).to.equal('media_player');
+    expect(DETECTOR_TYPE_TO_DOMAIN.mediaPlayer).to.equal(undefined);
+  });
+
+  describe("mediaPlayer's two COVER states: the panel shows one cover, chosen by role", () => {
+    // typePatterns.js declares COVER twice: /^media\.cover(\.big)?$/ (defaultRole
+    // media.cover), then /^media\.cover(\..*)$/. The 6.0.1 detector keeps only
+    // the first it finds (ChannelDetector.js:201-204) and maps it into the first
+    // slot whatever its role, so the defaultRole it reports says nothing: the
+    // object's own role decides, in whatever order the states arrive.
+    const meta: Record<string, ObjectMeta> = {
+      'sonos.0.p.cover': { name: 'Cover', role: 'media.cover', type: 'string' },
+      'sonos.0.p.cover_big': { name: 'Cover big', role: 'media.cover.big', type: 'string' },
+      'sonos.0.p.cover_small': { name: 'Cover small', role: 'media.cover.small', type: 'string' },
+    };
+    const coverOf = (...ids: string[]): string | undefined =>
+      mapControlToDevice(
+        'sonos.0.p',
+        {
+          type: 'media',
+          states: [
+            { id: 'sonos.0.p.state', name: 'STATE', required: true },
+            ...ids.map((id) => ({ id, name: 'COVER', defaultRole: 'media.cover' })),
+          ],
+        },
+        meta,
+      )?.channels.cover?.objectId;
+
+    it('takes media.cover over any other size, in either order', () => {
+      expect(coverOf('sonos.0.p.cover_small', 'sonos.0.p.cover')).to.equal('sonos.0.p.cover');
+      expect(coverOf('sonos.0.p.cover', 'sonos.0.p.cover_small')).to.equal('sonos.0.p.cover');
+      expect(coverOf('sonos.0.p.cover_big', 'sonos.0.p.cover')).to.equal('sonos.0.p.cover');
+      expect(coverOf('sonos.0.p.cover', 'sonos.0.p.cover_big')).to.equal('sonos.0.p.cover');
+    });
+
+    it("takes media.cover.big, the first pattern's other role, over any further size, in either order", () => {
+      expect(coverOf('sonos.0.p.cover_small', 'sonos.0.p.cover_big')).to.equal('sonos.0.p.cover_big');
+      expect(coverOf('sonos.0.p.cover_big', 'sonos.0.p.cover_small')).to.equal('sonos.0.p.cover_big');
+    });
+
+    it('keeps a lone other size as the cover', () => {
+      expect(coverOf('sonos.0.p.cover_small')).to.equal('sonos.0.p.cover_small');
+    });
+  });
+
+  it("drops the mediaPlayer channels no media role reads, and the pattern's own IGNORE states", () => {
+    // Each name is unique to mediaPlayer in typePatterns.js. IGNORE is how the
+    // pattern sets Chromecast's …paused/…playerState aside; SHUFFLE and REPEAT
+    // have no panel control; the rest is metadata the panel never shows.
+    const control: DetectedControl = {
+      type: 'media',
+      states: [
+        { id: 'cast.0.tv.state', name: 'STATE', required: true },
+        { id: 'cast.0.tv.paused', name: 'IGNORE' },
+        { id: 'cast.0.tv.shuffle', name: 'SHUFFLE', write: true },
+        { id: 'cast.0.tv.repeat', name: 'REPEAT', write: true },
+        { id: 'cast.0.tv.track', name: 'TRACK' },
+        { id: 'cast.0.tv.episode', name: 'EPISODE' },
+        { id: 'cast.0.tv.season', name: 'SEASON' },
+        { id: 'cast.0.tv.player_name', name: 'PLAYER_NAME' },
+        { id: 'cast.0.tv.player_type', name: 'PLAYER_TYPE' },
+      ],
+    };
+    expect(Object.keys(mapControlToDevice('cast.0.tv', control, {})!.channels)).to.deep.equal(['state']);
+  });
+
   it('falls back to the last object id segment when no name is known', () => {
     const control: DetectedControl = { type: 'temperature', states: [{ id: 'zigbee.0.unknown.value', name: 'ACTUAL' }] };
     const device = mapControlToDevice('zigbee.0.unknown', control, {});

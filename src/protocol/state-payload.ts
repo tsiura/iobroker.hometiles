@@ -1,6 +1,7 @@
 import type { Domain, VirtualEntity } from '../registry/types';
 import { buildClimatePayload } from './climate';
 import { buildCoverPayload } from './cover';
+import { buildMediaPayload } from './media';
 import { entityStateTopic } from './topics';
 
 export interface StatePublish {
@@ -76,6 +77,13 @@ export function buildStatePublish(haPrefix: string, entity: VirtualEntity): Stat
   // in `attributes` and never add supported_features at all.
   if (entity.domain === 'cover') {
     return { topic, payload: buildCoverPayload(entity), retain: true };
+  }
+
+  // Media: an allow-list of the keys the panel's media parser reads, and an
+  // explicit "no cover" -- the generic loop below would leave the artwork
+  // keys out, which keeps the last track's cover up (src/protocol/media.ts).
+  if (entity.domain === 'media_player') {
+    return { topic, payload: buildMediaPayload(entity), retain: true };
   }
 
   const body: Record<string, unknown> = {};

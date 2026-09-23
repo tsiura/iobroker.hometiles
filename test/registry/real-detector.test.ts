@@ -550,6 +550,87 @@ const dualSet = (withHeating: boolean): IoObjects =>
       : []),
   );
 
+// A Sonos player as ioBroker.sonos lays it out: a channel per player under
+// the adapter's root device; a boolean state_simple beside a string state,
+// which the detector does not take (mediaPlayer's STATE is Boolean or Number,
+// typePatterns.js); the cover as a path on ioBroker's own web server; seek
+// as a writable percentage.
+const SONOS = 'sonos.0.root.192_168_1_55';
+const SONOS_SET = objects(
+  device('sonos.0.root', 'Sonos'),
+  channel(SONOS, 'Wohnzimmer'),
+  state(`${SONOS}.state_simple`, { role: 'media.state', type: 'boolean', write: true }),
+  state(`${SONOS}.state`, { role: 'media.state', type: 'string', write: true }),
+  state(`${SONOS}.play`, { role: 'button.play', type: 'boolean', read: false, write: true }),
+  state(`${SONOS}.pause`, { role: 'button.pause', type: 'boolean', read: false, write: true }),
+  state(`${SONOS}.stop`, { role: 'button.stop', type: 'boolean', read: false, write: true }),
+  state(`${SONOS}.next`, { role: 'button.next', type: 'boolean', read: false, write: true }),
+  state(`${SONOS}.prev`, { role: 'button.prev', type: 'boolean', read: false, write: true }),
+  state(`${SONOS}.seek`, { role: 'media.seek', type: 'number', min: 0, max: 100, unit: '%', write: true }),
+  state(`${SONOS}.current_title`, { role: 'media.title', type: 'string', write: false }),
+  state(`${SONOS}.current_artist`, { role: 'media.artist', type: 'string', write: false }),
+  state(`${SONOS}.current_album`, { role: 'media.album', type: 'string', write: false }),
+  state(`${SONOS}.current_cover`, { role: 'media.cover', type: 'string', write: false }),
+  state(`${SONOS}.current_duration`, { role: 'media.duration', type: 'number', unit: 'seconds', write: false }),
+  state(`${SONOS}.current_elapsed`, { role: 'media.elapsed', type: 'number', unit: 'seconds', write: false }),
+  state(`${SONOS}.volume`, { role: 'level.volume', type: 'number', min: 0, max: 100, write: true }),
+  state(`${SONOS}.muted`, { role: 'media.mute', type: 'boolean', write: true }),
+  state(`${SONOS}.repeat`, { role: 'media.mode.repeat', type: 'number', write: true, states: { 0: 'none', 1: 'all', 2: 'one' } }),
+  state(`${SONOS}.shuffle`, { role: 'media.mode.shuffle', type: 'boolean', write: true }),
+  state(`${SONOS}.alive`, { role: 'indicator.reachable', type: 'boolean', write: false }),
+);
+const SONOS_VALUES: Record<string, SourceValue> = {
+  [`${SONOS}.state_simple`]: value(true),
+  [`${SONOS}.state`]: value('play'),
+  [`${SONOS}.current_title`]: value('Hotel California'),
+  [`${SONOS}.current_artist`]: value('Eagles'),
+  [`${SONOS}.current_album`]: value('Hotel California'),
+  [`${SONOS}.current_cover`]: value(`/state/${SONOS}.cover_png`),
+  [`${SONOS}.current_duration`]: value(391),
+  [`${SONOS}.current_elapsed`]: value(42),
+  [`${SONOS}.volume`]: value(25),
+  [`${SONOS}.muted`]: value(false),
+};
+
+// A Logitech Media Server player in the shape ioBroker.squeezeboxrpc uses: a
+// numeric media.state with its own states map, the cover as an http URL on
+// the server, a playing time but no seek state.
+const SQUEEZE = 'squeezeboxrpc.0.Players.Kueche';
+const SQUEEZE_SET = objects(
+  channel(SQUEEZE, 'Küche'),
+  state(`${SQUEEZE}.state`, { role: 'media.state', type: 'number', write: true, states: { 0: 'pause', 1: 'play', 2: 'stop' } }),
+  state(`${SQUEEZE}.btnPlay`, { role: 'button.play', type: 'boolean', read: false, write: true }),
+  state(`${SQUEEZE}.btnForward`, { role: 'button.next', type: 'boolean', read: false, write: true }),
+  state(`${SQUEEZE}.btnRewind`, { role: 'button.prev', type: 'boolean', read: false, write: true }),
+  state(`${SQUEEZE}.Volume`, { role: 'level.volume', type: 'number', min: 0, max: 100, write: true }),
+  state(`${SQUEEZE}.Title`, { role: 'media.title', type: 'string', write: false }),
+  state(`${SQUEEZE}.ArtworkUrl`, { role: 'media.cover', type: 'string', write: false }),
+  state(`${SQUEEZE}.Duration`, { role: 'media.duration', type: 'number', unit: 's', write: false }),
+  state(`${SQUEEZE}.Time`, { role: 'media.elapsed', type: 'number', unit: 's', write: false }),
+);
+const LMS_COVER = 'http://192.168.1.10:9000/music/current/cover.jpg?player=00:04:20:12:34:56';
+
+// A kitchen radio alias with one or two covers (mediaPlayer lists COVER twice).
+const RADIO = 'alias.0.Kueche.Radio';
+const radioSet = (...covers: Array<[name: string, role: string]>): IoObjects =>
+  objects(
+    channel(RADIO, 'Küchenradio'),
+    state(`${RADIO}.STATE`, { role: 'media.state', type: 'boolean', write: true }),
+    ...covers.map(([name, role]) => state(`${RADIO}.${name}`, { role, type: 'string', write: false })),
+  );
+
+// Two further media.state objects the mediaPlayer pattern sets aside by name
+// (IGNORE: /\.(paused|playerState)$/, "Ignore the following states of
+// Chromecast").
+const CAST = 'chromecast.0.Wohnzimmer_TV';
+const CAST_SET = objects(
+  device(CAST, 'Wohnzimmer TV'),
+  state(`${CAST}.state`, { role: 'media.state', type: 'boolean', write: true }),
+  state(`${CAST}.paused`, { role: 'media.state', type: 'boolean', write: true }),
+  state(`${CAST}.playerState`, { role: 'media.state', type: 'string', write: false }),
+  state(`${CAST}.volume`, { role: 'level.volume', type: 'number', min: 0, max: 1, write: true }),
+);
+
 const INSTALLATION: IoObjects = Object.assign(
   {},
   PROBE,
@@ -583,6 +664,9 @@ const INSTALLATION: IoObjects = Object.assign(
   WOHN_SET,
   ESS_SET,
   ST_SET,
+  SONOS_SET,
+  SQUEEZE_SET,
+  CAST_SET,
 );
 
 /** Every detected device one of whose channels is this state object. */
@@ -998,6 +1082,103 @@ describe('real type-detector end to end (Task 5c)', () => {
         expect(outcome.ok, `${label} ${call.kind}`).to.equal(landed.length > 0);
         expect(writes, `${label} ${call.kind}`).to.deep.equal(landed);
       }
+    });
+  });
+
+  describe('media_player', () => {
+    it('Task 9: a Sonos player is one entity, backed by exactly its real channels, publishing what the panel reads', () => {
+      const runs = run(SONOS_SET, SONOS_VALUES);
+      expect(runs.map((r) => r.device.objectId), 'nothing else from the Sonos tree').to.deep.equal([SONOS]);
+      const result = runFor(runs, SONOS);
+      expectRealChannels(SONOS_SET, result.device, {
+        state: `${SONOS}.state_simple`,
+        play: `${SONOS}.play`,
+        pause: `${SONOS}.pause`,
+        stop: `${SONOS}.stop`,
+        next: `${SONOS}.next`,
+        prev: `${SONOS}.prev`,
+        seek: `${SONOS}.seek`,
+        title: `${SONOS}.current_title`,
+        artist: `${SONOS}.current_artist`,
+        album: `${SONOS}.current_album`,
+        cover: `${SONOS}.current_cover`,
+        duration: `${SONOS}.current_duration`,
+        elapsed: `${SONOS}.current_elapsed`,
+        volume: `${SONOS}.volume`,
+        mute: `${SONOS}.muted`,
+      });
+      expect(json(result)).to.deep.equal({
+        state: 'playing',
+        volume_level: 0.25,
+        is_volume_muted: false,
+        media_position: 42,
+        media_duration: 391,
+        // A path on ioBroker's own web server: the panel cannot download it.
+        entity_picture: '',
+        media_title: 'Hotel California',
+        media_artist: 'Eagles',
+        media_album_name: 'Hotel California',
+      });
+    });
+
+    it('Task 9 / Ruling 23: the real synth carries channelMeta and writable from the detected objects', () => {
+      const entity = runFor(run(SONOS_SET, SONOS_VALUES), SONOS).entity!;
+      expect(entity.writable).to.deep.equal({ volume: true, seek: true });
+      expect(entity.channelMeta?.volume).to.include({ type: 'number', min: 0, max: 100, write: true, current: 25 });
+      expect(entity.channelMeta?.seek).to.include({ type: 'number', min: 0, max: 100, unit: '%', write: true });
+      expect(entity.channelMeta?.state).to.include({ type: 'boolean', write: true, current: true });
+    });
+
+    it('Task 9: a squeezebox player decodes its states map, and publishes no seek bar it has no seek for', () => {
+      const result = runFor(
+        run(SQUEEZE_SET, {
+          [`${SQUEEZE}.state`]: value(2),
+          [`${SQUEEZE}.Volume`]: value(40),
+          [`${SQUEEZE}.Title`]: value('Ruhe'),
+          [`${SQUEEZE}.ArtworkUrl`]: value(LMS_COVER),
+          [`${SQUEEZE}.Duration`]: value(200),
+          [`${SQUEEZE}.Time`]: value(30),
+        }),
+        SQUEEZE,
+      );
+      expectRealChannels(SQUEEZE_SET, result.device, {
+        state: `${SQUEEZE}.state`,
+        play: `${SQUEEZE}.btnPlay`,
+        next: `${SQUEEZE}.btnForward`,
+        prev: `${SQUEEZE}.btnRewind`,
+        volume: `${SQUEEZE}.Volume`,
+        title: `${SQUEEZE}.Title`,
+        cover: `${SQUEEZE}.ArtworkUrl`,
+        duration: `${SQUEEZE}.Duration`,
+        elapsed: `${SQUEEZE}.Time`,
+      });
+      expect(result.entity!.writable).to.deep.equal({ volume: true });
+      expect(json(result)).to.deep.equal({ state: 'idle', volume_level: 0.4, entity_picture: LMS_COVER, media_title: 'Ruhe' });
+    });
+
+    it("Task 9: COVER is media.cover even when a smaller cover's id sorts first, and the payload carries its URL", () => {
+      const values = {
+        [`${RADIO}.STATE`]: value(true),
+        [`${RADIO}.COVER`]: value('http://radio/cover.jpg'),
+        [`${RADIO}.A_COVER_SMALL`]: value('http://radio/small.jpg'),
+        [`${RADIO}.Z_COVER_SMALL`]: value('http://radio/small.jpg'),
+      };
+      for (const small of ['A_COVER_SMALL', 'Z_COVER_SMALL']) {
+        const result = runFor(run(radioSet([small, 'media.cover.small'], ['COVER', 'media.cover']), values), RADIO);
+        expect(result.device.channels.cover?.objectId, small).to.equal(`${RADIO}.COVER`);
+        expect(json(result).entity_picture, small).to.equal('http://radio/cover.jpg');
+      }
+    });
+
+    it('Task 9: a smaller cover alone is the cover', () => {
+      const result = runFor(run(radioSet(['COVER_SMALL', 'media.cover.small'])), RADIO);
+      expect(result.device.channels.cover?.objectId).to.equal(`${RADIO}.COVER_SMALL`);
+    });
+
+    it("Task 9: the media.state objects the pattern sets aside for Chromecast become no channel", () => {
+      const result = runFor(run(CAST_SET, { [`${CAST}.state`]: value(false), [`${CAST}.volume`]: value(0.5) }), CAST);
+      expectRealChannels(CAST_SET, result.device, { state: `${CAST}.state`, volume: `${CAST}.volume` });
+      expect(json(result)).to.deep.equal({ state: 'idle', volume_level: 0.5, entity_picture: '' });
     });
   });
 

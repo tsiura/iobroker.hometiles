@@ -146,6 +146,9 @@ export const DETECTOR_TYPE_TO_DOMAIN: Record<string, Domain> = {
   blind: 'cover',
   blindButtons: 'cover',
   gate: 'cover',
+  // The same trap: the pattern is keyed 'mediaPlayer', its Types value is
+  // 'media' (types.js: Types["media"] = "media").
+  media: 'media_player',
 };
 
 /**
@@ -203,6 +206,18 @@ const IGNORED_CHANNELS = new Set([
   'VALVE',
   'WINDOW',
   'PARTY',
+  // mediaPlayer's, each unique to that pattern: IGNORE is how it sets
+  // Chromecast's …paused/…playerState aside; the panel has no shuffle or
+  // repeat control (mqtt_handlers.cpp:2020-2122 sends only transport, seek,
+  // volume and mute) and shows no track, episode, season or player metadata.
+  'IGNORE',
+  'SHUFFLE',
+  'REPEAT',
+  'TRACK',
+  'EPISODE',
+  'SEASON',
+  'PLAYER_NAME',
+  'PLAYER_TYPE',
 ]);
 
 /**
@@ -256,6 +271,18 @@ function lastSegment(objectId: string): string {
   return objectId.split('.').pop() ?? objectId;
 }
 
+/**
+ * mediaPlayer declares COVER twice (typePatterns.js): /^media\.cover(\.big)?$/
+ * with defaultRole media.cover, then any other /^media\.cover(\..*)$/. The
+ * panel shows one cover, so one is kept: by the object's own role, in the
+ * pattern's order of preference, never by which arrives first. The 6.0.1
+ * detector already returns only one (ChannelDetector.js:201-204), but in the
+ * first slot, defaultRole included, whatever its role.
+ */
+function coverRank(role: string | undefined): number {
+  return role === 'media.cover' ? 0 : role === 'media.cover.big' ? 1 : 2;
+}
+
 export function mapControlToDevice(
   rootId: string,
   control: DetectedControl,
@@ -270,7 +297,8 @@ export function mapControlToDevice(
     if (!state.id) continue;
     const name = channelName(control.type, state);
     if (!name) continue;
-    if (channels[name]) continue;
+    const existing = channels[name];
+    if (existing && name !== 'cover') continue;
 
     const info = meta[state.id];
     const channel: ChannelInput = { objectId: state.id };
@@ -286,6 +314,7 @@ export function mapControlToDevice(
     if (state.write !== undefined || info?.write !== undefined) {
       channel.write = info?.write ?? state.write;
     }
+    if (existing && coverRank(channel.role) >= coverRank(existing.role)) continue;
     channels[name] = channel;
   }
 

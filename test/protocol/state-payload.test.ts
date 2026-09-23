@@ -127,6 +127,23 @@ describe('protocol/state-payload', () => {
     expect(parsed.state).to.equal('open');
   });
 
+  it('routes media_player through buildMediaPayload instead of the generic JSON body', () => {
+    // Full rule coverage lives in protocol/media.test.ts. The generic loop
+    // would forward every attribute (friendly_name here) and, with no cover,
+    // leave the artwork keys out -- which keeps the last track's cover up.
+    const p = buildStatePublish(
+      'ha/statestream',
+      entity({
+        entityId: 'media_player.wohnzimmer',
+        domain: 'media_player',
+        state: 'playing',
+        attributes: { friendly_name: 'Wohnzimmer', media_title: 'Ruhe' },
+      }),
+    );
+    expect(p!.topic).to.equal('ha/statestream/media_player/wohnzimmer/state');
+    expect(JSON.parse(p!.payload)).to.deep.equal({ state: 'playing', entity_picture: '', media_title: 'Ruhe' });
+  });
+
   it('publishes nothing for a scene', () => {
     expect(buildStatePublish('ha/statestream', entity({ entityId: 'scene.n', domain: 'scene' }))).to.equal(null);
   });
