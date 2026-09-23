@@ -393,6 +393,8 @@ export interface Discovery {
   anchors: RootAnchors;
   /** Function enums left out: members that are no list make the detector throw. */
   ignored: string[];
+  /** Objects left out: a role that is not text makes the detector throw (Ruling 62). */
+  badRoles: string[];
 }
 
 /** Ancestors before descendants would let an outer root take a nested root's controls. */
@@ -415,10 +417,10 @@ function controlName(rootName: string, stateName: string | undefined, anchor: st
 }
 
 /**
- * The detector's own error names no object (e.g. "(objects[id].common.role
- * || "").match is not a function" for a role that is no string,
- * ChannelDetector.js:90), so the root it was reading is added: the log has to
- * say where to look (Ruling 56).
+ * The detector's own error names no object, so the root it was reading is
+ * added: the log has to say where to look (Ruling 56). The objects known to
+ * make it throw never reach it (discoverDevices leaves them out); this is for
+ * whatever is not known yet.
  */
 function detectBelow(detector: DetectorPort, rootId: string): DetectedControl[] {
   try {
@@ -454,19 +456,23 @@ function requiredStates(control: DetectedControl): string[] {
  * already claimed EVERY state it requires; one that needs a state nobody
  * claimed is a composite and is kept (Ruling 46). The catch-all `info`
  * means nothing of its own: the states an earlier detection claimed are
- * taken out of it, and it goes only when none of its own is left
- * (Ruling 57). Only state objects count: info's ACTUAL matches any object
- * below its root (ChannelDetector.js:35-37, no objectType), and a channel
- * must never become an entity's reading (Ruling 52). The deepest root goes
- * first, so each control comes from the innermost root that holds it,
- * whatever order the objects came in.
+ * taken out of it, and it goes when none of its own is left, or when the
+ * root has a control of its own beside it -- not merely another root's
+ * control seen again (Ruling 57). Only state objects count: info's ACTUAL
+ * matches any object below its root (ChannelDetector.js:35-37, no
+ * objectType), and a channel must never become an entity's reading
+ * (Ruling 52). The deepest root goes first, so each control comes from the
+ * innermost root that holds it, whatever order the objects came in.
  *
  * Identity (Ruling 45): each root id stays with the control that REQUIRES
  * the state recorded for that root -- never one merely listing it as an
- * optional state -- however the detector's sort order shifts, and the
- * record itself never moves. A new root's id goes to its first mapped
- * control. Every other control is keyed by the first state it requires that
- * nobody claimed before it.
+ * optional state, nor a catch-all for a state a deeper root took -- however
+ * the detector's sort order shifts, and the record itself never moves. A new
+ * root's id goes to its first mapped control. Every other control is keyed
+ * by the first state it requires that nobody claimed before it.
+ *
+ * An object known to make the detector throw is left out and reported, not
+ * allowed to stop every discovery (Rulings 58 D, 60(2)).
  */
 export function discoverDevices(
   objects: Readonly<Record<string, IoBrokerObject>>,
@@ -476,14 +482,25 @@ export function discoverDevices(
   const detectable: Record<string, IoBrokerObject> = {};
   const meta: Record<string, ObjectMeta> = {};
   const ignored: string[] = [];
+  const badRoles: string[] = [];
   for (const [id, obj] of Object.entries(objects)) {
     if (!DETECTED_OBJECT_TYPES.has(obj.type)) continue;
-    // The detector calls members.includes on every function enum for each
-    // state it tests (ChannelDetector.js:150): one enum whose members are no
-    // list failed every root. Without it only enum-based detection suffers
-    // (Ruling 58 D).
-    if (obj.type === 'enum' && !Array.isArray((obj.common as { members?: unknown } | null | undefined)?.members)) {
-      ignored.push(id);
+    const common = obj.common as { members?: unknown; role?: unknown } | null | undefined;
+    if (obj.type === 'enum') {
+      // The detector calls members.includes on every function enum for each
+      // state it tests (ChannelDetector.js:150): one enum whose members are
+      // no list failed every root. Without it only enum-based detection
+      // suffers (Ruling 58 D). No members at all is valid (objects.d.ts:323),
+      // and the detector passes over it (roleEnumUtils.js getFunctionEnums).
+      if (common?.members !== undefined && !Array.isArray(common.members)) {
+        ignored.push(id);
+        continue;
+      }
+    } else if (common?.role && typeof common.role !== 'string') {
+      // Such a role fails every root above the object (ChannelDetector.js:90),
+      // so one hand-edited object stopped all discovery: only it is left out
+      // (Ruling 60(2)). An empty, false or null role never reaches that call.
+      badRoles.push(id);
       continue;
     }
     detectable[id] = obj;
@@ -499,21 +516,26 @@ export function discoverDevices(
   const nextAnchors: RootAnchors = {};
   for (const rootId of roots) {
     if (rootId.startsWith(`${ownNamespace}.`)) continue;
+    // Only state objects count (Ruling 52), and the catch-all keeps only what
+    // no deeper root claimed: the kitchen's own note, not the CO2 reading its
+    // sub-channel holds (Ruling 57). Both before anything below reads a
+    // detection -- the root id included, which must not stay with a catch-all
+    // for a state a new sub-channel took from it.
     const controls = detectBelow(detector, rootId).map((control) => ({
       ...control,
-      states: control.states.filter((state) => !state.id || detectable[state.id]?.type === 'state'),
+      states: control.states.filter(
+        (state) =>
+          !state.id || (detectable[state.id]?.type === 'state' && !(control.type === 'info' && claimed.has(state.id))),
+      ),
     }));
+    // A control of the root's own requires a state no deeper root claimed;
+    // any other detection is a deeper root's control seen again.
+    const typed = controls.some((c) => c.type !== 'info' && requiredStates(c).some((id) => !claimed.has(id)));
     const recorded = anchors[rootId];
     let holder = recorded === undefined ? undefined : controls.find((c) => requiredStates(c).includes(recorded));
     // Kept as recorded: if its control is gone the id goes to nobody.
     if (recorded !== undefined) nextAnchors[rootId] = recorded;
-    for (const detected of controls) {
-      // The catch-all keeps only what no earlier detection claimed: the
-      // kitchen's own note, not the CO2 reading its sub-channel holds.
-      const control =
-        detected.type === 'info'
-          ? { ...detected, states: detected.states.filter((state) => !state.id || !claimed.has(state.id)) }
-          : detected;
+    for (const control of controls) {
       // Claimed even when unmapped, so nothing less specific can later stand
       // in for it over the same states.
       const required = requiredStates(control);
@@ -524,8 +546,8 @@ export function discoverDevices(
       const anchor = own ?? required[0];
 
       const device = mapControlToDevice(rootId, control, meta);
-      if (device && !holder && recorded === undefined) holder = detected;
-      if (detected === holder) {
+      if (device && !holder && recorded === undefined) holder = control;
+      if (control === holder) {
         if (recorded === undefined && anchor) nextAnchors[rootId] = anchor;
       } else if (device && anchor) {
         device.objectId = anchor;
@@ -534,11 +556,12 @@ export function discoverDevices(
       // `info` is the catch-all: tried last (the final pattern in
       // typePatterns.js) and sorted last (ChannelDetector.js:722-729), it
       // holds only what the root's other detections left (:226, :336-361).
-      // Beside any other detection, mapped or not, it would publish that
-      // control's leftovers as a sensor in its place.
-      if (!device || !own || (control.type === 'info' && controls.length > 1)) continue;
+      // Beside a control of the root's own, mapped or not, it would publish
+      // that control's leftovers as a sensor in its place. Beside a deeper
+      // root's control seen again, what it holds is the root's own values.
+      if (!device || !own || (control.type === 'info' && typed)) continue;
       devices.push(device);
     }
   }
-  return { devices, anchors: nextAnchors, ignored };
+  return { devices, anchors: nextAnchors, ignored, badRoles };
 }

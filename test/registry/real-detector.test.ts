@@ -481,6 +481,43 @@ const MQTT_STATION_SET = objects(
   state(`${MQTT_STATION}.pm25.value`, { role: 'value', type: 'number', unit: 'ug/m3', write: false }),
 );
 
+// The reviewer's round-3 probes (Ruling 62, finding 2): a root's own value
+// beside a sub-channel whose control the detector TYPES. The root detects that
+// control again -- a repeat, itself dropped -- next to its catch-all info.
+const OWN = (root: string, rootObject: IoObject, ...sub: IoObject[]): IoObjects =>
+  objects(rootObject, state(`${root}.Anzeige`, { role: 'text', type: 'string', write: false }), ...sub);
+const BAD = 'alias.0.Bad';
+const BAD_SET = OWN(
+  BAD,
+  channel(BAD, 'Bad'),
+  channel(`${BAD}.Temp`, 'Temp'),
+  state(`${BAD}.Temp.ACTUAL`, { role: 'value.temperature', type: 'number', unit: '°C', write: false }),
+);
+const WOHN = 'alias.0.Wohn';
+const WOHN_SET = OWN(
+  WOHN,
+  channel(WOHN, 'Wohnen'),
+  channel(`${WOHN}.Heizung`, 'Heizung'),
+  state(`${WOHN}.Heizung.SET`, { role: 'level.temperature', type: 'number', unit: '°C', write: true, min: 5, max: 30 }),
+  state(`${WOHN}.Heizung.ACTUAL`, { role: 'value.temperature', type: 'number', unit: '°C', write: false }),
+);
+const ESS = 'alias.0.Ess';
+const ESS_SET = OWN(
+  ESS,
+  channel(ESS, 'Essen'),
+  channel(`${ESS}.Licht`, 'Licht'),
+  state(`${ESS}.Licht.SET`, { role: 'level.dimmer', type: 'number', unit: '%', write: true, min: 0, max: 100 }),
+  state(`${ESS}.Licht.ON_SET`, { role: 'switch.light', type: 'boolean', write: true }),
+);
+const ST = 'mqtt.0.st';
+const ST_SET = objects(
+  device(ST, 'Station'),
+  state(`${ST}.aqi`, { role: 'value', type: 'number', write: false }),
+  state(`${ST}.status`, { role: 'text', type: 'string', write: false }),
+  channel(`${ST}.t`, 'Temp'),
+  state(`${ST}.t.temperature`, { role: 'value.temperature', type: 'number', unit: '°C', write: false }),
+);
+
 // A bathroom sensor whose pressure state's own name starts with the root's
 // name, but as a longer word.
 const BATH = 'zigbee.0.00158d0004b5d6e7';
@@ -541,6 +578,11 @@ const INSTALLATION: IoObjects = Object.assign(
   // Info-only: in INSTALLATION alias.0.Wohnzimmer also holds AC and BLIND.
   roomSet(false, 'alias.0.Arbeitszimmer'),
   BATH_SET,
+  // alias.0.Bad also holds FLOOR's thermostat channel here.
+  BAD_SET,
+  WOHN_SET,
+  ESS_SET,
+  ST_SET,
 );
 
 /** Every detected device one of whose channels is this state object. */
@@ -1170,6 +1212,56 @@ describe('discovery orchestration (Task 5d)', () => {
     expectNoRequiredStateBacksTwoEntities({ ...FLUR_SET, ...MQTT_STATION_SET });
   });
 
+  it("(Ruling 57) a root's own value survives beside a sub-channel whose control is typed", () => {
+    // The root detects the sub-channel's temperature, thermostat or dimmer
+    // again. That repeat owns no state, so it is no control of the root's
+    // own, and the root's catch-all keeps the value nothing else holds.
+    const cases: Array<[IoObjects, string, string, string]> = [
+      [BAD_SET, `${BAD}.Temp`, 'temperature', `${BAD}.Anzeige`],
+      [WOHN_SET, `${WOHN}.Heizung`, 'thermostat', `${WOHN}.Anzeige`],
+      [ESS_SET, `${ESS}.Licht`, 'dimmer', `${ESS}.Anzeige`],
+      [ST_SET, `${ST}.t`, 'temperature', `${ST}.aqi`],
+    ];
+    for (const [all, sub, type, own] of cases) {
+      const devices = detectDevices(all);
+      // The root id stays with the repeat, the first control it saw, so the
+      // catch-all is keyed by its own state (Ruling 45).
+      expect(
+        devices.map((detected) => [detected.objectId, detected.detectorType]),
+        sub,
+      ).to.deep.equal([
+        [sub, type],
+        [own, 'info'],
+      ]);
+      expectRealChannels(all, devices[1]!, { actual: own });
+      expectNoRequiredStateBacksTwoEntities(all);
+    }
+  });
+
+  it('(Ruling 45) a catch-all does not keep the root id for a state a new sub-channel took from it', () => {
+    // At first the device's catch-all reads C.s, the first of its values,
+    // and the root id is recorded on it. Then the channel object C appears:
+    // C is a root of its own and holds C.s, and the device's catch-all keeps
+    // only t. The root id must not follow it there, onto another reading.
+    const DEV = 'mqtt.0.dev';
+    const flat = objects(
+      device(DEV, 'Gerät'),
+      state(`${DEV}.C.s`, { role: 'value', type: 'number', write: false }),
+      state(`${DEV}.t`, { role: 'text', type: 'string', write: false }),
+    );
+    const readings = ({ devices }: ReturnType<typeof discoverDevices>): string[][] =>
+      devices.map((detected) => [detected.objectId, detected.channels.actual!.objectId]);
+    const first = discoverDevices(flat, 'hometiles.0');
+    expect(readings(first)).to.deep.equal([[DEV, `${DEV}.C.s`]]);
+
+    const second = discoverDevices({ ...flat, ...objects(channel(`${DEV}.C`, 'Kanal')) }, 'hometiles.0', first.anchors);
+    expect(readings(second)).to.deep.equal([
+      [`${DEV}.C`, `${DEV}.C.s`],
+      [`${DEV}.t`, `${DEV}.t`],
+    ]);
+    expect(second.anchors[DEV]).to.equal(`${DEV}.C.s`);
+  });
+
   it("strips the root's name from a state name only as a whole word", () => {
     expect(run(BATH_SET).map(({ device: detected }) => detected.name)).to.deep.equal(['Bad', 'Bad Badezimmer Luftdruck']);
   });
@@ -1196,14 +1288,32 @@ describe('discovery orchestration (Task 5d)', () => {
     expect(third.devices.map(({ objectId }) => objectId)).to.deep.equal([DUAL]);
   });
 
-  it('(Ruling 56) a type-detector failure names the root whose objects it could not read', () => {
-    // A role that is no string makes the detector itself throw
-    // (ChannelDetector.js:90); the log must say where to look.
-    const broken = objects(
-      device(BALKON, 'Balkon'),
-      state(`${BALKON}.temperature`, { role: 5, type: 'number', unit: '°C', write: false }),
+  it('(Ruling 62) an object whose role is not text is left out, and only it', () => {
+    // Such a role makes the detector throw for every root above the object
+    // (ChannelDetector.js:90), so one hand-edited object stopped every
+    // discovery and froze every panel. A problem confined to one object skips
+    // that object (Ruling 60(2)); main.ts names it in a warning.
+    const broken = balkonSet(
+      state(`${BALKON}.status`, { role: 5, type: 'number', write: false }),
+      channel(`${BALKON}.extra`, 'Extra', { role: { en: 'extra' } }),
+      // Harmless: `false || ''` never reaches that call, so it stays.
+      state(`${BALKON}.flag`, { role: false, type: 'boolean', write: false }),
     );
-    expect(() => discoverDevices(broken, 'hometiles.0')).to.throw(`the objects below ${BALKON}`);
+    const { devices, badRoles } = discoverDevices(broken, 'hometiles.0');
+    expect(badRoles).to.deep.equal([`${BALKON}.status`, `${BALKON}.extra`]);
+    expect(devices.map((detected) => [detected.objectId, detected.detectorType])).to.deep.equal([
+      [BALKON, 'temperature'],
+      [`${BALKON}.pressure`, 'pressure'],
+    ]);
+  });
+
+  it('(Ruling 62) a function enum without members is valid, and not reported', () => {
+    // members is optional (@iobroker/types objects.d.ts:323) and the detector
+    // passes over such an enum (roleEnumUtils.js getFunctionEnums).
+    const empty: IoObject = { _id: 'enum.functions.leer', type: 'enum', common: { name: 'Leer' }, native: {} };
+    const { devices, ignored } = discoverDevices({ ...LAMP_SET, ...objects(empty) }, 'hometiles.0');
+    expect(ignored).to.deep.equal([]);
+    expect(devices.map((detected) => [detected.objectId, detected.domain])).to.deep.equal([[LAMP, 'light']]);
   });
 
   it('(Ruling 58 D) a function enum whose members are no list is left out, and only it', () => {

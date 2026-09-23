@@ -291,11 +291,17 @@ class HomeTiles extends utils.Adapter {
   // ---- Registry ----
 
   private async rebuildRegistry(): Promise<void> {
-    const { devices: detected, anchors, ignored } = await this.detectDevices();
+    const { devices: detected, anchors, ignored, badRoles } = await this.detectDevices();
     if (ignored.length > 0) {
       this.log.warn(
         `[Registry] Function enums left out, their members are not a list: ${ignored.join(', ')}. ` +
           'Devices typed only through them are published by their own roles until they are repaired',
+      );
+    }
+    if (badRoles.length > 0) {
+      this.log.warn(
+        `[Registry] Objects left out, their role is not text: ${badRoles.join(', ')}. ` +
+          'They are detected again once repaired',
       );
     }
     this.devices = applyOverrides(detected, (this.options.deviceOverrides ?? []) as DeviceOverride[]);

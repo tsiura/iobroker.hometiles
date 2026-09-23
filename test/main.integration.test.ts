@@ -84,15 +84,6 @@ const CORRUPT_ENUM_OBJECTS: Record<string, object> = {
 
 const FIXTURE_IDS = [...Object.keys(SENSOR_OBJECTS), ...Object.keys(CORRUPT_ENUM_OBJECTS)];
 
-/** The sensor, hand-corrupted: a role that is no string makes the type-detector itself throw. */
-const BROKEN_SENSOR_OBJECTS: Record<string, object> = {
-  ...SENSOR_OBJECTS,
-  [`${SENSOR}.temperature`]: {
-    type: 'state',
-    common: { name: 'Temperature', role: 5, type: 'number', unit: '°C', read: true, write: false },
-  },
-};
-
 /** A panel as the firmware announces itself: retained on the broker, like its last configuration. */
 const PANEL = 'e2e1';
 const ANNOUNCE_TOPIC = `tab5_lvgl/config/${PANEL}/bridge`;
@@ -109,6 +100,20 @@ const ANNOUNCEMENT = JSON.stringify({
   local_io: [],
 });
 const LAST_GOOD_APPLY = '{"marker":"the last good configuration"}';
+
+/**
+ * Objects that cannot be read at all: the object view discovery reads each
+ * device through is gone from the objects database. The one systemic failure
+ * a test can cause without touching the adapter's code (Ruling 60(2)).
+ */
+type DesignDocument = { views: Record<string, unknown> } & Record<string, unknown>;
+async function breakDeviceView(harness: IntegrationTestHarness): Promise<DesignDocument> {
+  const design = (await harness.objects.getObjectAsync('_design/system')) as DesignDocument;
+  const views = { ...design.views };
+  delete views.device;
+  await harness.objects.setObjectAsync('_design/system', { ...design, views });
+  return design;
+}
 
 // Opt-in: this downloads and runs a real js-controller, so it stays out of the
 // default suite. Run it with HOMETILES_INTEGRATION=1 npm test.
@@ -201,6 +206,12 @@ if (process.env.HOMETILES_INTEGRATION === '1') {
         let server: Server;
         let panel: MqttClient;
         const applies: string[] = [];
+        let design: DesignDocument | undefined;
+        // Never leave the objects database without its view: the harness
+        // backs up whatever the last suite of a run left behind.
+        after(async () => {
+          if (design) await getHarness().objects.setObjectAsync('_design/system', design);
+        });
         before(async () => {
           broker = new Aedes();
           server = createServer(broker.handle);
@@ -219,12 +230,13 @@ if (process.env.HOMETILES_INTEGRATION === '1') {
           broker.close();
         });
 
-        it('publishes no apply while discovery fails, and says where and what happens next', async function () {
+        it('publishes no apply while discovery fails, and says what failed and what happens next', async function () {
           this.timeout(120000);
           const harness = getHarness();
           const logs = await captureLogs(harness);
           await harness.changeAdapterConfig('hometiles', { native: { brokerHost: '127.0.0.1', brokerPort: port } });
-          await setObjects(harness, BROKEN_SENSOR_OBJECTS);
+          await setObjects(harness, SENSOR_OBJECTS);
+          design = await breakDeviceView(harness);
           await harness.startAdapterAndWait(true);
           await waitFor(harness, () => logs.find((log) => log.message.includes(`[Panel ${PANEL}] Session started`)), 'the panel');
           const failure = await waitFor(
@@ -232,7 +244,7 @@ if (process.env.HOMETILES_INTEGRATION === '1') {
             () => logs.find((log) => log.severity === 'error' && log.message.includes('Discovering devices failed')),
             'the discovery error',
           );
-          expect(failure.message).to.include(`the objects below ${SENSOR}`);
+          expect(failure.message).to.include('"device"');
           expect(failure.message).to.include('Panels keep their last configuration; retrying in 5 s');
           // A retained apply with every list empty would make the firmware
           // prune the panel's tile bindings and save that to flash.
@@ -249,7 +261,7 @@ if (process.env.HOMETILES_INTEGRATION === '1') {
             answer = reply as { error?: string };
           });
           await waitFor(harness, () => answer, 'the answer to listDetected');
-          expect(answer?.error).to.include(`the objects below ${SENSOR}`);
+          expect(answer?.error).to.include('"device"');
           await new Promise((resolve) => setTimeout(resolve, 1000));
           expect(harness.didAdapterStop(), 'the adapter keeps running').to.equal(false);
         });
@@ -257,7 +269,7 @@ if (process.env.HOMETILES_INTEGRATION === '1') {
         it('publishes the normal apply once a retry succeeds', async function () {
           this.timeout(120000);
           const harness = getHarness();
-          await setObjects(harness, SENSOR_OBJECTS);
+          if (design) await harness.objects.setObjectAsync('_design/system', design);
           const apply = await waitFor(harness, () => applies.find((payload) => payload.includes('sensor.balkon')), 'the normal apply');
           expect(JSON.parse(apply).sensors).to.deep.equal(['sensor.balkon']);
           expect(applies[0]).to.equal(LAST_GOOD_APPLY);
