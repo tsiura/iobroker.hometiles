@@ -30,6 +30,24 @@ export function buildEntityId(domain: Domain, source: string, taken: ReadonlySet
 }
 
 /**
+ * A persisted id map as main.ts stores it: a JSON object whose values are all
+ * strings. Anything else a hand edit can leave -- JSON null, an array, a
+ * number, a string, a non-string value, no JSON at all -- is undefined,
+ * never a value that throws later inside discovery (Ruling 51).
+ */
+export function parseStringMap(raw: unknown): Record<string, string> | undefined {
+  if (typeof raw !== 'string') return undefined;
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(raw);
+  } catch {
+    return undefined;
+  }
+  if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) return undefined;
+  return Object.values(parsed).every((value) => typeof value === 'string') ? (parsed as Record<string, string>) : undefined;
+}
+
+/**
  * Entity ids are keyed by ioBroker object id and persisted. A rename of the
  * underlying object must never orphan tiles already placed on a panel, so a
  * known object id keeps the id it was first given -- while it stays in that

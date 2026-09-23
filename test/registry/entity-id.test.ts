@@ -1,5 +1,5 @@
 import { expect } from 'chai';
-import { buildEntityId, resolveEntityIds, slugify } from '../../src/registry/entity-id';
+import { buildEntityId, parseStringMap, resolveEntityIds, slugify } from '../../src/registry/entity-id';
 import type { DeviceInput } from '../../src/registry/types';
 
 function device(objectId: string, name: string): DeviceInput {
@@ -93,6 +93,15 @@ describe('registry/entity-id', () => {
       { 'knx.0.Licht.Flur': 'switch.flurlicht', 'modbus.0.pumpe': 'sensor.pumpe' },
     );
     expect(resolved).to.deep.equal({ 'knx.0.Licht.Flur': 'light.flurlicht', 'modbus.0.pumpe': 'switch.pumpe' });
+  });
+
+  it('reads a stored id map only when it is a JSON object whose values are all strings (Ruling 51)', () => {
+    expect(parseStringMap('{"hue.0.a":"light.a"}')).to.deep.equal({ 'hue.0.a': 'light.a' });
+    expect(parseStringMap('{}')).to.deep.equal({});
+    // Everything a hand edit can leave behind. JSON null used to come back as
+    // null and throw inside discovery, stopping the adapter from starting.
+    const malformed: unknown[] = ['null', '[]', '["light.a"]', '5', '"light.a"', 'true', '{"a":5}', '{"a":null}', '{"a":{}}', 'not json', '', 5, true, {}];
+    for (const raw of malformed) expect(parseStringMap(raw), JSON.stringify(raw)).to.equal(undefined);
   });
 
   it('slugifies a display name whole instead of splitting it on a dot', () => {

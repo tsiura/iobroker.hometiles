@@ -10,6 +10,7 @@ import {
   stateTopic,
 } from './protocol/topics';
 import { discoverDevices, type Discovery, type RootAnchors } from './registry/detector';
+import { parseStringMap } from './registry/entity-id';
 import { EntityRegistry } from './registry/entity-registry';
 import { applyOverrides } from './registry/overrides';
 import { synthesise } from './registry/synth/index';
@@ -115,7 +116,14 @@ class HomeTiles extends utils.Adapter {
     });
     this.mqtt.onMessage((topic, payload) => void this.onMqttMessage(topic, payload));
 
-    await this.rebuildRegistry();
+    // One malformed object anywhere in the installation must not keep the
+    // adapter from serving panels: v0.1 crash-looped right here, rejecting
+    // onReady before MQTT ever connected (Ruling 51). Logged, then onward.
+    try {
+      await this.rebuildRegistry();
+    } catch (error) {
+      this.log.error(`[Registry] Discovering devices failed: ${(error as Error)?.stack ?? String(error)}`);
+    }
     await this.subscribeStatesAsync('panels.*');
 
     // A broker that is down must not stop the adapter: the client reconnects.
@@ -297,15 +305,13 @@ class HomeTiles extends utils.Adapter {
     await this.setState('info.panels', sessions.length, true);
   }
 
+  /** A stored map is validated before use: it is a hand-editable state (Ruling 51). */
   private async loadJsonMap(id: string): Promise<Record<string, string>> {
     const state = await this.getStateAsync(id);
-    if (!state || typeof state.val !== 'string') return {};
-    try {
-      return JSON.parse(state.val) as Record<string, string>;
-    } catch {
-      this.log.warn(`[Registry] Stored ${id} is corrupt, starting from scratch`);
-      return {};
-    }
+    if (state?.val === null || state?.val === undefined) return {};
+    const map = parseStringMap(state.val);
+    if (!map) this.log.warn(`[Registry] Stored ${id} is not a JSON object of strings, starting from scratch`);
+    return map ?? {};
   }
 
   private async saveJsonMap(id: string, name: string, map: Record<string, string>): Promise<void> {
