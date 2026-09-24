@@ -1,5 +1,5 @@
 import { expect } from 'chai';
-import type { DeviceOverride } from '../../src/config/options';
+import { validateOptions, type DeviceOverride } from '../../src/config/options';
 import { discoverDevices, type IoBrokerObject } from '../../src/registry/detector';
 import { idsToStore } from '../../src/registry/entity-id';
 import { EntityRegistry } from '../../src/registry/entity-registry';
@@ -98,6 +98,33 @@ describe('registry/overrides', () => {
       detectedDomain,
       room,
     });
+    /** A form this version of the picker armed: its ticks are the user's. */
+    const ARMED = { armed: true };
+
+    it("unticks every row of a form this picker did not arm, a 44d1111 Refresh's too, and keeps the ticks of one it did (Ruling 120, N2)", () => {
+      // What a saved 44d1111 Refresh left: the row filled in and still ticked
+      // from the earlier version, the user never having ticked it. A 4cbb6d3
+      // Refresh leaves the same shape: only the form's marker tells them apart.
+      const row: DeviceOverride = { objectId: 'zigbee.0.a', include: true, name: 'Draußen', detectedName: 'Balkon', detectedDomain: 'sensor', room: '' };
+      const again = [found('zigbee.0.a', 'Balkon', 'sensor')];
+      expect(mergeDetected([row], again)).to.deep.equal([{ ...row, include: false }]);
+      expect(mergeDetected([row], again, { armed: false })).to.deep.equal([{ ...row, include: false }]);
+      // Ticked again by the user in a form this picker armed, it stays ticked.
+      expect(mergeDetected([row], again, ARMED)).to.deep.equal([row]);
+    });
+
+    it('keeps a row it cannot read -- an object id that is not text, or no object at all -- where it stands, as it is (Ruling 120, N4)', () => {
+      const unreadable = [{ objectId: null, include: true, forcedDomain: 'switch' }, 'x', null, { objectId: 5 }];
+      const rows = [...unreadable, { objectId: 'hue.0.a', include: true, forcedDomain: 'light', detectedDomain: 'light' }];
+      const merged = mergeDetected(rows, [found('hue.0.a', 'A', 'light'), found('hue.0.b', 'B', 'light')], ARMED);
+      expect(merged).to.deep.equal([
+        ...unreadable,
+        { objectId: 'hue.0.a', include: true, forcedDomain: 'light', detectedName: 'A', detectedDomain: 'light', room: '' },
+        { objectId: 'hue.0.b', include: false, name: '', forcedDomain: '', detectedName: 'B', detectedDomain: 'light', room: '' },
+      ]);
+      // validateOptions leaves each of them out: none selects anything.
+      expect(validateOptions({ deviceOverrides: unreadable as unknown as DeviceOverride[] }).options.deviceOverrides).to.deep.equal([]);
+    });
 
     it('adds each newly detected device unticked, with no name and no forced domain', () => {
       expect(mergeDetected([], [found('hue.0.decke', 'Decke', 'light', 'Wohnzimmer')])).to.deep.equal([
@@ -122,7 +149,7 @@ describe('registry/overrides', () => {
       const merged = mergeDetected(rows, [
         found('hue.0.decke', 'Decke', 'light', 'Wohnzimmer'),
         found('zigbee.0.flur', 'Flur Bewegung', 'binary_sensor', 'Flur'),
-      ]);
+      ], ARMED);
       expect(merged).to.deep.equal([
         { objectId: 'hue.0.decke', include: true, name: 'Licht oben', forcedDomain: 'switch', detectedName: 'Decke', detectedDomain: 'light', room: 'Wohnzimmer' },
         { objectId: 'zigbee.0.flur', include: false, name: 'Flur', forcedDomain: 'binary_sensor', detectedName: 'Flur Bewegung', detectedDomain: 'binary_sensor', room: 'Flur' },
@@ -135,7 +162,7 @@ describe('registry/overrides', () => {
 
     it('keeps the row of a device detected no more, its choices as they were, and marks it in its detected name (Ruling 117)', () => {
       const gone: DeviceOverride = { objectId: 'hm-rpc.0.weg', include: true, name: 'Weg', forcedDomain: '', detectedName: 'Weg', detectedDomain: 'switch', room: 'Keller' };
-      expect(mergeDetected([gone], [found('hue.0.decke', 'Decke', 'light')])).to.deep.equal([
+      expect(mergeDetected([gone], [found('hue.0.decke', 'Decke', 'light')], ARMED)).to.deep.equal([
         { objectId: 'hm-rpc.0.weg', include: true, name: 'Weg', forcedDomain: '', detectedName: 'Weg (not detected)', detectedDomain: 'switch', room: 'Keller' },
         { objectId: 'hue.0.decke', include: false, name: '', forcedDomain: '', detectedName: 'Decke', detectedDomain: 'light', room: '' },
       ]);
@@ -147,12 +174,12 @@ describe('registry/overrides', () => {
         { objectId: 'hm-rpc.0.weg', include: true, detectedName: 'Weg', detectedDomain: 'switch' },
         { objectId: 'knx.0.alt', include: false, name: 'Alt' },
       ];
-      const once = mergeDetected(rows, [], '(nicht erkannt)');
+      const once = mergeDetected(rows, [], { ...ARMED, mark: '(nicht erkannt)' });
       expect(once.map((row) => row.detectedName)).to.deep.equal(['Weg (nicht erkannt)', '(nicht erkannt)']);
       // A second refresh adds no second mark.
-      expect(mergeDetected(once, [], '(nicht erkannt)')).to.deep.equal(once);
+      expect(mergeDetected(once, [], { ...ARMED, mark: '(nicht erkannt)' })).to.deep.equal(once);
       // Back again: detection's name, and nothing else changed.
-      const back = mergeDetected(once, [found('hm-rpc.0.weg', 'Weg', 'switch', 'Keller')], '(nicht erkannt)');
+      const back = mergeDetected(once, [found('hm-rpc.0.weg', 'Weg', 'switch', 'Keller')], { ...ARMED, mark: '(nicht erkannt)' });
       expect(back[0]).to.deep.equal({ objectId: 'hm-rpc.0.weg', include: true, detectedName: 'Weg', detectedDomain: 'switch', room: 'Keller' });
     });
 
@@ -165,7 +192,7 @@ describe('registry/overrides', () => {
         { objectId: 'a.0.w', include: false, detectedName: 'Weg (not detected) (nicht erkannt) (not detected)' },
         { objectId: 'a.0.z', include: false, detectedName: '(nicht erkannt)' },
       ];
-      expect(mergeDetected(rows, [], '(not detected)', marks).map((row) => row.detectedName)).to.deep.equal([
+      expect(mergeDetected(rows, [], { mark: '(not detected)', marks }).map((row) => row.detectedName)).to.deep.equal([
         'Weg (not detected)',
         'Weg (not detected)',
         'Weg (not detected)',
@@ -205,7 +232,7 @@ describe('registry/overrides', () => {
         { objectId: 'hue.0.a', include: true, name: 'last', detectedDomain: 'light' },
         { objectId: 'hue.0.b', include: false, name: 'after' },
       ];
-      const merged = mergeDetected(rows, [found('hue.0.a', 'A', 'light'), found('hue.0.b', 'B', 'light')]);
+      const merged = mergeDetected(rows, [found('hue.0.a', 'A', 'light'), found('hue.0.b', 'B', 'light')], ARMED);
       expect(merged).to.deep.equal([
         { objectId: 'hue.0.a', include: false, name: 'first', detectedName: 'A', detectedDomain: 'light', room: '' },
         // A blank row names no device: it stays as it is, and selects nothing.

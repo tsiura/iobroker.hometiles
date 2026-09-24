@@ -1,7 +1,7 @@
 import { expect } from 'chai';
 import { readdirSync, readFileSync } from 'node:fs';
 import path from 'node:path';
-import { validateOptions, type ManualEntity } from '../../src/config/options';
+import { PICKER_VERSION, validateOptions, type ManualEntity } from '../../src/config/options';
 import { MANUAL_DOMAINS } from '../../src/registry/manual';
 import { mergeDetected } from '../../src/registry/overrides';
 
@@ -108,9 +108,14 @@ describe('admin/jsonConfig', () => {
     expect(button).to.not.have.property('data');
     // Text that would break a pattern or a JSON literal, were it spliced in raw.
     const rows = [{ objectId: 'hue.0.a', include: true, name: 'Decke "oben" `1` ${data.x} \\ }', forcedDomain: '' }];
-    expect(JSON.parse(evaluatePattern(button.jsonData, { deviceOverrides: rows, brokerHost: 'x' }))).to.deep.equal({ rows });
-    // A form that holds no rows yet sends an empty list.
-    expect(JSON.parse(evaluatePattern(button.jsonData, {}))).to.deep.equal({ rows: [] });
+    // With the form's marker: whether this picker armed it, so whether its ticks are the user's (Ruling 120, N2).
+    expect(JSON.parse(evaluatePattern(button.jsonData, { deviceOverrides: rows, brokerHost: 'x', pickerArmed: PICKER_VERSION }))).to.deep.equal({
+      rows,
+      pickerArmed: PICKER_VERSION,
+    });
+    expect(JSON.parse(evaluatePattern(button.jsonData, { deviceOverrides: rows, pickerArmed: true }))).to.deep.equal({ rows, pickerArmed: true });
+    // A form that holds no rows and no marker yet sends an empty list, and no marker.
+    expect(JSON.parse(evaluatePattern(button.jsonData, {}))).to.deep.equal({ rows: [], pickerArmed: null });
     expect(Object.keys(button.result)).to.deep.equal(['refreshed']);
   });
 
@@ -188,6 +193,13 @@ describe('admin/jsonConfig', () => {
     for (const [language, strings] of Object.entries(translations)) {
       expect(strings.devices_info, language).to.include(strings.refresh_detected);
       expect(strings.devices_info, language).to.match(/export/i);
+    }
+  });
+
+  it('says in every language that saving after Refresh publishes every manual entity too, ticked rows or not (Ruling 120, N3)', () => {
+    for (const [language, strings] of Object.entries(translations)) {
+      expect(strings.devices_info, language).to.include(strings.manual_entities);
+      expect(strings.refresh_result, language).to.include(strings.manual_entities);
     }
   });
 

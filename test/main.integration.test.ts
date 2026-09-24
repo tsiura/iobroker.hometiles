@@ -193,8 +193,13 @@ const ROOM_OBJECTS: Record<string, object> = {
  * mark, so any text does.
  */
 const picked = (...objectIds: string[]): object[] => objectIds.map((objectId) => ({ objectId, include: true, detectedDomain: 'sensor' }));
-/** The marker a Refresh in the new Devices tab leaves in the saved form: publishing is armed (Ruling 118). */
-const ARMED = { pickerArmed: true };
+/**
+ * The marker a Refresh of this picker leaves in the saved form: publishing is
+ * armed (Ruling 118). The version is bumped, so the true of 4cbb6d3 arms
+ * no longer (Ruling 120).
+ */
+const PICKER = 2;
+const ARMED = { pickerArmed: PICKER };
 
 const FIXTURE_IDS = [
   ...Object.keys(SENSOR_OBJECTS),
@@ -960,7 +965,7 @@ if (process.env.HOMETILES_INTEGRATION === '1') {
                   { objectId: KAFFEE, include: false, name: '', forcedDomain: '', detectedName: 'Kaffee', detectedDomain: 'switch', room: '' },
                   { objectId: SENSOR, include: false, name: '', forcedDomain: '', detectedName: 'Balkon', detectedDomain: 'sensor', room: 'Balkon' },
                 ],
-                pickerArmed: true,
+                pickerArmed: PICKER,
               },
               result: 'refreshed',
               args: ['2', '2'],
@@ -978,12 +983,16 @@ if (process.env.HOMETILES_INTEGRATION === '1') {
               { objectId: SENSOR, include: true, name: 'Draußen', forcedDomain: '', detectedDomain: 'sensor' },
               // A row the table's "+" added: blank, it stays where it is.
               { objectId: '', include: false },
+              // An earlier version's "+" row never typed into: its object id is null. It stays too (N4).
+              { objectId: null, include: true, forcedDomain: 'switch' },
               { objectId: 'zigbee.0.weg', include: true, name: '', forcedDomain: '', detectedName: 'Weg (not detected)', detectedDomain: 'sensor' },
             ];
-            const reply = (await ask(harness, 'refreshDetected', { rows })) as { native: { deviceOverrides: object[] }; args: string[] };
+            // The form the first Refresh armed, the user having ticked since.
+            const reply = (await ask(harness, 'refreshDetected', { rows, pickerArmed: PICKER })) as { native: { deviceOverrides: object[] }; args: string[] };
             expect(reply.native.deviceOverrides).to.deep.equal([
               { objectId: SENSOR, include: true, name: 'Draußen', forcedDomain: '', detectedName: 'Balkon', detectedDomain: 'sensor', room: 'Balkon' },
               { objectId: '', include: false },
+              { objectId: null, include: true, forcedDomain: 'switch' },
               // The English mark gone, the system language's in its place.
               { objectId: 'zigbee.0.weg', include: true, name: '', forcedDomain: '', detectedName: 'Weg (nicht erkannt)', detectedDomain: 'sensor' },
               { objectId: KAFFEE, include: false, name: '', forcedDomain: '', detectedName: 'Kaffee', detectedDomain: 'switch', room: '' },
@@ -1022,7 +1031,8 @@ if (process.env.HOMETILES_INTEGRATION === '1') {
           it('publishes nothing -- not its rows, not its manual entity -- and names what waits for the Devices tab (Ruling 118)', async function () {
             this.timeout(120000);
             const harness = getHarness();
-            stores['info.entityIds'] = JSON.stringify({ [SENSOR]: 'sensor.balkon', [KAFFEE]: 'switch.kaffee' });
+            // 50f4c18 stored the manual entity's id beside the devices' (N1).
+            stores['info.entityIds'] = JSON.stringify({ [SENSOR]: 'sensor.balkon', [KAFFEE]: 'switch.kaffee', [`manual:${HELPER}`]: 'sensor.vorlauf' });
             delete stores['info.publishedIds'];
             const seenIcons = icons.length;
             const seenStates = balkonState.length;
@@ -1035,9 +1045,9 @@ if (process.env.HOMETILES_INTEGRATION === '1') {
             ]);
             expect(ready(logs)!.message).to.include('0 picked (manual entities included), 0 entities published');
             expect(await retained(APPLY_TOPIC, ICONS_TOPIC)).to.deep.equal({ [APPLY_TOPIC]: LAST_GOOD_APPLY, [ICONS_TOPIC]: OLD_ICONS });
-            // Every stored id is kept for a later pick.
+            // Every stored id is kept for a later pick, the manual entity's too (N1).
             expect(await keepStores(harness)).to.deep.equal({
-              'info.entityIds': { [SENSOR]: 'sensor.balkon', [KAFFEE]: 'switch.kaffee' },
+              'info.entityIds': { [SENSOR]: 'sensor.balkon', [KAFFEE]: 'switch.kaffee', [`manual:${HELPER}`]: 'sensor.vorlauf' },
               'info.publishedIds': {},
             });
           });
@@ -1050,7 +1060,7 @@ if (process.env.HOMETILES_INTEGRATION === '1') {
                 { objectId: SENSOR, include: false, name: 'Draußen', detectedName: 'Balkon', detectedDomain: 'sensor', room: 'Balkon' },
                 { objectId: KAFFEE, include: false, forcedDomain: 'switch', detectedName: 'Kaffee', detectedDomain: 'switch', room: '' },
               ],
-              pickerArmed: true,
+              pickerArmed: PICKER,
             });
             // The user ticks the sensor and saves: the admin writes the form whole.
             const rows = reply.native.deviceOverrides as Array<Record<string, unknown>>;
@@ -1058,14 +1068,50 @@ if (process.env.HOMETILES_INTEGRATION === '1') {
           });
         });
 
+        /** The ticked, filled-in rows a Refresh of 44d1111 or 4cbb6d3 left: the same shape, whichever wrote them. */
+        const EARLIER_REFRESH = [
+          { objectId: SENSOR, include: true, name: 'Draußen', detectedName: 'Balkon', detectedDomain: 'sensor', room: 'Balkon' },
+          { objectId: KAFFEE, include: true, forcedDomain: 'switch', detectedName: 'Kaffee', detectedDomain: 'switch', room: '' },
+        ];
+
+        for (const [version, marker] of [
+          ['44d1111', {}],
+          ['4cbb6d3', { pickerArmed: true }],
+        ] as const) {
+          suite(`a Refresh saved by ${version}, before this picker is used (Ruling 120, N2)`, (getHarness) => {
+            withCleanFixtures(getHarness);
+
+            it('publishes nothing: ticked rows in picker shape do not arm, only this picker\'s marker does', async function () {
+              this.timeout(120000);
+              const harness = getHarness();
+              const { logs, apply } = await run(harness, { ...marker, deviceOverrides: EARLIER_REFRESH });
+              expect(apply, 'no apply').to.equal(undefined);
+              expect(hints(logs)).to.deep.equal([
+                ['info', `[Registry] ${UNARMED}, then pick devices and save. Held back until then: 2 device rows of an earlier version`],
+              ]);
+              expect(await reported(harness)).to.equal(0);
+            });
+
+            it('shows those rows unticked after a Refresh: no tick of an earlier version counts until the user ticks again', async function () {
+              this.timeout(60000);
+              const reply = (await ask(getHarness(), 'refreshDetected', { rows: EARLIER_REFRESH, ...marker })) as { native: Record<string, unknown> };
+              expect(reply.native).to.deep.equal({
+                deviceOverrides: EARLIER_REFRESH.map((row) => ({ ...row, include: false })),
+                pickerArmed: PICKER,
+              });
+            });
+          });
+        }
+
         suite('armed by that Refresh, one device picked', (getHarness) => {
           withCleanFixtures(getHarness);
 
-          it('publishes exactly the pick and the manual entity the Devices tab showed, and no hint', async function () {
+          it('publishes exactly the pick and the manual entity the Devices tab showed, under the ids they had, and no hint', async function () {
             this.timeout(120000);
             const harness = getHarness();
             const seenIcons = icons.length;
-            const { logs, apply } = await run(harness, saved, LEGACY_MANUAL);
+            // Renamed before arming: the stored id still holds (N1).
+            const { logs, apply } = await run(harness, saved, [{ ...LEGACY_MANUAL[0], name: 'Vorlauftemperatur' }]);
             // The earlier version's switch row stayed unticked: no switch.
             expect(lists(apply)).to.deep.equal({ ...EMPTY, sensors: ['sensor.balkon', 'sensor.vorlauf'] });
             expect(icons.slice(seenIcons).map((payload) => JSON.parse(payload))).to.deep.equal([{ 'sensor.balkon': '', 'sensor.vorlauf': '' }]);

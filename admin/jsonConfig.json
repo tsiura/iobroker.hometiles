@@ -36,7 +36,7 @@
           "type": "sendTo",
           "label": "refresh_detected",
           "command": "refreshDetected",
-          "jsonData": "{\"rows\": ${JSON.stringify(data.deviceOverrides || [])}}",
+          "jsonData": "{\"rows\": ${JSON.stringify(data.deviceOverrides || [])}, \"pickerArmed\": ${JSON.stringify(data.pickerArmed || null)}}",
           "useNative": true,
           "showProcess": true,
           "result": { "refreshed": "refresh_result" },

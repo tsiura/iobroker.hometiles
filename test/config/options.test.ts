@@ -1,5 +1,5 @@
 import { expect } from 'chai';
-import { DEFAULTS, normaliseTopic, validateOptions, type AdapterOptions } from '../../src/config/options';
+import { DEFAULTS, normaliseTopic, PICKER_VERSION, validateOptions, type AdapterOptions } from '../../src/config/options';
 
 describe('config/options', () => {
   it('strips leading and trailing slashes and collapses doubles', () => {
@@ -89,9 +89,11 @@ describe('config/options', () => {
     ]);
   });
 
-  it('arms opt-in publishing only when the picker has set its marker, exactly true (Ruling 118)', () => {
-    expect(validateOptions({ pickerArmed: true }).options.pickerArmed).to.equal(true);
-    for (const pickerArmed of [undefined, null, false, 'true', 1, {}]) {
+  it("arms opt-in publishing only when this picker set its marker: exactly its version, not 4cbb6d3's true (Rulings 118, 120)", () => {
+    expect(PICKER_VERSION).to.equal(2);
+    const raw = { pickerArmed: PICKER_VERSION } as unknown as Partial<AdapterOptions>;
+    expect(validateOptions(raw).options.pickerArmed).to.equal(true);
+    for (const pickerArmed of [undefined, null, false, true, 'true', 1, '2', 3, {}]) {
       const { options } = validateOptions({ pickerArmed } as unknown as Partial<AdapterOptions>);
       expect(options.pickerArmed, String(pickerArmed)).to.equal(false);
     }

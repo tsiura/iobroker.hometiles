@@ -1,7 +1,7 @@
 import * as utils from '@iobroker/adapter-core';
 import { readdirSync, readFileSync } from 'node:fs';
 import path from 'node:path';
-import { validateOptions, type AdapterOptions, type DeviceOverride } from './config/options';
+import { PICKER_VERSION, validateOptions, type AdapterOptions, type DeviceOverride } from './config/options';
 import { AnnounceError } from './protocol/announce';
 import { listsAnyEntity, MAX_EDITABLES, splitEditables } from './protocol/apply';
 import { ENTITY_ID_RE } from './protocol/commands';
@@ -17,7 +17,7 @@ import { discoverDevices, type Discovery, type RootAnchors } from './registry/de
 import { idsToStore, parseStringMap } from './registry/entity-id';
 import { EntityRegistry } from './registry/entity-registry';
 import { listed, manualDevices } from './registry/manual';
-import { applyOverrides, byPicker, detectedRows, mergeDetected } from './registry/overrides';
+import { applyOverrides, detectedRows, mergeDetected } from './registry/overrides';
 import { synthesise } from './registry/synth/index';
 import type { DeviceInput, SourceValue, VirtualEntity } from './registry/types';
 import { Dispatcher } from './runtime/dispatcher';
@@ -212,9 +212,13 @@ class HomeTiles extends utils.Adapter {
     return listsAnyEntity(entities) ? entities.length : 0;
   }
 
-  /** What waits for the Devices tab beyond detection, so an upgraded installation says why nothing shows (Ruling 118). */
+  /**
+   * What waits for the Devices tab beyond detection, so an upgraded
+   * installation says why nothing shows (Ruling 118). Unarmed, every row is
+   * an earlier version's, a 44d1111 or 4cbb6d3 Refresh's too (Ruling 120).
+   */
   private waiting(manual: number): string {
-    const earlier = this.options.deviceOverrides.filter((row) => row.objectId.trim() && !byPicker(row)).length;
+    const earlier = this.options.deviceOverrides.filter((row) => row.objectId.trim()).length;
     const held = [manual ? `${manual} manual entities` : '', earlier ? `${earlier} device rows of an earlier version` : ''].filter(Boolean);
     return held.length ? `. Held back until then: ${held.join(', ')}` : '';
   }
@@ -434,8 +438,9 @@ class HomeTiles extends utils.Adapter {
       this.log.warn(`[Registry] Devices left out, no entity could be made of them: ${skipped.join(', ')}`);
     }
     // A detected device not picked keeps its stored id, so picking it again
-    // gives the id back (Task 21b rule 6).
-    this.persistedIds = idsToStore(this.persistedIds, detected, result.entityIds);
+    // gives the id back (Task 21b rule 6); so does a manual entity held back
+    // until the Devices tab is used, renamed meanwhile or not (Ruling 120, N1).
+    this.persistedIds = idsToStore(this.persistedIds, [...detected, ...manual.devices], result.entityIds);
     await this.saveJsonMap(ENTITY_ID_STATE, 'Persisted entity ids', this.persistedIds);
 
     for (const objectId of result.unsubscribe) await this.unsubscribeForeignStatesAsync(objectId);
@@ -626,27 +631,34 @@ class HomeTiles extends utils.Adapter {
 
       case 'refreshDetected': {
         // The picker (Task 21b). The form's rows arrive with the request
-        // (jsonData), unsaved choices included; the stored ones stand in
-        // should admin send none.
-        const sent = (message.message as { rows?: unknown } | null)?.rows;
-        const rows = Array.isArray(sent)
-          ? validateOptions({ deviceOverrides: sent as DeviceOverride[] }).options.deviceOverrides
+        // (jsonData), unsaved choices included, and so does its marker: only
+        // a form this picker armed holds ticks the user set here (Ruling 120).
+        // The stored ones stand in should admin send none.
+        const request = (message.message ?? {}) as { rows?: unknown; pickerArmed?: unknown };
+        const sent = Array.isArray(request.rows);
+        const armed = sent
+          ? validateOptions({ pickerArmed: request.pickerArmed } as Partial<AdapterOptions>).options.pickerArmed
+          : this.options.pickerArmed;
+        // One by one, so a row validateOptions leaves out stays where it
+        // stands, as it is: none may shift under the admin's cells (N4).
+        const rows: unknown[] = sent
+          ? (request.rows as unknown[]).map((row) => validateOptions({ deviceOverrides: [row] as DeviceOverride[] }).options.deviceOverrides[0] ?? row)
           : this.options.deviceOverrides;
         const { devices: detected, objects } = await this.detectDevices();
         const rooms = await this.objectsOfType('enum', 'enum.rooms.');
         const language = (await this.getForeignObjectAsync('system.config'))?.common?.language ?? 'en';
         const found = detectedRows(detected, { ...objects, ...rooms }, language);
-        const known = new Set(rows.map((row) => row.objectId));
+        const deviceOverrides = mergeDetected(rows, found, { armed, mark: adminText('not_detected', language), marks: adminTexts('not_detected') });
         // admin writes each key of `native` into the form (useNative;
         // json-config ConfigSendto.js:253-257, ConfigGeneric.onChange), saves
         // every form key that has no field (JsonConfig.onSave, :489-497), and
         // shows the `result` text filled with `args`. pickerArmed is such a
         // key: saved with the picker's rows, it arms publishing (Ruling 118).
-        const deviceOverrides = mergeDetected(rows, found, adminText('not_detected', language), adminTexts('not_detected'));
         return reply({
-          native: { deviceOverrides, pickerArmed: true },
+          native: { deviceOverrides, pickerArmed: PICKER_VERSION },
           result: 'refreshed',
-          args: [String(found.length), String(found.filter((row) => !known.has(row.objectId)).length)],
+          // The merge keeps every row and appends each new device.
+          args: [String(found.length), String(deviceOverrides.length - rows.length)],
         });
       }
 

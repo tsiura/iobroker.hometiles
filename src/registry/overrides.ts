@@ -102,12 +102,18 @@ export function detectedRows(
  *   too. The admin's table keys each row's cells by index, and a select keeps
  *   the value it mounted with (json-config ConfigTable.js:309,
  *   ConfigSelect.js:161-165): a row moved or dropped from under its cells
- *   would show another row's choice (Ruling 119). A blank row names no
- *   device, stays as it is and selects nothing.
+ *   would show another row's choice (Ruling 119). A blank row, or one it
+ *   cannot read -- its object id no text, or no object at all (N4) -- names no
+ *   device: it stays as it is, and selects nothing (validateOptions leaves
+ *   it out).
  * - A row of a detected device keeps the user's include, name and forced
  *   domain and takes what detection found, every row of a duplicated id alike
  *   (applyOverrides reads the last).
- * - A row the picker never wrote shows unticked (Ruling 118).
+ * - Its tick is the user's only if this picker wrote the row, in a form this
+ *   picker armed (`armed`, the form's native.pickerArmed at PICKER_VERSION):
+ *   every other row shows unticked (Rulings 118, 120). A saved Refresh of
+ *   44d1111 or 4cbb6d3 left rows of the same shape, with ticks the user
+ *   never set in this picker.
  * - A row whose device is detected no more stays, its detected name marked
  *   `mark` once (Ruling 117), after the mark of any language in `marks` is
  *   taken off (Ruling 119, M4): main.ts passes the system's language's text,
@@ -115,23 +121,27 @@ export function detectedRows(
  * - New devices follow, unticked, ordered by object id in code units, the
  *   same under every locale.
  */
-export function mergeDetected(
-  rows: readonly DeviceOverride[],
+export function mergeDetected<Row>(
+  rows: readonly (DeviceOverride | Row)[],
   detected: readonly Detected[],
-  mark = '(not detected)',
-  marks: readonly string[] = [mark],
-): DeviceOverride[] {
+  { armed = false, mark = '(not detected)', marks = [mark] }: { armed?: boolean; mark?: string; marks?: readonly string[] } = {},
+): (DeviceOverride | Row)[] {
   const found = new Map(detected.map((row) => [row.objectId, row]));
   const merged = rows.map((row) => {
-    if (!row.objectId.trim()) return row;
-    const own = byPicker(row) ? row : { ...row, include: false };
+    if (!readable(row) || !row.objectId.trim()) return row;
+    const own = armed && byPicker(row) ? row : { ...row, include: false };
     const hit = found.get(row.objectId);
     return hit ? { ...own, ...hit } : { ...own, detectedName: marked(row.detectedName ?? '', mark, marks) };
   });
-  const listed = new Set(rows.map((row) => row.objectId));
+  const listed = new Set(rows.filter(readable).map((row) => row.objectId));
   const byObjectId = (a: Detected, b: Detected): number => (a.objectId < b.objectId ? -1 : a.objectId > b.objectId ? 1 : 0);
   const added = detected.filter((row) => !listed.has(row.objectId)).sort(byObjectId);
   return [...merged, ...added.map((row) => ({ include: false, name: '', forcedDomain: '', ...row }))];
+}
+
+/** A form row the merge can read: an object naming its object id as text. */
+function readable(row: unknown): row is DeviceOverride {
+  return typeof row === 'object' && row !== null && typeof (row as { objectId?: unknown }).objectId === 'string';
 }
 
 /** A missing device's detected name, marked once: every mark it carries, in any language, taken off first. */

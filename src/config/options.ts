@@ -15,14 +15,22 @@ export interface AdapterOptions {
   deviceOverrides: DeviceOverride[];
   manualEntities: ManualEntity[];
   /**
-   * Set by the Devices tab's Refresh, and saved with the form: until then
-   * nothing is published, whatever rows or manual entities an earlier
-   * version left (Ruling 118). io-package.json gives it no default, so no
-   * install or upgrade sets it (js-controller extendNative adds only keys
-   * io-package.json has).
+   * The saved form holds PICKER_VERSION under this key: its Refresh set it.
+   * Until then nothing is published, whatever rows or manual entities an
+   * earlier version left (Ruling 118). io-package.json gives it no default,
+   * so no install or upgrade sets it (js-controller extendNative adds only
+   * keys io-package.json has).
    */
   pickerArmed: boolean;
 }
+
+/**
+ * What this picker's Refresh writes under native.pickerArmed. 4cbb6d3 wrote
+ * true, and its rows and those of a saved 44d1111 Refresh have one shape,
+ * ticks the user never set among them: bumped, both count as an earlier
+ * version's until the user ticks again in this picker (Ruling 120).
+ */
+export const PICKER_VERSION = 2;
 
 /**
  * One state published as one entity of the user's choosing (Task 13b), where
@@ -207,8 +215,8 @@ export function validateOptions(raw: Partial<AdapterOptions>): {
     protocolTrace: raw.protocolTrace ?? DEFAULTS.protocolTrace,
     deviceOverrides: deviceOverrides(raw.deviceOverrides, warnings),
     manualEntities: manualEntities(raw.manualEntities, warnings),
-    // Only the Refresh reply's true arms: a hand edit's "true" does not.
-    pickerArmed: raw.pickerArmed === true,
+    // Only this picker's Refresh arms: not a hand edit's "2", nor 4cbb6d3's true.
+    pickerArmed: (raw.pickerArmed as unknown) === PICKER_VERSION,
   };
 
   return { options, errors, warnings };
