@@ -222,6 +222,11 @@ describe('admin/jsonConfig', () => {
     expect(validateOptions({ currency: ioPackage.native.currency }).options.currency).to.equal('EUR');
   });
 
+  it('asks for counters that only grow, never one that resets daily: its week and month would be wrong (review m5)', () => {
+    expect(translations.en!.energy_info).to.include('never a counter that resets daily');
+    expect(translations.de!.energy_info).to.include('nie ein Zähler, der täglich zurückgesetzt wird');
+  });
+
   it("names each category's total in every language, where the Bridge sends German (Ruling 124)", () => {
     for (const [language, strings] of Object.entries(translations)) {
       for (const category of ENERGY_CATEGORIES) expect(strings, language).to.have.property(`energy_total_${category}`);
