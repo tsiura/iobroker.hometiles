@@ -75,6 +75,28 @@ describe('config/options', () => {
     expect(warnings).to.deep.equal([]);
   });
 
+  it('drops a detected name, domain or room that is not text, with a warning, and keeps the row (Ruling 119, M5)', () => {
+    // A hand edit: the refresh called .endsWith on such a name and failed every time.
+    const raw = {
+      deviceOverrides: [{ objectId: 'x.0.n', include: true, name: 'N', detectedName: 5, detectedDomain: { a: 1 }, room: ['Flur'] }],
+    } as unknown as Partial<AdapterOptions>;
+    const { options, warnings } = validateOptions(raw);
+    expect(options.deviceOverrides).to.deep.equal([{ objectId: 'x.0.n', include: true, name: 'N' }]);
+    expect(warnings).to.deep.equal([
+      'deviceOverrides entry 1 (x.0.n) has a detectedName that is not text; ignoring it',
+      'deviceOverrides entry 1 (x.0.n) has a detectedDomain that is not text; ignoring it',
+      'deviceOverrides entry 1 (x.0.n) has a room that is not text; ignoring it',
+    ]);
+  });
+
+  it('arms opt-in publishing only when the picker has set its marker, exactly true (Ruling 118)', () => {
+    expect(validateOptions({ pickerArmed: true }).options.pickerArmed).to.equal(true);
+    for (const pickerArmed of [undefined, null, false, 'true', 1, {}]) {
+      const { options } = validateOptions({ pickerArmed } as unknown as Partial<AdapterOptions>);
+      expect(options.pickerArmed, String(pickerArmed)).to.equal(false);
+    }
+  });
+
   it('keeps only well-formed manual entities, with a warning naming each one dropped (Task 13b)', () => {
     // The shape only: whether the domain suits the state is manualDevices'
     // to judge, against the object itself.

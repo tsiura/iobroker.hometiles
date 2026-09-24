@@ -186,8 +186,15 @@ const ROOM_OBJECTS: Record<string, object> = {
   'enum.rooms.balkon': { type: 'enum', common: { name: 'Balkon', members: [SENSOR] } },
 };
 
-/** Rows that pick devices (Task 21b): nothing reaches a panel without one. */
-const picked = (...objectIds: string[]): object[] => objectIds.map((objectId) => ({ objectId, include: true }));
+/**
+ * Rows that pick devices, as the picker writes them (Task 21b): nothing
+ * reaches a panel without one, and only a row carrying what Refresh found
+ * counts (Ruling 118). The runtime reads the detected domain only as that
+ * mark, so any text does.
+ */
+const picked = (...objectIds: string[]): object[] => objectIds.map((objectId) => ({ objectId, include: true, detectedDomain: 'sensor' }));
+/** The marker a Refresh in the new Devices tab leaves in the saved form: publishing is armed (Ruling 118). */
+const ARMED = { pickerArmed: true };
 
 const FIXTURE_IDS = [
   ...Object.keys(SENSOR_OBJECTS),
@@ -316,7 +323,7 @@ if (process.env.HOMETILES_INTEGRATION === '1') {
           const harness = getHarness();
           const logs = await captureLogs(harness);
           // A number where text belongs made validateOptions throw in onReady.
-          await harness.changeAdapterConfig('hometiles', { native: { clientId: 42, deviceOverrides: picked(SENSOR) } });
+          await harness.changeAdapterConfig('hometiles', { native: { clientId: 42, ...ARMED, deviceOverrides: picked(SENSOR) } });
           await setObjects(harness, SENSOR_OBJECTS);
           // JSON null used to throw inside discovery; a non-string id would
           // throw in resolveEntityIds. Both stopped the adapter from starting.
@@ -361,7 +368,7 @@ if (process.env.HOMETILES_INTEGRATION === '1') {
           const harness = getHarness();
           const logs = await captureLogs(harness);
           await harness.changeAdapterConfig('hometiles', {
-            native: { brokerHost: '127.0.0.1', brokerPort: port, deviceOverrides: picked('knx.0.Licht.Flur') },
+            native: { brokerHost: '127.0.0.1', brokerPort: port, ...ARMED, deviceOverrides: picked('knx.0.Licht.Flur') },
           });
           await setObjects(harness, CORRUPT_ENUM_OBJECTS);
           // Resolves once info.connection is true: MQTT connected.
@@ -420,7 +427,7 @@ if (process.env.HOMETILES_INTEGRATION === '1') {
           const harness = getHarness();
           const logs = await captureLogs(harness);
           await harness.changeAdapterConfig('hometiles', {
-            native: { brokerHost: '127.0.0.1', brokerPort: port, deviceOverrides: picked(SENSOR) },
+            native: { brokerHost: '127.0.0.1', brokerPort: port, ...ARMED, deviceOverrides: picked(SENSOR) },
           });
           await setObjects(harness, SENSOR_OBJECTS);
           const lastRun = JSON.stringify({ 'zigbee.0.alt': 'sensor.alt' });
@@ -485,7 +492,8 @@ if (process.env.HOMETILES_INTEGRATION === '1') {
               brokerHost: '127.0.0.1',
               brokerPort: port,
               // The alias picked too: only a picked device's values are read.
-              deviceOverrides: [...picked(SENSOR, BAD_ALIAS), { objectId: FORCED, include: true, forcedDomain: 'number' }],
+              ...ARMED,
+              deviceOverrides: [...picked(SENSOR, BAD_ALIAS), { objectId: FORCED, include: true, detectedDomain: 'sensor', forcedDomain: 'number' }],
             },
           });
           await setObjects(harness, { ...SENSOR_OBJECTS, ...BAD_OBJECTS });
@@ -532,6 +540,7 @@ if (process.env.HOMETILES_INTEGRATION === '1') {
             native: {
               brokerHost: '127.0.0.1',
               brokerPort: port,
+              ...ARMED,
               // Overrides are for detected devices: neither key removes it,
               // and a manual entity needs no row to be published (Task 21b).
               deviceOverrides: [
@@ -695,7 +704,7 @@ if (process.env.HOMETILES_INTEGRATION === '1') {
         async function start(harness: IntegrationTestHarness): Promise<{ logs: LogRecord[]; written: unknown[] }> {
           const logs = await captureLogs(harness);
           await harness.changeAdapterConfig('hometiles', {
-            native: { brokerHost: '127.0.0.1', brokerPort: port, deviceOverrides: picked(KAFFEE) },
+            native: { brokerHost: '127.0.0.1', brokerPort: port, ...ARMED, deviceOverrides: picked(KAFFEE) },
           });
           await setObjects(harness, KAFFEE_OBJECTS);
           await harness.states.setStateAsync(KAFFEE_SWITCH, { val: false, ack: true });
@@ -754,7 +763,7 @@ if (process.env.HOMETILES_INTEGRATION === '1') {
           const harness = getHarness();
           const logs = await captureLogs(harness);
           await harness.changeAdapterConfig('hometiles', {
-            native: { brokerHost: '127.0.0.1', brokerPort: port, deviceOverrides: picked(SENSOR) },
+            native: { brokerHost: '127.0.0.1', brokerPort: port, ...ARMED, deviceOverrides: picked(SENSOR) },
           });
           await setObjects(harness, SENSOR_OBJECTS);
           await harness.startAdapterAndWait(true);
@@ -795,7 +804,7 @@ if (process.env.HOMETILES_INTEGRATION === '1') {
           this.timeout(120000);
           const harness = getHarness();
           const logs = await captureLogs(harness);
-          await harness.changeAdapterConfig('hometiles', { native: { brokerHost: '127.0.0.1', brokerPort: port } });
+          await harness.changeAdapterConfig('hometiles', { native: { brokerHost: '127.0.0.1', brokerPort: port, ...ARMED } });
           await setManualEntities(harness, REGLER.map((stateId) => ({ stateId, domain: 'number' })));
           await setObjects(harness, REGLER_OBJECTS);
           await harness.startAdapterAndWait(true);
@@ -815,11 +824,13 @@ if (process.env.HOMETILES_INTEGRATION === '1') {
       // One broker for these suites: what a run retained on it survives the
       // restart that saving a selection causes (js-controller restarts an
       // instance whose object changes). The harness restores the database for
-      // each suite, so the stores a run leaves are carried into the next.
+      // each suite, so the stores a run leaves are carried into the next, and
+      // so is the form a suite "saves", as the admin writes it (JsonConfig.onSave).
       describe('opt-in selection (Task 21b)', () => {
         const port = 18858;
         const { applies, panel } = withBrokerAndPanel(port);
-        const HINT = 'No devices selected yet — pick devices in the adapter settings (Devices tab)';
+        const UNARMED = 'No devices selected yet — open the Devices tab and click Refresh detected devices';
+        const NOTHING = 'No devices selected yet — pick devices in the adapter settings (Devices tab)';
         const ICONS_TOPIC = `tab5_lvgl/config/${PANEL}/bridge/icons`;
         const BALKON_STATE = 'ha/e2e/sensor/balkon/state';
         const LISTS = ['sensors', 'binary_sensors', 'lights', 'switches', 'media_players', 'climates', 'covers', 'weathers', 'numbers', 'selects', 'datetimes', 'energy'];
@@ -836,6 +847,8 @@ if (process.env.HOMETILES_INTEGRATION === '1') {
         const icons: string[] = [];
         /** The id and publish stores the last run left, which the next one starts from. */
         const stores: Record<string, string> = {};
+        /** The instance config as a suite's admin form saved it, for the next suite's run. */
+        let saved: Record<string, unknown> = {};
 
         before(async () => {
           panel().on('message', (topic, payload) => {
@@ -867,18 +880,21 @@ if (process.env.HOMETILES_INTEGRATION === '1') {
         }
 
         /**
-         * Starts a run on these rows, from the stores the last run left, and
-         * waits until the panel's session is set up: its first push made or
-         * held back. Its logs, and its apply if it published one.
+         * Starts a run on this instance config and these manual entities, from
+         * the stores the last run left, and waits until the panel's session is
+         * set up: its first push made or held back. Its logs, and its apply if
+         * it published one.
          */
         async function run(
           harness: IntegrationTestHarness,
-          deviceOverrides: object[],
+          native: Record<string, unknown>,
+          manual: object[] = [],
           objects: Record<string, object> = SENSOR_OBJECTS,
         ): Promise<{ logs: LogRecord[]; apply: string | undefined }> {
           const logs = await captureLogs(harness);
-          await harness.changeAdapterConfig('hometiles', { native: { brokerHost: '127.0.0.1', brokerPort: port, deviceOverrides } });
-          await setObjects(harness, { ...objects, ...KAFFEE_OBJECTS, ...ROOM_OBJECTS });
+          await harness.changeAdapterConfig('hometiles', { native: { brokerHost: '127.0.0.1', brokerPort: port, ...native } });
+          await setManualEntities(harness, manual);
+          await setObjects(harness, { ...objects, ...KAFFEE_OBJECTS, ...ROOM_OBJECTS, ...HELPER_OBJECTS });
           await harness.states.setStateAsync(`${SENSOR}.temperature`, { val: 21.5, ack: true });
           for (const [id, val] of Object.entries(stores)) await harness.states.setStateAsync(`hometiles.0.${id}`, { val, ack: true });
           const panels = valuesOf(harness, 'hometiles.0.info.panels');
@@ -909,27 +925,33 @@ if (process.env.HOMETILES_INTEGRATION === '1') {
         }
 
         const hints = (logs: LogRecord[]): string[][] =>
-          logs.filter((log) => log.message.includes(HINT)).map((log) => [log.severity, log.message.slice(log.message.indexOf('[Registry]'))]);
+          logs
+            .filter((log) => log.message.includes('No devices selected yet'))
+            .map((log) => [log.severity, log.message.slice(log.message.indexOf('[Registry]'))]);
 
-        suite('nothing picked yet', (getHarness) => {
+        /** How many entities the adapter reports published (info.entities). */
+        const reported = async (harness: IntegrationTestHarness): Promise<unknown> => (await harness.states.getStateAsync('hometiles.0.info.entities'))?.val;
+
+        suite('a fresh install, before the Devices tab is used', (getHarness) => {
           withCleanFixtures(getHarness);
 
-          it('publishes no apply and no icons, leaves what the broker retains, and logs the hint once (Ruling 116)', async function () {
+          it('publishes no apply and no icons, leaves what the broker retains, and says to open the Devices tab (Rulings 116, 118)', async function () {
             this.timeout(120000);
             const harness = getHarness();
             const seenIcons = icons.length;
-            const { logs, apply } = await run(harness, []);
+            const { logs, apply } = await run(harness, {});
             expect(apply, 'no apply').to.equal(undefined);
             expect(icons.slice(seenIcons), 'no icons').to.deep.equal([]);
-            expect(hints(logs)).to.deep.equal([['info', `[Registry] ${HINT}`]]);
+            expect(hints(logs)).to.deep.equal([['info', `[Registry] ${UNARMED}, then pick devices and save`]]);
             expect(ready(logs)!.message).to.include('Ready. 2 devices detected, 0 picked (manual entities included), 0 entities published');
+            expect(await reported(harness)).to.equal(0);
             expect(await keepStores(harness)).to.deep.equal({ 'info.entityIds': {}, 'info.publishedIds': {} });
             expect(balkonState).to.deep.equal([]);
             // The panel keeps its layout: the broker retains what it had.
             expect(await retained(APPLY_TOPIC, ICONS_TOPIC)).to.deep.equal({ [APPLY_TOPIC]: LAST_GOOD_APPLY, [ICONS_TOPIC]: OLD_ICONS });
           });
 
-          it('fills the picker from detection: each device unticked, with its name, domain and room, by object id', async function () {
+          it('fills the picker from detection -- each device unticked, with its name, domain and room -- and arms publishing in the form', async function () {
             this.timeout(60000);
             const reply = await ask(getHarness(), 'refreshDetected', { rows: [] });
             expect(reply).to.deep.equal({
@@ -938,13 +960,14 @@ if (process.env.HOMETILES_INTEGRATION === '1') {
                   { objectId: KAFFEE, include: false, name: '', forcedDomain: '', detectedName: 'Kaffee', detectedDomain: 'switch', room: '' },
                   { objectId: SENSOR, include: false, name: '', forcedDomain: '', detectedName: 'Balkon', detectedDomain: 'sensor', room: 'Balkon' },
                 ],
+                pickerArmed: true,
               },
               result: 'refreshed',
               args: ['2', '2'],
             });
           });
 
-          it("keeps the form's choices, marks a row whose device is gone in the system's language, adds what is new, and publishes nothing", async function () {
+          it("keeps the form's rows where they stand, marks a row whose device is gone in the system's language, adds what is new, and publishes nothing", async function () {
             this.timeout(60000);
             const harness = getHarness();
             // The adapter reads its own admin translations (Ruling 117).
@@ -952,14 +975,17 @@ if (process.env.HOMETILES_INTEGRATION === '1') {
             await harness.objects.setObjectAsync('system.config', { ...system, common: { ...system.common, language: 'de' } });
             const seen = applies.length;
             const rows = [
-              { objectId: SENSOR, include: true, name: 'Draußen', forcedDomain: '' },
-              { objectId: 'zigbee.0.weg', include: true, name: '', forcedDomain: '' },
+              { objectId: SENSOR, include: true, name: 'Draußen', forcedDomain: '', detectedDomain: 'sensor' },
+              // A row the table's "+" added: blank, it stays where it is.
+              { objectId: '', include: false },
+              { objectId: 'zigbee.0.weg', include: true, name: '', forcedDomain: '', detectedName: 'Weg (not detected)', detectedDomain: 'sensor' },
             ];
             const reply = (await ask(harness, 'refreshDetected', { rows })) as { native: { deviceOverrides: object[] }; args: string[] };
-            // The form's rows where they were, the new device after them.
             expect(reply.native.deviceOverrides).to.deep.equal([
               { objectId: SENSOR, include: true, name: 'Draußen', forcedDomain: '', detectedName: 'Balkon', detectedDomain: 'sensor', room: 'Balkon' },
-              { objectId: 'zigbee.0.weg', include: true, name: '', forcedDomain: '', detectedName: '(nicht erkannt)' },
+              { objectId: '', include: false },
+              // The English mark gone, the system language's in its place.
+              { objectId: 'zigbee.0.weg', include: true, name: '', forcedDomain: '', detectedName: 'Weg (nicht erkannt)', detectedDomain: 'sensor' },
               { objectId: KAFFEE, include: false, name: '', forcedDomain: '', detectedName: 'Kaffee', detectedDomain: 'switch', room: '' },
             ]);
             expect(reply.args).to.deep.equal(['2', '1']);
@@ -983,22 +1009,73 @@ if (process.env.HOMETILES_INTEGRATION === '1') {
           });
         });
 
-        suite('one device picked', (getHarness) => {
+        /** An instance as 50f4c18 left it: rows ticked by default, a manual entity added by hand, every detected id stored. */
+        const LEGACY_ROWS = [
+          { objectId: SENSOR, include: true, name: 'Draußen' },
+          { objectId: KAFFEE, include: true, forcedDomain: 'switch' },
+        ];
+        const LEGACY_MANUAL = [{ stateId: HELPER, domain: 'sensor' }];
+
+        suite('an upgrade from 50f4c18, before the Devices tab is used', (getHarness) => {
           withCleanFixtures(getHarness);
 
-          it('publishes exactly that entity, its icons and its value, and no hint', async function () {
+          it('publishes nothing -- not its rows, not its manual entity -- and names what waits for the Devices tab (Ruling 118)', async function () {
+            this.timeout(120000);
+            const harness = getHarness();
+            stores['info.entityIds'] = JSON.stringify({ [SENSOR]: 'sensor.balkon', [KAFFEE]: 'switch.kaffee' });
+            delete stores['info.publishedIds'];
+            const seenIcons = icons.length;
+            const seenStates = balkonState.length;
+            const { logs, apply } = await run(harness, { deviceOverrides: LEGACY_ROWS }, LEGACY_MANUAL);
+            expect(apply, 'no apply').to.equal(undefined);
+            expect(icons.slice(seenIcons), 'no icons').to.deep.equal([]);
+            expect(balkonState.slice(seenStates), 'no state').to.deep.equal([]);
+            expect(hints(logs)).to.deep.equal([
+              ['info', `[Registry] ${UNARMED}, then pick devices and save. Held back until then: 1 manual entities, 2 device rows of an earlier version`],
+            ]);
+            expect(ready(logs)!.message).to.include('0 picked (manual entities included), 0 entities published');
+            expect(await retained(APPLY_TOPIC, ICONS_TOPIC)).to.deep.equal({ [APPLY_TOPIC]: LAST_GOOD_APPLY, [ICONS_TOPIC]: OLD_ICONS });
+            // Every stored id is kept for a later pick.
+            expect(await keepStores(harness)).to.deep.equal({
+              'info.entityIds': { [SENSOR]: 'sensor.balkon', [KAFFEE]: 'switch.kaffee' },
+              'info.publishedIds': {},
+            });
+          });
+
+          it('shows the rows of the earlier version unticked after a Refresh, their names and forced types kept, and arms publishing', async function () {
+            this.timeout(60000);
+            const reply = (await ask(getHarness(), 'refreshDetected', { rows: LEGACY_ROWS })) as { native: Record<string, unknown> };
+            expect(reply.native).to.deep.equal({
+              deviceOverrides: [
+                { objectId: SENSOR, include: false, name: 'Draußen', detectedName: 'Balkon', detectedDomain: 'sensor', room: 'Balkon' },
+                { objectId: KAFFEE, include: false, forcedDomain: 'switch', detectedName: 'Kaffee', detectedDomain: 'switch', room: '' },
+              ],
+              pickerArmed: true,
+            });
+            // The user ticks the sensor and saves: the admin writes the form whole.
+            const rows = reply.native.deviceOverrides as Array<Record<string, unknown>>;
+            saved = { ...reply.native, deviceOverrides: rows.map((row) => (row.objectId === SENSOR ? { ...row, include: true } : row)) };
+          });
+        });
+
+        suite('armed by that Refresh, one device picked', (getHarness) => {
+          withCleanFixtures(getHarness);
+
+          it('publishes exactly the pick and the manual entity the Devices tab showed, and no hint', async function () {
             this.timeout(120000);
             const harness = getHarness();
             const seenIcons = icons.length;
-            const { logs, apply } = await run(harness, picked(SENSOR));
-            expect(lists(apply)).to.deep.equal({ ...EMPTY, sensors: ['sensor.balkon'] });
-            expect(icons.slice(seenIcons).map((payload) => JSON.parse(payload))).to.deep.equal([{ 'sensor.balkon': '' }]);
+            const { logs, apply } = await run(harness, saved, LEGACY_MANUAL);
+            // The earlier version's switch row stayed unticked: no switch.
+            expect(lists(apply)).to.deep.equal({ ...EMPTY, sensors: ['sensor.balkon', 'sensor.vorlauf'] });
+            expect(icons.slice(seenIcons).map((payload) => JSON.parse(payload))).to.deep.equal([{ 'sensor.balkon': '', 'sensor.vorlauf': '' }]);
             await waitFor(harness, () => (balkonState.includes('21.5') ? true : undefined), "the sensor's value");
             expect(hints(logs)).to.deep.equal([]);
-            expect(ready(logs)!.message).to.include('Ready. 2 devices detected, 1 picked (manual entities included), 1 entities published');
+            expect(ready(logs)!.message).to.include('Ready. 2 devices detected, 2 picked (manual entities included), 2 entities published');
+            expect(await reported(harness)).to.equal(2);
             expect(await keepStores(harness)).to.deep.equal({
-              'info.entityIds': { [SENSOR]: 'sensor.balkon' },
-              'info.publishedIds': { [SENSOR]: 'sensor.balkon' },
+              'info.entityIds': { [SENSOR]: 'sensor.balkon', [KAFFEE]: 'switch.kaffee', [`manual:${HELPER}`]: 'sensor.vorlauf' },
+              'info.publishedIds': { [SENSOR]: 'sensor.balkon', [`manual:${HELPER}`]: 'sensor.vorlauf' },
             });
           });
         });
@@ -1006,7 +1083,7 @@ if (process.env.HOMETILES_INTEGRATION === '1') {
         suite('everything un-picked, after the restart its save causes', (getHarness) => {
           withCleanFixtures(getHarness);
 
-          it('holds the apply back again: the panel keeps its layout and values, the broker what it retains, the id stays stored (Ruling 116)', async function () {
+          it('holds the apply back again: the panel keeps its layout and values, the broker what it retains, the ids stay stored (Ruling 116)', async function () {
             this.timeout(120000);
             const harness = getHarness();
             const before = await retained(APPLY_TOPIC, ICONS_TOPIC, BALKON_STATE);
@@ -1014,17 +1091,19 @@ if (process.env.HOMETILES_INTEGRATION === '1') {
             expect(before[BALKON_STATE], 'a retained state').to.be.a('string').and.not.equal('');
             const seenStates = balkonState.length;
             const seenIcons = icons.length;
-            const { logs, apply } = await run(harness, [{ objectId: SENSOR, include: false }]);
+            const rows = (saved.deviceOverrides as Array<Record<string, unknown>>).map((row) => ({ ...row, include: false }));
+            const { logs, apply } = await run(harness, { ...saved, deviceOverrides: rows });
             expect(apply, 'no apply').to.equal(undefined);
             expect(icons.slice(seenIcons), 'no icons').to.deep.equal([]);
             // No clear either: the panel still shows the sensor.
             expect(balkonState.slice(seenStates), 'no clear').to.deep.equal([]);
             expect(await retained(APPLY_TOPIC, ICONS_TOPIC, BALKON_STATE)).to.deep.equal(before);
-            expect(hints(logs)).to.deep.equal([['info', `[Registry] ${HINT}`]]);
+            expect(hints(logs)).to.deep.equal([['info', `[Registry] ${NOTHING}`]]);
+            expect(await reported(harness)).to.equal(0);
             // The record still names what the panels hold, to clear it once an apply goes out.
             expect(await keepStores(harness)).to.deep.equal({
-              'info.entityIds': { [SENSOR]: 'sensor.balkon' },
-              'info.publishedIds': { [SENSOR]: 'sensor.balkon' },
+              'info.entityIds': { [SENSOR]: 'sensor.balkon', [KAFFEE]: 'switch.kaffee' },
+              'info.publishedIds': { [SENSOR]: 'sensor.balkon', [`manual:${HELPER}`]: 'sensor.vorlauf' },
             });
           });
         });
@@ -1038,7 +1117,7 @@ if (process.env.HOMETILES_INTEGRATION === '1') {
             const seenStates = balkonState.length;
             // And a hand edit that is no entity id: it must not stop the panel's start (Ruling 51).
             stores['info.publishedIds'] = JSON.stringify({ ...JSON.parse(stores['info.publishedIds'] ?? '{}'), 'zigbee.0.weg': 'kaputt' });
-            const { logs, apply } = await run(harness, picked(KAFFEE));
+            const { logs, apply } = await run(harness, { ...ARMED, deviceOverrides: picked(KAFFEE) });
             expect(lists(apply)).to.deep.equal({ ...EMPTY, switches: ['switch.kaffee'] });
             await waitFor(harness, () => (balkonState.slice(seenStates).includes('') ? true : undefined), 'the cleared state');
             const failed = logs.filter((log) => log.message.includes('failed'));
@@ -1058,7 +1137,7 @@ if (process.env.HOMETILES_INTEGRATION === '1') {
           it('publishes it under the id it had, though its name now derives another', async function () {
             this.timeout(120000);
             const renamed = { ...SENSOR_OBJECTS, [SENSOR]: { type: 'device', common: { name: 'Terrasse' } } };
-            const { apply } = await run(getHarness(), picked(SENSOR), renamed);
+            const { apply } = await run(getHarness(), { ...ARMED, deviceOverrides: picked(SENSOR) }, [], renamed);
             expect(lists(apply)).to.deep.equal({ ...EMPTY, sensors: ['sensor.balkon'] });
           });
         });
@@ -1066,13 +1145,17 @@ if (process.env.HOMETILES_INTEGRATION === '1') {
         suite('only a scene picked', (getHarness) => {
           withCleanFixtures(getHarness);
 
-          it('holds the apply back as well, a scene being in no list, and says why', async function () {
+          it('holds the apply back as well, a scene being in no list, says why, and reports nothing published (M7)', async function () {
             this.timeout(120000);
-            const { logs, apply } = await run(getHarness(), [{ objectId: KAFFEE, include: true, forcedDomain: 'scene' }]);
+            const harness = getHarness();
+            const scene = [{ objectId: KAFFEE, include: true, detectedDomain: 'switch', forcedDomain: 'scene' }];
+            const { logs, apply } = await run(harness, { ...ARMED, deviceOverrides: scene });
             expect(apply, 'no apply').to.equal(undefined);
             const held = logs.filter((log) => log.message.includes('[Registry] Nothing picked shows in a panel list'));
             expect(held.map((log) => log.severity)).to.deep.equal(['info']);
             expect(hints(logs)).to.deep.equal([]);
+            expect(ready(logs)!.message).to.include('1 picked (manual entities included), 0 entities published');
+            expect(await reported(harness)).to.equal(0);
           });
         });
       });

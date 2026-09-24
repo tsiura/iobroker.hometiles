@@ -12,35 +12,55 @@ const DEVICES: DeviceInput[] = [
 ];
 
 describe('registry/overrides', () => {
+  /**
+   * A row as the picker writes it: Refresh fills in what detection found, and
+   * only then does a ticked row count as a pick (Ruling 118).
+   */
+  const pick = (objectId: string, extra: Partial<DeviceOverride> = {}): DeviceOverride => ({
+    objectId,
+    include: true,
+    detectedName: objectId.toUpperCase(),
+    detectedDomain: 'switch',
+    ...extra,
+  });
+
   describe('selection: nothing reaches the panels unless the user picks it (Task 21b)', () => {
     it('publishes no detected device that has no row', () => {
       expect(applyOverrides(DEVICES, [])).to.deep.equal([]);
     });
 
-    it('publishes exactly the devices whose row says include true', () => {
-      expect(applyOverrides(DEVICES, [{ objectId: 'b', include: true }])).to.deep.equal([DEVICES[1]]);
-      const both = applyOverrides(DEVICES, [
-        { objectId: 'a', include: true },
-        { objectId: 'b', include: true },
-      ]);
-      expect(both).to.deep.equal(DEVICES);
+    it('publishes exactly the devices whose picker row says include true', () => {
+      expect(applyOverrides(DEVICES, [pick('b')])).to.deep.equal([DEVICES[1]]);
+      expect(applyOverrides(DEVICES, [pick('a'), pick('b')])).to.deep.equal(DEVICES);
     });
 
     it('publishes nothing for a row whose include is false, absent, or anything but true', () => {
       // A hand edit can leave any of these; only the admin checkbox's true picks.
       for (const include of [false, undefined, 'true', 1, null]) {
-        const row = { objectId: 'a', include } as unknown as DeviceOverride;
+        const row = { ...pick('a'), include } as unknown as DeviceOverride;
         expect(applyOverrides(DEVICES, [row]), String(include)).to.deep.equal([]);
       }
     });
 
+    it('counts no row the picker did not write, however ticked (Ruling 118)', () => {
+      // An earlier version's row: its include was ticked by default and meant "not excluded".
+      expect(applyOverrides(DEVICES, [{ objectId: 'a', include: true, name: 'Kaffee', forcedDomain: 'switch' }])).to.deep.equal([]);
+      // A row added with "+" and ticked: the admin leaves every column it has no default for null.
+      const added = { include: true, detectedName: null, name: null, detectedDomain: null, forcedDomain: null, room: null, objectId: 'a' };
+      expect(applyOverrides(DEVICES, [added as unknown as DeviceOverride])).to.deep.equal([]);
+      // Nor a hand edit's empty or non-text mark.
+      for (const detectedDomain of ['', 5, {}]) {
+        expect(applyOverrides(DEVICES, [{ ...pick('a'), detectedDomain } as unknown as DeviceOverride]), String(detectedDomain)).to.deep.equal([]);
+      }
+    });
+
     it('renames a picked device', () => {
-      const result = applyOverrides(DEVICES, [{ objectId: 'a', include: true, name: 'Kaffee' }]);
+      const result = applyOverrides(DEVICES, [pick('a', { name: 'Kaffee' })]);
       expect(result.map((d) => [d.objectId, d.name])).to.deep.equal([['a', 'Kaffee']]);
     });
 
     it('forces a picked device into a different domain', () => {
-      const result = applyOverrides(DEVICES, [{ objectId: 'b', include: true, forcedDomain: 'binary_sensor' }]);
+      const result = applyOverrides(DEVICES, [pick('b', { forcedDomain: 'binary_sensor' })]);
       expect(result.map((d) => [d.objectId, d.domain])).to.deep.equal([['b', 'binary_sensor']]);
     });
 
@@ -48,20 +68,17 @@ describe('registry/overrides', () => {
       // 'camera' is deliberately never a Domain member (out of scope by explicit
       // product decision), so it stays a valid negative case across releases
       // unlike a domain such as 'climate' that later became real in v0.2.
-      const result = applyOverrides(DEVICES, [{ objectId: 'b', include: true, forcedDomain: 'camera' }]);
+      const result = applyOverrides(DEVICES, [pick('b', { forcedDomain: 'camera' })]);
       expect(result.map((d) => [d.objectId, d.domain])).to.deep.equal([['b', 'sensor']]);
     });
 
     it('publishes nothing for a row whose device is detected no more', () => {
-      expect(applyOverrides(DEVICES, [{ objectId: 'gone', include: true }])).to.deep.equal([]);
+      expect(applyOverrides(DEVICES, [pick('gone')])).to.deep.equal([]);
     });
 
     it('matches rows by object id, never by position', () => {
       const reordered = [...DEVICES].reverse();
-      const result = applyOverrides(reordered, [
-        { objectId: 'a', include: true, name: 'Renamed' },
-        { objectId: 'b', include: true },
-      ]);
+      const result = applyOverrides(reordered, [pick('a', { name: 'Renamed' }), pick('b')]);
       expect(result.map((d) => [d.objectId, d.name])).to.deep.equal([
         ['b', 'B'],
         ['a', 'Renamed'],
@@ -69,7 +86,7 @@ describe('registry/overrides', () => {
     });
 
     it('ignores an empty name override rather than blanking the device name', () => {
-      const result = applyOverrides(DEVICES, [{ objectId: 'a', include: true, name: '   ' }]);
+      const result = applyOverrides(DEVICES, [pick('a', { name: '   ' })]);
       expect(result[0]!.name).to.equal('A');
     });
   });
@@ -96,11 +113,11 @@ describe('registry/overrides', () => {
       ]);
     });
 
-    it("keeps a row's include, name and forced domain, and brings what detection found up to date", () => {
+    it("keeps a picker row's include, name and forced domain, brings what detection found up to date, and shows an earlier version's row unticked (Ruling 118)", () => {
       const rows: DeviceOverride[] = [
         { objectId: 'hue.0.decke', include: true, name: 'Licht oben', forcedDomain: 'switch', detectedName: 'Alt', detectedDomain: 'switch', room: '' },
-        // A row from before the picker, typed by hand: no detected fields yet.
-        { objectId: 'zigbee.0.flur', include: false, name: 'Flur' },
+        // An earlier version's row: ticked by default, it meant "not excluded".
+        { objectId: 'zigbee.0.flur', include: true, name: 'Flur', forcedDomain: 'binary_sensor' },
       ];
       const merged = mergeDetected(rows, [
         found('hue.0.decke', 'Decke', 'light', 'Wohnzimmer'),
@@ -108,8 +125,12 @@ describe('registry/overrides', () => {
       ]);
       expect(merged).to.deep.equal([
         { objectId: 'hue.0.decke', include: true, name: 'Licht oben', forcedDomain: 'switch', detectedName: 'Decke', detectedDomain: 'light', room: 'Wohnzimmer' },
-        { objectId: 'zigbee.0.flur', include: false, name: 'Flur', detectedName: 'Flur Bewegung', detectedDomain: 'binary_sensor', room: 'Flur' },
+        { objectId: 'zigbee.0.flur', include: false, name: 'Flur', forcedDomain: 'binary_sensor', detectedName: 'Flur Bewegung', detectedDomain: 'binary_sensor', room: 'Flur' },
       ]);
+      // Unticked, it is no pick; ticked again by the user, it is one.
+      const flur: DeviceInput = { objectId: 'zigbee.0.flur', name: 'Flur Bewegung', detectorType: 'motion', domain: 'binary_sensor', channels: {} };
+      expect(applyOverrides([flur], merged)).to.deep.equal([]);
+      expect(applyOverrides([flur], [{ ...merged[1]!, include: true }]).map((d) => d.name)).to.deep.equal(['Flur']);
     });
 
     it('keeps the row of a device detected no more, its choices as they were, and marks it in its detected name (Ruling 117)', () => {
@@ -123,7 +144,7 @@ describe('registry/overrides', () => {
     it('marks a missing device once, in the text it is given, and unmarks it once it is detected again (Ruling 117)', () => {
       // A row typed by hand, never detected, has no name to mark: the mark is all it shows.
       const rows: DeviceOverride[] = [
-        { objectId: 'hm-rpc.0.weg', include: true, detectedName: 'Weg' },
+        { objectId: 'hm-rpc.0.weg', include: true, detectedName: 'Weg', detectedDomain: 'switch' },
         { objectId: 'knx.0.alt', include: false, name: 'Alt' },
       ];
       const once = mergeDetected(rows, [], '(nicht erkannt)');
@@ -135,8 +156,25 @@ describe('registry/overrides', () => {
       expect(back[0]).to.deep.equal({ objectId: 'hm-rpc.0.weg', include: true, detectedName: 'Weg', detectedDomain: 'switch', room: 'Keller' });
     });
 
+    it("drops every language's mark before marking again, so a language change stacks none (Ruling 119, M4)", () => {
+      const marks = ['(not detected)', '(nicht erkannt)'];
+      const rows: DeviceOverride[] = [
+        { objectId: 'a.0.x', include: false, detectedName: 'Weg (nicht erkannt)' },
+        // What 44d1111 left after a language change, and after two.
+        { objectId: 'a.0.y', include: false, detectedName: 'Weg (nicht erkannt) (not detected)' },
+        { objectId: 'a.0.w', include: false, detectedName: 'Weg (not detected) (nicht erkannt) (not detected)' },
+        { objectId: 'a.0.z', include: false, detectedName: '(nicht erkannt)' },
+      ];
+      expect(mergeDetected(rows, [], '(not detected)', marks).map((row) => row.detectedName)).to.deep.equal([
+        'Weg (not detected)',
+        'Weg (not detected)',
+        'Weg (not detected)',
+        '(not detected)',
+      ]);
+    });
+
     it("moves none of the form's rows and puts new devices after them by object id, whatever order detection found them in", () => {
-      // The user's order, as sorting a column in the admin leaves it.
+      // The order the admin shows and stores; its cells are keyed by row index.
       const rows: DeviceOverride[] = [
         { objectId: 'zigbee.0.b', include: true },
         { objectId: 'alias.0.weg', include: false },
@@ -159,18 +197,26 @@ describe('registry/overrides', () => {
       expect(mergeDetected([], detected).map((row) => row.objectId)).to.deep.equal(['Zigbee.0.upper', 'alias.0.neu', 'hue.0.a', 'zigbee.0.b', 'zigbee.0.c']);
     });
 
-    it('keeps the last of two rows for one device, the one the selection reads, and drops a row naming no object', () => {
+    it('keeps every row where it stands, blank and duplicate ones too, so none moves under the cell that shows it (Ruling 119, M3)', () => {
       const rows = [
-        { objectId: 'hue.0.a', include: false, name: 'first' },
+        { objectId: 'hue.0.a', include: false, name: 'first', detectedDomain: 'light' },
         { objectId: '  ', include: true },
         { objectId: '', include: true },
-        { objectId: 'hue.0.a', include: true, name: 'last' },
+        { objectId: 'hue.0.a', include: true, name: 'last', detectedDomain: 'light' },
+        { objectId: 'hue.0.b', include: false, name: 'after' },
       ];
-      const merged = mergeDetected(rows, [found('hue.0.a', 'A', 'light')]);
-      expect(merged).to.deep.equal([{ objectId: 'hue.0.a', include: true, name: 'last', detectedName: 'A', detectedDomain: 'light', room: '' }]);
-      // applyOverrides reads the same row.
+      const merged = mergeDetected(rows, [found('hue.0.a', 'A', 'light'), found('hue.0.b', 'B', 'light')]);
+      expect(merged).to.deep.equal([
+        { objectId: 'hue.0.a', include: false, name: 'first', detectedName: 'A', detectedDomain: 'light', room: '' },
+        // A blank row names no device: it stays as it is, and selects nothing.
+        { objectId: '  ', include: true },
+        { objectId: '', include: true },
+        { objectId: 'hue.0.a', include: true, name: 'last', detectedName: 'A', detectedDomain: 'light', room: '' },
+        { objectId: 'hue.0.b', include: false, name: 'after', detectedName: 'B', detectedDomain: 'light', room: '' },
+      ]);
+      // Of two rows for one device the selection reads the last.
       const device: DeviceInput = { objectId: 'hue.0.a', name: 'A', detectorType: 'light', domain: 'light', channels: {} };
-      expect(applyOverrides([device], rows).map((d) => d.name)).to.deep.equal(['last']);
+      expect(applyOverrides([device], merged).map((d) => d.name)).to.deep.equal(['last']);
     });
 
     it('changes none of the rows it is given', () => {
@@ -254,8 +300,8 @@ describe('registry/overrides', () => {
     it('subscribes to the channels of the picked devices only', () => {
       const registry = new EntityRegistry({ onEntityChanged: () => undefined, onMembershipChanged: () => undefined }, 0);
       const rows: DeviceOverride[] = [
-        { objectId: HUE, include: true },
-        { objectId: `${BALKON}.pressure`, include: true },
+        pick(HUE),
+        pick(`${BALKON}.pressure`),
         { objectId: MOTION, include: false },
       ];
       const result = registry.rebuild(applyOverrides(detected, rows), {});
@@ -268,25 +314,25 @@ describe('registry/overrides', () => {
       // Each pick is a save, and so a rebuild: main.ts stores idsToStore's map.
       const registry = new EntityRegistry({ onEntityChanged: () => undefined, onMembershipChanged: () => undefined }, 0);
       let stored: Record<string, string> = {};
-      const pick = (...objectIds: string[]): ReturnType<EntityRegistry['rebuild']> => {
-        const result = registry.rebuild(applyOverrides(detected, objectIds.map((objectId) => ({ objectId, include: true }))), stored);
+      const save = (...objectIds: string[]): ReturnType<EntityRegistry['rebuild']> => {
+        const result = registry.rebuild(applyOverrides(detected, objectIds.map((objectId) => pick(objectId))), stored);
         stored = idsToStore(stored, detected, result.entityIds);
         return result;
       };
 
-      pick(BALKON);
+      save(BALKON);
       expect(stored).to.deep.equal({ [BALKON]: 'sensor.balkon' });
 
       // Un-picked: the entity leaves through the removal path, its id stays stored.
-      expect(pick().removed).to.deep.equal(['sensor.balkon']);
+      expect(save().removed).to.deep.equal(['sensor.balkon']);
       expect(registry.all()).to.deep.equal([]);
       expect(stored).to.deep.equal({ [BALKON]: 'sensor.balkon' });
 
       // The other "Balkon", picked on its own, cannot take that id.
-      pick(BALKON_2);
+      save(BALKON_2);
       expect(stored).to.deep.equal({ [BALKON]: 'sensor.balkon', [BALKON_2]: 'sensor.balkon_2' });
 
-      pick(BALKON, BALKON_2);
+      save(BALKON, BALKON_2);
       expect(registry.all().map((entity) => entity.entityId)).to.have.members(['sensor.balkon', 'sensor.balkon_2']);
       expect(stored).to.deep.equal({ [BALKON]: 'sensor.balkon', [BALKON_2]: 'sensor.balkon_2' });
 
@@ -298,7 +344,7 @@ describe('registry/overrides', () => {
 
       // Forced into another domain, a picked device gets an id there, and the
       // store holds the id in use, not the one before (Task 13b's rule).
-      const forced = registry.rebuild(applyOverrides(detected, [{ objectId: BALKON, include: true, forcedDomain: 'binary_sensor' }]), stored);
+      const forced = registry.rebuild(applyOverrides(detected, [pick(BALKON, { forcedDomain: 'binary_sensor' })]), stored);
       stored = idsToStore(stored, detected, forced.entityIds);
       expect(stored).to.deep.equal({ [BALKON]: 'binary_sensor.balkon', [BALKON_2]: 'sensor.balkon_2' });
     });

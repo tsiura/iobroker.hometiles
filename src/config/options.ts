@@ -14,6 +14,14 @@ export interface AdapterOptions {
   protocolTrace: boolean;
   deviceOverrides: DeviceOverride[];
   manualEntities: ManualEntity[];
+  /**
+   * Set by the Devices tab's Refresh, and saved with the form: until then
+   * nothing is published, whatever rows or manual entities an earlier
+   * version left (Ruling 118). io-package.json gives it no default, so no
+   * install or upgrade sets it (js-controller extendNative adds only keys
+   * io-package.json has).
+   */
+  pickerArmed: boolean;
 }
 
 /**
@@ -68,6 +76,7 @@ export const DEFAULTS: AdapterOptions = {
   protocolTrace: false,
   deviceOverrides: [],
   manualEntities: [],
+  pickerArmed: false,
 };
 
 export function normaliseTopic(value: string | undefined, fallback: string): string {
@@ -114,6 +123,13 @@ function deviceOverrides(value: unknown, warnings: string[]): DeviceOverride[] {
     if (typeof (kept.name ?? '') !== 'string') {
       warnings.push(`deviceOverrides entry ${index + 1} (${kept.objectId}) has a name that is not text; ignoring the name`);
       delete kept.name;
+    }
+    // What detection found is shown as text and marked as text: a hand edit's
+    // number made every Refresh fail (Ruling 119, M5).
+    for (const field of ['detectedName', 'detectedDomain', 'room'] as const) {
+      if (typeof (kept[field] ?? '') === 'string') continue;
+      warnings.push(`deviceOverrides entry ${index + 1} (${kept.objectId}) has a ${field} that is not text; ignoring it`);
+      delete kept[field];
     }
     overrides.push(kept);
   });
@@ -191,6 +207,8 @@ export function validateOptions(raw: Partial<AdapterOptions>): {
     protocolTrace: raw.protocolTrace ?? DEFAULTS.protocolTrace,
     deviceOverrides: deviceOverrides(raw.deviceOverrides, warnings),
     manualEntities: manualEntities(raw.manualEntities, warnings),
+    // Only the Refresh reply's true arms: a hand edit's "true" does not.
+    pickerArmed: raw.pickerArmed === true,
   };
 
   return { options, errors, warnings };

@@ -14,7 +14,7 @@
   "ha_prefix": "Präfix für Entity-Status",
   "ha_prefix_help": "Topic-Präfix, auf dem das Panel Entity-Status erwartet. Auf allen Panels gleich.",
   "test_broker": "Broker-Verbindung testen",
-  "devices_info": "Nichts erscheint auf den Panels, bevor es ausgewählt ist; bis dahin behält jedes Panel sein Layout. Erkannte Geräte aktualisieren listet jedes Gerät, das der Adapter erkennt: für jedes Gerät, das die Panels erhalten sollen, Auf Panels zeigen ankreuzen und speichern. Der Adapter startet neu und veröffentlicht die Auswahl.",
+  "devices_info": "Nichts erscheint auf den Panels, bis Erkannte Geräte aktualisieren geklickt, für jedes Gerät, das die Panels erhalten sollen, Auf Panels zeigen angekreuzt und gespeichert wurde; bis dahin behält jedes Panel sein Layout, und Zeilen und manuelle Entitäten einer früheren Version warten ebenfalls. Achtung: sobald eine Auswahl gespeichert ist, entfernt jedes Panel seine Kacheln für alles, was nicht ausgewählt ist. Vorher das Kachel-Layout jedes Panels exportieren, wenn es erhalten bleiben soll.",
   "refresh_detected": "Erkannte Geräte aktualisieren",
   "refresh_result": "%s Geräte erkannt, davon %s neu. Für jedes Gerät, das die Panels erhalten sollen, Auf Panels zeigen ankreuzen und speichern.",
   "detected_devices": "Erkannte Geräte",

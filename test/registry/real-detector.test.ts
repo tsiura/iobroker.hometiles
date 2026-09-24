@@ -2105,7 +2105,7 @@ describe('number, select and datetime (Task 13)', () => {
     ]);
     const hidden = applyOverrides(detected, [
       { objectId: `${LAMP_DEVICE}.config`, include: false },
-      { objectId: LAMP_DEVICE, include: true },
+      { objectId: LAMP_DEVICE, include: true, detectedDomain: 'light' },
     ]);
     expect(hidden.map((d) => d.objectId)).to.deep.equal([LAMP_DEVICE]);
 
@@ -2130,7 +2130,7 @@ describe('number, select and datetime (Task 13)', () => {
     const tree = (common: Record<string, unknown>): IoObjects =>
       objects(channel(ROOT, 'Betriebsart'), state(SET, { write: true, ...common }));
     const forced = (all: IoObjects, forcedDomain: string): DeviceInput[] =>
-      applyOverrides(detectDevices(all), [{ objectId: ROOT, include: true, forcedDomain }]);
+      applyOverrides(detectDevices(all), [{ objectId: ROOT, include: true, detectedDomain: 'number', forcedDomain }]);
 
     for (const [label, common, detectedAs, raw, shown, ecoRaw] of [
       [
@@ -2208,7 +2208,7 @@ describe('number, select and datetime (Task 13)', () => {
     it('a detected device with neither SET nor a reading, forced into any editable domain, is no entity (M7 c)', () => {
       // A media player's channels are its transport, volume and metadata.
       for (const forcedDomain of ['number', 'select', 'datetime'] as const) {
-        const devices = applyOverrides(detectDevices(SONOS_SET), [{ objectId: SONOS, include: true, forcedDomain }]);
+        const devices = applyOverrides(detectDevices(SONOS_SET), [{ objectId: SONOS, include: true, detectedDomain: 'media_player', forcedDomain }]);
         expect(devices.map((d) => [d.objectId, d.domain])).to.deep.equal([[SONOS, forcedDomain]]);
         expect(synthesise(devices[0]!, `${forcedDomain}.wohnzimmer`, SONOS_VALUES), forcedDomain).to.equal(null);
         const registry = new EntityRegistry({ onEntityChanged: () => undefined, onMembershipChanged: () => undefined }, 0);
@@ -2273,7 +2273,7 @@ describe('bridge/apply from real detections (Task 21)', () => {
     const forced: Record<string, string> = { [MODE]: 'select', [ALARM]: 'datetime' };
     const devices = applyOverrides(
       detectDevices(TREE),
-      detectDevices(TREE).map(({ objectId }) => ({ objectId, include: true, ...(forced[objectId] ? { forcedDomain: forced[objectId] } : {}) })),
+      detectDevices(TREE).map(({ objectId, domain }) => ({ objectId, include: true, detectedDomain: domain, ...(forced[objectId] ? { forcedDomain: forced[objectId] } : {}) })),
     );
     const registry = new EntityRegistry({ onEntityChanged: () => undefined, onMembershipChanged: () => undefined }, 0);
     registry.rebuild(devices, {});

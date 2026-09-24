@@ -14,7 +14,7 @@
   "ha_prefix": "Entity state prefix",
   "ha_prefix_help": "Topic prefix the panel listens on for entity state. Same on every panel.",
   "test_broker": "Test broker connection",
-  "devices_info": "Nothing reaches the panels until you pick it; until then each panel keeps the layout it has. Refresh detected devices lists every device the adapter detects: tick Show on panels for each one the panels should get, then save. The adapter restarts and publishes what you picked.",
+  "devices_info": "Nothing reaches the panels until you click Refresh detected devices, tick Show on panels for each device the panels should get, and save; until then each panel keeps the layout it has, and so do rows and manual entities from an earlier version. Warning: once you pick and save, every panel removes its tiles for anything not picked. Export each panel's tile layout first if you want to keep it.",
   "refresh_detected": "Refresh detected devices",
   "refresh_result": "%s devices detected, %s of them new. Tick Show on panels for each device the panels should get, then save.",
   "detected_devices": "Detected devices",

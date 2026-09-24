@@ -114,7 +114,7 @@ describe('admin/jsonConfig', () => {
     expect(Object.keys(button.result)).to.deep.equal(['refreshed']);
   });
 
-  it("shows what detection found read-only beside the user's choices, filterable and sortable, and lets a row be deleted (Task 21b, Ruling 117)", () => {
+  it("shows what detection found read-only beside the user's choices, filterable but never sorted, and lets a row be deleted (Task 21b, Rulings 117, 119)", () => {
     const table = config.items.devices.items.deviceOverrides;
     expect(table.type).to.equal('table');
     // noDelete would take the delete button with the add button (json-config ConfigTable).
@@ -130,11 +130,17 @@ describe('admin/jsonConfig', () => {
     // Exactly the fields a refreshed row holds.
     const [row] = mergeDetected([], [{ objectId: 'hue.0.a', detectedName: 'A', detectedDomain: 'light', room: 'Flur' }]);
     expect(Object.keys(byAttr)).to.have.members(Object.keys(row!));
-    expect(byAttr.include).to.include({ type: 'checkbox', sort: true });
+    expect(byAttr.include).to.include({ type: 'checkbox' });
     for (const attr of ['include', 'name', 'forcedDomain']) expect(byAttr[attr]!.readOnly, attr).to.not.equal(true);
     for (const attr of ['detectedName', 'detectedDomain', 'room', 'objectId']) {
-      expect(byAttr[attr], attr).to.include({ type: 'text', readOnly: true, filter: true, sort: true });
+      expect(byAttr[attr], attr).to.include({ type: 'text', readOnly: true, filter: true });
     }
+    // A column sort reorders only what the table shows (json-config
+    // ConfigTable.handleRequestSort), never the form's rows that Refresh
+    // sends and replaces, and a select keeps the value it mounted with
+    // (ConfigSelect._getValue): after a Refresh a sorted table would show one
+    // device's forced type beside another (Ruling 119, M2).
+    for (const column of table.items) expect(column.sort, column.attr).to.not.equal(true);
   });
 
   it('lets the user add manual entities: a state picker, the domains one state can serve, a name and a datetime kind (Task 21b)', () => {
@@ -176,6 +182,13 @@ describe('admin/jsonConfig', () => {
     walk(config.items);
     expect(found.size).to.be.greaterThan(0);
     for (const command of found) expect(commands, `unknown command ${command}`).to.include(command);
+  });
+
+  it('names the Refresh button in every language, and warns that saving a pick prunes the panels, to export their layout first (Rulings 118, 119 M6)', () => {
+    for (const [language, strings] of Object.entries(translations)) {
+      expect(strings.devices_info, language).to.include(strings.refresh_detected);
+      expect(strings.devices_info, language).to.match(/export/i);
+    }
   });
 
   it('ships every translation file with the key set of the English source', () => {

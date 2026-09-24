@@ -1,5 +1,5 @@
 import * as utils from '@iobroker/adapter-core';
-import { readFileSync } from 'node:fs';
+import { readdirSync, readFileSync } from 'node:fs';
 import path from 'node:path';
 import { validateOptions, type AdapterOptions, type DeviceOverride } from './config/options';
 import { AnnounceError } from './protocol/announce';
@@ -17,7 +17,7 @@ import { discoverDevices, type Discovery, type RootAnchors } from './registry/de
 import { idsToStore, parseStringMap } from './registry/entity-id';
 import { EntityRegistry } from './registry/entity-registry';
 import { listed, manualDevices } from './registry/manual';
-import { applyOverrides, detectedRows, mergeDetected } from './registry/overrides';
+import { applyOverrides, byPicker, detectedRows, mergeDetected } from './registry/overrides';
 import { synthesise } from './registry/synth/index';
 import type { DeviceInput, SourceValue, VirtualEntity } from './registry/types';
 import { Dispatcher } from './runtime/dispatcher';
@@ -32,12 +32,30 @@ const ENTITY_ID_STATE = 'info.entityIds';
 const ROOT_ANCHOR_STATE = 'info.rootAnchors';
 /** The entities the panels were given, kept across the restart a saved selection causes (Task 21b). */
 const PUBLISHED_STATE = 'info.publishedIds';
+/** Rulings 116 and 118, once per rebuild that holds everything back until the Devices tab has been used. */
+const NOT_ARMED = 'No devices selected yet — open the Devices tab and click Refresh detected devices, then pick devices and save';
 /** Task 21b rule 5 and Ruling 116, once per rebuild that holds the apply back because nothing is picked. */
 const NOTHING_SELECTED = 'No devices selected yet — pick devices in the adapter settings (Devices tab)';
 /** Ruling 116, once per rebuild that holds the apply back although something is picked. */
 const NOTHING_LISTED =
   'Nothing picked shows in a panel list: a scene needs none, and no entity could be made of the rest. ' +
   'Panels keep their last configuration until something is picked that does';
+/** A failed discovery is retried after 5 s, 10 s, 20 s ... and at most every 5 minutes. */
+const DISCOVERY_RETRY_FIRST_MS = 5_000;
+const DISCOVERY_RETRY_MAX_MS = 300_000;
+
+const I18N_DIR = path.join(__dirname, '..', 'admin', 'i18n');
+
+/** One text of one admin translation file, or undefined. Only a language code names a file, never a path. */
+function i18nText(language: string, key: string): string | undefined {
+  if (!/^[a-z]{2}(-[a-z]{2,4})?$/i.test(language)) return undefined;
+  try {
+    const text: unknown = JSON.parse(readFileSync(path.join(I18N_DIR, `${language}.json`), 'utf8'))[key];
+    return typeof text === 'string' ? text : undefined;
+  } catch {
+    return undefined;
+  }
+}
 
 /**
  * A text from the admin's own translations (admin/i18n), in `language`, else
@@ -45,21 +63,19 @@ const NOTHING_LISTED =
  * the form's labels (Ruling 117). The key itself when neither file has it.
  */
 function adminText(key: string, language: string): string {
-  for (const lang of [language, 'en']) {
-    // Only a language code names a file: never a path.
-    if (!/^[a-z]{2}(-[a-z]{2,4})?$/i.test(lang)) continue;
-    try {
-      const text: unknown = JSON.parse(readFileSync(path.join(__dirname, '..', 'admin', 'i18n', `${lang}.json`), 'utf8'))[key];
-      if (typeof text === 'string') return text;
-    } catch {
-      // No translation file for this language: try the next.
-    }
-  }
-  return key;
+  return i18nText(language, key) ?? i18nText('en', key) ?? key;
 }
-/** A failed discovery is retried after 5 s, 10 s, 20 s ... and at most every 5 minutes. */
-const DISCOVERY_RETRY_FIRST_MS = 5_000;
-const DISCOVERY_RETRY_MAX_MS = 300_000;
+
+/** The text in every language admin/i18n has: a mark written in one is taken off in all (Ruling 119, M4). */
+function adminTexts(key: string): string[] {
+  let files: string[] = [];
+  try {
+    files = readdirSync(I18N_DIR).filter((file) => file.endsWith('.json'));
+  } catch {
+    // No translations installed: no mark to take off.
+  }
+  return files.flatMap((file) => i18nText(file.slice(0, -'.json'.length), key) ?? []);
+}
 
 class HomeTiles extends utils.Adapter {
   private options!: AdapterOptions;
@@ -186,8 +202,21 @@ class HomeTiles extends utils.Adapter {
   private get tally(): string {
     return (
       `${this.detected.length} devices detected, ${this.devices.length} picked (manual entities included), ` +
-      `${this.registry.all().length} entities published`
+      `${this.publishedCount} entities published`
     );
+  }
+
+  /** The entities the panels are given: none while the apply is held back (Ruling 116, Ruling 119 M7). */
+  private get publishedCount(): number {
+    const entities = this.registry.all();
+    return listsAnyEntity(entities) ? entities.length : 0;
+  }
+
+  /** What waits for the Devices tab beyond detection, so an upgraded installation says why nothing shows (Ruling 118). */
+  private waiting(manual: number): string {
+    const earlier = this.options.deviceOverrides.filter((row) => row.objectId.trim() && !byPicker(row)).length;
+    const held = [manual ? `${manual} manual entities` : '', earlier ? `${earlier} device rows of an earlier version` : ''].filter(Boolean);
+    return held.length ? `. Held back until then: ${held.join(', ')}` : '';
   }
 
   /**
@@ -385,9 +414,12 @@ class HomeTiles extends utils.Adapter {
     // Opt-in (Task 21b): a detected device reaches the registry only once the
     // user picks it. A manual entity is the user's pick already, and overrides
     // are for detected devices (Task 13b); after them, it never takes an id
-    // one of them would be given.
+    // one of them would be given. Until the Devices tab has been used, though,
+    // nothing is: an earlier version's rows and hand-added manual entities
+    // would give each panel a list of only those (Ruling 118).
+    const armed = this.options.pickerArmed;
     this.detected = detected;
-    this.devices = [...applyOverrides(detected, this.options.deviceOverrides), ...manual.devices];
+    this.devices = armed ? [...applyOverrides(detected, this.options.deviceOverrides), ...manual.devices] : [];
     this.rootAnchors = anchors;
     await this.saveJsonMap(ROOT_ANCHOR_STATE, 'Root anchors: the state each root id stays with', anchors);
 
@@ -395,7 +427,8 @@ class HomeTiles extends utils.Adapter {
     // Ruling 116: while no entity lands in a list, the panels are given
     // nothing (panelEntities), and the log says why instead.
     const holding = !listsAnyEntity(this.registry.all());
-    if (holding) this.log.info(`[Registry] ${this.devices.length === 0 ? NOTHING_SELECTED : NOTHING_LISTED}`);
+    if (!armed) this.log.info(`[Registry] ${NOT_ARMED}${this.waiting(manual.devices.length)}`);
+    else if (holding) this.log.info(`[Registry] ${this.devices.length === 0 ? NOTHING_SELECTED : NOTHING_LISTED}`);
     if (result.skipped.length > 0) {
       const skipped = result.skipped.map(({ objectId, reason }) => `${objectId} (${reason})`);
       this.log.warn(`[Registry] Devices left out, no entity could be made of them: ${skipped.join(', ')}`);
@@ -476,7 +509,7 @@ class HomeTiles extends utils.Adapter {
     }
     await this.saveJsonMap(PUBLISHED_STATE, 'Entity ids the panels were given', this.published);
 
-    await this.setState('info.entities', this.registry.all().length, true);
+    await this.setState('info.entities', this.publishedCount, true);
   }
 
   /** The discovery, and the objects it read: the manual entities' states are among them. */
@@ -604,10 +637,14 @@ class HomeTiles extends utils.Adapter {
         const language = (await this.getForeignObjectAsync('system.config'))?.common?.language ?? 'en';
         const found = detectedRows(detected, { ...objects, ...rooms }, language);
         const known = new Set(rows.map((row) => row.objectId));
-        // admin writes `native` into the form (useNative) and shows the
-        // `result` text, filled with `args` (json-config ConfigSendto).
+        // admin writes each key of `native` into the form (useNative;
+        // json-config ConfigSendto.js:253-257, ConfigGeneric.onChange), saves
+        // every form key that has no field (JsonConfig.onSave, :489-497), and
+        // shows the `result` text filled with `args`. pickerArmed is such a
+        // key: saved with the picker's rows, it arms publishing (Ruling 118).
+        const deviceOverrides = mergeDetected(rows, found, adminText('not_detected', language), adminTexts('not_detected'));
         return reply({
-          native: { deviceOverrides: mergeDetected(rows, found, adminText('not_detected', language)) },
+          native: { deviceOverrides, pickerArmed: true },
           result: 'refreshed',
           args: [String(found.length), String(found.filter((row) => !known.has(row.objectId)).length)],
         });

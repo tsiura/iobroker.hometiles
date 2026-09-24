@@ -54,10 +54,10 @@
           "md": 12,
           "lg": 12,
           "items": [
-            { "type": "checkbox", "attr": "include", "title": "column_include", "width": "8%", "sort": true, "default": false },
-            { "type": "text", "attr": "detectedName", "title": "column_detected_name", "width": "18%", "readOnly": true, "filter": true, "sort": true },
+            { "type": "checkbox", "attr": "include", "title": "column_include", "width": "8%", "default": false },
+            { "type": "text", "attr": "detectedName", "title": "column_detected_name", "width": "18%", "readOnly": true, "filter": true },
             { "type": "text", "attr": "name", "title": "column_name", "width": "15%" },
-            { "type": "text", "attr": "detectedDomain", "title": "column_domain", "width": "10%", "readOnly": true, "filter": true, "sort": true },
+            { "type": "text", "attr": "detectedDomain", "title": "column_domain", "width": "10%", "readOnly": true, "filter": true },
             {
               "type": "select",
               "attr": "forcedDomain",
@@ -72,8 +72,8 @@
                 { "label": "domain_scene", "value": "scene" }
               ]
             },
-            { "type": "text", "attr": "room", "title": "column_room", "width": "15%", "readOnly": true, "filter": true, "sort": true },
-            { "type": "text", "attr": "objectId", "title": "column_object_id", "width": "22%", "readOnly": true, "filter": true, "sort": true, "default": "" }
+            { "type": "text", "attr": "room", "title": "column_room", "width": "15%", "readOnly": true, "filter": true },
+            { "type": "text", "attr": "objectId", "title": "column_object_id", "width": "22%", "readOnly": true, "filter": true, "default": "" }
           ]
         },
         "_manualInfo": { "type": "staticText", "text": "manual_info", "newLine": true, "sm": 12, "md": 12, "lg": 12 },

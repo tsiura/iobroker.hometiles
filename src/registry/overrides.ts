@@ -8,11 +8,22 @@ function isDomain(value: string | undefined): value is Domain {
 }
 
 /**
+ * Whether the picker wrote this row: Refresh fills in what detection found,
+ * the detected domain among it. An earlier version's row lacks it -- its
+ * checkbox was ticked by default and meant "not excluded" -- and so does a
+ * row the table's "+" added (Ruling 118).
+ */
+export function byPicker(row: DeviceOverride): boolean {
+  return typeof row.detectedDomain === 'string' && row.detectedDomain !== '';
+}
+
+/**
  * The detected devices the user picked (Task 21b): only a device whose row
- * says include: true reaches the panels. No row, or any other include, keeps
- * it off them -- a large installation does not fit in one bridge/apply
- * (Task 21), so nothing is published unless picked. A picked device takes
- * its row's name and forced domain.
+ * the picker wrote and the user ticked (include: true) reaches the panels.
+ * No row, any other include, or a row of an earlier version keeps it off
+ * them -- a large installation does not fit in one bridge/apply (Task 21),
+ * so nothing is published unless picked. A picked device takes its row's
+ * name and forced domain.
  *
  * Rows are keyed by ioBroker object id, never by position, so reordering or
  * filtering the admin table can never move a choice to another device.
@@ -23,7 +34,7 @@ export function applyOverrides(devices: DeviceInput[], overrides: DeviceOverride
 
   for (const device of devices) {
     const override = byObjectId.get(device.objectId);
-    if (override?.include !== true) continue;
+    if (override?.include !== true || !byPicker(override)) continue;
 
     const name = (override.name ?? '').trim();
     result.push({
@@ -85,37 +96,54 @@ export function detectedRows(
 }
 
 /**
- * The picker's rows after a refresh (Task 21b): every detected device, a new
- * one unticked; a row the user has keeps its include, name and forced domain,
- * with what detection found brought up to date; a row whose device is
- * detected no more stays, its detected name marked `notDetected` once
- * (Ruling 117) -- main.ts passes the text in the system's language.
+ * The picker's rows after a refresh (Task 21b), for the form to show and save:
  *
- * The form's rows stay where they are, and new devices follow them ordered by
- * object id in code units, the same under every locale: an empty table fills
- * sorted, and a refresh moves no row the user sees. The admin's table keys
- * its cells by row index, and a select keeps a value the user changed, so a
- * row moved under it would show another device's choice (json-config
- * ConfigTable, ConfigSelect). A row naming no object selects nothing and is
- * dropped; of two rows for one device the last is kept, the one
- * applyOverrides reads.
+ * - Every row of the form stays where it stands, a blank or duplicated one
+ *   too. The admin's table keys each row's cells by index, and a select keeps
+ *   the value it mounted with (json-config ConfigTable.js:309,
+ *   ConfigSelect.js:161-165): a row moved or dropped from under its cells
+ *   would show another row's choice (Ruling 119). A blank row names no
+ *   device, stays as it is and selects nothing.
+ * - A row of a detected device keeps the user's include, name and forced
+ *   domain and takes what detection found, every row of a duplicated id alike
+ *   (applyOverrides reads the last).
+ * - A row the picker never wrote shows unticked (Ruling 118).
+ * - A row whose device is detected no more stays, its detected name marked
+ *   `mark` once (Ruling 117), after the mark of any language in `marks` is
+ *   taken off (Ruling 119, M4): main.ts passes the system's language's text,
+ *   and every language's.
+ * - New devices follow, unticked, ordered by object id in code units, the
+ *   same under every locale.
  */
 export function mergeDetected(
   rows: readonly DeviceOverride[],
   detected: readonly Detected[],
-  notDetected = '(not detected)',
+  mark = '(not detected)',
+  marks: readonly string[] = [mark],
 ): DeviceOverride[] {
-  const merged = new Map<string, DeviceOverride>();
-  for (const row of rows) {
-    if (!row.objectId.trim()) continue;
-    // Marked once; a device detected again takes detection's name below.
-    const name = row.detectedName ?? '';
-    merged.set(row.objectId, name.endsWith(notDetected) ? row : { ...row, detectedName: name ? `${name} ${notDetected}` : notDetected });
-  }
+  const found = new Map(detected.map((row) => [row.objectId, row]));
+  const merged = rows.map((row) => {
+    if (!row.objectId.trim()) return row;
+    const own = byPicker(row) ? row : { ...row, include: false };
+    const hit = found.get(row.objectId);
+    return hit ? { ...own, ...hit } : { ...own, detectedName: marked(row.detectedName ?? '', mark, marks) };
+  });
+  const listed = new Set(rows.map((row) => row.objectId));
   const byObjectId = (a: Detected, b: Detected): number => (a.objectId < b.objectId ? -1 : a.objectId > b.objectId ? 1 : 0);
-  // A key already there keeps its place; a new one goes last.
-  for (const found of [...detected].sort(byObjectId)) {
-    merged.set(found.objectId, { ...(merged.get(found.objectId) ?? { include: false, name: '', forcedDomain: '' }), ...found });
+  const added = detected.filter((row) => !listed.has(row.objectId)).sort(byObjectId);
+  return [...merged, ...added.map((row) => ({ include: false, name: '', forcedDomain: '', ...row }))];
+}
+
+/** A missing device's detected name, marked once: every mark it carries, in any language, taken off first. */
+function marked(name: string, mark: string, marks: readonly string[]): string {
+  let bare = name;
+  for (let again = true; again; ) {
+    again = false;
+    for (const each of [mark, ...marks]) {
+      if (!each || !bare.endsWith(each)) continue;
+      bare = bare.slice(0, -each.length).trimEnd();
+      again = true;
+    }
   }
-  return [...merged.values()];
+  return bare ? `${bare} ${mark}` : mark;
 }
