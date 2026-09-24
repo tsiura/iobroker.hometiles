@@ -1465,6 +1465,79 @@ git add -A && git commit -m "feat(protocol): publish the new entity arrays and m
 
 ---
 
+## Task 21b: Opt-in entity selection (added during execution, Ruling 115)
+
+**Why.** The adapter publishes every device it detects, but a panel accepts
+at most 32767 bytes of bridge/apply (Task 21), and a large installation
+does not fit. The user chose the Home Assistant bridge's model: nothing
+reaches the panels unless the user picks it. Opt-in only — there is NO
+"publish everything detected" mode.
+
+**Files** (follow the existing layout; adjust if the code says otherwise):
+- Modify: `src/registry/overrides.ts`, `src/config/options.ts`, `src/main.ts`
+  (the rebuild and the admin `onMessage` commands), `admin/jsonConfig.json`,
+  `admin/i18n/*`, `io-package.json` (native defaults).
+- Test: `test/registry/overrides.test.ts`, new tests for the refresh merge,
+  `test/config/*`, and an integration test.
+
+**Rules:**
+1. Selection. A detected device is published only when its
+   `deviceOverrides` row has `include: true` (shown to the user as "Show on
+   panels"). A device with no row, or with `include: false`, is not
+   published: no entity, no subscription, not in bridge/apply. Manual
+   entities (Task 13b) are always published, because the user added them.
+2. Detection still runs in full: its result feeds the admin picker. Only
+   the SELECTED devices are handed to the registry, synthesised and
+   subscribed.
+3. The picker. On the Devices tab, a "Refresh detected devices" sendTo
+   fills the `deviceOverrides` table with every detected device through
+   the form's native config:
+   - new devices are added unticked;
+   - existing rows keep include, name and forcedDomain unchanged;
+   - rows for devices no longer detected are kept;
+   - rows are ordered deterministically.
+   Show the detected name, domain, room (function or room enum, if any) and
+   object id read-only beside the editable include, name and forcedDomain.
+   Make the table filterable and sortable if jsonConfig supports it. Keep
+   the existing listDetected, previewEntity and testBroker commands
+   working.
+4. The manual entities table (moved here from Task 23). Its columns are
+   stateId (an ioBroker object picker, restricted to state objects), domain
+   (a select of the allowed manual domains), name, and kind (empty, date,
+   time or datetime). Add `native.manualEntities: []` to io-package.json
+   (Task 13b C4) and keep validateOptions as the authority on bad rows.
+5. First run and empty selection: panels get empty lists. Log one English
+   hint per rebuild: "No devices selected yet — pick devices in the
+   adapter settings (Devices tab)".
+6. Entity ids never change because of selection: picking, un-picking and
+   re-picking a device yields the same id (persisted ids, the same
+   derivation). A device that is un-picked disappears from the panels'
+   lists, and its retained state topics are cleared through the EXISTING
+   removal path.
+7. Every new admin label is translated for every language admin/i18n
+   already has; English is the source.
+8. Verify every jsonConfig construct you use (table, sendTo with native
+   update, objectId picker in a table, filter and sort) against current
+   ioBroker admin documentation before relying on it — cite what you
+   checked.
+
+**Tests:**
+- the default flip (no row = not published);
+- include true or false;
+- manual entities always published;
+- the refresh merge as a pure function: new rows unticked, existing
+  choices kept, missing rows kept, stable order;
+- subscriptions only for selected devices;
+- un-pick clears retained state;
+- id stability across pick, un-pick and re-pick;
+- the empty-selection hint;
+- jsonConfig parses and references only commands and attrs the adapter
+  handles;
+- an integration test: an empty selection publishes empty lists, and a
+  selection publishes exactly that entity.
+
+---
+
 ## Task 22: Wire the request topics into the panel session
 
 **Files:**
