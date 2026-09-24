@@ -173,6 +173,15 @@ const KAFFEE_OBJECTS: Record<string, object> = {
   [KAFFEE_SWITCH]: { type: 'state', common: { name: 'Schalten', role: 'switch', type: 'boolean', read: true, write: true } },
 };
 
+/** More editable numbers than a panel keeps values for (Ruling 111): 130 helpers, "Regler 000" to "Regler 129". */
+const REGLER = Array.from({ length: 130 }, (_, index) => `0_userdata.0.Regler.Soll_${String(index).padStart(3, '0')}`);
+const REGLER_OBJECTS: Record<string, object> = Object.fromEntries(
+  REGLER.map((id, index) => [
+    id,
+    { type: 'state', common: { name: `Regler ${String(index).padStart(3, '0')}`, role: 'level', type: 'number', min: 0, max: 100, read: true, write: true } },
+  ]),
+);
+
 const FIXTURE_IDS = [
   ...Object.keys(SENSOR_OBJECTS),
   ...Object.keys(CORRUPT_ENUM_OBJECTS),
@@ -735,7 +744,39 @@ if (process.env.HOMETILES_INTEGRATION === '1') {
           expect(empty, `${empty.length} of ${applies.length} applies without the sensor`).to.deep.equal([]);
           // Nor does the log claim one was pushed.
           const pushed = logs.map((log) => log.message).filter((message) => message.includes('Configuration pushed'));
-          expect(pushed.filter((message) => !message.endsWith(', 1 entities')), pushed.join('\n')).to.deep.equal([]);
+          expect(pushed.filter((message) => !message.includes('Configuration pushed, 1 entities, ')), pushed.join('\n')).to.deep.equal([]);
+        });
+      });
+
+      suite('more numbers, selects and datetimes than a panel keeps (Ruling 111)', (getHarness) => {
+        withCleanFixtures(getHarness);
+        const port = 18857;
+        const { applies } = withBrokerAndPanel(port);
+        const removeRegler = async (): Promise<void> => {
+          for (const id of REGLER) await getHarness().objects.delObjectAsync(id).catch(() => undefined);
+        };
+        before(removeRegler);
+        after(async () => {
+          await removeRegler();
+          await setManualEntities(getHarness(), []);
+        });
+
+        it('lists the first 128 by entity id, and names in one warning how many were left out', async function () {
+          this.timeout(120000);
+          const harness = getHarness();
+          const logs = await captureLogs(harness);
+          await harness.changeAdapterConfig('hometiles', { native: { brokerHost: '127.0.0.1', brokerPort: port } });
+          await setManualEntities(harness, REGLER.map((stateId) => ({ stateId, domain: 'number' })));
+          await setObjects(harness, REGLER_OBJECTS);
+          await harness.startAdapterAndWait(true);
+
+          const apply = await waitFor(harness, () => applies.find((payload) => payload.includes('number.regler_000')), 'the apply');
+          const { numbers, editable_meta: meta } = JSON.parse(apply) as { numbers: string[]; editable_meta: Array<{ entity_id: string }> };
+          expect(numbers).to.deep.equal(REGLER.slice(0, 128).map((_, index) => `number.regler_${String(index).padStart(3, '0')}`));
+          expect(meta.map((entry) => entry.entity_id)).to.deep.equal(numbers);
+          const capped = logs.filter((log) => log.message.includes('at most 128'));
+          expect(capped.map((log) => log.severity), capped.map((log) => log.message).join('\n')).to.deep.equal(['warn']);
+          expect(capped[0]!.message).to.include('[Registry] 2 ').and.include('number.regler_128, number.regler_129');
         });
       });
     },

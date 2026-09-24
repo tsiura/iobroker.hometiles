@@ -59,15 +59,17 @@ function harness(now: () => number = Date.now) {
     },
     silentLog,
   );
+  const infos: string[] = [];
   const warnings: string[] = [];
   const errors: string[] = [];
   const capturingLog = {
     ...silentLog,
+    info: (message: string): void => void infos.push(message),
     warn: (message: string): void => void warnings.push(message),
     error: (message: string): void => void errors.push(message),
   };
   const session = new PanelSession(parseAnnouncement('a1', ANNOUNCE), transport, dispatcher, capturingLog, now);
-  return { session, published, subscribed, writes, registryEntities, warnings, errors };
+  return { session, published, subscribed, writes, registryEntities, infos, warnings, errors };
 }
 
 describe('runtime/panel-session', () => {
@@ -187,12 +189,20 @@ describe('runtime/panel-session', () => {
     expect(published.some((p) => p.topic === 'tab5_lvgl/config/a1/bridge/apply')).to.equal(true);
   });
 
-  it('re-pushes when the configuration actually changed', () => {
+  it('re-pushes when the configuration actually changed, and the icon map with it, which names every entity (m1)', () => {
     const { session, published } = harness();
     session.pushConfig([entity({})]);
     published.length = 0;
     expect(session.pushConfig([entity({}), entity({ entityId: 'sensor.u' })])).to.equal(true);
-    expect(published).to.have.length(1);
+    expect(published.map((p) => [p.topic, p.retain])).to.deep.equal([
+      ['tab5_lvgl/config/a1/bridge/apply', true],
+      ['tab5_lvgl/config/a1/bridge/icons', true],
+    ]);
+    expect(JSON.parse(published[1]!.payload)).to.deep.equal({ 'sensor.t': '', 'sensor.u': '' });
+    // The same icons again: not re-sent with an apply that changed otherwise.
+    published.length = 0;
+    session.pushConfig([entity({ attributes: { friendly_name: 'Neu' } }), entity({ entityId: 'sensor.u' })]);
+    expect(published.map((p) => p.topic)).to.deep.equal(['tab5_lvgl/config/a1/bridge/apply']);
   });
 
   it('honours a forced bridge/request through the wired refresh handler', async () => {
@@ -276,6 +286,12 @@ describe('runtime/panel-session', () => {
       expect(session.pushConfig(sized(session, LIMIT))).to.equal(true);
       expect(Buffer.byteLength(published.find((p) => p.topic === APPLY)!.payload)).to.equal(LIMIT);
       expect(errors).to.deep.equal([]);
+    });
+
+    it('logs how close each published apply is to the limit (m3)', () => {
+      const { session, infos } = harness();
+      session.pushConfig(sized(session, 30000));
+      expect(infos).to.deep.equal([`[Panel a1] Configuration pushed, 1 entities, 30000 of ${LIMIT} bytes`]);
     });
 
     it('publishes nothing one byte over, and says so once in English with the size and the largest sections', () => {

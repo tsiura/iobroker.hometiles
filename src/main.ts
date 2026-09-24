@@ -1,6 +1,7 @@
 import * as utils from '@iobroker/adapter-core';
 import { validateOptions, type AdapterOptions, type DeviceOverride } from './config/options';
 import { AnnounceError } from './protocol/announce';
+import { MAX_EDITABLES, splitEditables } from './protocol/apply';
 import { buildStatePublish } from './protocol/state-payload';
 import {
   ANNOUNCE_TOPIC_PATTERN,
@@ -382,6 +383,16 @@ class HomeTiles extends utils.Adapter {
       return why === undefined || !state ? [] : [`${state.objectId} (${why})`];
     });
     if (readOnly.length > 0) this.log.warn(`[Registry] Manual entities shown read-only: ${listed(readOnly)}`);
+
+    // Ruling 111: what no panel is given, once per rebuild rather than per panel.
+    const { left } = splitEditables(this.registry.all());
+    if (left.length > 0) {
+      this.log.warn(
+        `[Registry] ${left.length} numbers, selects and datetimes left off the panels: a panel keeps at most ` +
+          `${MAX_EDITABLES}, taken by entity id (${listed(left.map((entity) => entity.entityId))}). ` +
+          'Exclude devices under Device overrides to choose which',
+      );
+    }
 
     // Only a panel that was given a configuration is told an entity left it
     // (Ruling 56).

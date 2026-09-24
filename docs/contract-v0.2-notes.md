@@ -51,6 +51,37 @@ Consequence: adding a domain does not need a bespoke meta parser on the
 firmware side. It needs the entity id in the right array, a name and icon in
 the matching `*_meta`, and state on the state topic.
 
+## What the panel can parse (Task 21 fix round 1, Rulings 109-112)
+
+- **Only read fields are sent (R109).** sensor_meta: entity_id, name, unit,
+  value, state_kind, icon (:1209-1236); binary_sensor_meta: entity_id, name,
+  device_class, state, available, last_changed, icon (:1259-1313);
+  light/switch/scene_meta: entity_id and icon only, entities without one left
+  out (:1388-1390).
+- **Icons are MDI names or nothing (R110):** `mdi:` + `[a-z0-9-]+`, any
+  case. Anything else is stored verbatim and drawn as the "?" glyph 0xF02D8
+  in place of the tile's icon, on a cover in place of its open/closed icon
+  (`mdi_icons.cpp:7549`, `cover/renderer.cpp:304-311`).
+- **`bridge/icons` is a flat map** `{"<entity_id>":"<icon>"}`, one pair per
+  entity (`applyIconUpdate` :743-771); `""` removes the icon the panel holds
+  (:757-762). A wrapped `{"icons":{...}}` is ignored.
+- **Zero icons:** an apply that carries no icon at all keeps the panel's
+  whole map (:663-665), and an empty map `{}` or empty section clears
+  nothing. Only a `""` pair does, so the adapter sends every entity it
+  publishes, `""` where it has no MDI icon: its own entities lose a stale
+  icon on the next push or reconnect, no reboot needed. An icon held for an
+  id the adapter does not publish (a removed device, an HA leftover) stays
+  until the panel reboots (the map is RAM only).
+- **Free text (R112):** in names, units and values, `[ ] { }` become `( )`,
+  `"` becomes `'`, control characters a space. sensor_meta and
+  binary_sensor_meta end at the first `]` (:1198, :1246), a sensor_meta entry
+  at the first `}` (:1205); `extractStringField` ends a value at the first `"`
+  (:1073-1077); every map is a blob of `id=text` lines, first line wins
+  (:1627-1660). Entity ids and scene_map aliases are never rewritten: a
+  changed alias clears the panel's scene slots and saves that (:693-699).
+- **At most 128 numbers, selects and datetimes (R111)**, the first by entity
+  id: the panel keeps no more values (:1781-1786).
+
 ## Extra topics beyond state/cmnd
 
 **CORRECTED 2026-09-22:** these are NOT built from the user-configured base

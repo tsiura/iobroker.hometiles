@@ -1,7 +1,7 @@
 import { expect } from 'chai';
-import { buildApplyPayload, buildIconsPayload, configSignature } from '../../src/protocol/apply';
+import { buildApplyPayload, buildIconsPayload, configSignature, splitEditables } from '../../src/protocol/apply';
 import type { VirtualEntity } from '../../src/registry/types';
-import { panelIcons, panelList, panelNames } from './panel-scan';
+import { panelBinaryMeta, panelIconMap, panelIconUpdate, panelIcons, panelList, panelNameIndex, panelNames, panelSensorMeta } from './panel-scan';
 
 function e(over: Partial<VirtualEntity>): VirtualEntity {
   return {
@@ -59,25 +59,25 @@ describe('protocol/apply', () => {
     expect(parsed.energy).to.deep.equal([]);
   });
 
-  it('builds sensor_meta with the exact keys the firmware parser reads', () => {
+  it('builds sensor_meta with exactly the keys the firmware parser reads (Ruling 109)', () => {
+    // parseSensorMetaSection reads entity_id, unit, name, value and
+    // state_kind (ha_bridge_config.cpp:1209-1236), the icon walker the icon;
+    // nothing reads state or number.
     const parsed = JSON.parse(buildApplyPayload({ entities: ENTITIES, sceneMap: {} }));
     expect(parsed.sensor_meta[0]).to.deep.equal({
       entity_id: 'sensor.temp',
       name: 'Wohnzimmer',
       unit: '°C',
-      state: '21.5',
       value: '21.5',
       state_kind: 'number',
-      number: true,
       icon: 'mdi:thermometer',
     });
   });
 
-  it('marks a textual sensor with state_kind state and number false', () => {
+  it('marks a textual sensor with state_kind state', () => {
     const text = e({ entityId: 'sensor.mode', state: 'heating', attributes: { friendly_name: 'Modus' } });
     const parsed = JSON.parse(buildApplyPayload({ entities: [text], sceneMap: {} }));
     expect(parsed.sensor_meta[0].state_kind).to.equal('state');
-    expect(parsed.sensor_meta[0].number).to.equal(false);
   });
 
   it('derives state_kind from the declared numeric type, not from the current state string', () => {
@@ -93,7 +93,6 @@ describe('protocol/apply', () => {
     });
     const parsed = JSON.parse(buildApplyPayload({ entities: [startingUp], sceneMap: {} }));
     expect(parsed.sensor_meta[0].state_kind).to.equal('number');
-    expect(parsed.sensor_meta[0].number).to.equal(true);
   });
 
   it('does not read a numeric-looking transient string as state_kind number without a declared measurement type', () => {
@@ -102,18 +101,22 @@ describe('protocol/apply', () => {
     const notDeclared = e({ entityId: 'sensor.raw', state: '0x10', attributes: { friendly_name: 'Raw' } });
     const parsed = JSON.parse(buildApplyPayload({ entities: [notDeclared], sceneMap: {} }));
     expect(parsed.sensor_meta[0].state_kind).to.equal('state');
-    expect(parsed.sensor_meta[0].number).to.equal(false);
   });
 
-  it('builds binary_sensor_meta with availability and the localisable state labels', () => {
+  it('builds binary_sensor_meta with exactly the keys the firmware reads, no state labels (Ruling 109)', () => {
+    // parseBinarySensorMetaSection reads entity_id, name, state, available,
+    // device_class, icon and last_changed (ha_bridge_config.cpp:1259-1313);
+    // on/off/unknown/unavailable are compared with state, never read as keys.
     const parsed = JSON.parse(buildApplyPayload({ entities: ENTITIES, sceneMap: {} }));
-    const meta = parsed.binary_sensor_meta[0];
-    expect(meta.entity_id).to.equal('binary_sensor.tuer');
-    expect(meta.device_class).to.equal('door');
-    expect(meta.state).to.equal('on');
-    expect(meta.available).to.equal(true);
-    expect(meta.last_changed).to.equal(1_757_000_000);
-    expect(meta.icon).to.equal('mdi:door');
+    expect(parsed.binary_sensor_meta[0]).to.deep.equal({
+      entity_id: 'binary_sensor.tuer',
+      name: 'Haustuer',
+      device_class: 'door',
+      state: 'on',
+      available: true,
+      last_changed: 1_757_000_000,
+      icon: 'mdi:door',
+    });
   });
 
   it('omits last_changed entirely when the source has never produced a value', () => {
@@ -155,12 +158,13 @@ describe('protocol/apply', () => {
     expect(configSignature(forward)).to.equal(configSignature(reversed));
   });
 
-  it('builds an icons-only payload keyed by entity id', () => {
-    const parsed = JSON.parse(buildIconsPayload(ENTITIES));
-    expect(parsed.icons).to.deep.equal({
-      'sensor.temp': 'mdi:thermometer',
-      'binary_sensor.tuer': 'mdi:door',
-    });
+  it('builds bridge/icons as the flat map the panel reads: each entity its MDI icon, or "" (m1, Ruling 110)', () => {
+    // applyIconUpdate takes each top-level pair as entity id and icon
+    // (ha_bridge_config.cpp:743-771), as the Bridge sends it
+    // (__init__.py:3529-3530); "" removes an icon the panel holds (:757-762).
+    expect(buildIconsPayload(ENTITIES)).to.equal(
+      '{"binary_sensor.tuer":"mdi:door","light.decke":"","scene.nacht":"","sensor.temp":"mdi:thermometer","switch.kaffee":""}',
+    );
   });
 });
 
@@ -259,25 +263,191 @@ describe('protocol/apply: the v0.2 domains (Task 21)', () => {
     expect(panelList(apply, 'numbers')).to.deep.equal(['number.vorlauf']);
   });
 
-  // buildApplyPayload at 526ef5b for V01 and V01_SCENES, byte for byte.
-  const GOLDEN_526EF5B = String.raw`{"sensors":["sensor.mode","sensor.temp"],"binary_sensors":["binary_sensor.never","binary_sensor.tuer"],"lights":["light.decke"],"switches":["switch.kaffee"],"media_players":[],"climates":[],"covers":[],"cameras":[],"weathers":[],"energy":[],"scene_map":{"gute nacht":"scene.nacht"},"sensor_meta":[{"entity_id":"sensor.mode","name":"Modus \"Heizung\"","unit":"","state":"heating","value":"heating","state_kind":"state","number":false},{"entity_id":"sensor.temp","name":"Wohnzimmer","unit":"°C","state":"21.5","value":"21.5","state_kind":"number","number":true,"icon":"mdi:thermometer"}],"binary_sensor_meta":[{"entity_id":"binary_sensor.never","name":"Nie","device_class":"","state":"unavailable","on":"on","off":"off","unknown":"unknown","unavailable":"unavailable","available":false},{"entity_id":"binary_sensor.tuer","name":"Haustür","device_class":"door","state":"on","on":"on","off":"off","unknown":"unknown","unavailable":"unavailable","available":true,"last_changed":1757000000,"icon":"mdi:door"}],"light_meta":[{"entity_id":"light.decke","name":"Decke","state":"on","available":true,"icon":"mdi:ceiling-light"}],"switch_meta":[{"entity_id":"switch.kaffee","name":"Kaffee","state":"off","available":true}],"scene_meta":[{"entity_id":"scene.nacht","name":"Gute Nacht","state":"unknown","available":true}]}`;
-  const V01: VirtualEntity[] = [
+  // Every domain, every rule: the whole payload, derived by hand from the
+  // rules, not from the code. It replaces 526ef5b's golden, which Rulings
+  // 109, 110 and 112 break by design, and pins the key order with it: the
+  // lists first, then energy and scene_map, then the meta sections.
+  const EVERY_DOMAIN: VirtualEntity[] = [
     e({ entityId: 'sensor.temp', state: '21.5', attributes: { friendly_name: 'Wohnzimmer', unit_of_measurement: '°C', icon: 'mdi:thermometer', state_class: 'measurement' } }),
     e({ entityId: 'sensor.mode', state: 'heating', attributes: { friendly_name: 'Modus "Heizung"' } }),
     e({ entityId: 'binary_sensor.tuer', domain: 'binary_sensor', state: 'on', attributes: { friendly_name: 'Haustür', device_class: 'door', icon: 'mdi:door' } }),
     e({ entityId: 'binary_sensor.never', domain: 'binary_sensor', state: 'unavailable', available: false, lastChanged: 0, attributes: { friendly_name: 'Nie' } }),
-    e({ entityId: 'switch.kaffee', domain: 'switch', state: 'off', attributes: { friendly_name: 'Kaffee' } }),
+    e({ entityId: 'switch.kaffee', domain: 'switch', state: 'off', attributes: { friendly_name: 'Kaffee', icon: 'img/kaffee.png' } }),
     e({ entityId: 'light.decke', domain: 'light', state: 'on', attributes: { friendly_name: 'Decke', brightness_pct: 60, icon: 'mdi:ceiling-light' } }),
-    e({ entityId: 'scene.nacht', domain: 'scene', state: 'unknown', attributes: { friendly_name: 'Gute Nacht' } }),
+    e({ entityId: 'scene.nacht', domain: 'scene', state: 'unknown', attributes: { friendly_name: 'Gute Nacht', icon: 'mdi:weather-night' } }),
+    ...V02,
   ];
-  const V01_SCENES = { 'Gute Nacht': 'scene.nacht', Leer: '' };
+  const GOLDEN = String.raw`{"sensors":["sensor.mode","sensor.temp"],"binary_sensors":["binary_sensor.never","binary_sensor.tuer"],"lights":["light.decke"],"switches":["switch.kaffee"],"media_players":["media_player.kueche"],"climates":["climate.wohnzimmer"],"covers":["cover.rollladen"],"weathers":["weather.station"],"numbers":["number.vorlauf"],"selects":["select.betriebsart"],"datetimes":["datetime.weckzeit"],"energy":[],"scene_map":{"gute nacht":"scene.nacht"},"sensor_meta":[{"entity_id":"sensor.mode","name":"Modus 'Heizung'","unit":"","value":"heating","state_kind":"state"},{"entity_id":"sensor.temp","name":"Wohnzimmer","unit":"°C","value":"21.5","state_kind":"number","icon":"mdi:thermometer"}],"binary_sensor_meta":[{"entity_id":"binary_sensor.never","name":"Nie","device_class":"","state":"unavailable","available":false},{"entity_id":"binary_sensor.tuer","name":"Haustür","device_class":"door","state":"on","available":true,"last_changed":1757000000,"icon":"mdi:door"}],"light_meta":[{"entity_id":"light.decke","icon":"mdi:ceiling-light"}],"switch_meta":[],"scene_meta":[{"entity_id":"scene.nacht","icon":"mdi:weather-night"}],"media_player_meta":[{"entity_id":"media_player.kueche","name":"Küchenradio","icon":"mdi:radio"}],"climate_meta":[{"entity_id":"climate.wohnzimmer","name":"Klima Wohnzimmer","icon":"mdi:air-conditioner"}],"cover_meta":[{"entity_id":"cover.rollladen","name":"Rollladen"}],"weather_meta":[{"entity_id":"weather.station","name":"Wetterstation","icon":"mdi:weather-partly-cloudy"}],"editable_meta":[{"entity_id":"datetime.weckzeit","name":"Weckzeit"},{"entity_id":"number.vorlauf","name":"Vorlauf Soll"},{"entity_id":"select.betriebsart","name":"Betriebsart","icon":"mdi:tune"}]}`;
 
-  it('leaves every v0.1 section byte-identical to 526ef5b', () => {
-    // The only differences: cameras is gone (Ruling 107), the three editable
-    // lists follow weathers, and the five new meta sections close the payload.
-    const expected = GOLDEN_526EF5B.replace('"cameras":[],', '')
-      .replace('"weathers":[],', '"weathers":[],"numbers":[],"selects":[],"datetimes":[],')
-      .replace(/}$/, ',"media_player_meta":[],"climate_meta":[],"cover_meta":[],"weather_meta":[],"editable_meta":[]}');
-    expect(payload(V01, V01_SCENES)).to.equal(expected);
+  it('builds, for every domain, exactly the golden payload (Rulings 106-112)', () => {
+    expect(payload(EVERY_DOMAIN, { 'Gute Nacht': 'scene.nacht', Leer: '' })).to.equal(GOLDEN);
+  });
+});
+
+describe('protocol/apply: what the panel can parse (Task 21 fix round 1)', () => {
+  const payload = (entities: VirtualEntity[], sceneMap: Record<string, string> = {}): string => buildApplyPayload({ entities, sceneMap });
+  const sensor = (id: string, name: string, over: Partial<VirtualEntity> = {}): VirtualEntity =>
+    e({ entityId: `sensor.${id}`, state: '230', attributes: { friendly_name: name, unit_of_measurement: 'W', state_class: 'measurement' }, ...over });
+
+  describe('Ruling 109: nothing the panel does not read', () => {
+    it('sends light_meta, switch_meta and scene_meta as icon maps, leaving out an entity without an icon', () => {
+      // Read for icons alone (ha_bridge_config.cpp:1388-1390): not in the
+      // name sections (:657-661), and nothing reads their state.
+      const parsed = JSON.parse(payload(ENTITIES));
+      expect([parsed.light_meta, parsed.switch_meta, parsed.scene_meta]).to.deep.equal([[], [], []]);
+      const lit = e({ entityId: 'light.flur', domain: 'light', state: 'on', attributes: { friendly_name: 'Flur', icon: 'mdi:ceiling-light' } });
+      expect(JSON.parse(payload([...ENTITIES, lit])).light_meta).to.deep.equal([{ entity_id: 'light.flur', icon: 'mdi:ceiling-light' }]);
+    });
+  });
+
+  describe('Ruling 110: an icon only when it is an MDI name', () => {
+    // A name the panel cannot draw becomes a "?" glyph that replaces the
+    // tile's own icon, and a cover's open/closed one (mdi_icons.cpp:7549,
+    // cover/renderer.cpp:304-311).
+    const NOT_MDI = ['img/blind.png', '/icons/lamp.svg', 'data:image/svg+xml;utf8,<svg x="1"/>', 'lamp', 'mdi-lamp', 'mdi:', 'mdi:lamp"x', 'mdi:lamp]', 'mdi:lamp.png', ' mdi:lamp'];
+    const DOMAINS = ['sensor', 'binary_sensor', 'light', 'switch', 'scene', 'climate', 'cover', 'media_player', 'weather', 'number', 'select', 'datetime'] as const;
+    const withIcon = (icon: string): VirtualEntity[] =>
+      DOMAINS.map((domain) => e({ entityId: `${domain}.x`, domain, attributes: { friendly_name: 'X', icon } }));
+
+    for (const icon of NOT_MDI) {
+      it(`sends no ${JSON.stringify(icon)} icon, in any section or on bridge/icons`, () => {
+        const apply = payload(withIcon(icon));
+        expect(panelIconMap(apply, new Map())).to.deep.equal(new Map());
+        expect(JSON.parse(apply), apply).to.satisfy((parsed: Record<string, unknown[]>) =>
+          Object.values(parsed).every((section) => !Array.isArray(section) || section.every((entry) => typeof entry !== 'object' || !('icon' in (entry as object)))),
+        );
+        expect(Object.values(JSON.parse(buildIconsPayload(withIcon(icon))))).to.satisfy((icons: string[]) => icons.every((i) => i === ''));
+      });
+    }
+
+    it('sends an MDI name in any case, which the panel lowercases (mdi_icons.cpp:7508-7521), in every section', () => {
+      const apply = payload(withIcon('MDI:Lamp-Outline'));
+      expect([...panelIconMap(apply, new Map()).entries()].sort()).to.deep.equal(DOMAINS.map((domain) => [`${domain}.x`, 'MDI:Lamp-Outline']).sort());
+      expect(Object.values(JSON.parse(buildIconsPayload(withIcon('mdi:lamp'))))).to.deep.equal(DOMAINS.map(() => 'mdi:lamp'));
+    });
+  });
+
+  describe('the zero-icons trap (Ruling 113 item 4)', () => {
+    it('clears through bridge/icons the icons a panel still holds, although an apply with no icon keeps them', () => {
+      // What an earlier apply left: "?" paths on two of this adapter's
+      // entities, and an MDI icon that has since gone from its object.
+      const held = new Map([
+        ['sensor.temp', 'img/temp.png'],
+        ['light.decke', 'mdi:ceiling-light'],
+        ['switch.kaffee', 'img/kaffee.png'],
+      ]);
+      // The same entities now: no MDI icon among them, one a path still.
+      const now = ENTITIES.map((entity) =>
+        e({ ...entity, attributes: { friendly_name: entity.attributes.friendly_name, ...(entity.entityId === 'sensor.temp' ? { icon: 'img/temp.png' } : {}) } }),
+      );
+      // No icon in the apply: the panel keeps the map it had (:663-665) ...
+      const afterApply = panelIconMap(payload(now), held);
+      expect(afterApply).to.deep.equal(held);
+      // ... and an empty map clears nothing: only a pair per entity does.
+      expect(panelIconUpdate(new Map(afterApply), '{}')).to.equal(false);
+      expect(panelIconUpdate(afterApply, buildIconsPayload(now))).to.equal(true);
+      expect(afterApply).to.deep.equal(new Map());
+    });
+  });
+
+  describe('Ruling 111: at most 128 numbers, selects and datetimes', () => {
+    const editables = (domain: 'number' | 'select' | 'datetime', count: number): VirtualEntity[] =>
+      Array.from({ length: count }, (_, i) => e({ entityId: `${domain}.v_${String(i).padStart(3, '0')}`, domain, attributes: { friendly_name: `V ${i}` } }));
+    // 40 datetimes, then 50 numbers, then 40 selects by entity id: 130.
+    const ALL = [...editables('select', 40), ...editables('number', 50), ...editables('datetime', 40)];
+
+    it('lists the first 128 by entity id, and names those same 128 in editable_meta', () => {
+      for (const order of [ALL, [...ALL].reverse()]) {
+        const parsed = JSON.parse(payload(order));
+        expect(parsed.datetimes).to.have.length(40);
+        expect(parsed.numbers).to.have.length(50);
+        expect(parsed.selects).to.deep.equal(editables('select', 38).map((entity) => entity.entityId));
+        expect(parsed.editable_meta.map((m: { entity_id: string }) => m.entity_id)).to.deep.equal([...parsed.datetimes, ...parsed.numbers, ...parsed.selects]);
+      }
+    });
+
+    it('lists all of them up to 128', () => {
+      const parsed = JSON.parse(payload(ALL.slice(0, 128)));
+      expect(parsed.datetimes.length + parsed.numbers.length + parsed.selects.length).to.equal(128);
+    });
+
+    it('names as left out exactly those the apply leaves out, in whatever order the registry holds them', () => {
+      // main.ts warns with this, over the registry's own order.
+      const { kept, left } = splitEditables(ALL);
+      expect(left.map((entity) => entity.entityId)).to.deep.equal(['select.v_038', 'select.v_039']);
+      expect(kept.map((entity) => entity.entityId)).to.deep.equal(JSON.parse(payload(ALL)).editable_meta.map((m: { entity_id: string }) => m.entity_id));
+    });
+  });
+
+  describe('Ruling 112: free text the panel parses by hand', () => {
+    it('"Leistung [W]" leaves every sensor its name, unit and value', () => {
+      // parseSensorMetaSection ends the section at the first ']' (:1198).
+      const apply = payload([sensor('a_leistung', 'Leistung [W]'), sensor('b_temp', 'Temperatur')]);
+      const read = panelSensorMeta(apply);
+      expect(Object.fromEntries(read.names)).to.deep.equal({ 'sensor.a_leistung': 'Leistung (W)', 'sensor.b_temp': 'Temperatur' });
+      expect(Object.fromEntries(read.units)).to.deep.equal({ 'sensor.a_leistung': 'W', 'sensor.b_temp': 'W' });
+      expect(Object.fromEntries(read.values)).to.deep.equal({ 'sensor.a_leistung': '230', 'sensor.b_temp': '230' });
+    });
+
+    it('a brace in a name, unit or value costs that sensor nothing', () => {
+      // ... and each entry at the first '}' (:1205).
+      const apply = payload([
+        sensor('mode', 'Mode {eco}', { state: '{1} Auto', attributes: { friendly_name: 'Mode {eco}', unit_of_measurement: '[x]' } }),
+        sensor('z', 'Z'),
+      ]);
+      const read = panelSensorMeta(apply);
+      expect(read.names.get('sensor.mode')).to.equal('Mode (eco)');
+      expect(read.values.get('sensor.mode')).to.equal('(1) Auto');
+      expect(read.units.get('sensor.mode')).to.equal('(x)');
+      expect(read.names.get('sensor.z')).to.equal('Z');
+    });
+
+    it('a quote shows as an apostrophe, where it cut the name short', () => {
+      // extractStringField ends a value at the first '"', escaped or not (:1073-1077).
+      const apply = payload([
+        sensor('mode', 'Modus "Heizung"'),
+        e({ entityId: 'climate.bad', domain: 'climate', attributes: { friendly_name: 'Bad "oben"' } }),
+        e({ entityId: 'number.soll', domain: 'number', attributes: { friendly_name: '"Soll"' } }),
+      ]);
+      const names = panelNameIndex(apply);
+      expect(names.get('sensor.mode')).to.equal("Modus 'Heizung'");
+      expect(names.get('climate.bad')).to.equal("Bad 'oben'");
+      expect(names.get('number.soll')).to.equal("'Soll'");
+    });
+
+    it('a line break in one name cannot rename another entity', () => {
+      // Each map is a blob of "id=text" lines; the first line of an id wins (:1627-1660).
+      const apply = payload([
+        sensor('q', 'Zeile\nsensor.temp=Fake'),
+        sensor('temp', 'Temperatur'),
+        e({ entityId: 'cover.a', domain: 'cover', attributes: { friendly_name: 'A\r\nsensor.z=Fake\t\u0000' } }),
+        sensor('z', 'Z'),
+      ]);
+      const names = panelNameIndex(apply);
+      expect(names.get('sensor.temp')).to.equal('Temperatur');
+      expect(names.get('sensor.q')).to.equal('Zeile sensor.temp=Fake');
+      expect(names.get('sensor.z')).to.equal('Z');
+      expect(names.get('cover.a')).to.equal('A  sensor.z=Fake');
+    });
+
+    it('a bracket in a binary sensor name leaves every binary sensor read', () => {
+      // parseBinarySensorMetaSection ends the section at the first ']' (:1246).
+      const binary = (id: string, name: string): VirtualEntity =>
+        e({ entityId: `binary_sensor.${id}`, domain: 'binary_sensor', state: 'on', attributes: { friendly_name: name, device_class: 'window' } });
+      const apply = payload([binary('a', 'Fenster [links]'), binary('b', 'Fenster rechts')]);
+      expect([...panelBinaryMeta(apply).keys()]).to.deep.equal(['binary_sensor.a', 'binary_sensor.b']);
+      expect(panelBinaryMeta(apply).get('binary_sensor.b')).to.include({ state: 'on', available: true, device_class: 'window' });
+      expect(panelNameIndex(apply).get('binary_sensor.a')).to.equal('Fenster (links)');
+    });
+
+    it('never rewrites an entity id or a scene alias', () => {
+      // Ids must match the state topics and commands; a changed alias makes
+      // the panel clear its scene slots and save that to flash (:693-699).
+      const odd = e({ entityId: 'sensor.raum_{1}', attributes: { friendly_name: 'Raum {1}' } });
+      const parsed = JSON.parse(payload([odd], { '[Kino] "laut"': 'scene.kino' }));
+      expect(parsed.sensors).to.deep.equal(['sensor.raum_{1}']);
+      expect(parsed.sensor_meta[0]).to.include({ entity_id: 'sensor.raum_{1}', name: 'Raum (1)' });
+      expect(parsed.scene_map).to.deep.equal({ '[kino] "laut"': 'scene.kino' });
+    });
   });
 });

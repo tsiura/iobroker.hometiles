@@ -241,7 +241,8 @@ export class PanelSession {
       this.transport.publish({ topic: iconsTopic(this.deviceId), payload: icons, retain: true });
     }
 
-    this.log.info(`[Panel ${this.deviceId}] Configuration pushed, ${entities.length} entities`);
+    // m3: how close the installation is to the limit, before a push is refused.
+    this.log.info(`[Panel ${this.deviceId}] Configuration pushed, ${entities.length} entities, ${bytes} of ${MAX_APPLY_BYTES} bytes`);
     return true;
   }
 

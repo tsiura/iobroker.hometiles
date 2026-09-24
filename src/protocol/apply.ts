@@ -20,9 +20,49 @@ export interface ApplyInput {
  */
 export const MAX_APPLY_BYTES = 32767;
 
+/**
+ * Ruling 111: a panel keeps the values of at most this many numbers,
+ * selects and datetimes together, refusing any further one without a log
+ * (ha_bridge_config.cpp:1781-1786), and its tiles draw from those values
+ * alone (value_control.cpp:136-150).
+ */
+export const MAX_EDITABLES = 128;
+const EDITABLE: readonly Domain[] = ['number', 'select', 'datetime'];
+
 function text(attributes: Record<string, unknown>, key: string): string | undefined {
   const value = attributes[key];
   return typeof value === 'string' && value.length ? value : undefined;
+}
+
+/**
+ * Ruling 112: free text the panel's hand-rolled parsers can take.
+ * sensor_meta and binary_sensor_meta end at the first ']'
+ * (ha_bridge_config.cpp:1198, :1246), a sensor_meta entry at the first '}'
+ * (:1205), and extractStringField a value at the first '"', escaped or not
+ * (:1073-1077). Every name, unit and value lands in a blob of "id=text"
+ * lines, so a line break in one adds an entry of its own (:1627-1660).
+ * Brackets and braces become parentheses, a quote an apostrophe, a control
+ * character a space. Never applied to an entity id or a scene alias: those
+ * must match the state topics, the commands and the panel's scene slots.
+ */
+const PANEL_SAFE: Readonly<Record<string, string>> = { '[': '(', ']': ')', '{': '(', '}': ')', '"': "'" };
+const panelText = (value: string): string => value.replace(/[[\]{}"\u0000-\u001f\u007f]/g, (c) => PANEL_SAFE[c] ?? ' ');
+
+/** The name the panel shows: the friendly name, else the entity id. */
+const displayName = (entity: VirtualEntity): string => panelText(text(entity.attributes, 'friendly_name') ?? entity.entityId);
+
+/**
+ * Ruling 110: the icon, only when it is an MDI name -- "mdi:" and letters,
+ * digits and hyphens, as all 7447 names the panel knows are
+ * (mdi_icons.cpp). Anything else the panel keeps as it is and draws as a
+ * "?" glyph in place of the tile's own icon (mdi_icons.cpp:7549), and on a
+ * cover in place of its open/closed icon too (cover/renderer.cpp:304-311).
+ * In any case: the panel lowercases (mdi_icons.cpp:7508-7521).
+ */
+const MDI_ICON = /^mdi:[a-z0-9-]+$/i;
+function mdiIcon(entity: VirtualEntity): string | undefined {
+  const icon = text(entity.attributes, 'icon');
+  return icon !== undefined && MDI_ICON.test(icon) ? icon : undefined;
 }
 
 function idsFor(entities: VirtualEntity[], domain: Domain): string[] {
@@ -48,12 +88,14 @@ function sensorMeta(entities: VirtualEntity[]): Record<string, unknown>[] {
       // also stops a numeric-looking transient string like "0x10" from being
       // read as a number by coercion.
       const numeric = entity.attributes.state_class === 'measurement';
+      // What parseSensorMetaSection reads and nothing else
+      // (ha_bridge_config.cpp:1209-1236): value is the initial value it
+      // shows; state and number are never read (Ruling 109).
       const meta: Record<string, unknown> = {
         entity_id: entity.entityId,
-        name: text(entity.attributes, 'friendly_name') ?? entity.entityId,
-        unit: text(entity.attributes, 'unit_of_measurement') ?? '',
-        state: entity.state,
-        value: entity.state,
+        name: displayName(entity),
+        unit: panelText(text(entity.attributes, 'unit_of_measurement') ?? ''),
+        value: panelText(entity.state),
         // Firmware accepts only "number" or "state" here: parseSensorMetaSection
         // in ha_bridge_config.cpp stores the key only for those two values, and
         // sensor/renderer.cpp branches on them to pick graph vs history mode.
@@ -61,9 +103,8 @@ function sensorMeta(entities: VirtualEntity[]): Record<string, unknown>[] {
         // and the panel falls back to a unit-based heuristic that guesses wrong
         // for a textual sensor that happens to carry a unit.
         state_kind: numeric ? 'number' : 'state',
-        number: numeric,
       };
-      const icon = text(entity.attributes, 'icon');
+      const icon = mdiIcon(entity);
       if (icon) meta.icon = icon;
       return meta;
     });
@@ -73,15 +114,14 @@ function binarySensorMeta(entities: VirtualEntity[]): Record<string, unknown>[] 
   return entities
     .filter((entity) => entity.domain === 'binary_sensor')
     .map((entity) => {
+      // What parseBinarySensorMetaSection reads and nothing else
+      // (ha_bridge_config.cpp:1259-1313): on, off, unknown and unavailable are
+      // compared with state there, never read as keys (Ruling 109).
       const meta: Record<string, unknown> = {
         entity_id: entity.entityId,
-        name: text(entity.attributes, 'friendly_name') ?? entity.entityId,
+        name: displayName(entity),
         device_class: text(entity.attributes, 'device_class') ?? '',
         state: entity.state,
-        on: 'on',
-        off: 'off',
-        unknown: 'unknown',
-        unavailable: 'unavailable',
         available: entity.available,
       };
       // lastChanged 0 means the source has never produced a value. Publishing
@@ -89,26 +129,22 @@ function binarySensorMeta(entities: VirtualEntity[]): Record<string, unknown>[] 
       // and fabricating Date.now() would make a dead entity look fresh on every
       // push. Omitting the key lets the firmware's scanner simply not find it.
       if (entity.lastChanged > 0) meta.last_changed = unixSeconds(entity.lastChanged);
-      const icon = text(entity.attributes, 'icon');
+      const icon = mdiIcon(entity);
       if (icon) meta.icon = icon;
       return meta;
     });
 }
 
-function simpleMeta(entities: VirtualEntity[], domain: Domain): Record<string, unknown>[] {
-  return entities
-    .filter((entity) => entity.domain === domain)
-    .map((entity) => {
-      const meta: Record<string, unknown> = {
-        entity_id: entity.entityId,
-        name: text(entity.attributes, 'friendly_name') ?? entity.entityId,
-        state: entity.state,
-        available: entity.available,
-      };
-      const icon = text(entity.attributes, 'icon');
-      if (icon) meta.icon = icon;
-      return meta;
-    });
+/**
+ * light_meta, switch_meta and scene_meta: read for icons alone
+ * (ha_bridge_config.cpp:1388-1390; they are no name sections, :657-661), so
+ * an entity without an icon has nothing to say there (Ruling 109).
+ */
+function iconMeta(entities: VirtualEntity[], domain: Domain): Record<string, unknown>[] {
+  return entities.flatMap((entity) => {
+    const icon = entity.domain === domain ? mdiIcon(entity) : undefined;
+    return icon ? [{ entity_id: entity.entityId, icon }] : [];
+  });
 }
 
 /**
@@ -121,14 +157,21 @@ function nameMeta(entities: VirtualEntity[], domains: readonly Domain[]): Record
   return entities
     .filter((entity) => domains.includes(entity.domain))
     .map((entity) => {
-      const meta: Record<string, unknown> = {
-        entity_id: entity.entityId,
-        name: text(entity.attributes, 'friendly_name') ?? entity.entityId,
-      };
-      const icon = text(entity.attributes, 'icon');
+      const meta: Record<string, unknown> = { entity_id: entity.entityId, name: displayName(entity) };
+      const icon = mdiIcon(entity);
       if (icon) meta.icon = icon;
       return meta;
     });
+}
+
+/**
+ * The numbers, selects and datetimes a panel is given -- the first
+ * MAX_EDITABLES by entity id, whatever order they come in -- and those left
+ * out (Ruling 111).
+ */
+export function splitEditables(entities: VirtualEntity[]): { kept: VirtualEntity[]; left: VirtualEntity[] } {
+  const editables = entities.filter((entity) => EDITABLE.includes(entity.domain)).sort(byEntityId);
+  return { kept: editables.slice(0, MAX_EDITABLES), left: editables.slice(MAX_EDITABLES) };
 }
 
 function byEntityId(a: VirtualEntity, b: VirtualEntity): number {
@@ -156,6 +199,7 @@ export function buildApplyPayload(input: ApplyInput): string {
   // (mqtt_handlers.cpp:1306-1314). No cameras (Ruling 107): the adapter
   // serves none, and the panel clears its list whether the key is absent or
   // empty (:631-636).
+  const { kept: editables } = splitEditables(entities);
   const payload = {
     sensors: idsFor(entities, 'sensor'),
     binary_sensors: idsFor(entities, 'binary_sensor'),
@@ -165,9 +209,9 @@ export function buildApplyPayload(input: ApplyInput): string {
     climates: idsFor(entities, 'climate'),
     covers: idsFor(entities, 'cover'),
     weathers: idsFor(entities, 'weather'),
-    numbers: idsFor(entities, 'number'),
-    selects: idsFor(entities, 'select'),
-    datetimes: idsFor(entities, 'datetime'),
+    numbers: idsFor(editables, 'number'),
+    selects: idsFor(editables, 'select'),
+    datetimes: idsFor(editables, 'datetime'),
     // Not served yet, and sent empty all the same: the firmware keeps a STALE
     // energy configuration while this key is absent (:594-597, :669-675), so
     // a panel migrated from Home Assistant would keep old energy sources
@@ -176,15 +220,15 @@ export function buildApplyPayload(input: ApplyInput): string {
     scene_map: sceneMap,
     sensor_meta: sensorMeta(entities),
     binary_sensor_meta: binarySensorMeta(entities),
-    light_meta: simpleMeta(entities, 'light'),
-    switch_meta: simpleMeta(entities, 'switch'),
-    scene_meta: simpleMeta(entities, 'scene'),
+    light_meta: iconMeta(entities, 'light'),
+    switch_meta: iconMeta(entities, 'switch'),
+    scene_meta: iconMeta(entities, 'scene'),
     media_player_meta: nameMeta(entities, ['media_player']),
     climate_meta: nameMeta(entities, ['climate']),
     cover_meta: nameMeta(entities, ['cover']),
     weather_meta: nameMeta(entities, ['weather']),
     // One section for all three: there is no number_meta (:661).
-    editable_meta: nameMeta(entities, ['number', 'select', 'datetime']),
+    editable_meta: nameMeta(editables, EDITABLE),
   };
 
   return JSON.stringify(payload);
@@ -194,11 +238,16 @@ export function configSignature(payload: string): string {
   return createHash('sha256').update(payload).digest('hex');
 }
 
+/**
+ * bridge/icons: the flat map of entity id to icon the Bridge sends
+ * (__init__.py:3529-3530), each top-level pair one entity to
+ * applyIconUpdate (ha_bridge_config.cpp:743-771). Every entity is in it:
+ * "" removes an icon the panel still holds (:757-762). That is the one way
+ * to clear one, since an apply that carries no icon at all leaves the
+ * panel's whole map as it was (:663-665).
+ */
 export function buildIconsPayload(entities: VirtualEntity[]): string {
   const icons: Record<string, string> = {};
-  for (const entity of [...entities].sort(byEntityId)) {
-    const icon = text(entity.attributes, 'icon');
-    if (icon) icons[entity.entityId] = icon;
-  }
-  return JSON.stringify({ icons });
+  for (const entity of [...entities].sort(byEntityId)) icons[entity.entityId] = mdiIcon(entity) ?? '';
+  return JSON.stringify(icons);
 }
