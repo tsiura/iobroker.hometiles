@@ -1407,6 +1407,80 @@ git add -A && git commit -m "feat(protocol): energy request parsing and response
 
 ---
 
+## Task 20b: Energy meters — configuration, consumption from history, catalog (added during execution, Ruling 124)
+
+**Why.** Task 20 parses `energy/request` and builds `energy/response`, but no
+task decides WHERE the numbers come from. The Home Assistant bridge reads
+HA's energy dashboard preferences and recorder statistics
+(HomeTiles-Bridge `__init__.py` `_async_handle_energy_request`, :2505-2840).
+ioBroker has neither, so the user declares meters, and the adapter derives
+consumption from their history (Task 19's provider).
+
+**Files** (follow the existing layout; adjust if the code says otherwise):
+- Modify: `src/config/options.ts` (an `energyMeters` list and a `currency`
+  option), `io-package.json` (native defaults), `admin/jsonConfig.json` +
+  `admin/i18n/*` (an Energy tab), `src/protocol/apply.ts` (the `energy`
+  catalog).
+- Create: `src/runtime/energy-source.ts` (a pure computation plus a thin
+  provider-backed fetch).
+- Test: unit tests for the computation, config validation and the catalog,
+  plus an integration test.
+
+**Rules:**
+1. Config row: `{ stateId, category, sign, name?, price? }`.
+   - category is one of grid, solar, battery, gas, water, device or
+     device_water (the firmware's icon categories,
+     energy_data.cpp:161-171);
+   - sign is 1 (import or consumption) or -1 (export, e.g. grid feed-in);
+   - price is per unit, in the global `currency` option (default EUR).
+   stateId must be a CUMULATIVE meter state (a counter such as a kWh total).
+   validateOptions rejects bad rows with reasons, as manual entities do.
+   Energy meters are an explicit pick (Task 21b), so they are always
+   published — but only while the picker is ARMED (Ruling 118): never send
+   anything to a panel from an unarmed adapter.
+2. Periods mirror the Bridge (__init__.py:2657-2668), in the host's local
+   time zone:
+   - day = local midnight to now, hourly buckets;
+   - week = local midnight 6 days ago to now, daily buckets;
+   - month = local midnight on the 1st to now, daily buckets.
+   Never more than 32 values (ENERGY_VALUES_MAX).
+3. Consumption per bucket = the counter's increase across the bucket. Take
+   the reading in effect at each boundary: the last sample at or before it,
+   including one before the period start. Treat a decrease as a counter
+   reset: count only positive deltas. A bucket with no reading in effect
+   yet is null. The total is the sum of the non-null buckets. Drop samples
+   with q != 0. Round as the Bridge does (3 decimals; 2 for cost).
+4. Entries follow the Bridge's shape (:2776-2830):
+   - one `{id, category, sign, values, total, name?, unit?}` per meter,
+     where id is the meter's entity id in the adapter's registry, as its
+     tile binds by entity id;
+   - a cost entry `{id: "<id>_cost", is_cost: true, unit: currency,
+     values, total}` when a price is set;
+   - per-category total entries (is_total) only where the Bridge makes
+     them, with translated names instead of the Bridge's hard-coded German
+     ones.
+   The sign is applied the way the firmware re-applies it: read
+   apply_energy_sign (energy_data.cpp:156-159) so it never double-flips.
+5. The `energy` catalog in bridge/apply (contract §6.4,
+   ha_bridge_config.cpp:1108-1184): one `{id, name, unit, category}` per
+   meter, sanitised like other free text (Ruling 112), inside Task 21's
+   size guard.
+6. A meter without history (not logged in the history instance) still
+   gets an entry, with total from the live counter delta if it can be
+   computed, otherwise values all null and no total. Log one English hint
+   per rebuild naming the meter.
+
+**Tests:**
+- the bucket math: resets, gaps, a pre-period reading, DST days of 23 and
+  25 hours, a month over 31 days, and the ≤ 32 cap;
+- the sign and cost rounding;
+- config validation;
+- the catalog placement and sanitising;
+- an integration test: a meter with history publishes a day response
+  whose values sum to its total.
+
+---
+
 ## Task 21: Extend bridge/apply with the new entity arrays and meta sections
 
 **Read first:** the `applyJson` section of `docs/contract-v0.2-notes.md`.
