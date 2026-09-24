@@ -110,6 +110,45 @@ export function resolveEntityIds(
   return resolved;
 }
 
+/** The key an energy meter's id is stored under, `energy:<state id>` (Task 20b): no device's key starts so. */
+export const ENERGY_KEY = 'energy:';
+/** An energy meter's cost entry is `<id>_cost` (__init__.py:2814), which the panel draws with a currency icon. */
+const COST = '_cost';
+
+/**
+ * Energy meter ids, stored like a manual entity's (Task 20b): `energy.` and
+ * the name's slug, kept once given. No registry id is ever one -- none of
+ * their domains is energy -- so a meter never shares an id, a name or a state
+ * topic with an entity. An id and its cost entry's id are taken together, so
+ * no meter's id is another's cost id either way round.
+ */
+export function resolveEnergyIds(
+  meters: ReadonlyArray<{ stateId: string; name: string }>,
+  persisted: Readonly<Record<string, string>>,
+): Record<string, string> {
+  const ids: Record<string, string> = {};
+  const taken = new Set<string>();
+  const free = (id: string): boolean => !taken.has(id) && !taken.has(`${id}${COST}`);
+  const take = (key: string, id: string): void => {
+    ids[key] = id;
+    taken.add(id).add(`${id}${COST}`);
+  };
+  for (const { stateId } of meters) {
+    const key = ENERGY_KEY + stateId;
+    const stored = Object.hasOwn(persisted, key) ? persisted[key] : undefined;
+    if (stored?.startsWith('energy.') && free(stored)) take(key, stored);
+  }
+  for (const { stateId, name } of meters) {
+    const key = ENERGY_KEY + stateId;
+    if (ids[key]) continue;
+    const root = `energy.${slugify(name)}`.slice(0, MAX_ENTITY_ID_LENGTH - SUFFIX_ROOM - COST.length).replace(/_+$/, '');
+    let id = root;
+    for (let suffix = 2; !free(id); suffix++) id = `${root}_${suffix}`;
+    take(key, id);
+  }
+  return ids;
+}
+
 /**
  * The ids to store after a rebuild: each one the registry resolved, and the
  * stored id of every detected device it was not handed -- one not picked, or

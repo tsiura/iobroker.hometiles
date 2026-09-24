@@ -1,7 +1,8 @@
 import { expect } from 'chai';
 import { buildApplyPayload, buildIconsPayload, configSignature, listsAnyEntity, splitEditables } from '../../src/protocol/apply';
 import { DOMAINS, type VirtualEntity } from '../../src/registry/types';
-import { panelBinaryMeta, panelIconMap, panelIconUpdate, panelIcons, panelList, panelNameIndex, panelNames, panelSensorMeta } from './panel-scan';
+import type { EnergyCatalogEntry } from '../../src/protocol/energy';
+import { panelBinaryMeta, panelEnergyCatalog, panelIconMap, panelIconUpdate, panelIcons, panelList, panelNameIndex, panelNames, panelSensorMeta } from './panel-scan';
 
 function e(over: Partial<VirtualEntity>): VirtualEntity {
   return {
@@ -469,5 +470,94 @@ describe('protocol/apply: an apply with every list empty (Ruling 116)', () => {
     expect(listsAnyEntity([e({ entityId: 'scene.nacht', domain: 'scene' })])).to.equal(false);
     expect(listsAnyEntity([])).to.equal(false);
     expect(listsAnyEntity(ENTITIES)).to.equal(true);
+  });
+});
+
+describe('protocol/apply: the energy catalog (Task 20b)', () => {
+  const CATALOG: EnergyCatalogEntry[] = [
+    { id: 'energy.netzbezug', name: 'Netzbezug', unit: 'kWh', category: 'grid' },
+    { id: 'energy.netzbezug_cost', name: 'Netzbezug (EUR)', unit: 'EUR', category: 'grid' },
+    { id: 'energy.pv', name: 'PV Dach', category: 'solar' },
+    { id: 'grid_total', name: 'Netz gesamt', unit: 'kWh', category: 'grid' },
+  ];
+  const payload = (energy: EnergyCatalogEntry[], entities: VirtualEntity[] = ENTITIES, sceneMap: Record<string, string> = {}): string =>
+    buildApplyPayload({ entities, sceneMap, energy });
+
+  it('lists each entry with exactly the id, name, unit and category the panel reads (ha_bridge_config.cpp:1108-1184)', () => {
+    const parsed = JSON.parse(payload(CATALOG));
+    expect(parsed.energy).to.deep.equal(CATALOG);
+    const panel = panelEnergyCatalog(payload(CATALOG))!;
+    expect(panel.ids).to.deep.equal(CATALOG.map((entry) => entry.id));
+    expect(Object.fromEntries(panel.names)).to.deep.equal(Object.fromEntries(CATALOG.map((entry) => [entry.id, entry.name])));
+    expect(Object.fromEntries(panel.units)).to.deep.equal({ 'energy.netzbezug': 'kWh', 'energy.netzbezug_cost': 'EUR', grid_total: 'kWh' });
+    // The icon a tile draws comes from here (energyIconForCategory): a cost id is the currency.
+    expect(Object.fromEntries(panel.icons)).to.deep.equal({
+      'energy.netzbezug': 'transmission-tower',
+      'energy.netzbezug_cost': 'currency-eur',
+      'energy.pv': 'solar-power',
+      grid_total: 'transmission-tower',
+    });
+  });
+
+  it('keeps sending an empty catalog without meters, and the golden payload of every domain', () => {
+    expect(JSON.parse(payload([])).energy).to.deep.equal([]);
+    expect(JSON.parse(buildApplyPayload({ entities: ENTITIES, sceneMap: {} })).energy).to.deep.equal([]);
+  });
+
+  it('sits after the entity lists and before the first free text, so no name, unit or alias spelled "energy" shadows it', () => {
+    const decoys = [
+      e({ entityId: 'sensor.decoy_a', state: 'energy', attributes: { friendly_name: 'energy', unit_of_measurement: 'energy' } }),
+      e({ entityId: 'binary_sensor.decoy_b', domain: 'binary_sensor', state: 'on', attributes: { friendly_name: 'energy' } }),
+    ];
+    const apply = payload(CATALOG, [...ENTITIES, ...decoys], { energy: 'scene.nacht', 'x"energy': 'scene.nacht' });
+    expect(panelEnergyCatalog(apply)!.ids).to.deep.equal(CATALOG.map((entry) => entry.id));
+    const keys = Object.keys(JSON.parse(apply));
+    expect(keys.indexOf('energy')).to.equal(keys.indexOf('datetimes') + 1);
+    expect(keys.indexOf('energy')).to.be.lessThan(keys.indexOf('scene_map'));
+  });
+
+  it('never lets a text equal to a key spell it: quoted, it would be found before the section, or in place of a field', () => {
+    // A catalog name "sensor_meta" is the text "sensor_meta" with its quotes,
+    // before sensor_meta itself; "cameras" would make the panel read a list
+    // it is never sent; "category" would be read as the category's own key.
+    const shadowing: EnergyCatalogEntry[] = [
+      { id: 'energy.a', name: 'sensor_meta', unit: 'scene_map', category: 'solar' },
+      { id: 'energy.b', name: 'cameras', unit: 'category', category: 'gas' },
+      { id: 'energy.c', name: 'binary_sensor_meta', unit: 'unit', category: 'water' },
+    ];
+    const apply = payload(shadowing, ENTITIES, { 'gute nacht': 'scene.nacht' });
+    expect(panelSensorMeta(apply).names.get('sensor.temp')).to.equal('Wohnzimmer');
+    expect(panelList(apply, 'cameras')).to.equal(undefined);
+    expect(panelBinaryMeta(apply).get('binary_sensor.tuer')).to.include({ state: 'on' });
+    const panel = panelEnergyCatalog(apply)!;
+    // Each still reads as it was named: the parser trims (ha_bridge_config.cpp:1079).
+    expect(Object.fromEntries(panel.names)).to.deep.equal({ 'energy.a': 'sensor_meta', 'energy.b': 'cameras', 'energy.c': 'binary_sensor_meta' });
+    expect(Object.fromEntries(panel.units)).to.deep.equal({ 'energy.a': 'scene_map', 'energy.b': 'category', 'energy.c': 'unit' });
+    expect(Object.fromEntries(panel.icons)).to.deep.equal({ 'energy.a': 'solar-power', 'energy.b': 'fire', 'energy.c': 'water' });
+    // The same holds in every other section (Ruling 112): a sensor named after a field.
+    const odd = e({ entityId: 'sensor.odd', state: '230', attributes: { friendly_name: 'value', unit_of_measurement: 'W', state_class: 'measurement' } });
+    const read = panelSensorMeta(buildApplyPayload({ entities: [odd], sceneMap: {} }));
+    expect([read.names.get('sensor.odd'), read.units.get('sensor.odd'), read.values.get('sensor.odd')]).to.deep.equal(['value', 'W', '230']);
+  });
+
+  it('makes free text safe for the hand-rolled parser (Ruling 112): a bracket, brace, quote or line break costs no entry', () => {
+    const odd: EnergyCatalogEntry[] = [
+      { id: 'energy.a', name: 'Wärmepumpe [innen] {Heizen}', unit: 'k"Wh"', category: 'device' },
+      { id: 'energy.b', name: 'Zeile\nsensor.temp=Fake', unit: 'kWh\u0000', category: 'device' },
+      { id: 'energy.c', name: 'Letzter', unit: 'm³', category: 'water' },
+    ];
+    const panel = panelEnergyCatalog(payload(odd))!;
+    expect(panel.ids).to.deep.equal(['energy.a', 'energy.b', 'energy.c']);
+    expect(panel.names.get('energy.a')).to.equal('Wärmepumpe (innen) (Heizen)');
+    expect(panel.units.get('energy.a')).to.equal("k'Wh'");
+    expect(panel.names.get('energy.b')).to.equal('Zeile sensor.temp=Fake');
+    expect(panel.units.get('energy.b')).to.equal('kWh');
+    expect(panel.names.get('energy.c')).to.equal('Letzter');
+    expect(panel.units.get('energy.c')).to.equal('m³');
+  });
+
+  it('never rewrites an id: it is what a tile binds to (energy_data.cpp:186)', () => {
+    const parsed = JSON.parse(payload([{ id: 'energy.raum_1', name: 'Raum [1]', category: 'device' }]));
+    expect(parsed.energy[0]).to.deep.equal({ id: 'energy.raum_1', name: 'Raum (1)', category: 'device' });
   });
 });

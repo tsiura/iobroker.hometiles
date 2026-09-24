@@ -1,6 +1,6 @@
 import { expect } from 'chai';
 import { requireEntityId } from '../../src/protocol/commands';
-import { buildEntityId, parseStringMap, resolveEntityIds, slugify } from '../../src/registry/entity-id';
+import { buildEntityId, ENERGY_KEY, parseStringMap, resolveEnergyIds, resolveEntityIds, slugify } from '../../src/registry/entity-id';
 import type { DeviceInput } from '../../src/registry/types';
 
 function device(objectId: string, name: string): DeviceInput {
@@ -144,5 +144,49 @@ describe('registry/entity-id', () => {
   it('falls back to the object id tail when the device has no name', () => {
     const resolved = resolveEntityIds([{ ...device('zigbee.0.kueche', '   '), domain: 'switch' }], {});
     expect(resolved['zigbee.0.kueche']).to.equal('switch.kueche');
+  });
+
+  describe('energy meter ids (Task 20b)', () => {
+    const meter = (stateId: string, name: string): { stateId: string; name: string } => ({ stateId, name });
+
+    it('derives energy.<name> for each meter, kept under energy:<state id>, a namespace no registry id is in', () => {
+      const ids = resolveEnergyIds([meter('shelly.0.em.total', 'Netzbezug'), meter('shelly.0.em.returned', 'Einspeisung')], {});
+      expect(ids).to.deep.equal({ 'energy:shelly.0.em.total': 'energy.netzbezug', 'energy:shelly.0.em.returned': 'energy.einspeisung' });
+      expect(ENERGY_KEY).to.equal('energy:');
+      // A registry id is <domain>.<slug>, and no domain is energy.
+      expect(resolveEntityIds([device('shelly.0.em.total', 'Netzbezug')], ids)['shelly.0.em.total']).to.equal('switch.netzbezug');
+    });
+
+    it('keeps the id a meter was given, whatever its name becomes', () => {
+      const stored = { 'energy:shelly.0.em.total': 'energy.hausanschluss' };
+      expect(resolveEnergyIds([meter('shelly.0.em.total', 'Netzbezug')], stored)).to.deep.equal(stored);
+    });
+
+    it("never gives a meter another meter's id or its cost entry's id, <id>_cost", () => {
+      const ids = resolveEnergyIds([meter('a.0.grid', 'Grid'), meter('a.0.cost', 'Grid cost'), meter('a.0.again', 'Grid')], {});
+      expect(ids).to.deep.equal({ 'energy:a.0.grid': 'energy.grid', 'energy:a.0.cost': 'energy.grid_cost_2', 'energy:a.0.again': 'energy.grid_2' });
+      // Nor, the other way round, one whose own cost id is a meter's.
+      const reverse = resolveEnergyIds([meter('a.0.cost', 'Grid cost'), meter('a.0.grid', 'Grid')], {});
+      expect(reverse).to.deep.equal({ 'energy:a.0.cost': 'energy.grid_cost', 'energy:a.0.grid': 'energy.grid_2' });
+      for (const all of [ids, reverse]) {
+        const taken = Object.values(all).flatMap((id) => [id, `${id}_cost`]);
+        expect(new Set(taken).size).to.equal(taken.length);
+      }
+    });
+
+    it('gives a new id where a stored one is no energy id, or is already given to a meter or its cost entry', () => {
+      const stored = { 'energy:a.0.x': 'sensor.x', 'energy:a.0.y': 'energy.z', 'energy:a.0.z': 'energy.z', 'energy:a.0.w': 'energy.z_cost' };
+      const ids = resolveEnergyIds([meter('a.0.x', 'X'), meter('a.0.y', 'Y'), meter('a.0.z', 'Z'), meter('a.0.w', 'W')], stored);
+      expect(ids).to.deep.equal({ 'energy:a.0.x': 'energy.x', 'energy:a.0.y': 'energy.z', 'energy:a.0.z': 'energy.z_2', 'energy:a.0.w': 'energy.w' });
+    });
+
+    it('keeps an id and its cost id within the 255 characters of an entity id', () => {
+      const ids = resolveEnergyIds([meter('a.0.long', 'Zu '.repeat(100)), meter('a.0.long2', 'Zu '.repeat(100))], {});
+      for (const id of Object.values(ids)) {
+        expect(`${id}_cost`.length, id).to.be.at.most(255);
+        expect(id).to.match(/^energy\.[a-z0-9_]+$/).and.not.match(/_$/);
+      }
+      expect(ids['energy:a.0.long2']).to.equal(`${ids['energy:a.0.long']}_2`);
+    });
   });
 });

@@ -5,6 +5,7 @@ import { PICKER_VERSION, validateOptions, type AdapterOptions, type DeviceOverri
 import { AnnounceError } from './protocol/announce';
 import { listsAnyEntity, MAX_EDITABLES, splitEditables } from './protocol/apply';
 import { ENTITY_ID_RE } from './protocol/commands';
+import { ENERGY_CATEGORIES } from './protocol/energy';
 import { buildStatePublish } from './protocol/state-payload';
 import {
   ANNOUNCE_TOPIC_PATTERN,
@@ -21,6 +22,8 @@ import { applyOverrides, detectedRows, mergeDetected } from './registry/override
 import { synthesise } from './registry/synth/index';
 import type { DeviceInput, SourceValue, VirtualEntity } from './registry/types';
 import { Dispatcher } from './runtime/dispatcher';
+import { energyMeters, EnergySource, type TotalNames } from './runtime/energy-source';
+import { HistoryProvider } from './runtime/history-provider';
 import { HomeTilesMqttClient, type Logger } from './runtime/mqtt-client';
 import { PanelManager } from './runtime/panel-manager';
 import { PanelObjects } from './runtime/panel-objects';
@@ -84,6 +87,13 @@ class HomeTiles extends utils.Adapter {
   private panels!: PanelManager;
   private panelObjects!: PanelObjects;
   private dispatcher!: Dispatcher;
+  /** Panel history and energy read through it (Task 19): Task 22 answers history requests with it too. */
+  private history!: HistoryProvider;
+  /**
+   * The energy meters (Task 20b): their catalog goes into every apply, and
+   * Task 22 answers a panel's energy/request with energy.answer(deviceId, payload).
+   */
+  private energy!: EnergySource;
   private persistedIds: Record<string, string> = {};
   private rootAnchors: RootAnchors = {};
   /** What the registry is handed: the picked devices, then the manual entities (Task 21b). */
@@ -132,6 +142,8 @@ class HomeTiles extends utils.Adapter {
     );
 
     this.mqtt = new HomeTilesMqttClient(options, this.log4);
+    this.history = new HistoryProvider(this, this.log4, options.historyInstance);
+    this.energy = new EnergySource(this.history, this, this.log4);
     this.registry = new EntityRegistry(
       {
         onEntityChanged: (entity) => this.publishEntity(entity),
@@ -176,6 +188,7 @@ class HomeTiles extends utils.Adapter {
       log: this.log4,
       entities: () => this.panelEntities(),
       unpublished: () => this.unpublished,
+      energy: () => this.energy.catalog(),
       onSessionsChanged: async () => {
         await this.syncPanelObjects();
       },
@@ -219,7 +232,12 @@ class HomeTiles extends utils.Adapter {
    */
   private waiting(manual: number): string {
     const earlier = this.options.deviceOverrides.filter((row) => row.objectId.trim()).length;
-    const held = [manual ? `${manual} manual entities` : '', earlier ? `${earlier} device rows of an earlier version` : ''].filter(Boolean);
+    const meters = this.options.energyMeters.length;
+    const held = [
+      manual ? `${manual} manual entities` : '',
+      earlier ? `${earlier} device rows of an earlier version` : '',
+      meters ? `${meters} energy meters` : '',
+    ].filter(Boolean);
     return held.length ? `. Held back until then: ${held.join(', ')}` : '';
   }
 
@@ -426,6 +444,8 @@ class HomeTiles extends utils.Adapter {
     this.devices = armed ? [...applyOverrides(detected, this.options.deviceOverrides), ...manual.devices] : [];
     this.rootAnchors = anchors;
     await this.saveJsonMap(ROOT_ANCHOR_STATE, 'Root anchors: the state each root id stays with', anchors);
+    // Before the registry, whose membership change pushes the apply with their catalog.
+    const energyIds = await this.configureEnergy(objects, armed);
 
     const result = this.registry.rebuild(this.devices, this.persistedIds);
     // Ruling 116: while no entity lands in a list, the panels are given
@@ -440,7 +460,8 @@ class HomeTiles extends utils.Adapter {
     // A detected device not picked keeps its stored id, so picking it again
     // gives the id back (Task 21b rule 6); so does a manual entity held back
     // until the Devices tab is used, renamed meanwhile or not (Ruling 120, N1).
-    this.persistedIds = idsToStore(this.persistedIds, [...detected, ...manual.devices], result.entityIds);
+    // Energy meters keep theirs under energy:<state id>, like manual entities, as long as they are set (Task 20b).
+    this.persistedIds = { ...idsToStore(this.persistedIds, [...detected, ...manual.devices], result.entityIds), ...energyIds };
     await this.saveJsonMap(ENTITY_ID_STATE, 'Persisted entity ids', this.persistedIds);
 
     for (const objectId of result.unsubscribe) await this.unsubscribeForeignStatesAsync(objectId);
@@ -515,6 +536,34 @@ class HomeTiles extends utils.Adapter {
     await this.saveJsonMap(PUBLISHED_STATE, 'Entity ids the panels were given', this.published);
 
     await this.setState('info.entities', this.publishedCount, true);
+  }
+
+  /**
+   * The Energy tab's meters (Task 20b): what the energy source answers panels
+   * with and lists in every apply, only while armed (Ruling 118), with each
+   * category's total named in the system's language. One warning per rebuild
+   * names the meters left out, and one those the history instance does not
+   * log, whose tiles would show nothing. The meters' ids, to store.
+   */
+  private async configureEnergy(objects: Record<string, ioBroker.Object>, armed: boolean): Promise<Record<string, string>> {
+    const rows = this.options.energyMeters;
+    const instance = rows.length > 0 ? await this.history.instanceName().catch(() => '') : '';
+    const { meters, ids, rejected, unlogged } = energyMeters(rows, objects, this.persistedIds, this.namespace, instance);
+    if (rejected.length > 0) {
+      this.log.warn(`[Energy] Meters left out: ${listed(rejected.map(({ stateId, reason }) => `${stateId} (${reason})`))}`);
+    }
+    if (meters.length > 0 && !instance) {
+      this.log.warn('[Energy] No history instance is set on the Advanced tab and the system has no default one: energy tiles show no consumption');
+    } else if (unlogged.length > 0) {
+      this.log.warn(
+        `[Energy] Not logged by ${instance}, so their energy tiles show no consumption: ${listed(unlogged)}. ` +
+          `Enable ${instance} in the settings of each of these states`,
+      );
+    }
+    const language = (await this.getForeignObjectAsync('system.config'))?.common?.language ?? 'en';
+    const totals = Object.fromEntries(ENERGY_CATEGORIES.map((category) => [category, adminText(`energy_total_${category}`, language)])) as TotalNames;
+    this.energy.configure({ armed, meters, currency: this.options.currency, totals });
+    return ids;
   }
 
   /** The discovery, and the objects it read: the manual entities' states are among them. */

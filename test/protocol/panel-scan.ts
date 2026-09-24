@@ -316,3 +316,49 @@ export function panelIconUpdate(icons: Map<string, string>, payload: string): bo
   }
   return changed;
 }
+
+/** energyIconForCategory (:1083-1099): a cost id or a euro unit first, then the category, lightning-bolt else. */
+function energyIcon(category: string, id: string, unit: string): string {
+  const cat = asciiTrim(category).toLowerCase();
+  const u = unit.toLowerCase();
+  if (id.toLowerCase().endsWith('_cost') || u === 'eur' || u === 'euro') return 'currency-eur';
+  const icons: Record<string, string> = { solar: 'solar-power', grid: 'transmission-tower', battery: 'battery-charging', gas: 'fire', water: 'water', device_water: 'water' };
+  return icons[cat] ?? 'lightning-bolt';
+}
+
+/**
+ * The energy catalog a panel reads from bridge/apply (Task 20b): applyJson
+ * finds the FIRST "energy" in the text (:588, :668-675), and
+ * parseEnergySection (:1108-1184) takes the first '[' after it, the first ']'
+ * after that, and each '{' to the first '}' as one entry, reading id, name,
+ * unit and category with extractStringField. The ids it lists, and the names,
+ * units and icons it upserts; undefined when the payload has no "energy".
+ */
+export function panelEnergyCatalog(
+  payload: string,
+): { ids: string[]; names: Map<string, string>; units: Map<string, string>; icons: Map<string, string> } | undefined {
+  const at = payload.indexOf('"energy"');
+  if (at < 0) return undefined;
+  const body = payload.slice(at);
+  const start = body.indexOf('[');
+  const end = start < 0 ? -1 : body.indexOf(']', start);
+  const out = { ids: [] as string[], names: new Map<string, string>(), units: new Map<string, string>(), icons: new Map<string, string>() };
+  if (start < 0 || end < start) return out;
+  const segment = body.slice(start + 1, end);
+  for (let from = segment.indexOf('{'); from >= 0; ) {
+    const to = segment.indexOf('}', from);
+    if (to < 0) break;
+    const object = segment.slice(from, to + 1);
+    const id = field(object, 'id');
+    if (id) {
+      if (!out.ids.some((known) => known.toLowerCase() === id.toLowerCase())) out.ids.push(id);
+      const name = field(object, 'name');
+      if (name) out.names.set(id, name);
+      const unit = field(object, 'unit');
+      if (unit) out.units.set(id, unit);
+      out.icons.set(id, energyIcon(field(object, 'category') ?? '', id, unit ?? ''));
+    }
+    from = segment.indexOf('{', to + 1);
+  }
+  return out;
+}

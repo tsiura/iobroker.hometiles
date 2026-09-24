@@ -5,6 +5,8 @@ import {
   bridgeRequestTopic,
   commandTopic,
   deviceIdFromAnnounceTopic,
+  energyRequestTopic,
+  energyResponseTopic,
   entityStateTopic,
   iconsTopic,
   ioCommandTopic,
@@ -30,6 +32,9 @@ describe('protocol/topics', () => {
     expect(applyTopic('a1')).to.equal('tab5_lvgl/config/a1/bridge/apply');
     expect(iconsTopic('a1')).to.equal('tab5_lvgl/config/a1/bridge/icons');
     expect(bridgeRequestTopic('a1')).to.equal('tab5_lvgl/config/a1/bridge/request');
+    // network_manager.cpp:592-593 (Task 20b).
+    expect(energyRequestTopic('a1')).to.equal('tab5_lvgl/config/a1/energy/request');
+    expect(energyResponseTopic('a1')).to.equal('tab5_lvgl/config/a1/energy/response');
   });
 
   it('builds command and state topics under the panel base', () => {

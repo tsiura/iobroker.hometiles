@@ -1,9 +1,12 @@
 import { createHash } from 'node:crypto';
 import type { Domain, VirtualEntity } from '../registry/types';
+import type { EnergyCatalogEntry } from './energy';
 
 export interface ApplyInput {
   entities: VirtualEntity[];
   sceneMap: Record<string, string>;
+  /** The energy meters' catalog (Task 20b), in the order a rebuild resolved them. */
+  energy?: readonly EnergyCatalogEntry[];
 }
 
 /**
@@ -55,7 +58,58 @@ function text(attributes: Record<string, unknown>, key: string): string | undefi
  * must match the state topics, the commands and the panel's scene slots.
  */
 const PANEL_SAFE: Readonly<Record<string, string>> = { '[': '(', ']': ')', '{': '(', '}': ')', '"': "'" };
-const panelText = (value: string): string => value.replace(/[[\]{}"\u0000-\u001f\u007f]/g, (c) => PANEL_SAFE[c] ?? ' ');
+
+/**
+ * Every key the panel looks for in an apply (applyJson and parseIconMetaSections,
+ * ha_bridge_config.cpp:567-661, :1382-1394), and every field its hand-rolled
+ * parsers read by name (extractStringField, :1066-1081). A text equal to one
+ * is that key, quoted as it goes out: found before its section, the panel
+ * reads the section from there, one it is never sent (cameras) as well, and
+ * an object reads a field from the wrong place. A trailing space keeps the
+ * text apart; the panel trims it where it reads the text (:1079, :1627-1660)
+ * (Task 20b).
+ */
+const PANEL_KEYS: ReadonlySet<string> = new Set([
+  'sensors',
+  'configured_sensors',
+  'numbers',
+  'selects',
+  'datetimes',
+  'binary_sensors',
+  'energy',
+  'weathers',
+  'lights',
+  'switches',
+  'media_players',
+  'climates',
+  'covers',
+  'cameras',
+  'scene_map',
+  'sensor_meta',
+  'binary_sensor_meta',
+  'editable_meta',
+  'weather_meta',
+  'light_meta',
+  'switch_meta',
+  'scene_meta',
+  'media_player_meta',
+  'climate_meta',
+  'cover_meta',
+  'camera_meta',
+  'entity_id',
+  'name',
+  'unit',
+  'value',
+  'state_kind',
+  'icon',
+  'id',
+  'category',
+]);
+
+const panelText = (value: string): string => {
+  const safe = value.replace(/[[\]{}"\u0000-\u001f\u007f]/g, (c) => PANEL_SAFE[c] ?? ' ');
+  return PANEL_KEYS.has(safe) ? `${safe} ` : safe;
+};
 
 /** The name the panel shows: the friendly name, else the entity id. */
 const displayName = (entity: VirtualEntity): string => panelText(text(entity.attributes, 'friendly_name') ?? entity.entityId);
@@ -174,6 +228,16 @@ function nameMeta(entities: VirtualEntity[], domains: readonly Domain[]): Record
 }
 
 /**
+ * A catalog entry as parseEnergySection reads it (ha_bridge_config.cpp:1108-1184):
+ * the first '{' to the first '}' of the section, each field the first quoted
+ * token after its name. Free text made safe (Ruling 112), never the id: a tile
+ * binds to it (energy_data.cpp:186). No unit, no key.
+ */
+function energyEntry({ id, name, unit, category }: EnergyCatalogEntry): Record<string, string> {
+  return unit ? { id, name: panelText(name), unit: panelText(unit), category } : { id, name: panelText(name), category };
+}
+
+/**
  * The numbers, selects and datetimes a panel is given -- the first
  * MAX_EDITABLES by entity id, whatever order they come in -- and those left
  * out (Ruling 111).
@@ -232,11 +296,13 @@ export function buildApplyPayload(input: ApplyInput): string {
     numbers: idsFor(editables, 'number'),
     selects: idsFor(editables, 'select'),
     datetimes: idsFor(editables, 'datetime'),
-    // Not served yet, and sent empty all the same: the firmware keeps a STALE
-    // energy configuration while this key is absent (:594-597, :669-675), so
-    // a panel migrated from Home Assistant would keep old energy sources
-    // forever.
-    energy: [] as string[],
+    // The energy meters' catalog (Task 20b), sent empty without meters: the
+    // firmware keeps a STALE energy configuration while this key is absent
+    // (:594-597, :669-675), so a panel migrated from Home Assistant would
+    // keep old energy sources forever. It holds free text, made safe above,
+    // and it comes before scene_map, whose aliases are sent as they are: an
+    // alias "energy" there would spell this key.
+    energy: (input.energy ?? []).map(energyEntry),
     scene_map: sceneMap,
     sensor_meta: sensorMeta(entities),
     binary_sensor_meta: binarySensorMeta(entities),

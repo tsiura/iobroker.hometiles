@@ -1,4 +1,5 @@
 import { AnnounceError, parseAnnouncement } from '../protocol/announce';
+import type { EnergyCatalogEntry } from '../protocol/energy';
 import type { VirtualEntity } from '../registry/types';
 import type { Dispatcher } from './dispatcher';
 import type { Logger } from './mqtt-client';
@@ -21,6 +22,8 @@ export interface PanelManagerDeps {
    * initial push clears their retained states, after its configuration.
    */
   unpublished?(): readonly string[];
+  /** The energy meters' catalog for every apply (Task 20b); none without. */
+  energy?(): readonly EnergyCatalogEntry[];
   /** Called after a session is created, updated or removed. */
   onSessionsChanged(): void | Promise<void>;
   /**
@@ -81,7 +84,7 @@ export class PanelManager {
       );
     }
 
-    const session = new PanelSession(announcement, this.deps.transport, this.deps.dispatcher, this.deps.log);
+    const session = new PanelSession(announcement, this.deps.transport, this.deps.dispatcher, this.deps.log, Date.now, () => this.deps.energy?.() ?? []);
     session.onRefreshRequested = (): void => {
       session.pushConfig(this.deps.entities(), true);
       for (const entity of this.deps.entities() ?? []) session.pushEntityState(entity);

@@ -2,6 +2,7 @@ import type { Announcement, LocalIoChannel } from '../protocol/announce';
 import { buildApplyPayload, buildIconsPayload, configSignature, MAX_APPLY_BYTES, MAX_ICONS_BYTES } from '../protocol/apply';
 import { CommandError, parseCommand, parseValueCommand, requireEntityId, type ServiceCall } from '../protocol/commands';
 import { buildValueAck, CONTROL_SESSION, MAX_CONTROL_BYTES, type ValueStatus } from '../protocol/editable';
+import type { EnergyCatalogEntry } from '../protocol/energy';
 import { buildStateClear, buildStatePublish } from '../protocol/state-payload';
 import {
   applyTopic,
@@ -124,6 +125,8 @@ export class PanelSession {
     private readonly dispatcher: Dispatcher,
     private readonly log: Logger,
     private readonly now: () => number = Date.now,
+    /** The energy meters' catalog, as the last rebuild resolved them (Task 20b). */
+    private readonly energy: () => readonly EnergyCatalogEntry[] = () => [],
   ) {}
 
   get deviceId(): string {
@@ -219,7 +222,7 @@ export class PanelSession {
    */
   pushConfig(entities: VirtualEntity[] | null, force = false): boolean {
     if (!entities) return false;
-    const payload = buildApplyPayload({ entities, sceneMap: this.sceneMap });
+    const payload = buildApplyPayload({ entities, sceneMap: this.sceneMap, energy: this.energy() });
     const signature = configSignature(payload);
     const bytes = Buffer.byteLength(payload, 'utf8');
     if (bytes > MAX_APPLY_BYTES) {
@@ -228,7 +231,8 @@ export class PanelSession {
         this.log.error(
           `[Panel ${this.deviceId}] Configuration not pushed: it is ${bytes} bytes, over the ${MAX_APPLY_BYTES} bytes a ` +
             `panel takes in one bridge/apply (largest sections: ${largestSections(payload)}). Pick fewer devices on the ` +
-            'Devices tab of the adapter settings until it fits; the panel keeps its last configuration meanwhile',
+            'Devices tab of the adapter settings, or set fewer energy meters on the Energy tab, until it fits; the panel ' +
+            'keeps its last configuration meanwhile',
         );
       }
       return false;

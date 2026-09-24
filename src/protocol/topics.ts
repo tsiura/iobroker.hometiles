@@ -39,6 +39,15 @@ export function weatherRequestTopic(deviceId: string): string {
   return `${CONFIG_TOPIC_ROOT}/${deviceId}/weather/request`;
 }
 
+/** A panel's energy request and its answer (network_manager.cpp:592-593): config-plane, never under the base topic. */
+export function energyRequestTopic(deviceId: string): string {
+  return `${CONFIG_TOPIC_ROOT}/${deviceId}/energy/request`;
+}
+
+export function energyResponseTopic(deviceId: string): string {
+  return `${CONFIG_TOPIC_ROOT}/${deviceId}/energy/response`;
+}
+
 export function commandTopic(baseTopic: string, leaf: string): string {
   return `${baseTopic}/cmnd/${leaf}`;
 }

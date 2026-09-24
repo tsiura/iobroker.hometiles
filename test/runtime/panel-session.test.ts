@@ -336,6 +336,30 @@ describe('runtime/panel-session', () => {
       expect(errors).to.have.length(2);
     });
 
+    it('counts the energy catalog it is given, names it among the largest sections, and says where to cut (Task 20b)', () => {
+      const { session: plain } = harness();
+      const small = [entity({})];
+      const base = Buffer.byteLength(buildApplyPayload({ entities: small, sceneMap: plain.sceneMap }));
+      // Each entry, {"id":"energy.m_0000","name":"xxx...","category":"device"} and its comma, is over 77 bytes.
+      const catalog = Array.from({ length: Math.ceil((LIMIT - base) / 77) + 1 }, (_, i) => ({
+        id: `energy.m_${String(i).padStart(4, '0')}`,
+        name: 'x'.repeat(30),
+        category: 'device',
+      }));
+      const published: PublishRequest[] = [];
+      const errors: string[] = [];
+      const transport: PanelTransport = { publish: (request) => void published.push(request), subscribe: async () => undefined, unsubscribe: async () => undefined };
+      const log = { ...silentLog, error: (message: string): void => void errors.push(message) };
+      const dispatcher = new Dispatcher({ byId: () => undefined, bySceneAlias: () => undefined }, async () => undefined, silentLog);
+      const session = new PanelSession(parseAnnouncement('a1', ANNOUNCE), transport, dispatcher, log, Date.now, () => catalog);
+      expect(session.pushConfig(small)).to.equal(false);
+      expect(published).to.deep.equal([]);
+      expect(errors[0]).to.match(/largest sections: energy \d+ bytes/).and.include('energy meters on the Energy tab');
+      catalog.length = 2;
+      expect(session.pushConfig(small)).to.equal(true);
+      expect(JSON.parse(published.find((p) => p.topic === APPLY)!.payload).energy).to.deep.equal(catalog);
+    });
+
     it('compares a later push with the configuration last published, not the one refused', () => {
       // A refused apply never reached the broker: going back to the published
       // one needs no publish, and a forced push still sends it.

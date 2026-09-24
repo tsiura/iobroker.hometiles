@@ -1,4 +1,5 @@
 import { expect } from 'chai';
+import type { EnergyCatalogEntry } from '../../src/protocol/energy';
 import { Dispatcher } from '../../src/runtime/dispatcher';
 import type { PublishRequest } from '../../src/runtime/mqtt-client';
 import { PanelManager } from '../../src/runtime/panel-manager';
@@ -29,7 +30,11 @@ const ENTITY: VirtualEntity = {
   lastChanged: 1_757_000_000_000,
 };
 
-function harness(entities: () => VirtualEntity[] | null = () => [ENTITY], unpublished?: () => readonly string[]) {
+function harness(
+  entities: () => VirtualEntity[] | null = () => [ENTITY],
+  unpublished?: () => readonly string[],
+  energy?: () => readonly EnergyCatalogEntry[],
+) {
   const published: PublishRequest[] = [];
   const subscribed: string[] = [];
   const unsubscribed: string[] = [];
@@ -60,6 +65,7 @@ function harness(entities: () => VirtualEntity[] | null = () => [ENTITY], unpubl
     log,
     entities,
     ...(unpublished ? { unpublished } : {}),
+    ...(energy ? { energy } : {}),
     onSessionsChanged: () => {
       sessionsChanged++;
     },
@@ -87,6 +93,24 @@ describe('runtime/panel-manager', () => {
     expect(manager.get('a1')).to.not.equal(undefined);
     expect(published.some((p) => p.topic === 'tab5_lvgl/config/a1/bridge/apply')).to.equal(true);
     expect(published.some((p) => p.topic === 'ha/statestream/switch/k/state')).to.equal(true);
+  });
+
+  it("gives each panel's apply the energy catalog, at every push: announcement, refresh and a new announcement (Task 20b)", async () => {
+    let catalog: EnergyCatalogEntry[] = [{ id: 'energy.netzbezug', name: 'Netzbezug', unit: 'kWh', category: 'grid' }];
+    const { manager, published } = harness(() => [ENTITY], undefined, () => catalog);
+    const applied = (): unknown => JSON.parse(published.filter((p) => p.topic === 'tab5_lvgl/config/a1/bridge/apply').at(-1)!.payload).energy;
+    await manager.handleAnnouncement('a1', announcement('a1', 'panel-a'));
+    expect(applied()).to.deep.equal(catalog);
+    catalog = [...catalog, { id: 'energy.pv', name: 'PV', category: 'solar' }];
+    await manager.handleMessage('tab5_lvgl/config/a1/bridge/request', 'force', false);
+    expect(applied()).to.deep.equal(catalog);
+    catalog = [];
+    await manager.handleAnnouncement('a1', announcement('a1', 'panel-a'));
+    expect(applied()).to.deep.equal([]);
+    // Without a catalog, an empty one, as before.
+    const bare = harness();
+    await bare.manager.handleAnnouncement('a1', announcement('a1', 'panel-a'));
+    expect(JSON.parse(bare.published.find((p) => p.topic === 'tab5_lvgl/config/a1/bridge/apply')!.payload).energy).to.deep.equal([]);
   });
 
   it("clears, after a new panel's configuration, the retained state of each entity the last run published and this one does not (Task 21b)", async () => {

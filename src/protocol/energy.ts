@@ -43,6 +43,18 @@ export interface EnergyEntry {
 }
 
 /**
+ * One entry of bridge/apply's `energy` catalog (contract §6.4): all the panel
+ * reads of it -- an id to list, and the name, unit and category-drawn icon it
+ * files under that id for tiles to show (ha_bridge_config.cpp:1108-1184).
+ */
+export interface EnergyCatalogEntry {
+  id: string;
+  name: string;
+  unit?: string;
+  category: string;
+}
+
+/**
  * The period of a panel's {"period":"day"|"week"|"month"}; any other period is
  * day, as on the panel (mqtt_handlers.cpp:2531-2535) and in the Bridge, which
  * trims and lowercases it (__init__.py:2514-2516). Null when the payload is no
@@ -89,9 +101,13 @@ export interface EnergyResponse {
   entriesDropped: number;
 }
 
-/** An entry as it goes out: at most MAX_ENERGY_VALUES values, nothing that is not finite. */
+/**
+ * An entry as it goes out: at most MAX_ENERGY_VALUES values. JSON.stringify
+ * sends a value that is not finite as null, which the panel marks invalid; a
+ * total that is not finite is left out rather than sent as null.
+ */
 function wire(entry: EnergyEntry): Record<string, unknown> {
-  const out: Record<string, unknown> = { ...entry, values: entry.values.slice(0, MAX_ENERGY_VALUES).map((v) => (v !== null && Number.isFinite(v) ? v : null)) };
+  const out: Record<string, unknown> = { ...entry, values: entry.values.slice(0, MAX_ENERGY_VALUES) };
   if (entry.total === undefined || !Number.isFinite(entry.total)) delete out.total;
   return out;
 }
