@@ -40,10 +40,9 @@ async function waitFor<T>(harness: IntegrationTestHarness, find: () => T | undef
 }
 
 /**
- * changeAdapterConfig deep-merges (alcalzone-shared extend), which turns a
- * list the instance's native does not hold yet into an object. manualEntities
- * has no io-package.json default until its admin table exists (Task 23), so
- * it is set whole.
+ * changeAdapterConfig deep-merges (alcalzone-shared extend): a list goes
+ * into the one the instance holds index by index, and one it does not hold
+ * yet becomes an object. The list is set whole instead.
  */
 async function setManualEntities(harness: IntegrationTestHarness, entries: object[]): Promise<void> {
   const id = 'system.adapter.hometiles.0';
@@ -182,12 +181,21 @@ const REGLER_OBJECTS: Record<string, object> = Object.fromEntries(
   ]),
 );
 
+/** The balcony, for the picker's room column (Task 21b): the sensor is in it. */
+const ROOM_OBJECTS: Record<string, object> = {
+  'enum.rooms.balkon': { type: 'enum', common: { name: 'Balkon', members: [SENSOR] } },
+};
+
+/** Rows that pick devices (Task 21b): nothing reaches a panel without one. */
+const picked = (...objectIds: string[]): object[] => objectIds.map((objectId) => ({ objectId, include: true }));
+
 const FIXTURE_IDS = [
   ...Object.keys(SENSOR_OBJECTS),
   ...Object.keys(CORRUPT_ENUM_OBJECTS),
   ...Object.keys(BAD_OBJECTS),
   ...Object.keys(HELPER_OBJECTS),
   ...Object.keys(KAFFEE_OBJECTS),
+  ...Object.keys(ROOM_OBJECTS),
 ];
 
 /** A panel as the firmware announces itself: retained on the broker, like its last configuration. */
@@ -308,7 +316,7 @@ if (process.env.HOMETILES_INTEGRATION === '1') {
           const harness = getHarness();
           const logs = await captureLogs(harness);
           // A number where text belongs made validateOptions throw in onReady.
-          await harness.changeAdapterConfig('hometiles', { native: { clientId: 42 } });
+          await harness.changeAdapterConfig('hometiles', { native: { clientId: 42, deviceOverrides: picked(SENSOR) } });
           await setObjects(harness, SENSOR_OBJECTS);
           // JSON null used to throw inside discovery; a non-string id would
           // throw in resolveEntityIds. Both stopped the adapter from starting.
@@ -352,7 +360,9 @@ if (process.env.HOMETILES_INTEGRATION === '1') {
           this.timeout(120000);
           const harness = getHarness();
           const logs = await captureLogs(harness);
-          await harness.changeAdapterConfig('hometiles', { native: { brokerHost: '127.0.0.1', brokerPort: port } });
+          await harness.changeAdapterConfig('hometiles', {
+            native: { brokerHost: '127.0.0.1', brokerPort: port, deviceOverrides: picked('knx.0.Licht.Flur') },
+          });
           await setObjects(harness, CORRUPT_ENUM_OBJECTS);
           // Resolves once info.connection is true: MQTT connected.
           await harness.startAdapterAndWait(true);
@@ -376,6 +386,9 @@ if (process.env.HOMETILES_INTEGRATION === '1') {
         let server: Server;
         let panel: MqttClient;
         const applies: string[] = [];
+        /** An entity the last run published and this run's selection leaves out (Task 21b). */
+        const ALT_STATE = 'ha/e2e/sensor/alt/state';
+        const altState: string[] = [];
         let design: DesignDocument | undefined;
         // Never leave the objects database without its view: the harness
         // backs up whatever the last suite of a run left behind.
@@ -389,10 +402,12 @@ if (process.env.HOMETILES_INTEGRATION === '1') {
           panel = await mqtt.connectAsync(`mqtt://127.0.0.1:${port}`);
           await panel.publishAsync(APPLY_TOPIC, LAST_GOOD_APPLY, { retain: true });
           await panel.publishAsync(ANNOUNCE_TOPIC, ANNOUNCEMENT, { retain: true });
+          await panel.publishAsync(ALT_STATE, '7', { retain: true });
           panel.on('message', (topic, payload) => {
             if (topic === APPLY_TOPIC) applies.push(payload.toString());
+            if (topic === ALT_STATE) altState.push(payload.toString());
           });
-          await panel.subscribeAsync(APPLY_TOPIC);
+          await panel.subscribeAsync([APPLY_TOPIC, ALT_STATE]);
         });
         after((done) => {
           panel.end(true);
@@ -404,8 +419,12 @@ if (process.env.HOMETILES_INTEGRATION === '1') {
           this.timeout(120000);
           const harness = getHarness();
           const logs = await captureLogs(harness);
-          await harness.changeAdapterConfig('hometiles', { native: { brokerHost: '127.0.0.1', brokerPort: port } });
+          await harness.changeAdapterConfig('hometiles', {
+            native: { brokerHost: '127.0.0.1', brokerPort: port, deviceOverrides: picked(SENSOR) },
+          });
           await setObjects(harness, SENSOR_OBJECTS);
+          const lastRun = JSON.stringify({ 'zigbee.0.alt': 'sensor.alt' });
+          await harness.states.setStateAsync('hometiles.0.info.publishedIds', { val: lastRun, ack: true });
           design = await breakDeviceView(harness);
           await harness.startAdapterAndWait(true);
           await waitFor(harness, () => logs.find((log) => log.message.includes(`[Panel ${PANEL}] Session started`)), 'the panel');
@@ -443,6 +462,10 @@ if (process.env.HOMETILES_INTEGRATION === '1') {
           const apply = await waitFor(harness, () => applies.find((payload) => payload.includes('sensor.balkon')), 'the normal apply');
           expect(JSON.parse(apply).sensors).to.deep.equal(['sensor.balkon']);
           expect(applies[0]).to.equal(LAST_GOOD_APPLY);
+          // The panel announced while discovery failed, so it is told now what
+          // the last run published and this one does not (Task 21b).
+          await waitFor(harness, () => (altState.includes('') ? true : undefined), 'the cleared state');
+          expect(altState).to.deep.equal(['7', '']);
         });
       });
 
@@ -461,7 +484,8 @@ if (process.env.HOMETILES_INTEGRATION === '1') {
             native: {
               brokerHost: '127.0.0.1',
               brokerPort: port,
-              deviceOverrides: [{ objectId: FORCED, forcedDomain: 'number' }],
+              // The alias picked too: only a picked device's values are read.
+              deviceOverrides: [...picked(SENSOR, BAD_ALIAS), { objectId: FORCED, include: true, forcedDomain: 'number' }],
             },
           });
           await setObjects(harness, { ...SENSOR_OBJECTS, ...BAD_OBJECTS });
@@ -508,8 +532,10 @@ if (process.env.HOMETILES_INTEGRATION === '1') {
             native: {
               brokerHost: '127.0.0.1',
               brokerPort: port,
-              // Overrides are for detected devices: neither key removes it.
+              // Overrides are for detected devices: neither key removes it,
+              // and a manual entity needs no row to be published (Task 21b).
               deviceOverrides: [
+                ...picked(SENSOR),
                 { objectId: HELPER, include: false },
                 { objectId: `manual:${HELPER}`, include: false },
               ],
@@ -668,7 +694,9 @@ if (process.env.HOMETILES_INTEGRATION === '1') {
 
         async function start(harness: IntegrationTestHarness): Promise<{ logs: LogRecord[]; written: unknown[] }> {
           const logs = await captureLogs(harness);
-          await harness.changeAdapterConfig('hometiles', { native: { brokerHost: '127.0.0.1', brokerPort: port } });
+          await harness.changeAdapterConfig('hometiles', {
+            native: { brokerHost: '127.0.0.1', brokerPort: port, deviceOverrides: picked(KAFFEE) },
+          });
           await setObjects(harness, KAFFEE_OBJECTS);
           await harness.states.setStateAsync(KAFFEE_SWITCH, { val: false, ack: true });
           const written = commandsTo(harness, KAFFEE_SWITCH);
@@ -725,7 +753,9 @@ if (process.env.HOMETILES_INTEGRATION === '1') {
           this.timeout(120000);
           const harness = getHarness();
           const logs = await captureLogs(harness);
-          await harness.changeAdapterConfig('hometiles', { native: { brokerHost: '127.0.0.1', brokerPort: port } });
+          await harness.changeAdapterConfig('hometiles', {
+            native: { brokerHost: '127.0.0.1', brokerPort: port, deviceOverrides: picked(SENSOR) },
+          });
           await setObjects(harness, SENSOR_OBJECTS);
           await harness.startAdapterAndWait(true);
           await waitFor(harness, () => applies.find((payload) => payload.includes('sensor.balkon')), 'the normal apply');
@@ -777,6 +807,205 @@ if (process.env.HOMETILES_INTEGRATION === '1') {
           const capped = logs.filter((log) => log.message.includes('at most 128'));
           expect(capped.map((log) => log.severity), capped.map((log) => log.message).join('\n')).to.deep.equal(['warn']);
           expect(capped[0]!.message).to.include('[Registry] 2 ').and.include('number.regler_128, number.regler_129');
+          // Manual entities alone are a selection: no hint to pick devices (Task 21b).
+          expect(logs.filter((log) => log.message.includes('No devices selected yet'))).to.deep.equal([]);
+        });
+      });
+
+      // One broker for the four suites: what a run retained on it survives the
+      // restart that saving a selection causes (js-controller restarts an
+      // instance whose object changes). The harness restores the database for
+      // each suite, so the stores a run leaves are carried into the next.
+      describe('opt-in selection (Task 21b)', () => {
+        const port = 18858;
+        const { applies, panel } = withBrokerAndPanel(port);
+        const HINT = 'No devices selected yet — pick devices in the adapter settings (Devices tab)';
+        const BALKON_STATE = 'ha/e2e/sensor/balkon/state';
+        const LISTS = ['sensors', 'binary_sensors', 'lights', 'switches', 'media_players', 'climates', 'covers', 'weathers', 'numbers', 'selects', 'datetimes', 'energy'];
+        const EMPTY = Object.fromEntries(LISTS.map((key) => [key, []]));
+        const lists = (apply: string): Record<string, unknown> => {
+          const parsed = JSON.parse(apply) as Record<string, unknown>;
+          return Object.fromEntries(LISTS.map((key) => [key, parsed[key]]));
+        };
+        /** Every payload on the sensor's state topic, in order, across the runs. */
+        const balkonState: string[] = [];
+        /** The id and publish stores the last run left, which the next one starts from. */
+        const stores: Record<string, string> = {};
+
+        before(async () => {
+          panel().on('message', (topic, payload) => {
+            if (topic === BALKON_STATE) balkonState.push(payload.toString());
+          });
+          await panel().subscribeAsync(BALKON_STATE);
+        });
+
+        /** Starts a run on these rows, from the stores the last run left: its logs and its apply. */
+        async function run(
+          harness: IntegrationTestHarness,
+          deviceOverrides: object[],
+          objects: Record<string, object> = SENSOR_OBJECTS,
+        ): Promise<{ logs: LogRecord[]; apply: string }> {
+          const logs = await captureLogs(harness);
+          await harness.changeAdapterConfig('hometiles', { native: { brokerHost: '127.0.0.1', brokerPort: port, deviceOverrides } });
+          await setObjects(harness, { ...objects, ...KAFFEE_OBJECTS, ...ROOM_OBJECTS });
+          await harness.states.setStateAsync(`${SENSOR}.temperature`, { val: 21.5, ack: true });
+          for (const [id, val] of Object.entries(stores)) await harness.states.setStateAsync(`hometiles.0.${id}`, { val, ack: true });
+          const seen = applies.length;
+          await harness.startAdapterAndWait(true);
+          const apply = await waitFor(harness, () => applies[seen], 'the apply');
+          await waitFor(harness, () => ready(logs), 'onReady to finish');
+          return { logs, apply };
+        }
+
+        /** The stores this run left, parsed, kept for the next run. */
+        async function keepStores(harness: IntegrationTestHarness): Promise<Record<string, unknown>> {
+          for (const id of ['info.entityIds', 'info.publishedIds']) {
+            stores[id] = String((await harness.states.getStateAsync(`hometiles.0.${id}`))?.val);
+          }
+          return Object.fromEntries(Object.entries(stores).map(([id, val]) => [id, JSON.parse(val)]));
+        }
+
+        /** An admin request, sent as admin sends one, and the adapter's answer. */
+        async function ask(harness: IntegrationTestHarness, command: string, message: unknown): Promise<unknown> {
+          let answer: unknown;
+          harness.sendTo('hometiles.0', command, message, (reply: unknown) => {
+            answer = reply;
+          });
+          return waitFor(harness, () => answer, `the answer to ${command}`);
+        }
+
+        suite('nothing picked yet', (getHarness) => {
+          withCleanFixtures(getHarness);
+
+          it('publishes empty lists and no value, and logs the hint once', async function () {
+            this.timeout(120000);
+            const harness = getHarness();
+            const { logs, apply } = await run(harness, []);
+            expect(lists(apply)).to.deep.equal(EMPTY);
+            const hints = logs.filter((log) => log.message.includes(HINT));
+            expect(hints.map((log) => [log.severity, log.message.slice(log.message.indexOf('[Registry]'))])).to.deep.equal([
+              ['info', `[Registry] ${HINT}`],
+            ]);
+            expect(ready(logs)!.message).to.include('Ready. 2 devices detected, 0 picked (manual entities included), 0 entities published');
+            expect(await keepStores(harness)).to.deep.equal({ 'info.entityIds': {}, 'info.publishedIds': {} });
+            // The sensor holds a value, and nothing subscribed to it publishes it.
+            await new Promise((resolve) => setTimeout(resolve, 500));
+            expect(balkonState).to.deep.equal([]);
+          });
+
+          it('fills the picker from detection: each device unticked, with its name, domain and room, by object id', async function () {
+            this.timeout(60000);
+            const reply = await ask(getHarness(), 'refreshDetected', { rows: [] });
+            expect(reply).to.deep.equal({
+              native: {
+                deviceOverrides: [
+                  { objectId: KAFFEE, include: false, name: '', forcedDomain: '', detectedName: 'Kaffee', detectedDomain: 'switch', room: '' },
+                  { objectId: SENSOR, include: false, name: '', forcedDomain: '', detectedName: 'Balkon', detectedDomain: 'sensor', room: 'Balkon' },
+                ],
+              },
+              result: 'refreshed',
+              args: ['2', '2'],
+            });
+          });
+
+          it("keeps the form's choices and a row whose device is gone, adds only what is new, and publishes nothing", async function () {
+            this.timeout(60000);
+            const seen = applies.length;
+            const rows = [
+              { objectId: SENSOR, include: true, name: 'Draußen', forcedDomain: '' },
+              { objectId: 'zigbee.0.weg', include: true, name: '', forcedDomain: '' },
+            ];
+            const reply = (await ask(getHarness(), 'refreshDetected', { rows })) as { native: { deviceOverrides: object[] }; args: string[] };
+            expect(reply.native.deviceOverrides).to.deep.equal([
+              { objectId: KAFFEE, include: false, name: '', forcedDomain: '', detectedName: 'Kaffee', detectedDomain: 'switch', room: '' },
+              { objectId: SENSOR, include: true, name: 'Draußen', forcedDomain: '', detectedName: 'Balkon', detectedDomain: 'sensor', room: 'Balkon' },
+              { objectId: 'zigbee.0.weg', include: true, name: '', forcedDomain: '' },
+            ]);
+            expect(reply.args).to.deep.equal(['2', '1']);
+            // A choice applies once saved, which restarts the adapter.
+            await new Promise((resolve) => setTimeout(resolve, 500));
+            expect(applies.length).to.equal(seen);
+          });
+
+          it('still answers listDetected, testBroker and previewEntity, which shows a device before it is picked', async function () {
+            this.timeout(60000);
+            const harness = getHarness();
+            const found = (await ask(harness, 'listDetected', {})) as Array<{ objectId: string; entityId: string }>;
+            expect(found.map((device) => [device.objectId, device.entityId])).to.have.deep.members([
+              [SENSOR, ''],
+              [KAFFEE, ''],
+            ]);
+            expect(await ask(harness, 'testBroker', {})).to.deep.equal({ connected: true });
+            const preview = (await ask(harness, 'previewEntity', { objectId: SENSOR })) as { entity: object; publish: object };
+            expect(preview.entity).to.include({ entityId: 'sensor.preview', state: '21.5' });
+            expect(preview.publish).to.include({ topic: 'ha/statestream/sensor/preview/state', payload: '21.5' });
+          });
+        });
+
+        suite('one device picked', (getHarness) => {
+          withCleanFixtures(getHarness);
+
+          it('publishes exactly that entity, with its value, and no hint', async function () {
+            this.timeout(120000);
+            const harness = getHarness();
+            const { logs, apply } = await run(harness, picked(SENSOR));
+            expect(lists(apply)).to.deep.equal({ ...EMPTY, sensors: ['sensor.balkon'] });
+            await waitFor(harness, () => (balkonState.includes('21.5') ? true : undefined), "the sensor's value");
+            expect(logs.filter((log) => log.message.includes(HINT))).to.deep.equal([]);
+            expect(ready(logs)!.message).to.include('Ready. 2 devices detected, 1 picked (manual entities included), 1 entities published');
+            expect(await keepStores(harness)).to.deep.equal({
+              'info.entityIds': { [SENSOR]: 'sensor.balkon' },
+              'info.publishedIds': { [SENSOR]: 'sensor.balkon' },
+            });
+          });
+        });
+
+        suite('un-picked, after the restart its save causes', (getHarness) => {
+          withCleanFixtures(getHarness);
+
+          it('takes the entity off the panel, clears its retained state, and keeps its id for a later pick', async function () {
+            this.timeout(120000);
+            const harness = getHarness();
+            const seen = balkonState.length;
+            // And a hand edit that is no entity id: it must not stop the panel's start (Ruling 51).
+            stores['info.publishedIds'] = JSON.stringify({ ...JSON.parse(stores['info.publishedIds'] ?? '{}'), 'zigbee.0.weg': 'kaputt' });
+            const panels = valuesOf(harness, 'hometiles.0.info.panels');
+            const { logs, apply } = await run(harness, [{ objectId: SENSOR, include: false }]);
+            expect(lists(apply)).to.deep.equal(EMPTY);
+            await waitFor(harness, () => (balkonState.slice(seen).includes('') ? true : undefined), 'the cleared state');
+            // The session's start ran to its end: its objects are synced.
+            await waitFor(harness, () => (panels.includes(1) ? true : undefined), 'the panel objects');
+            const failed = logs.filter((log) => log.message.includes('failed'));
+            expect(failed.map((log) => log.message)).to.deep.equal([]);
+            expect(await keepStores(harness)).to.deep.equal({
+              'info.entityIds': { [SENSOR]: 'sensor.balkon' },
+              'info.publishedIds': {},
+            });
+            // Nothing is left retained for a panel that subscribes later.
+            const late = await mqtt.connectAsync(`mqtt://127.0.0.1:${port}`);
+            try {
+              const retained: string[] = [];
+              late.on('message', (_topic, payload, packet) => {
+                if (packet.retain) retained.push(payload.toString());
+              });
+              await late.subscribeAsync(BALKON_STATE);
+              await new Promise((resolve) => setTimeout(resolve, 500));
+              expect(retained).to.deep.equal([]);
+            } finally {
+              late.end(true);
+            }
+          });
+        });
+
+        suite('picked again', (getHarness) => {
+          withCleanFixtures(getHarness);
+
+          it('publishes it under the id it had, though its name now derives another', async function () {
+            this.timeout(120000);
+            const renamed = { ...SENSOR_OBJECTS, [SENSOR]: { type: 'device', common: { name: 'Terrasse' } } };
+            const { apply } = await run(getHarness(), picked(SENSOR), renamed);
+            expect(lists(apply)).to.deep.equal({ ...EMPTY, sensors: ['sensor.balkon'] });
+          });
         });
       });
     },

@@ -68,6 +68,13 @@ describe('config/options', () => {
     expect(warnings).to.have.length(3);
   });
 
+  it("keeps a picker row whole, what detection found included, so a saved table refreshes as it was shown (Task 21b)", () => {
+    const row = { objectId: 'hue.0.a', include: true, name: '', forcedDomain: '', detectedName: 'Decke', detectedDomain: 'light', room: 'Wohnzimmer' };
+    const { options, warnings } = validateOptions({ deviceOverrides: [row] });
+    expect(options.deviceOverrides).to.deep.equal([row]);
+    expect(warnings).to.deep.equal([]);
+  });
+
   it('keeps only well-formed manual entities, with a warning naming each one dropped (Task 13b)', () => {
     // The shape only: whether the domain suits the state is manualDevices'
     // to judge, against the object itself.

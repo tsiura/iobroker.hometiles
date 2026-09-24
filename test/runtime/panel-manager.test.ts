@@ -29,7 +29,7 @@ const ENTITY: VirtualEntity = {
   lastChanged: 1_757_000_000_000,
 };
 
-function harness(entities: () => VirtualEntity[] | null = () => [ENTITY]) {
+function harness(entities: () => VirtualEntity[] | null = () => [ENTITY], unpublished?: () => readonly string[]) {
   const published: PublishRequest[] = [];
   const subscribed: string[] = [];
   const unsubscribed: string[] = [];
@@ -59,6 +59,7 @@ function harness(entities: () => VirtualEntity[] | null = () => [ENTITY]) {
     dispatcher,
     log,
     entities,
+    ...(unpublished ? { unpublished } : {}),
     onSessionsChanged: () => {
       sessionsChanged++;
     },
@@ -86,6 +87,30 @@ describe('runtime/panel-manager', () => {
     expect(manager.get('a1')).to.not.equal(undefined);
     expect(published.some((p) => p.topic === 'tab5_lvgl/config/a1/bridge/apply')).to.equal(true);
     expect(published.some((p) => p.topic === 'ha/statestream/switch/k/state')).to.equal(true);
+  });
+
+  it("clears, after a new panel's configuration, the retained state of each entity the last run published and this one does not (Task 21b)", async () => {
+    // An un-pick is a config save, so a restart: no rebuild of this run names
+    // the entity, and the panel announces after the first one.
+    const { manager, published } = harness(() => [ENTITY], () => ['sensor.balkon', 'number.soll']);
+    await manager.handleAnnouncement('a1', announcement('a1', 'panel-a'));
+    expect(published.map((p) => [p.topic, p.payload === '' ? 'cleared' : 'set', p.retain])).to.deep.equal([
+      ['tab5_lvgl/config/a1/bridge/apply', 'set', true],
+      ['tab5_lvgl/config/a1/bridge/icons', 'set', true],
+      ['ha/statestream/switch/k/state', 'set', true],
+      ['ha/statestream/sensor/balkon/state', 'cleared', true],
+      ['ha/statestream/number/soll/control', 'cleared', true],
+    ]);
+    // Once per new session: a panel announcing again is not told twice.
+    const count = published.length;
+    await manager.handleAnnouncement('a1', announcement('a1', 'panel-a'));
+    expect(published.slice(count).filter((p) => p.payload === '')).to.deep.equal([]);
+  });
+
+  it('clears nothing for a panel announcing before discovery has succeeded (Ruling 56)', async () => {
+    const { manager, published } = harness(() => null, () => ['sensor.balkon']);
+    await manager.handleAnnouncement('a1', announcement('a1', 'panel-a'));
+    expect(published).to.deep.equal([]);
   });
 
   it('publishes nothing to a panel announcing before discovery has succeeded (Ruling 56)', async () => {

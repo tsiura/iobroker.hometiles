@@ -57,7 +57,8 @@ export class CommandError extends Error {
 
 const MAX_SCENE_ALIAS_LENGTH = 128;
 // MAX_ENTITY_ID_LENGTH is the registry's: every id it derives fits it (Task 13b round 1, m4).
-const ENTITY_ID_RE = /^[a-z_]+\.[a-z0-9_]+$/;
+/** The shape of an entity id: every id the registry derives has it. */
+export const ENTITY_ID_RE = /^[a-z_]+\.[a-z0-9_]+$/;
 
 function parseObject(raw: string): Record<string, unknown> {
   let parsed: unknown;

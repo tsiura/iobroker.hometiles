@@ -68,9 +68,12 @@ Until those are done, treat v0.1 as ready to test, not ready to rely on.
 2. **Connection**: enter the broker address and credentials. Keep the base topic
    matching the panel's own device topic base, and leave the entity prefix at
    `ha/statestream` unless you changed it on the panel.
-3. **Devices**: press *Scan for devices*, then include the devices you want on
-   your panels. Overrides are stored per object id, so renaming an object in
-   ioBroker never breaks a tile you already placed.
+3. **Devices**: nothing reaches the panels until you pick it. With the adapter
+   running, press *Refresh detected devices*, tick *Show on panels* for each
+   device the panels should get, and save. A state no detection reaches, such
+   as a `0_userdata.0` helper, goes under *Manual entities*. Choices are stored
+   per object id, so renaming an object in ioBroker never breaks a tile you
+   already placed.
 4. **Panels**: a panel that already has broker credentials announces itself and
    appears under `hometiles.0.panels.*` automatically. A brand-new panel has no
    credentials yet, so enter its IP address here once to push them.

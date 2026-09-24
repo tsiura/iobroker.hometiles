@@ -40,9 +40,18 @@ export interface DeviceOverride {
    * (discoverDevices). Overrides are keyed by this, never by list index.
    */
   objectId: string;
+  /** Shown as "Show on panels": only true publishes the device (Task 21b). */
   include: boolean;
   name?: string;
   forcedDomain?: string;
+  /**
+   * What detection found, shown read-only in the picker (Task 21b). The
+   * refresh writes these, the admin stores them, nothing else reads them.
+   */
+  detectedName?: string;
+  detectedDomain?: string;
+  /** The room enums, then the function enums, that hold the device. */
+  room?: string;
 }
 
 export const DEFAULTS: AdapterOptions = {

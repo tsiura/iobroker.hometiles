@@ -302,7 +302,8 @@ describe('runtime/panel-session', () => {
       expect(errors).to.have.length(1);
       expect(errors[0]).to.include('[Panel a1]').and.to.include(`${LIMIT + 1} bytes`).and.to.include(`${LIMIT}`);
       expect(errors[0]).to.match(/sensor_meta \d+ bytes/);
-      expect(errors[0]).to.match(/exclude/i);
+      // The remedy names the picker (Task 21b): nothing is published unless picked.
+      expect(errors[0]).to.include('Pick fewer devices on the Devices tab');
     });
 
     it('does not repeat the error for the same configuration, forced or not', () => {

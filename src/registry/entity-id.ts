@@ -109,3 +109,23 @@ export function resolveEntityIds(
 
   return resolved;
 }
+
+/**
+ * The ids to store after a rebuild: each one the registry resolved, and the
+ * stored id of every detected device it was not handed -- one not picked, or
+ * un-picked (Task 21b). Stored, the id stays reserved (resolveEntityIds), so
+ * picking the device again gives it back, whatever took its name meanwhile.
+ * A device detected no more loses its id, as it did before the picker.
+ */
+export function idsToStore(
+  persisted: Readonly<Record<string, string>>,
+  detected: readonly DeviceInput[],
+  resolved: Readonly<Record<string, string>>,
+): Record<string, string> {
+  const kept: Record<string, string> = {};
+  for (const { objectId } of detected) {
+    const entityId = Object.hasOwn(persisted, objectId) ? persisted[objectId] : undefined;
+    if (entityId !== undefined) kept[objectId] = entityId;
+  }
+  return { ...kept, ...resolved };
+}

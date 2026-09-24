@@ -14,6 +14,13 @@ export interface PanelManagerDeps {
    * and the panel keeps its last configuration (Ruling 56).
    */
   entities(): VirtualEntity[] | null;
+  /**
+   * Entities the panels were given in an earlier run and are not given now.
+   * One the user un-picked left with the restart that saving the choice
+   * causes, so no rebuild of this run names it (Task 21b). A new panel's
+   * initial push clears their retained states, after its configuration.
+   */
+  unpublished?(): readonly string[];
   /** Called after a session is created, updated or removed. */
   onSessionsChanged(): void | Promise<void>;
   /**
@@ -82,8 +89,10 @@ export class PanelManager {
 
     this.panels.set(deviceId, session);
     await session.start();
-    session.pushConfig(this.deps.entities(), true);
-    for (const entity of this.deps.entities() ?? []) session.pushEntityState(entity);
+    const entities = this.deps.entities();
+    session.pushConfig(entities, true);
+    for (const entity of entities ?? []) session.pushEntityState(entity);
+    if (entities) for (const entityId of this.deps.unpublished?.() ?? []) session.clearEntityState(entityId);
     await this.deps.onSessionsChanged();
   }
 

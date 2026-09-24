@@ -33,7 +33,8 @@
     "coalesceMs": 200,
     "maxPublishQueue": 2000,
     "protocolTrace": false,
-    "deviceOverrides": []
+    "deviceOverrides": [],
+    "manualEntities": []
   },
   "objects": [],
   "instanceObjects": [

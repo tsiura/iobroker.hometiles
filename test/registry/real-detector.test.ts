@@ -2088,7 +2088,8 @@ describe('number, select and datetime (Task 13)', () => {
 
   it("a lone level in a sub-channel of its own is a number beside the device's control, which an override hides (Ruling 87)", () => {
     // Probe A: a zigbee lamp with its transition time in a configuration
-    // channel. A tile appears only where one is placed; include=false hides it.
+    // channel. A tile appears only where one is placed; the lamp alone picked
+    // leaves it off the panels (Task 21b: include=false or no row).
     const LAMP_DEVICE = 'zigbee.0.lamp';
     const probeA = objects(
       device(LAMP_DEVICE, 'Lampe'),
@@ -2102,7 +2103,10 @@ describe('number, select and datetime (Task 13)', () => {
       [`${LAMP_DEVICE}.config`, 'number'],
       [LAMP_DEVICE, 'light'],
     ]);
-    const hidden = applyOverrides(detected, [{ objectId: `${LAMP_DEVICE}.config`, include: false }]);
+    const hidden = applyOverrides(detected, [
+      { objectId: `${LAMP_DEVICE}.config`, include: false },
+      { objectId: LAMP_DEVICE, include: true },
+    ]);
     expect(hidden.map((d) => d.objectId)).to.deep.equal([LAMP_DEVICE]);
 
     // Probe C, the hm-rpc shape: the dimmer in channel 1, a ramp time alone in channel 2.
@@ -2265,10 +2269,12 @@ describe('bridge/apply from real detections (Task 21)', () => {
   };
 
   it('lists, names and gives the icon of each one in the apply a panel session publishes', () => {
-    const devices = applyOverrides(detectDevices(TREE), [
-      { objectId: MODE, include: true, forcedDomain: 'select' },
-      { objectId: ALARM, include: true, forcedDomain: 'datetime' },
-    ]);
+    // Every detected device picked (Task 21b), two of them forced.
+    const forced: Record<string, string> = { [MODE]: 'select', [ALARM]: 'datetime' };
+    const devices = applyOverrides(
+      detectDevices(TREE),
+      detectDevices(TREE).map(({ objectId }) => ({ objectId, include: true, ...(forced[objectId] ? { forcedDomain: forced[objectId] } : {}) })),
+    );
     const registry = new EntityRegistry({ onEntityChanged: () => undefined, onMembershipChanged: () => undefined }, 0);
     registry.rebuild(devices, {});
     const published: PublishRequest[] = [];

@@ -2,6 +2,7 @@ import * as utils from '@iobroker/adapter-core';
 import { validateOptions, type AdapterOptions, type DeviceOverride } from './config/options';
 import { AnnounceError } from './protocol/announce';
 import { MAX_EDITABLES, splitEditables } from './protocol/apply';
+import { ENTITY_ID_RE } from './protocol/commands';
 import { buildStatePublish } from './protocol/state-payload';
 import {
   ANNOUNCE_TOPIC_PATTERN,
@@ -11,10 +12,10 @@ import {
   stateTopic,
 } from './protocol/topics';
 import { discoverDevices, type Discovery, type RootAnchors } from './registry/detector';
-import { parseStringMap } from './registry/entity-id';
+import { idsToStore, parseStringMap } from './registry/entity-id';
 import { EntityRegistry } from './registry/entity-registry';
 import { listed, manualDevices } from './registry/manual';
-import { applyOverrides } from './registry/overrides';
+import { applyOverrides, detectedRows, mergeDetected } from './registry/overrides';
 import { synthesise } from './registry/synth/index';
 import type { DeviceInput, SourceValue, VirtualEntity } from './registry/types';
 import { Dispatcher } from './runtime/dispatcher';
@@ -27,6 +28,10 @@ import { mergeSceneAliases } from './runtime/scene-aliases';
 
 const ENTITY_ID_STATE = 'info.entityIds';
 const ROOT_ANCHOR_STATE = 'info.rootAnchors';
+/** The entities the panels were given, kept across the restart a saved selection causes (Task 21b). */
+const PUBLISHED_STATE = 'info.publishedIds';
+/** Task 21b rule 5, once per rebuild that hands the registry nothing. */
+const NOTHING_SELECTED = 'No devices selected yet — pick devices in the adapter settings (Devices tab)';
 /** A failed discovery is retried after 5 s, 10 s, 20 s ... and at most every 5 minutes. */
 const DISCOVERY_RETRY_FIRST_MS = 5_000;
 const DISCOVERY_RETRY_MAX_MS = 300_000;
@@ -40,7 +45,14 @@ class HomeTiles extends utils.Adapter {
   private dispatcher!: Dispatcher;
   private persistedIds: Record<string, string> = {};
   private rootAnchors: RootAnchors = {};
+  /** What the registry is handed: the picked devices, then the manual entities (Task 21b). */
   private devices: DeviceInput[] = [];
+  /** Every detected device, picked or not: previewEntity shows one before it is picked. */
+  private detected: DeviceInput[] = [];
+  /** Object id -> entity id of each entity the panels were given at the last rebuild, in this run or the last. */
+  private published: Record<string, string> = {};
+  /** Entity ids an earlier rebuild published and the registry holds no more; a new panel is told (Task 21b). */
+  private unpublished: string[] = [];
   /** Until a discovery has succeeded in this run, panels get no configuration (Ruling 56). */
   private discovered = false;
   /** Set first on unload: from then on nothing is published (Ruling 62 B). */
@@ -73,6 +85,10 @@ class HomeTiles extends utils.Adapter {
     await this.setState('info.connection', false, true);
     this.persistedIds = await this.loadJsonMap(ENTITY_ID_STATE);
     this.rootAnchors = await this.loadJsonMap(ROOT_ANCHOR_STATE);
+    // A hand-edited id that is no entity id would make its clear throw (Ruling 51).
+    this.published = Object.fromEntries(
+      Object.entries(await this.loadJsonMap(PUBLISHED_STATE)).filter(([, entityId]) => ENTITY_ID_RE.test(entityId)),
+    );
 
     this.mqtt = new HomeTilesMqttClient(options, this.log4);
     this.registry = new EntityRegistry(
@@ -118,6 +134,7 @@ class HomeTiles extends utils.Adapter {
       dispatcher: this.dispatcher,
       log: this.log4,
       entities: () => this.panelEntities(),
+      unpublished: () => this.unpublished,
       onSessionsChanged: async () => {
         await this.syncPanelObjects();
       },
@@ -136,9 +153,15 @@ class HomeTiles extends utils.Adapter {
     // A broker that is down must not stop the adapter: the client reconnects.
     await this.mqtt.connect();
     this.log.info(
-      this.discovered
-        ? `[HomeTiles] Ready. ${this.devices.length} devices detected, ${this.registry.all().length} entities published`
-        : '[HomeTiles] Ready. Devices are published once a discovery succeeds',
+      this.discovered ? `[HomeTiles] Ready. ${this.tally}` : '[HomeTiles] Ready. Devices are published once a discovery succeeds',
+    );
+  }
+
+  /** What detection found, what the user picked (Task 21b), and what the panels get. */
+  private get tally(): string {
+    return (
+      `${this.detected.length} devices detected, ${this.devices.length} picked (manual entities included), ` +
+      `${this.registry.all().length} entities published`
     );
   }
 
@@ -169,9 +192,7 @@ class HomeTiles extends utils.Adapter {
     }
     this.discovered = true;
     if (attempt > 0) {
-      this.log.info(
-        `[Registry] Discovery succeeded: ${this.devices.length} devices detected, ${this.registry.all().length} entities published`,
-      );
+      this.log.info(`[Registry] Discovery succeeded: ${this.tally}`);
     }
     // Panels that announced meanwhile got nothing; they get everything now.
     for (const session of this.panels.sessions()) this.pushEverything(session);
@@ -190,6 +211,8 @@ class HomeTiles extends utils.Adapter {
     const entities = this.panelEntities();
     session.pushConfig(entities, true);
     for (const entity of entities ?? []) session.pushEntityState(entity);
+    // A panel that announced while discovery kept failing is told here.
+    if (entities) for (const entityId of this.unpublished) session.clearEntityState(entityId);
   }
 
   private async onUnload(callback: () => void): Promise<void> {
@@ -329,11 +352,13 @@ class HomeTiles extends utils.Adapter {
       const rejected = manual.rejected.map(({ stateId, reason }) => `${stateId} (${reason})`);
       this.log.warn(`[Registry] Manual entities left out: ${listed(rejected)}`);
     }
-    // Overrides are for detected devices; a manual entity is already explicit
-    // (Task 13b). After the detected ones, it never takes an id one of them
-    // would be given.
-    const overridden = applyOverrides(detected, (this.options.deviceOverrides ?? []) as DeviceOverride[]);
-    this.devices = [...overridden, ...manual.devices];
+    // Opt-in (Task 21b): a detected device reaches the registry only once the
+    // user picks it. A manual entity is the user's pick already, and overrides
+    // are for detected devices (Task 13b); after them, it never takes an id
+    // one of them would be given.
+    this.detected = detected;
+    this.devices = [...applyOverrides(detected, this.options.deviceOverrides), ...manual.devices];
+    if (this.devices.length === 0) this.log.info(`[Registry] ${NOTHING_SELECTED}`);
     this.rootAnchors = anchors;
     await this.saveJsonMap(ROOT_ANCHOR_STATE, 'Root anchors: the state each root id stays with', anchors);
 
@@ -342,8 +367,10 @@ class HomeTiles extends utils.Adapter {
       const skipped = result.skipped.map(({ objectId, reason }) => `${objectId} (${reason})`);
       this.log.warn(`[Registry] Devices left out, no entity could be made of them: ${skipped.join(', ')}`);
     }
-    this.persistedIds = result.entityIds;
-    await this.saveJsonMap(ENTITY_ID_STATE, 'Persisted entity ids', result.entityIds);
+    // A detected device not picked keeps its stored id, so picking it again
+    // gives the id back (Task 21b rule 6).
+    this.persistedIds = idsToStore(this.persistedIds, detected, result.entityIds);
+    await this.saveJsonMap(ENTITY_ID_STATE, 'Persisted entity ids', this.persistedIds);
 
     for (const objectId of result.unsubscribe) await this.unsubscribeForeignStatesAsync(objectId);
     for (const objectId of result.subscribe) await this.subscribeForeignStatesAsync(objectId);
@@ -390,14 +417,24 @@ class HomeTiles extends utils.Adapter {
       this.log.warn(
         `[Registry] ${left.length} numbers, selects and datetimes left off the panels: a panel keeps at most ` +
           `${MAX_EDITABLES}, taken by entity id (${listed(left.map((entity) => entity.entityId))}). ` +
-          'Exclude devices under Device overrides to choose which',
+          'Pick fewer on the Devices tab of the adapter settings to choose which',
       );
     }
 
+    // What the panels were given before and are not now. Saving a selection
+    // restarts the adapter, so the registry starts empty and its own removed
+    // list never names an entity the user un-picked: the record of the last
+    // rebuild, which outlives the restart, does (Task 21b rule 6).
+    const now = new Set(this.registry.all().map((entity) => entity.entityId));
+    const gone = Object.values(this.published).filter((entityId) => !now.has(entityId));
+    this.published = Object.fromEntries(Object.entries(result.entityIds).filter(([, entityId]) => now.has(entityId)));
+    await this.saveJsonMap(PUBLISHED_STATE, 'Entity ids the panels were given', this.published);
+    this.unpublished = [...new Set([...this.unpublished, ...gone])].filter((entityId) => !now.has(entityId));
+
     // Only a panel that was given a configuration is told an entity left it
-    // (Ruling 56).
+    // (Ruling 56); one that announces later is told by its first push.
     if (this.discovered) {
-      for (const entityId of result.removed) {
+      for (const entityId of gone) {
         for (const session of this.panels.sessions()) session.clearEntityState(entityId);
       }
     }
@@ -517,9 +554,32 @@ class HomeTiles extends utils.Adapter {
         return;
       }
 
+      case 'refreshDetected': {
+        // The picker (Task 21b). The form's rows arrive with the request
+        // (jsonData), unsaved choices included; the stored ones stand in
+        // should admin send none.
+        const sent = (message.message as { rows?: unknown } | null)?.rows;
+        const rows = Array.isArray(sent)
+          ? validateOptions({ deviceOverrides: sent as DeviceOverride[] }).options.deviceOverrides
+          : this.options.deviceOverrides;
+        const { devices: detected, objects } = await this.detectDevices();
+        const rooms = await this.objectsOfType('enum', 'enum.rooms.');
+        const language = (await this.getForeignObjectAsync('system.config'))?.common?.language ?? 'en';
+        const found = detectedRows(detected, { ...objects, ...rooms }, language);
+        const known = new Set(rows.map((row) => row.objectId));
+        // admin writes `native` into the form (useNative) and shows the
+        // `result` text, filled with `args` (json-config ConfigSendto).
+        return reply({
+          native: { deviceOverrides: mergeDetected(rows, found) },
+          result: 'refreshed',
+          args: [String(found.length), String(found.filter((row) => !known.has(row.objectId)).length)],
+        });
+      }
+
       case 'previewEntity': {
         const objectId = String((message.message as { objectId?: string })?.objectId ?? '');
-        const device = this.devices.find((candidate) => candidate.objectId === objectId);
+        // A detected device can be previewed before it is picked.
+        const device = [...this.devices, ...this.detected].find((candidate) => candidate.objectId === objectId);
         if (!device) return reply({ error: 'device_not_detected' });
 
         const entityId = this.persistedIds[objectId] ?? `${device.domain}.preview`;

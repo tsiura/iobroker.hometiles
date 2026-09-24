@@ -31,32 +31,39 @@
       "type": "panel",
       "label": "tab_devices",
       "items": {
+        "_devicesInfo": { "type": "staticText", "text": "devices_info", "sm": 12, "md": 12, "lg": 12 },
         "_detected": {
           "type": "sendTo",
-          "label": "list_detected",
-          "command": "listDetected",
-          "variant": "contained",
+          "label": "refresh_detected",
+          "command": "refreshDetected",
+          "jsonData": "{\"rows\": ${JSON.stringify(data.deviceOverrides || [])}}",
           "useNative": true,
+          "showProcess": true,
+          "result": { "refreshed": "refresh_result" },
+          "variant": "contained",
+          "newLine": true,
           "sm": 12,
           "md": 4,
           "lg": 3
         },
         "deviceOverrides": {
           "type": "table",
-          "label": "device_overrides",
+          "label": "detected_devices",
+          "noDelete": true,
           "newLine": true,
           "sm": 12,
           "md": 12,
           "lg": 12,
           "items": [
-            { "type": "text", "attr": "objectId", "title": "column_object_id", "width": "40%", "filter": true, "sort": true },
-            { "type": "checkbox", "attr": "include", "title": "column_include", "width": "10%", "default": true },
-            { "type": "text", "attr": "name", "title": "column_name", "width": "25%" },
+            { "type": "checkbox", "attr": "include", "title": "column_include", "width": "8%", "sort": true, "default": false },
+            { "type": "text", "attr": "detectedName", "title": "column_detected_name", "width": "18%", "readOnly": true, "filter": true, "sort": true },
+            { "type": "text", "attr": "name", "title": "column_name", "width": "15%" },
+            { "type": "text", "attr": "detectedDomain", "title": "column_domain", "width": "10%", "readOnly": true, "filter": true, "sort": true },
             {
               "type": "select",
               "attr": "forcedDomain",
               "title": "column_forced_domain",
-              "width": "25%",
+              "width": "12%",
               "options": [
                 { "label": "domain_auto", "value": "" },
                 { "label": "domain_sensor", "value": "sensor" },
@@ -64,6 +71,51 @@
                 { "label": "domain_switch", "value": "switch" },
                 { "label": "domain_light", "value": "light" },
                 { "label": "domain_scene", "value": "scene" }
+              ]
+            },
+            { "type": "text", "attr": "room", "title": "column_room", "width": "15%", "readOnly": true, "filter": true, "sort": true },
+            { "type": "text", "attr": "objectId", "title": "column_object_id", "width": "22%", "readOnly": true, "filter": true, "sort": true }
+          ]
+        },
+        "_manualInfo": { "type": "staticText", "text": "manual_info", "newLine": true, "sm": 12, "md": 12, "lg": 12 },
+        "manualEntities": {
+          "type": "table",
+          "label": "manual_entities",
+          "newLine": true,
+          "sm": 12,
+          "md": 12,
+          "lg": 12,
+          "items": [
+            { "type": "objectId", "attr": "stateId", "title": "column_state_id", "width": "40%", "types": ["state"], "default": "" },
+            {
+              "type": "select",
+              "attr": "domain",
+              "title": "column_domain",
+              "width": "20%",
+              "default": "sensor",
+              "options": [
+                { "label": "domain_sensor", "value": "sensor" },
+                { "label": "domain_binary_sensor", "value": "binary_sensor" },
+                { "label": "domain_switch", "value": "switch" },
+                { "label": "domain_scene", "value": "scene" },
+                { "label": "domain_number", "value": "number" },
+                { "label": "domain_select", "value": "select" },
+                { "label": "domain_datetime", "value": "datetime" }
+              ]
+            },
+            { "type": "text", "attr": "name", "title": "column_name", "width": "20%", "default": "" },
+            {
+              "type": "select",
+              "attr": "kind",
+              "title": "column_kind",
+              "width": "20%",
+              "default": "",
+              "disabled": "data.domain !== 'datetime'",
+              "options": [
+                { "label": "kind_none", "value": "" },
+                { "label": "kind_date", "value": "date" },
+                { "label": "kind_time", "value": "time" },
+                { "label": "kind_datetime", "value": "datetime" }
               ]
             }
           ]

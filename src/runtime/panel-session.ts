@@ -227,8 +227,8 @@ export class PanelSession {
         this.refusedSignature = signature;
         this.log.error(
           `[Panel ${this.deviceId}] Configuration not pushed: it is ${bytes} bytes, over the ${MAX_APPLY_BYTES} bytes a ` +
-            `panel takes in one bridge/apply (largest sections: ${largestSections(payload)}). Exclude devices under ` +
-            'Device overrides in the adapter configuration until it fits; the panel keeps its last configuration meanwhile',
+            `panel takes in one bridge/apply (largest sections: ${largestSections(payload)}). Pick fewer devices on the ` +
+            'Devices tab of the adapter settings until it fits; the panel keeps its last configuration meanwhile',
         );
       }
       return false;
@@ -248,7 +248,7 @@ export class PanelSession {
         this.refusedIconsFor = signature;
         this.log.error(
           `[Panel ${this.deviceId}] Icons not pushed: bridge/icons is ${iconBytes} bytes with its MDI icons alone, over the ` +
-            `${MAX_ICONS_BYTES} bytes a panel takes. Exclude devices under Device overrides in the adapter configuration ` +
+            `${MAX_ICONS_BYTES} bytes a panel takes. Pick fewer devices on the Devices tab of the adapter settings ` +
             'until it fits; the panel keeps the icons it has meanwhile',
         );
       }

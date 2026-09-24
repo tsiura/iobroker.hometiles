@@ -1,9 +1,46 @@
 import { expect } from 'chai';
-import { readFileSync } from 'node:fs';
+import { readdirSync, readFileSync } from 'node:fs';
 import path from 'node:path';
+import { validateOptions, type ManualEntity } from '../../src/config/options';
+import { MANUAL_DOMAINS } from '../../src/registry/manual';
+import { mergeDetected } from '../../src/registry/overrides';
 
 const config = JSON.parse(readFileSync(path.join(__dirname, '../../admin/jsonConfig.json'), 'utf8'));
 const ioPackage = JSON.parse(readFileSync(path.join(__dirname, '../../io-package.json'), 'utf8'));
+/** Every language admin/i18n has, by file name. */
+const I18N = path.join(__dirname, '../../admin/i18n');
+const translations: Record<string, Record<string, string>> = Object.fromEntries(
+  readdirSync(I18N)
+    .filter((file) => file.endsWith('.json'))
+    .map((file) => [file.slice(0, -'.json'.length), JSON.parse(readFileSync(path.join(I18N, file), 'utf8'))]),
+);
+
+/** The admin commands main.ts answers: the cases of its onMessage switch. */
+const handled = new Set(
+  [...readFileSync(path.join(__dirname, '../../src/main.ts'), 'utf8').matchAll(/^\s*case '([A-Za-z]+)':/gm)].map((match) => match[1]),
+);
+
+interface Column {
+  type: string;
+  attr: string;
+  readOnly?: boolean;
+  filter?: boolean;
+  sort?: boolean;
+  types?: string[];
+  default?: unknown;
+  disabled?: string;
+  options?: Array<{ label: string; value: string }>;
+}
+const columns = (table: { items: Column[] }): Record<string, Column> =>
+  Object.fromEntries(table.items.map((column) => [column.attr, column]));
+
+/**
+ * A pattern as the admin evaluates it: a JavaScript template literal over the
+ * form's data (json-config ConfigGeneric.getPatternAsync, escapeString).
+ */
+function evaluatePattern(pattern: string, data: Record<string, unknown>): string {
+  return new Function('data', `return \`${pattern.replace(/`/g, '\\`')}\``)(data) as string;
+}
 
 /**
  * In a jsonConfig panel the native binding is the KEY of each entry in `items`.
@@ -64,8 +101,62 @@ describe('admin/jsonConfig', () => {
     expect(values).to.deep.equal(['', 'sensor', 'binary_sensor', 'switch', 'light', 'scene']);
   });
 
+  it('fills the detected devices table through the form, sending the rows the form holds, unsaved choices included (Task 21b)', () => {
+    const button = config.items.devices.items._detected;
+    expect(button).to.include({ type: 'sendTo', command: 'refreshDetected', useNative: true });
+    // jsonData and data exclude each other (json-config README, sendTo).
+    expect(button).to.not.have.property('data');
+    // Text that would break a pattern or a JSON literal, were it spliced in raw.
+    const rows = [{ objectId: 'hue.0.a', include: true, name: 'Decke "oben" `1` ${data.x} \\ }', forcedDomain: '' }];
+    expect(JSON.parse(evaluatePattern(button.jsonData, { deviceOverrides: rows, brokerHost: 'x' }))).to.deep.equal({ rows });
+    // A form that holds no rows yet sends an empty list.
+    expect(JSON.parse(evaluatePattern(button.jsonData, {}))).to.deep.equal({ rows: [] });
+    expect(Object.keys(button.result)).to.deep.equal(['refreshed']);
+  });
+
+  it("shows what detection found read-only beside the user's choices, filterable and sortable, and adds or deletes no row (Task 21b)", () => {
+    const table = config.items.devices.items.deviceOverrides;
+    expect(table).to.include({ type: 'table', noDelete: true });
+    const byAttr = columns(table);
+    // Exactly the fields a refreshed row holds.
+    const [row] = mergeDetected([], [{ objectId: 'hue.0.a', detectedName: 'A', detectedDomain: 'light', room: 'Flur' }]);
+    expect(Object.keys(byAttr)).to.have.members(Object.keys(row!));
+    expect(byAttr.include).to.include({ type: 'checkbox', sort: true });
+    for (const attr of ['include', 'name', 'forcedDomain']) expect(byAttr[attr]!.readOnly, attr).to.not.equal(true);
+    for (const attr of ['detectedName', 'detectedDomain', 'room', 'objectId']) {
+      expect(byAttr[attr], attr).to.include({ type: 'text', readOnly: true, filter: true, sort: true });
+    }
+  });
+
+  it('lets the user add manual entities: a state picker, the domains one state can serve, a name and a datetime kind (Task 21b)', () => {
+    const table = config.items.devices.items.manualEntities;
+    expect(table.type).to.equal('table');
+    const byAttr = columns(table);
+    // Exactly the fields validateOptions keeps of a complete entry.
+    const entry: ManualEntity = { stateId: '0_userdata.0.a', domain: 'datetime', name: 'A', kind: 'time' };
+    expect(Object.keys(byAttr)).to.have.members(Object.keys(validateOptions({ manualEntities: [entry] }).options.manualEntities[0]!));
+    expect(byAttr.stateId).to.include({ type: 'objectId' });
+    expect(byAttr.stateId!.types).to.deep.equal(['state']);
+    expect(byAttr.domain!.options!.map((option) => option.value)).to.deep.equal([...MANUAL_DOMAINS]);
+    expect(MANUAL_DOMAINS).to.include(byAttr.domain!.default);
+
+    const kinds = byAttr.kind!.options!.map((option) => option.value);
+    expect(kinds).to.deep.equal(['', 'date', 'time', 'datetime']);
+    // validateOptions takes each: the empty one as no kind, and silently.
+    const { options, warnings } = validateOptions({ manualEntities: kinds.map((kind) => ({ ...entry, kind }) as ManualEntity) });
+    expect(options.manualEntities.map((kept) => kept.kind)).to.deep.equal([undefined, 'date', 'time', 'datetime']);
+    expect(warnings).to.deep.equal([]);
+    // A kind is a datetime's alone: the admin evaluates `disabled` on the row.
+    const disabled = (domain: string): unknown => new Function('data', `return ${byAttr.kind!.disabled}`)({ domain });
+    expect(MANUAL_DOMAINS.map((domain) => [domain, disabled(domain)])).to.deep.equal(
+      MANUAL_DOMAINS.map((domain) => [domain, domain !== 'datetime']),
+    );
+  });
+
   it('wires each action button to a command the adapter implements', () => {
-    const commands = new Set(['listDetected', 'testBroker', 'previewEntity', 'pairPanel']);
+    // Read from main.ts itself, so a command it stops answering fails here.
+    expect([...handled]).to.include.members(['listDetected', 'refreshDetected', 'testBroker', 'previewEntity', 'pairPanel']);
+    const commands = handled;
     const found = new Set<string>();
     const walk = (node: unknown): void => {
       if (!node || typeof node !== 'object') return;
@@ -78,10 +169,12 @@ describe('admin/jsonConfig', () => {
     for (const command of found) expect(commands, `unknown command ${command}`).to.include(command);
   });
 
-  it('ships both translation files with matching key sets', () => {
+  it('ships every translation file with the key set of the English source', () => {
     const en = JSON.parse(readFileSync(path.join(__dirname, '../../admin/i18n/en.json'), 'utf8'));
-    const de = JSON.parse(readFileSync(path.join(__dirname, '../../admin/i18n/de.json'), 'utf8'));
-    expect(Object.keys(de).sort()).to.deep.equal(Object.keys(en).sort());
+    expect(Object.keys(translations).sort()).to.include.members(['de', 'en']);
+    for (const [language, strings] of Object.entries(translations)) {
+      expect(Object.keys(strings).sort(), language).to.deep.equal(Object.keys(en).sort());
+    }
   });
 
   it('defines every identifier the UI actually references', () => {
@@ -96,17 +189,20 @@ describe('admin/jsonConfig', () => {
         const value = record[prop];
         if (typeof value === 'string' && value) referenced.add(value);
       }
+      // A sendTo's result texts are translations too (json-config types.d.ts, ConfigItemSendTo).
+      if (record.type === 'sendTo' && record.result) {
+        for (const value of Object.values(record.result as Record<string, unknown>)) if (typeof value === 'string') referenced.add(value);
+      }
       for (const value of Object.values(record)) walk(value);
     };
     walk(config.items);
 
-    const en = JSON.parse(readFileSync(path.join(__dirname, '../../admin/i18n/en.json'), 'utf8'));
-    const de = JSON.parse(readFileSync(path.join(__dirname, '../../admin/i18n/de.json'), 'utf8'));
-
     expect(referenced.size, 'the walk must actually find identifiers').to.be.greaterThan(20);
+    expect(referenced, 'the result text').to.include('refresh_result');
     for (const key of referenced) {
-      expect(en, `en.json is missing "${key}"`).to.have.property(key);
-      expect(de, `de.json is missing "${key}"`).to.have.property(key);
+      for (const [language, strings] of Object.entries(translations)) {
+        expect(strings, `${language}.json is missing "${key}"`).to.have.property(key);
+      }
     }
   });
 });

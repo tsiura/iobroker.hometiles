@@ -30,6 +30,9 @@ const USABLE_TYPES = new Map<string, readonly string[]>([
   ['datetime', ['string', 'number']],
 ]);
 
+/** The domains a manual entity can take: the admin table offers exactly these. */
+export const MANUAL_DOMAINS: readonly string[] = [...USABLE_TYPES.keys()];
+
 export interface ManualDevices {
   devices: DeviceInput[];
   /** At most one per state id: main.ts logs each once per rebuild. */
