@@ -7,6 +7,7 @@ import { closeSync, existsSync, lstatSync, mkdirSync, openSync, readFileSync, rm
 import { createServer, type Server } from 'node:net';
 import os from 'node:os';
 import path from 'node:path';
+import { EnergySource, type TotalNames } from '../src/runtime/energy-source';
 import { HistoryProvider, MAX_HISTORY_ROWS, type HistoryResult, type HistorySource } from '../src/runtime/history-provider';
 
 /** A log line as js-controller forwards it (js-controller-common-db logger.js). */
@@ -52,6 +53,13 @@ async function setManualEntities(harness: IntegrationTestHarness, entries: objec
   const id = 'system.adapter.hometiles.0';
   const instance = (await harness.objects.getObjectAsync(id)) as { native: Record<string, unknown> } & Record<string, unknown>;
   await harness.objects.setObjectAsync(id, { ...instance, native: { ...instance.native, manualEntities: entries } });
+}
+
+/** The Energy tab's rows, set whole as setManualEntities sets its list (Task 20b). */
+async function setEnergyMeters(harness: IntegrationTestHarness, rows: object[]): Promise<void> {
+  const id = 'system.adapter.hometiles.0';
+  const instance = (await harness.objects.getObjectAsync(id)) as { native: Record<string, unknown> } & Record<string, unknown>;
+  await harness.objects.setObjectAsync(id, { ...instance, native: { ...instance.native, energyMeters: rows } });
 }
 
 async function setObjects(harness: IntegrationTestHarness, objects: Record<string, object>): Promise<void> {
@@ -886,6 +894,62 @@ if (process.env.HOMETILES_INTEGRATION === '1') {
         });
       });
 
+      suite('energy meters in the apply (Task 20b)', (getHarness) => {
+        withCleanFixtures(getHarness);
+        const port = 18859;
+        const { applies } = withBrokerAndPanel(port);
+        const BEZUG = '0_userdata.0.Energie.Bezug';
+        const EINSPEISUNG = '0_userdata.0.Energie.Einspeisung';
+        const counter = (name: string): object => ({
+          type: 'state',
+          common: { name, role: 'value.energy.consumed', type: 'number', unit: 'kWh', read: true, write: false },
+        });
+        const METER_OBJECTS = { [BEZUG]: counter('Bezug'), [EINSPEISUNG]: counter('Einspeisung') };
+        let system: ({ common: Record<string, unknown> } & Record<string, unknown>) | undefined;
+        const removeMeters = async (): Promise<void> => {
+          for (const id of Object.keys(METER_OBJECTS)) await getHarness().objects.delObjectAsync(id).catch(() => undefined);
+        };
+        before(removeMeters);
+        after(async () => {
+          await removeMeters();
+          await setEnergyMeters(getHarness(), []);
+          if (system) await getHarness().objects.setObjectAsync('system.config', system);
+        });
+
+        it('lists each meter, its cost entry and its category total in bridge/apply, in the system language, under ids it keeps, and names what it cannot use', async function () {
+          this.timeout(120000);
+          const harness = getHarness();
+          const logs = await captureLogs(harness);
+          system = (await harness.objects.getObjectAsync('system.config')) as typeof system;
+          await harness.objects.setObjectAsync('system.config', { ...system!, common: { ...system!.common, language: 'de' } });
+          await harness.changeAdapterConfig('hometiles', {
+            native: { brokerHost: '127.0.0.1', brokerPort: port, ...ARMED, deviceOverrides: picked(SENSOR), historyInstance: 'history.0', currency: 'EUR' },
+          });
+          await setEnergyMeters(harness, [
+            { stateId: BEZUG, category: 'grid', sign: 1, name: 'Hausanschluss [Bezug]', price: 0.3 },
+            { stateId: EINSPEISUNG, category: 'grid', sign: -1 },
+            { stateId: '0_userdata.0.Energie.Fehlt', category: 'solar', sign: 1 },
+          ]);
+          await setObjects(harness, { ...SENSOR_OBJECTS, ...METER_OBJECTS });
+          await harness.startAdapterAndWait(true);
+
+          const apply = await waitFor(harness, () => applies.find((payload) => payload.includes('energy.')), 'the apply with the catalog');
+          expect(JSON.parse(apply).sensors).to.deep.equal(['sensor.balkon']);
+          expect(JSON.parse(apply).energy).to.deep.equal([
+            { id: 'energy.hausanschluss_bezug', name: 'Hausanschluss (Bezug)', unit: 'kWh', category: 'grid' },
+            { id: 'energy.hausanschluss_bezug_cost', name: 'Hausanschluss (Bezug) (EUR)', unit: 'EUR', category: 'grid' },
+            { id: 'energy.einspeisung', name: 'Einspeisung', unit: 'kWh', category: 'grid' },
+            { id: 'grid_total', name: 'Netz gesamt', unit: 'kWh', category: 'grid' },
+          ]);
+          const stored = JSON.parse(String((await harness.states.getStateAsync('hometiles.0.info.entityIds'))?.val)) as Record<string, string>;
+          expect(stored).to.include({ [`energy:${BEZUG}`]: 'energy.hausanschluss_bezug', [`energy:${EINSPEISUNG}`]: 'energy.einspeisung' });
+          const energy = logs.filter((log) => log.message.includes('[Energy]'));
+          expect(energy.map((log) => log.severity), energy.map((log) => log.message).join('\n')).to.deep.equal(['warn', 'warn']);
+          expect(energy[0]!.message).to.include('0_userdata.0.Energie.Fehlt (no such object)');
+          expect(energy[1]!.message).to.include('history.0').and.include(BEZUG).and.include(EINSPEISUNG);
+        });
+      });
+
       // One broker for these suites: what a run retained on it survives the
       // restart that saving a selection causes (js-controller restarts an
       // instance whose object changes). The harness restores the database for
@@ -1281,12 +1345,20 @@ if (process.env.HOMETILES_INTEGRATION === '1') {
           busy: '0_userdata.0.t19.busy',
           marked: '0_userdata.0.t19.marked',
           unlogged: '0_userdata.0.t19.unlogged',
+          meter: '0_userdata.0.t20.meter',
         };
         const WINDOW = [row(start - 72 * HOUR, 18.5), ...every(start + HOUR / 4, HOUR / 2, 48)];
         const SAME_DAY = [row(morning - 5 * HOUR, 3), row(morning - 60_000, 7), ...every(morning + 60_000, 120_000, 400)];
         /** Three days back: its 42.5 hours of rows cross a midnight whatever the hour, so two day files hold them. */
         const busyStart = start - 48 * HOUR;
         const BUSY = [row(busyStart - HOUR, 1), ...every(busyStart + HOUR, 30_000, MAX_HISTORY_ROWS + 100)];
+        /** A kWh counter every 10 minutes, 0.1 a row, from 20:00 yesterday to two minutes before `until` (Task 20b). */
+        const meterRows = (until: number): HistoryRow[] => {
+          const eightPm = new Date(until).setHours(-4, 0, 0, 0);
+          return Array.from({ length: Math.floor((until - 120_000 - eightPm) / 600_000) + 1 }, (_, i) => row(eightPm + i * 600_000, 900 + i / 10));
+        };
+        /** Planted as the suite starts, so its newest row is minutes old when the energy test asks. */
+        let METER: HistoryRow[] = [];
         const MARKED = [
           row(start - 72 * HOUR, 18.5),
           row(start - HOUR, null, 0x40),
@@ -1314,6 +1386,8 @@ if (process.env.HOMETILES_INTEGRATION === '1') {
           plantHistory(ID.sameDay, SAME_DAY);
           plantHistory(ID.busy, BUSY);
           plantHistory(ID.marked, MARKED);
+          METER = meterRows(Date.now());
+          plantHistory(ID.meter, METER);
 
           const harness = getHarness();
           systemConfig = await harness.objects.getObjectAsync('system.config');
@@ -1406,6 +1480,42 @@ if (process.env.HOMETILES_INTEGRATION === '1') {
         it('asks nothing for a state the instance does not log', async function () {
           this.timeout(60000);
           expect(await ask(provide(), ID.unlogged)).to.deep.include({ rows: [], available: false, reason: 'not_logged' });
+        });
+
+        it("answers a day's energy request from a logged meter: each hour its increase, summing to the total, and nothing for one not logged (Task 20b)", async function () {
+          this.timeout(60000);
+          const harness = getHarness();
+          const live = (METER.at(-1)!.val as number) + 0.1;
+          await harness.states.setStateAsync(ID.meter, { val: live, ack: true });
+          const totals = { grid: 'Grid total', solar: 'Solar total', battery: 'Battery total', gas: 'Gas total', water: 'Water total', device: 'Devices total', device_water: 'Water devices total' } as TotalNames;
+          const lines: string[] = [];
+          const source = new EnergySource(provide('history.0', lines), harnessHistory(harness), { info() {}, warn: (m) => void lines.push(m), error: (m) => void lines.push(m), debug() {} });
+          source.configure({
+            armed: true,
+            meters: [
+              { id: 'energy.meter', stateId: ID.meter, category: 'grid', sign: 1, name: 'Meter', unit: 'kWh' },
+              { id: 'energy.unlogged', stateId: ID.unlogged, category: 'device', sign: 1, name: 'Unlogged' },
+            ],
+            currency: 'EUR',
+            totals,
+          });
+          const answer = await source.answer('e2e', '{"period":"day"}');
+          expect(answer!.topic).to.equal('tab5_lvgl/config/e2e/energy/response');
+          const parsed = JSON.parse(answer!.payload) as { period: string; start: string; entries: Array<{ id: string; values: Array<number | null>; total?: number }> };
+          const midnight = new Date(Date.now()).setHours(0, 0, 0, 0);
+          expect(parsed.period).to.equal('day');
+          expect(new Date(parsed.start).getTime()).to.equal(midnight);
+          const [meter, unlogged] = parsed.entries;
+          const hours = Math.floor((Date.now() - midnight) / 3_600_000);
+          expect(meter!.values, lines.join('\n')).to.have.lengthOf(hours + 1);
+          // A reading before midnight and one before each hour, the running hour to the live one.
+          expect(meter!.values.every((value) => value !== null), JSON.stringify(meter!.values)).to.equal(true);
+          expect(meter!.values.slice(0, hours)).to.deep.equal(Array(hours).fill(0.6));
+          const sum = (meter!.values as number[]).reduce((total, value) => total + value, 0);
+          expect(Math.round(sum * 1000) / 1000).to.equal(meter!.total);
+          expect(meter!.total).to.equal(Math.round((live - (METER.filter((r) => r.ts < midnight).at(-1)!.val as number)) * 1000) / 1000);
+          expect(unlogged!.values).to.deep.equal(Array(hours + 1).fill(null));
+          expect(unlogged).to.not.have.property('total');
         });
       });
     },
