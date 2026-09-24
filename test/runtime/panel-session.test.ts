@@ -349,6 +349,123 @@ describe('runtime/panel-session', () => {
     });
   });
 
+  describe('the bridge/icons size limit (Ruling 114)', () => {
+    const APPLY = 'tab5_lvgl/config/a1/bridge/apply';
+    const ICONS = 'tab5_lvgl/config/a1/bridge/icons';
+    // The panel copies bridge/icons into the 32768-byte LARGE_BUF and cuts it
+    // at 32767 bytes, without a log; the cut map does not parse, and none of
+    // it is applied (mqtt_handlers.cpp:1496, :1779-1791;
+    // ha_bridge_config.cpp:736-737).
+    const LIMIT = 32767;
+    const bytes = (text: string): number => Buffer.byteLength(text);
+    const iconsOf = (published: PublishRequest[]): PublishRequest | undefined => published.find((p) => p.topic === ICONS);
+    /** A switch with a 30-character id; the first three carry an MDI icon. */
+    const socket = (i: number): VirtualEntity =>
+      entity({
+        entityId: `switch.zwischenstecker_nr_${String(i).padStart(4, '0')}`,
+        domain: 'switch',
+        state: 'off',
+        attributes: { friendly_name: `Zwischenstecker ${i}`, ...(i < 3 ? { icon: 'mdi:power-socket-de' } : {}) },
+      });
+    /** A number with an MDI icon: past the 128th in bridge/icons only, not in the apply (Ruling 111). */
+    const setpoint = (i: number, id = `number.sollwert_heizkreis_nr_${String(i).padStart(4, '0')}`): VirtualEntity =>
+      entity({ entityId: id, domain: 'number', attributes: { friendly_name: `Sollwert ${i}`, icon: 'mdi:thermostat' } });
+    /**
+     * Icon-less scenes -- in no list, so the apply stays small -- whose whole
+     * icon map is exactly `size` UTF-8 bytes. The last id carries ten
+     * two-byte umlauts: the map is ten characters shorter than it is long.
+     */
+    function scenesWithIconMapOf(size: number): VirtualEntity[] {
+      const scene = (id: string): VirtualEntity => entity({ entityId: id, domain: 'scene', state: 'unknown', attributes: { friendly_name: 'S' } });
+      const map = (list: VirtualEntity[]): number => bytes(JSON.stringify(Object.fromEntries(list.map((s) => [s.entityId, '']))));
+      const scenes = Array.from({ length: Math.floor((size - 150) / 22) }, (_, i) => scene(`scene.szene_${String(i).padStart(4, '0')}`));
+      const rest = size - map([...scenes, scene('scene.z')]);
+      const all = [...scenes, scene(`scene.z${'ü'.repeat(10)}${'x'.repeat(rest - 20)}`)];
+      expect(map(all)).to.equal(size);
+      return all;
+    }
+
+    it('publishes the whole map, "" entries included, when it fits', () => {
+      const { session, published } = harness();
+      session.pushConfig([entity({}), socket(0), socket(9)]);
+      expect(JSON.parse(iconsOf(published)!.payload)).to.deep.equal({
+        'sensor.t': '',
+        'switch.zwischenstecker_nr_0000': 'mdi:power-socket-de',
+        'switch.zwischenstecker_nr_0009': '',
+      });
+    });
+
+    it('publishes a whole map of exactly the limit', () => {
+      const { session, published, errors } = harness();
+      session.pushConfig(scenesWithIconMapOf(LIMIT));
+      const icons = iconsOf(published)!;
+      expect(bytes(icons.payload)).to.equal(LIMIT);
+      expect(Object.values(JSON.parse(icons.payload))).to.satisfy((values: string[]) => values.every((value) => value === ''));
+      expect(errors).to.deep.equal([]);
+    });
+
+    it('drops the "" entries one byte over, counted in UTF-8 bytes', () => {
+      const { session, published } = harness();
+      session.pushConfig(scenesWithIconMapOf(LIMIT + 1));
+      expect(iconsOf(published)!.payload).to.equal('{}');
+    });
+
+    it('publishes the MDI icons of 940 long-id switches without their "" entries, where the apply still fits', () => {
+      const { session, published, errors } = harness();
+      const sockets = Array.from({ length: 940 }, (_, i) => socket(i));
+      // The premise: the apply fits, the whole map would not.
+      expect(session.pushConfig(sockets)).to.equal(true);
+      expect(bytes(published.find((p) => p.topic === APPLY)!.payload)).to.be.at.most(LIMIT);
+      expect(bytes(JSON.stringify(Object.fromEntries(sockets.map((s) => [s.entityId, s.attributes.icon ?? '']))))).to.be.above(LIMIT);
+      const icons = iconsOf(published)!;
+      expect(icons.retain).to.equal(true);
+      expect(JSON.parse(icons.payload)).to.deep.equal({
+        'switch.zwischenstecker_nr_0000': 'mdi:power-socket-de',
+        'switch.zwischenstecker_nr_0001': 'mdi:power-socket-de',
+        'switch.zwischenstecker_nr_0002': 'mdi:power-socket-de',
+      });
+      expect(errors).to.deep.equal([]);
+    });
+
+    it('publishes no icons when the MDI ones alone are over the limit, and says so once, with the byte count', () => {
+      // Possible only past the 128 numbers, selects and datetimes the apply
+      // takes: every other icon costs the apply more than the map.
+      const { session, published, errors } = harness();
+      const setpoints = Array.from({ length: 700 }, (_, i) => setpoint(i));
+      const size = bytes(JSON.stringify(Object.fromEntries(setpoints.map((s) => [s.entityId, 'mdi:thermostat']))));
+      expect(session.pushConfig(setpoints)).to.equal(true);
+      expect(published.map((p) => p.topic)).to.deep.equal([APPLY]);
+      expect(errors).to.have.length(1);
+      expect(errors[0]).to.include('[Panel a1]').and.to.include(`${size} bytes`).and.to.include(`${LIMIT}`);
+      expect(session.pushConfig(setpoints, true)).to.equal(true);
+      expect(published.map((p) => p.topic)).to.deep.equal([APPLY, APPLY]);
+      expect(errors).to.have.length(1);
+    });
+
+    it('publishes the icons again once they fit, and names the next refusal anew', () => {
+      const { session, published, errors } = harness();
+      const setpoints = Array.from({ length: 700 }, (_, i) => setpoint(i));
+      session.pushConfig(setpoints);
+      published.length = 0;
+      session.pushConfig(setpoints.slice(0, 100));
+      expect(Object.keys(JSON.parse(iconsOf(published)!.payload))).to.deep.equal(setpoints.slice(0, 100).map((s) => s.entityId));
+      published.length = 0;
+      session.pushConfig(setpoints.slice(0, 650));
+      expect(iconsOf(published)).to.equal(undefined);
+      expect(errors).to.have.length(2);
+    });
+
+    it('counts UTF-8 bytes of the MDI map too, not characters', () => {
+      // 500 numbers whose ids hold 26 two-byte umlauts each: about 28,500
+      // characters, over 41,000 bytes.
+      const { session, published, errors } = harness();
+      const setpoints = Array.from({ length: 500 }, (_, i) => setpoint(i, `number.${'ü'.repeat(26)}_${String(i).padStart(4, '0')}`));
+      expect(session.pushConfig(setpoints)).to.equal(true);
+      expect(iconsOf(published)).to.equal(undefined);
+      expect(errors).to.have.length(1);
+    });
+  });
+
   it('warns instead of silently doing nothing when no refresh handler is wired', async () => {
     const { session, published, warnings } = harness();
     await session.start();

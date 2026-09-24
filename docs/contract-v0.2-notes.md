@@ -72,6 +72,16 @@ the matching `*_meta`, and state on the state topic.
   icon on the next push or reconnect, no reboot needed. An icon held for an
   id the adapter does not publish (a removed device, an HA leftover) stays
   until the panel reboots (the map is RAM only).
+- **`bridge/icons` is cut at 32767 bytes too (R114):** the panel copies it
+  into its own 32768-byte buffer and cuts it without a log
+  (`mqtt_handlers.cpp:1496`, `:1779-1785`); the cut map fails to parse and
+  none of it is applied (`ha_bridge_config.cpp:736-737`). Over the limit the
+  adapter drops the `""` entries first and publishes the MDI ones: **a
+  degraded map leaves the dropped entities' stale icons until a panel
+  reboot.** Over the limit even then -- possible only through the icons of
+  numbers, selects and datetimes past the 128th, which are in the map but not
+  in the apply -- it publishes no map and logs an error; the apply still goes
+  out. A map that fits again is published.
 - **Free text (R112):** in names, units and values, `[ ] { }` become `( )`,
   `"` becomes `'`, control characters a space. sensor_meta and
   binary_sensor_meta end at the first `]` (:1198, :1246), a sensor_meta entry

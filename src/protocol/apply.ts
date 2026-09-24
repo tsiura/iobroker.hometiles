@@ -21,6 +21,15 @@ export interface ApplyInput {
 export const MAX_APPLY_BYTES = 32767;
 
 /**
+ * The largest bridge/icons payload a panel applies, in UTF-8 bytes (Ruling
+ * 114): processMqttMessage copies it into its own 32768-byte buffer, NUL
+ * included, and cuts anything longer without a log (mqtt_handlers.cpp:1496,
+ * :1779-1785); the cut map then fails to parse, and applyIconUpdate applies
+ * none of it (ha_bridge_config.cpp:736-737).
+ */
+export const MAX_ICONS_BYTES = 32767;
+
+/**
  * Ruling 111: a panel keeps the values of at most this many numbers,
  * selects and datetimes together, refusing any further one without a log
  * (ha_bridge_config.cpp:1781-1786), and its tiles draw from those values
@@ -245,9 +254,16 @@ export function configSignature(payload: string): string {
  * "" removes an icon the panel still holds (:757-762). That is the one way
  * to clear one, since an apply that carries no icon at all leaves the
  * panel's whole map as it was (:663-665).
+ *
+ * Over MAX_ICONS_BYTES the "" entries go first (Ruling 114): the MDI icons
+ * still arrive, and an entity left out keeps whatever icon the panel holds
+ * until it reboots. What is left can still be over the limit -- the icons
+ * of the numbers, selects and datetimes past the 128th are in it, and not
+ * in the apply -- and the session then publishes none.
  */
 export function buildIconsPayload(entities: VirtualEntity[]): string {
-  const icons: Record<string, string> = {};
-  for (const entity of [...entities].sort(byEntityId)) icons[entity.entityId] = mdiIcon(entity) ?? '';
-  return JSON.stringify(icons);
+  const icons = [...entities].sort(byEntityId).map((entity): [string, string] => [entity.entityId, mdiIcon(entity) ?? '']);
+  const whole = JSON.stringify(Object.fromEntries(icons));
+  if (Buffer.byteLength(whole, 'utf8') <= MAX_ICONS_BYTES) return whole;
+  return JSON.stringify(Object.fromEntries(icons.filter(([, icon]) => icon)));
 }

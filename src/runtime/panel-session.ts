@@ -1,5 +1,5 @@
 import type { Announcement, LocalIoChannel } from '../protocol/announce';
-import { buildApplyPayload, buildIconsPayload, configSignature, MAX_APPLY_BYTES } from '../protocol/apply';
+import { buildApplyPayload, buildIconsPayload, configSignature, MAX_APPLY_BYTES, MAX_ICONS_BYTES } from '../protocol/apply';
 import { CommandError, parseCommand, parseValueCommand, requireEntityId, type ServiceCall } from '../protocol/commands';
 import { buildValueAck, CONTROL_SESSION, MAX_CONTROL_BYTES, type ValueStatus } from '../protocol/editable';
 import { buildStateClear, buildStatePublish } from '../protocol/state-payload';
@@ -90,6 +90,8 @@ export class PanelSession {
   /** The last configuration refused as too large, so each is named in one error only (Ruling 108). */
   private refusedSignature: string | null = null;
   private lastIconsPayload: string | null = null;
+  /** The configuration whose icon map was last refused as too large, so each is named in one error only (Ruling 114). */
+  private refusedIconsFor: string | null = null;
   private started = false;
   /** The weather entities pushed to this panel, as last pushed: what its weather request is answered with. */
   private readonly weathers = new Map<string, VirtualEntity>();
@@ -211,7 +213,9 @@ export class PanelSession {
    * Nor is a configuration over MAX_APPLY_BYTES published (Ruling 108): the
    * panel would apply a cut copy of it at every reconnect. The broker keeps
    * the last good retained apply and icons, and the panel its configuration;
-   * one error names each configuration that does not fit.
+   * one error names each configuration that does not fit. An icon map over
+   * MAX_ICONS_BYTES, even without its "" entries, is held back the same way
+   * (Ruling 114), with the apply still published.
    */
   pushConfig(entities: VirtualEntity[] | null, force = false): boolean {
     if (!entities) return false;
@@ -235,10 +239,25 @@ export class PanelSession {
     this.lastSignature = signature;
     this.transport.publish({ topic: applyTopic(this.deviceId), payload, retain: true });
 
+    // Ruling 114: an icon map a panel would cut is not published either;
+    // buildIconsPayload has already left out the "" entries to make it fit.
     const icons = buildIconsPayload(entities);
-    if (icons !== this.lastIconsPayload) {
-      this.lastIconsPayload = icons;
-      this.transport.publish({ topic: iconsTopic(this.deviceId), payload: icons, retain: true });
+    const iconBytes = Buffer.byteLength(icons, 'utf8');
+    if (iconBytes > MAX_ICONS_BYTES) {
+      if (signature !== this.refusedIconsFor) {
+        this.refusedIconsFor = signature;
+        this.log.error(
+          `[Panel ${this.deviceId}] Icons not pushed: bridge/icons is ${iconBytes} bytes with its MDI icons alone, over the ` +
+            `${MAX_ICONS_BYTES} bytes a panel takes. Exclude devices under Device overrides in the adapter configuration ` +
+            'until it fits; the panel keeps the icons it has meanwhile',
+        );
+      }
+    } else {
+      this.refusedIconsFor = null;
+      if (icons !== this.lastIconsPayload) {
+        this.lastIconsPayload = icons;
+        this.transport.publish({ topic: iconsTopic(this.deviceId), payload: icons, retain: true });
+      }
     }
 
     // m3: how close the installation is to the limit, before a push is refused.
