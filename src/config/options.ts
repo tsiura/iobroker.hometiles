@@ -1,3 +1,4 @@
+import { ENERGY_CATEGORIES, type EnergyCategory } from '../protocol/energy';
 import type { DatetimeKind } from '../registry/types';
 
 export interface AdapterOptions {
@@ -28,6 +29,25 @@ export interface AdapterOptions {
    * history instance, if one is set.
    */
   historyInstance: string;
+  /** The meters energy tiles show the consumption of (Task 20b, Ruling 124). */
+  energyMeters: EnergyMeterRow[];
+  /** The currency the meters' prices are in: the unit of their cost entries. */
+  currency: string;
+}
+
+/**
+ * One cumulative meter, a counter such as a kWh total, as the Energy tab
+ * stores it (Task 20b). Keyed by stateId, never by list index;
+ * runtime/energy-source.ts judges whether the state can be one.
+ */
+export interface EnergyMeterRow {
+  stateId: string;
+  category: EnergyCategory;
+  /** 1: import or consumption; -1: export, such as grid feed-in, which the panel shows negative. */
+  sign: 1 | -1;
+  name?: string;
+  /** Per unit of the meter, in `currency`: a cost entry beside the meter's own. */
+  price?: number;
 }
 
 /** An instance id as js-controller names one: an adapter name, a dot, a number (history.0, sql.1). */
@@ -95,6 +115,8 @@ export const DEFAULTS: AdapterOptions = {
   manualEntities: [],
   pickerArmed: false,
   historyInstance: '',
+  energyMeters: [],
+  currency: 'EUR',
 };
 
 export function normaliseTopic(value: string | undefined, fallback: string): string {
@@ -104,7 +126,7 @@ export function normaliseTopic(value: string | undefined, fallback: string): str
   return collapsed || fallback;
 }
 
-type TextOption = 'brokerHost' | 'brokerUser' | 'brokerPassword' | 'clientId' | 'baseTopic' | 'haPrefix';
+type TextOption = 'brokerHost' | 'brokerUser' | 'brokerPassword' | 'clientId' | 'baseTopic' | 'haPrefix' | 'currency';
 
 /**
  * Admin stores text here, but the instance config is hand-editable: one
@@ -188,6 +210,56 @@ function manualEntities(value: unknown, warnings: string[]): ManualEntity[] {
   return entries;
 }
 
+/**
+ * Energy meters as the Energy tab or a hand edit leaves them, the shape only
+ * (Task 20b): a row without a state, a category the panel draws or a sign is
+ * dropped, the first row of a state is used, and a name or price that is no
+ * name or price costs itself, not the row. The admin stores a cleared number
+ * as '' (json-config ConfigNumber) and a sign as the number its select holds.
+ */
+function energyMeters(value: unknown, warnings: string[]): EnergyMeterRow[] {
+  if (value === undefined || value === null) return [];
+  if (!Array.isArray(value)) {
+    warnings.push('energyMeters is not a list; ignoring every energy meter');
+    return [];
+  }
+  const meters: EnergyMeterRow[] = [];
+  const seen = new Set<string>();
+  value.forEach((raw: unknown, index) => {
+    const row = raw as Partial<Record<keyof EnergyMeterRow, unknown>> | null;
+    if (typeof row !== 'object' || row === null || typeof row.stateId !== 'string' || !row.stateId.trim()) {
+      warnings.push(`energyMeters entry ${index + 1} names no state id; ignoring it`);
+      return;
+    }
+    const stateId = row.stateId.trim();
+    const where = `energyMeters entry ${index + 1} (${stateId})`;
+    if (!ENERGY_CATEGORIES.includes(row.category as EnergyCategory)) {
+      warnings.push(`${where} has no category of ${ENERGY_CATEGORIES.join(', ')}; ignoring it`);
+      return;
+    }
+    const sign = row.sign === 1 || row.sign === '1' ? 1 : row.sign === -1 || row.sign === '-1' ? -1 : undefined;
+    if (!sign) {
+      warnings.push(`${where} has a sign that is neither 1 (import) nor -1 (export); ignoring it`);
+      return;
+    }
+    if (seen.has(stateId)) {
+      warnings.push(`${where} is listed more than once; the first entry is used`);
+      return;
+    }
+    seen.add(stateId);
+    const kept: EnergyMeterRow = { stateId, category: row.category as EnergyCategory, sign };
+    if (typeof row.name === 'string') {
+      if (row.name.trim()) kept.name = row.name.trim();
+    } else if (row.name !== undefined && row.name !== null) warnings.push(`${where} has a name that is not text; ignoring the name`);
+    if (typeof row.price === 'number' && Number.isFinite(row.price) && row.price >= 0) kept.price = row.price;
+    else if (row.price !== undefined && row.price !== null && row.price !== '') {
+      warnings.push(`${where} has a price that is no number of 0 or more; ignoring the price`);
+    }
+    meters.push(kept);
+  });
+  return meters;
+}
+
 /** The admin's instance select, or a hand edit: anything but an instance id is none, never a guess. */
 function historyInstance(value: unknown, warnings: string[]): string {
   if (value === undefined || value === null || value === '') return '';
@@ -236,6 +308,8 @@ export function validateOptions(raw: Partial<AdapterOptions>): {
     // Only this picker's Refresh arms: not a hand edit's "2", nor 4cbb6d3's true.
     pickerArmed: (raw.pickerArmed as unknown) === PICKER_VERSION,
     historyInstance: historyInstance(raw.historyInstance, warnings),
+    energyMeters: energyMeters(raw.energyMeters, warnings),
+    currency: (text(raw, 'currency', warnings) ?? DEFAULTS.currency).trim() || DEFAULTS.currency,
   };
 
   return { options, errors, warnings };

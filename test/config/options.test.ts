@@ -184,4 +184,78 @@ describe('config/options', () => {
       'manualEntities entry 3 (0_userdata.0.Wecker.Termin) has a kind that is not date, time or datetime; ignoring the kind',
     ]);
   });
+
+  describe('energy meters (Task 20b)', () => {
+    it('keeps each well-formed meter, trimmed, and drops the rest with a warning naming each one', () => {
+      // The shape only: whether the state is a counter is energyMeters' to
+      // judge, against the object itself.
+      const raw = {
+        energyMeters: [
+          { stateId: 'shelly.0.em.total', category: 'grid', sign: 1, name: ' Netzbezug ', price: 0.32 },
+          // No picker leaves spaces around an id; a hand edit can.
+          { stateId: ' shelly.0.em.returned ', category: 'grid', sign: -1, price: 0.08 },
+          // The admin stores a cleared number as '', a cleared name as ''; a hand edit may write the sign as text.
+          { stateId: 'modbus.0.pv.total', category: 'solar', sign: '1', name: '', price: '' },
+          { stateId: 'x.0.free', category: 'device', sign: '-1', price: 0 },
+          null,
+          'shelly.0.em.total',
+          { category: 'grid', sign: 1 },
+          { stateId: '  ', category: 'grid', sign: 1 },
+          { stateId: 'x.0.heat', category: 'heat', sign: 1 },
+          { stateId: 'x.0.nosign', category: 'grid' },
+          { stateId: 'x.0.zero', category: 'grid', sign: 0 },
+          { stateId: 'x.0.yes', category: 'grid', sign: true },
+          { stateId: 'shelly.0.em.total', category: 'solar', sign: 1 },
+          { stateId: 'x.0.water', category: 'water', sign: 1, name: 4, price: -1 },
+          { stateId: 'x.0.gas', category: 'gas', sign: -1, price: 'teuer' },
+          { stateId: 'x.0.pump', category: 'device_water', sign: 1, price: null, name: null },
+          { stateId: 'x.0.nan', category: 'battery', sign: 1, price: Number.POSITIVE_INFINITY },
+        ],
+      } as unknown as Partial<AdapterOptions>;
+      const { options, warnings } = validateOptions(raw);
+      expect(options.energyMeters).to.deep.equal([
+        { stateId: 'shelly.0.em.total', category: 'grid', sign: 1, name: 'Netzbezug', price: 0.32 },
+        { stateId: 'shelly.0.em.returned', category: 'grid', sign: -1, price: 0.08 },
+        { stateId: 'modbus.0.pv.total', category: 'solar', sign: 1 },
+        { stateId: 'x.0.free', category: 'device', sign: -1, price: 0 },
+        { stateId: 'x.0.water', category: 'water', sign: 1 },
+        { stateId: 'x.0.gas', category: 'gas', sign: -1 },
+        { stateId: 'x.0.pump', category: 'device_water', sign: 1 },
+        { stateId: 'x.0.nan', category: 'battery', sign: 1 },
+      ]);
+      expect(warnings).to.deep.equal([
+        'energyMeters entry 5 names no state id; ignoring it',
+        'energyMeters entry 6 names no state id; ignoring it',
+        'energyMeters entry 7 names no state id; ignoring it',
+        'energyMeters entry 8 names no state id; ignoring it',
+        'energyMeters entry 9 (x.0.heat) has no category of grid, solar, battery, gas, water, device, device_water; ignoring it',
+        'energyMeters entry 10 (x.0.nosign) has a sign that is neither 1 (import) nor -1 (export); ignoring it',
+        'energyMeters entry 11 (x.0.zero) has a sign that is neither 1 (import) nor -1 (export); ignoring it',
+        'energyMeters entry 12 (x.0.yes) has a sign that is neither 1 (import) nor -1 (export); ignoring it',
+        'energyMeters entry 13 (shelly.0.em.total) is listed more than once; the first entry is used',
+        'energyMeters entry 14 (x.0.water) has a name that is not text; ignoring the name',
+        'energyMeters entry 14 (x.0.water) has a price that is no number of 0 or more; ignoring the price',
+        'energyMeters entry 15 (x.0.gas) has a price that is no number of 0 or more; ignoring the price',
+        'energyMeters entry 17 (x.0.nan) has a price that is no number of 0 or more; ignoring the price',
+      ]);
+    });
+
+    it('ignores every meter, with one warning, when the list is no list', () => {
+      const { options, warnings } = validateOptions({ energyMeters: { stateId: 'x.0.a' } } as unknown as Partial<AdapterOptions>);
+      expect(options.energyMeters).to.deep.equal([]);
+      expect(warnings).to.deep.equal(['energyMeters is not a list; ignoring every energy meter']);
+      expect(DEFAULTS.energyMeters).to.deep.equal([]);
+    });
+
+    it('keeps the currency trimmed, EUR when there is none, and warns when it is no text', () => {
+      expect(DEFAULTS.currency).to.equal('EUR');
+      expect(validateOptions({ currency: ' CHF ' }).options.currency).to.equal('CHF');
+      for (const currency of ['', '   ', undefined, null]) {
+        const { options, warnings } = validateOptions({ currency } as unknown as Partial<AdapterOptions>);
+        expect([options.currency, warnings], String(currency)).to.deep.equal(['EUR', []]);
+      }
+      const { options, warnings } = validateOptions({ currency: 5 } as unknown as Partial<AdapterOptions>);
+      expect([options.currency, warnings]).to.deep.equal(['EUR', ['currency is not text but a number; using the default']]);
+    });
+  });
 });

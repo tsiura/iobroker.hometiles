@@ -35,7 +35,9 @@
     "protocolTrace": false,
     "deviceOverrides": [],
     "manualEntities": [],
-    "historyInstance": ""
+    "historyInstance": "",
+    "energyMeters": [],
+    "currency": "EUR"
   },
   "objects": [],
   "instanceObjects": [

@@ -1,7 +1,8 @@
 import { expect } from 'chai';
 import { readdirSync, readFileSync } from 'node:fs';
 import path from 'node:path';
-import { PICKER_VERSION, validateOptions, type ManualEntity } from '../../src/config/options';
+import { PICKER_VERSION, validateOptions, type EnergyMeterRow, type ManualEntity } from '../../src/config/options';
+import { ENERGY_CATEGORIES } from '../../src/protocol/energy';
 import { MANUAL_DOMAINS } from '../../src/registry/manual';
 import { mergeDetected } from '../../src/registry/overrides';
 
@@ -63,8 +64,8 @@ describe('admin/jsonConfig', () => {
     expect(config.type).to.equal('tabs');
   });
 
-  it('has the four tabs the design specifies', () => {
-    expect(Object.keys(config.items)).to.deep.equal(['connection', 'devices', 'panels', 'advanced']);
+  it('has the tabs the design specifies, and the Energy tab beside the devices (Task 20b)', () => {
+    expect(Object.keys(config.items)).to.deep.equal(['connection', 'devices', 'energy', 'panels', 'advanced']);
   });
 
   it('binds every field to a native key that io-package.json defines', () => {
@@ -186,6 +187,46 @@ describe('admin/jsonConfig', () => {
     expect(ioPackage.native.historyInstance).to.equal('');
     const { options, warnings } = validateOptions({ historyInstance: ioPackage.native.historyInstance });
     expect([options.historyInstance, warnings]).to.deep.equal(['', []]);
+  });
+
+  it('lets the user declare energy meters: a state, a category the panel draws, a direction, a name and a price (Task 20b)', () => {
+    const table = config.items.energy.items.energyMeters;
+    expect(table.type).to.equal('table');
+    const byAttr = columns(table);
+    // Exactly the fields validateOptions keeps of a complete row.
+    const row: EnergyMeterRow = { stateId: 'shelly.0.em.returned', category: 'grid', sign: -1, name: 'Einspeisung', price: 0.08 };
+    expect(Object.keys(byAttr)).to.have.members(Object.keys(validateOptions({ energyMeters: [row] }).options.energyMeters[0]!));
+    expect(byAttr.stateId).to.include({ type: 'objectId' });
+    expect(byAttr.stateId!.types).to.deep.equal(['state']);
+    // json-config 10.0.6 ConfigSelect keeps an option's value as it is, a number too (MenuItem value, :264).
+    expect(byAttr.category!.options!.map((option) => option.value)).to.deep.equal([...ENERGY_CATEGORIES]);
+    expect(byAttr.sign!.options!.map((option) => option.value)).to.deep.equal([1, -1]);
+    // ConfigNumber stores a number, or '' once cleared (:154-170); a price is never negative.
+    expect(byAttr.price).to.include({ type: 'number', min: 0 });
+    expect(byAttr.name).to.include({ type: 'text' });
+    // ConfigTable marks a repeated state (validateUniqueProps, :355-380); validateOptions keeps the first anyway.
+    expect(table.uniqueColumns).to.deep.equal(['stateId']);
+    // A row the admin adds holds each column's default, else null (ConfigTable.onAdd, :704-732):
+    // once its state is picked it is a meter, and costs no warning.
+    const added = Object.fromEntries(table.items.map((column: Column) => [column.attr, column.default ?? null]));
+    const { options, warnings } = validateOptions({ energyMeters: [{ ...added, stateId: 'shelly.0.em.total' }] as EnergyMeterRow[] });
+    expect(options.energyMeters).to.deep.equal([{ stateId: 'shelly.0.em.total', category: 'grid', sign: 1 }]);
+    expect(warnings).to.deep.equal([]);
+    expect(ioPackage.native.energyMeters).to.deep.equal([]);
+  });
+
+  it('asks for the currency the prices are in, EUR by default (Task 20b)', () => {
+    const field = config.items.energy.items.currency;
+    expect(field).to.include({ type: 'text' });
+    expect(ioPackage.native.currency).to.equal('EUR');
+    expect(validateOptions({ currency: ioPackage.native.currency }).options.currency).to.equal('EUR');
+  });
+
+  it("names each category's total in every language, where the Bridge sends German (Ruling 124)", () => {
+    for (const [language, strings] of Object.entries(translations)) {
+      for (const category of ENERGY_CATEGORIES) expect(strings, language).to.have.property(`energy_total_${category}`);
+    }
+    expect(translations.de!.energy_total_grid).to.equal('Netz gesamt');
   });
 
   it('wires each action button to a command the adapter implements', () => {
