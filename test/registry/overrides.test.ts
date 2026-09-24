@@ -120,18 +120,28 @@ describe('registry/overrides', () => {
       ]);
     });
 
-    it('orders rows by object id, whatever order the rows and the detection came in, and a second refresh changes nothing', () => {
+    it("moves none of the form's rows and puts new devices after them by object id, whatever order detection found them in", () => {
+      // The user's order, as sorting a column in the admin leaves it.
       const rows: DeviceOverride[] = [
         { objectId: 'zigbee.0.b', include: true },
         { objectId: 'alias.0.weg', include: false },
         { objectId: 'hue.0.a', include: false, name: 'A' },
       ];
-      const detected = [found('zigbee.0.c', 'C', 'sensor'), found('hue.0.a', 'A', 'light'), found('zigbee.0.b', 'B', 'switch'), found('Zigbee.0.upper', 'U', 'sensor')];
+      const detected = [
+        found('zigbee.0.c', 'C', 'sensor'),
+        found('hue.0.a', 'A', 'light'),
+        found('zigbee.0.b', 'B', 'switch'),
+        found('Zigbee.0.upper', 'U', 'sensor'),
+        found('alias.0.neu', 'N', 'sensor'),
+      ];
       const merged = mergeDetected(rows, detected);
-      // Code-unit order, the same under every locale: capitals first.
-      expect(merged.map((row) => row.objectId)).to.deep.equal(['Zigbee.0.upper', 'alias.0.weg', 'hue.0.a', 'zigbee.0.b', 'zigbee.0.c']);
-      expect(mergeDetected([...rows].reverse(), [...detected].reverse())).to.deep.equal(merged);
+      // New ones in code-unit order, the same under every locale: capitals first.
+      const order = ['zigbee.0.b', 'alias.0.weg', 'hue.0.a', 'Zigbee.0.upper', 'alias.0.neu', 'zigbee.0.c'];
+      expect(merged.map((row) => row.objectId)).to.deep.equal(order);
+      expect(mergeDetected(rows, [...detected].reverse())).to.deep.equal(merged);
+      // A second refresh changes nothing, and an empty table fills sorted.
       expect(mergeDetected(merged, detected)).to.deep.equal(merged);
+      expect(mergeDetected([], detected).map((row) => row.objectId)).to.deep.equal(['Zigbee.0.upper', 'alias.0.neu', 'hue.0.a', 'zigbee.0.b', 'zigbee.0.c']);
     });
 
     it('keeps the last of two rows for one device, the one the selection reads, and drops a row naming no object', () => {

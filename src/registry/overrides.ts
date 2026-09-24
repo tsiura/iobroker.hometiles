@@ -88,16 +88,24 @@ export function detectedRows(
  * The picker's rows after a refresh (Task 21b): every detected device, a new
  * one unticked; a row the user has keeps its include, name and forced domain,
  * with what detection found brought up to date; a row whose device is
- * detected no more stays as it was. Ordered by object id in code units, the
- * same under every locale, so a refresh orders the rows alike whatever order
- * they came in. A row naming no object selects nothing and is dropped; of two
- * rows for one device the last is kept, the one applyOverrides reads.
+ * detected no more stays as it was.
+ *
+ * The form's rows stay where they are, and new devices follow them ordered by
+ * object id in code units, the same under every locale: an empty table fills
+ * sorted, and a refresh moves no row the user sees. The admin's table keys
+ * its cells by row index, and a select keeps a value the user changed, so a
+ * row moved under it would show another device's choice (json-config
+ * ConfigTable, ConfigSelect). A row naming no object selects nothing and is
+ * dropped; of two rows for one device the last is kept, the one
+ * applyOverrides reads.
  */
 export function mergeDetected(rows: readonly DeviceOverride[], detected: readonly Detected[]): DeviceOverride[] {
-  const byObjectId = new Map<string, DeviceOverride>();
-  for (const row of rows) if (row.objectId.trim()) byObjectId.set(row.objectId, row);
-  for (const found of detected) {
-    byObjectId.set(found.objectId, { ...(byObjectId.get(found.objectId) ?? { include: false, name: '', forcedDomain: '' }), ...found });
+  const merged = new Map<string, DeviceOverride>();
+  for (const row of rows) if (row.objectId.trim()) merged.set(row.objectId, row);
+  const byObjectId = (a: Detected, b: Detected): number => (a.objectId < b.objectId ? -1 : a.objectId > b.objectId ? 1 : 0);
+  // A key already there keeps its place; a new one goes last.
+  for (const found of [...detected].sort(byObjectId)) {
+    merged.set(found.objectId, { ...(merged.get(found.objectId) ?? { include: false, name: '', forcedDomain: '' }), ...found });
   }
-  return [...byObjectId.values()].sort((a, b) => (a.objectId < b.objectId ? -1 : a.objectId > b.objectId ? 1 : 0));
+  return [...merged.values()];
 }

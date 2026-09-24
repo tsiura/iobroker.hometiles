@@ -916,10 +916,11 @@ if (process.env.HOMETILES_INTEGRATION === '1') {
               { objectId: 'zigbee.0.weg', include: true, name: '', forcedDomain: '' },
             ];
             const reply = (await ask(getHarness(), 'refreshDetected', { rows })) as { native: { deviceOverrides: object[] }; args: string[] };
+            // The form's rows where they were, the new device after them.
             expect(reply.native.deviceOverrides).to.deep.equal([
-              { objectId: KAFFEE, include: false, name: '', forcedDomain: '', detectedName: 'Kaffee', detectedDomain: 'switch', room: '' },
               { objectId: SENSOR, include: true, name: 'Draußen', forcedDomain: '', detectedName: 'Balkon', detectedDomain: 'sensor', room: 'Balkon' },
               { objectId: 'zigbee.0.weg', include: true, name: '', forcedDomain: '' },
+              { objectId: KAFFEE, include: false, name: '', forcedDomain: '', detectedName: 'Kaffee', detectedDomain: 'switch', room: '' },
             ]);
             expect(reply.args).to.deep.equal(['2', '1']);
             // A choice applies once saved, which restarts the adapter.
