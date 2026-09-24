@@ -198,7 +198,7 @@ describe('admin/jsonConfig', () => {
     expect(Object.keys(byAttr)).to.have.members(Object.keys(validateOptions({ energyMeters: [row] }).options.energyMeters[0]!));
     expect(byAttr.stateId).to.include({ type: 'objectId' });
     expect(byAttr.stateId!.types).to.deep.equal(['state']);
-    // json-config 10.0.6 ConfigSelect keeps an option's value as it is, a number too (MenuItem value, :264).
+    // json-config 10.0.6 ConfigSelect keeps an option's value as it is, a number too (MenuItem value :257, onChange :239).
     expect(byAttr.category!.options!.map((option) => option.value)).to.deep.equal([...ENERGY_CATEGORIES]);
     expect(byAttr.sign!.options!.map((option) => option.value)).to.deep.equal([1, -1]);
     // ConfigNumber stores a number, or '' once cleared (:154-170); a price is never negative.
