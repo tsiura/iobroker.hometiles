@@ -273,9 +273,17 @@ export class EnergySource {
     this.config = config;
   }
 
-  /** The catalog of bridge/apply: none until a rebuild configured the meters. */
+  /**
+   * Whether panels are given meters: once armed (Ruling 118), while one is
+   * set. They alone make an apply worth sending (Ruling 131).
+   */
+  content(): boolean {
+    return !!this.config?.armed && this.config.meters.length > 0;
+  }
+
+  /** The catalog of bridge/apply: the meters' while content(), else none. */
   catalog(): EnergyCatalogEntry[] {
-    return this.config ? energyCatalog(this.config.meters, this.config.currency, this.config.totals) : [];
+    return this.content() ? energyCatalog(this.config!.meters, this.config!.currency, this.config!.totals) : [];
   }
 
   /**

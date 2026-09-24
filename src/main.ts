@@ -222,7 +222,17 @@ class HomeTiles extends utils.Adapter {
   /** The entities the panels are given: none while the apply is held back (Ruling 116, Ruling 119 M7). */
   private get publishedCount(): number {
     const entities = this.registry.all();
-    return listsAnyEntity(entities) ? entities.length : 0;
+    return this.hasContent(entities) ? entities.length : 0;
+  }
+
+  /**
+   * Whether an apply is worth a panel's layout (Ruling 116): an entity lands
+   * in a list, or an energy meter is set once armed (Ruling 131). Every
+   * held-back check asks this one, so the log, info.entities and the clears
+   * agree with what goes out (Ruling 119 M7).
+   */
+  private hasContent(entities: readonly VirtualEntity[]): boolean {
+    return listsAnyEntity(entities) || this.energy.content();
   }
 
   /**
@@ -277,15 +287,18 @@ class HomeTiles extends utils.Adapter {
   /**
    * The entities panels may be given: none until a discovery has succeeded
    * (Ruling 56), nor once the adapter stops, when the registry is emptied
-   * (Ruling 62 B), nor while none of them lands in a list (Ruling 116):
-   * nothing picked yet, or everything un-picked. An apply with every list
-   * empty would make each panel drop its layout and save that. Null holds
-   * back every push -- apply, icons, states and clears -- so each panel
-   * keeps its last configuration, and the broker its retained one.
+   * (Ruling 62 B), nor while none of them lands in a list and no energy
+   * meter is set (Rulings 116, 131): nothing picked yet, or everything
+   * un-picked. An apply with every list empty would make each panel drop its
+   * layout and save that. Null holds back every push -- apply, icons, states
+   * and clears -- so each panel keeps its last configuration, and the broker
+   * its retained one. Meters alone are an explicit pick: their apply goes
+   * out, its entity lists empty.
    */
   private panelEntities(): VirtualEntity[] | null {
-    const entities = this.discovered && !this.unloading ? this.registry.all() : [];
-    return listsAnyEntity(entities) ? entities : null;
+    if (!this.discovered || this.unloading) return null;
+    const entities = this.registry.all();
+    return this.hasContent(entities) ? entities : null;
   }
 
   private pushEverything(session: PanelSession): void {
@@ -451,9 +464,10 @@ class HomeTiles extends utils.Adapter {
     const energyIds = await this.configureEnergy(objects, armed);
 
     const result = this.registry.rebuild(this.devices, this.persistedIds);
-    // Ruling 116: while no entity lands in a list, the panels are given
-    // nothing (panelEntities), and the log says why instead.
-    const holding = !listsAnyEntity(this.registry.all());
+    // Ruling 116: while no entity lands in a list and no meter is set
+    // (Ruling 131), the panels are given nothing (panelEntities), and the log
+    // says why instead.
+    const holding = !this.hasContent(this.registry.all());
     if (!armed) this.log.info(`[Registry] ${NOT_ARMED}${this.waiting(manual.devices.length)}`);
     else if (holding) this.log.info(`[Registry] ${this.devices.length === 0 ? NOTHING_SELECTED : NOTHING_LISTED}`);
     if (result.skipped.length > 0) {

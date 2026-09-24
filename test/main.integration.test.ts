@@ -830,15 +830,25 @@ if (process.env.HOMETILES_INTEGRATION === '1') {
         withCleanFixtures(getHarness);
         const port = 18854;
         const { applies, panel } = withBrokerAndPanel(port);
+        const ZAEHLER = '0_userdata.0.Energie.Zaehler';
+        after(async () => {
+          await getHarness().objects.delObjectAsync(ZAEHLER).catch(() => undefined);
+          await setEnergyMeters(getHarness(), []);
+        });
 
-        it('publishes no empty configuration, however many requests arrive while it stops', async function () {
+        it('publishes no empty configuration, however many requests arrive while it stops, an energy meter set or not (Ruling 131)', async function () {
           this.timeout(120000);
           const harness = getHarness();
           const logs = await captureLogs(harness);
           await harness.changeAdapterConfig('hometiles', {
             native: { brokerHost: '127.0.0.1', brokerPort: port, ...ARMED, deviceOverrides: picked(SENSOR) },
           });
-          await setObjects(harness, SENSOR_OBJECTS);
+          // A meter alone is worth an apply (Ruling 131); an emptied registry beside it is not.
+          await setEnergyMeters(harness, [{ stateId: ZAEHLER, category: 'grid', sign: 1 }]);
+          await setObjects(harness, {
+            ...SENSOR_OBJECTS,
+            [ZAEHLER]: { type: 'state', common: { name: 'Zähler', role: 'value.energy.consumed', type: 'number', unit: 'kWh', read: true, write: false } },
+          });
           await harness.startAdapterAndWait(true);
           await waitFor(harness, () => applies.find((payload) => payload.includes('sensor.balkon')), 'the normal apply');
 
@@ -949,6 +959,73 @@ if (process.env.HOMETILES_INTEGRATION === '1') {
           expect(energy[1]!.message).to.include('history.0').and.include(BEZUG).and.include(EINSPEISUNG);
         });
       });
+
+      // Ruling 131: a meter is content for Ruling 116, once armed (Ruling 118).
+      for (const [armed, port] of [
+        [true, 18860],
+        [false, 18861],
+      ] as const) {
+        suite(`energy meters, no entity in a list, ${armed ? 'armed' : 'before the Devices tab is used'} (Ruling 131)`, (getHarness) => {
+          withCleanFixtures(getHarness);
+          const { applies } = withBrokerAndPanel(port);
+          const ZAEHLER = '0_userdata.0.Energie.Zaehler';
+          const removeMeter = async (): Promise<void> => {
+            await getHarness().objects.delObjectAsync(ZAEHLER).catch(() => undefined);
+          };
+          before(removeMeter);
+          after(async () => {
+            await removeMeter();
+            await setEnergyMeters(getHarness(), []);
+          });
+
+          const title = armed
+            ? 'publishes the apply for the meter beside a scene, which lands in no list: every entity list empty, no hint, the scene counted'
+            : 'publishes nothing, and names the meter among what waits';
+          it(title, async function () {
+            this.timeout(120000);
+            const harness = getHarness();
+            const logs = await captureLogs(harness);
+            // Only a scene picked: on its own it holds the apply back (M7).
+            const scene = [{ objectId: KAFFEE, include: true, detectedDomain: 'switch', forcedDomain: 'scene' }];
+            await harness.changeAdapterConfig('hometiles', {
+              native: { brokerHost: '127.0.0.1', brokerPort: port, ...(armed ? ARMED : {}), deviceOverrides: scene, historyInstance: 'history.0' },
+            });
+            await setEnergyMeters(harness, [{ stateId: ZAEHLER, category: 'grid', sign: 1, name: 'Zähler' }]);
+            await setObjects(harness, {
+              ...KAFFEE_OBJECTS,
+              [ZAEHLER]: { type: 'state', common: { name: 'Zähler', role: 'value.energy.consumed', type: 'number', unit: 'kWh', read: true, write: false } },
+            });
+            const panels = valuesOf(harness, 'hometiles.0.info.panels');
+            await harness.startAdapterAndWait(true);
+            await waitFor(harness, () => ready(logs), 'onReady to finish');
+            await waitFor(harness, () => (panels.includes(1) ? true : undefined), 'the panel session');
+            await pause(500);
+            const hints = logs
+              .map((log) => log.message)
+              .filter((message) => message.includes('No devices selected yet') || message.includes('Nothing picked shows in a panel list'));
+            const published = async (): Promise<unknown> => JSON.parse(String((await harness.states.getStateAsync('hometiles.0.info.publishedIds'))?.val));
+            if (!armed) {
+              expect(applies, 'no apply').to.deep.equal([]);
+              expect(hints).to.have.lengthOf(1);
+              expect(hints[0]).to.include('Held back until then: 1 device rows of an earlier version, 1 energy meters');
+              expect(await harness.states.getStateAsync('hometiles.0.info.entities')).to.include({ val: 0 });
+              expect(await published()).to.deep.equal({});
+              return;
+            }
+            expect(applies, 'an apply').to.not.deep.equal([]);
+            const apply = JSON.parse(applies.at(-1)!) as Record<string, unknown>;
+            for (const list of ['sensors', 'binary_sensors', 'lights', 'switches', 'media_players', 'climates', 'covers', 'weathers', 'numbers', 'selects', 'datetimes']) {
+              expect(apply[list], list).to.deep.equal([]);
+            }
+            expect((apply.energy as Array<{ id: string }>).map((entry) => entry.id)).to.include('energy.zahler');
+            expect(hints).to.deep.equal([]);
+            // What went out is what the adapter reports and records (Ruling 119 M7).
+            expect(ready(logs)!.message).to.include('1 picked (manual entities included), 1 entities published');
+            expect(await harness.states.getStateAsync('hometiles.0.info.entities')).to.include({ val: 1 });
+            expect(await published()).to.deep.equal({ [KAFFEE]: 'scene.kaffee' });
+          });
+        });
+      }
 
       // One broker for these suites: what a run retained on it survives the
       // restart that saving a selection causes (js-controller restarts an

@@ -227,6 +227,13 @@ describe('admin/jsonConfig', () => {
     expect(translations.de!.energy_info).to.include('nie ein Zähler, der täglich zurückgesetzt wird');
   });
 
+  it('warns on the Energy tab too that meters alone prune the panels once Refresh is saved, to export their layout first (Ruling 131)', () => {
+    for (const [language, strings] of Object.entries(translations)) {
+      expect(strings.energy_info, language).to.include(strings.refresh_detected);
+      expect(strings.energy_info, language).to.match(/export/i);
+    }
+  });
+
   it("names each category's total in every language, where the Bridge sends German (Ruling 124)", () => {
     for (const [language, strings] of Object.entries(translations)) {
       for (const category of ENERGY_CATEGORIES) expect(strings, language).to.have.property(`energy_total_${category}`);

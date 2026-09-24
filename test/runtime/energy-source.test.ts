@@ -444,6 +444,17 @@ describe('runtime/energy-source', () => {
       expect(history.asked).to.deep.equal([]);
     });
 
+    it('gives panels its meters only once armed, and while one is set: an apply is worth sending for them alone (Rulings 118, 131)', () => {
+      const source = new EnergySource(fakeHistory(), states({}), logger());
+      expect([source.content(), source.catalog()]).to.deep.equal([false, []]);
+      source.configure(configured({ armed: false }));
+      expect([source.content(), source.catalog()]).to.deep.equal([false, []]);
+      source.configure(configured({ meters: [] }));
+      expect([source.content(), source.catalog()]).to.deep.equal([false, []]);
+      source.configure(configured());
+      expect([source.content(), source.catalog()]).to.deep.equal([true, energyCatalog([meter()], 'EUR', TOTALS)]);
+    });
+
     it('answers nothing to a payload that is no request', async () => {
       const source = new EnergySource(fakeHistory(), states({}), logger());
       source.configure(configured());
