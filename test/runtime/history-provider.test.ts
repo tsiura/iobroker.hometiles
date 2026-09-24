@@ -799,6 +799,29 @@ describe('runtime/history-provider', () => {
       expect(result.readings).to.deep.equal(HOURS.map((t) => expected(COUNTER, t)));
     });
 
+    it('looks further back, once, behind rows that are none, also when the week before holds no row', async () => {
+      // A meter quiet for two weeks: its newest rows before that are three
+      // null markers (writeNulls with changesOnly off), its reading a day older.
+      const quiet = MIDNIGHTS[0]! - 14 * DAY;
+      const rows: Stored[] = [
+        { ts: quiet - DAY, val: 7, q: 0 },
+        ...series(quiet - 3 * MINUTE, MINUTE, 3, () => null).map((row) => ({ ...row, q: 0x40 })),
+      ];
+      for (const [name, make] of flavours.filter(([flavour]) => flavour !== 'influxdb')) {
+        const fake = make(rows);
+        const result = await before(provide(fake), [MIDNIGHTS[0]!]);
+        expect(result.readings, name).to.deep.equal([7]);
+        expect(
+          fake.calls.map(({ options }) => [options.start === undefined, options.count]),
+          name,
+        ).to.deep.equal([
+          [false, 3],
+          [true, 3],
+          [true, MAX_HISTORY_ROWS],
+        ]);
+      }
+    });
+
     it('looks further back, once, for a reading behind rows that are none', async () => {
       // Three bad rows right before the midnight, the reading two days older.
       const rows: Stored[] = [

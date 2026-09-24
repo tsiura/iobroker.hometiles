@@ -436,15 +436,15 @@ export class HistoryProvider {
   }
 
   /**
-   * The newest row at or before `end` that suits `kind`, however old. First
-   * from the newest `count` rows of the week up to `end` (M-8: without a start
-   * InfluxDB 2.x reads its whole retention, main.js:2718-2723, :2776). Only
-   * when those hold none is it asked for with no start: as far back as the
-   * bound when rows came that do not suit, of bad quality or no number
-   * (Task 20b), else the newest `count` however old. An empty answer then is
-   * final: the rows a day file spills past `end` are dropped before it is
-   * sent. Both questions share what is left before `deadline` (C3); with less
-   * than MIN_QUESTION_MS left none is asked, as if it had timed out.
+   * The newest row at or before `end` that suits `kind`, however old: from
+   * the newest `count` rows of the week up to `end` (M-8: without a start
+   * InfluxDB 2.x reads its whole retention, main.js:2718-2723, :2776), and
+   * only when the week holds no row, from the newest `count` however old. An
+   * empty answer then is final: the rows a day file spills past `end` are
+   * dropped before it is sent. When rows came and none suits -- of bad
+   * quality, or no number -- it looks back once more, as far as the bound
+   * (Task 20b). The questions share what is left before `deadline` (C3); with
+   * less than MIN_QUESTION_MS left none is asked, as if it had timed out.
    */
   private async prior(
     lease: Lease,
@@ -455,14 +455,15 @@ export class HistoryProvider {
     kind: HistoryKind,
     deadline = Infinity,
   ): Promise<SourceValue | undefined | HistoryFailure> {
-    const near = await this.question(lease, instance, id, { start: end - PRIOR_LOOKBACK_MS, end, count }, deadline);
-    if (typeof near === 'string') return near;
-    const found = suited(near, kind, end);
-    if (found) return found;
-    const far = await this.question(lease, instance, id, { end, count: near.length > 0 ? MAX_HISTORY_ROWS : count }, deadline);
-    if (typeof far === 'string') return far;
-    if (far.length > 0 && usable(far, kind).length === 0) this.unusable(instance, id, far.length, kind);
-    return suited(far, kind, end);
+    let rows = await this.question(lease, instance, id, { start: end - PRIOR_LOOKBACK_MS, end, count }, deadline);
+    if (Array.isArray(rows) && rows.length === 0) rows = await this.question(lease, instance, id, { end, count }, deadline);
+    if (typeof rows === 'string') return rows;
+    const found = suited(rows, kind, end);
+    if (found || rows.length === 0) return found;
+    const back = count < MAX_HISTORY_ROWS ? await this.question(lease, instance, id, { end, count: MAX_HISTORY_ROWS }, deadline) : rows;
+    if (typeof back === 'string') return back;
+    if (back.length > 0 && usable(back, kind).length === 0) this.unusable(instance, id, back.length, kind);
+    return suited(back, kind, end);
   }
 
   /** ask() with what is left before `deadline`, at most QUERY_TIMEOUT_MS; `timeout` at once with less than MIN_QUESTION_MS. */
