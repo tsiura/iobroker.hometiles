@@ -240,19 +240,30 @@ gated at `sensor_popup.cpp:2304-2307`). Keys:
 | `device_class` | string, nullable | HA device class; explicit JSON `null` clears the cached one, absent key keeps it (`:1846-1851`, see §7) |
 | `current` | string, nullable | Live state string; same explicit-null-vs-absent rule (`:1852-1856`) |
 | `available` | bool, nullable | Same explicit-null-vs-absent rule; null ⇒ treated as unavailable (`:1857-1861`) |
-| `last_changed` | epoch **seconds** | via `extract_epoch` (`:836-852`, accepts uint64/long/numeric string, rejects negative); explicit null clears it to 0, absent keeps the old value (`:1862-1870`) |
+| `last_changed` | epoch **seconds** | via `extract_epoch` (`:836-852`, accepts an integer or a numeric string; a negative, a fraction or null is 0 — every epoch in this payload must be a whole number); explicit null clears it to 0, absent keeps the old value (`:1862-1870`) |
 | `error` | any | If present at all (any value), forces `history_available=false` (`:1873-1874`) |
 | `history_available` | bool | Default `true` if absent and no `error` key (`:1873-1874`) |
 | `range_start`, `range_end` | epoch seconds | If `range_end` absent, uses device's current time; if `range_start` absent, computed as `range_end - hours*3600` (`:1877-1885`) — **confirms epoch is in seconds**, not milliseconds (3600 s/hour arithmetic) |
 | `timeline_points` | uint16 | Point count for the compact timeline strip, max `kBinaryMaxTimelineBins=768` (`:1779`, const at `:60`) |
 | `timeline_encoding` | string | Must be literally `"2bit-hex"` or the timeline is rejected (`:1780`) |
 | `timeline_data` | hex string | 2 bits/point, 4 points/byte, 2 hex chars/byte, case-insensitive hex (`decode_binary_timeline`, `:1767-1801`; nibble decode `:1760-1765`). Length must equal `ceil(points/4)*2` exactly or the whole timeline is rejected (not truncated) (`:1783-1785`) |
-| `segments` | array of `{start, end, state}` | Explicit on/off/unknown/unavailable runs; capped at `kBinaryMaxSegments=96` (`:59`) — **extra segments beyond 96 are silently truncated** (`:1897-1899`: `if (...) break;`), and any segment with `end <= start` or a zero epoch is dropped (`:1906-1908`). Firmware re-sorts by `start` ascending after loading (`:1911-1915`) — **wire order of segments does not matter** |
+| `segments` | array of `{start, end, state}` | Explicit on/off/unknown/unavailable runs; capped at `kBinaryMaxSegments=96` (`:59`) — **the FIRST 96 valid segments in wire order are kept** (`:1897-1899`: `if (...) break;`; a segment with `end <= start` or a zero epoch is skipped without counting, `:1906-1908`), and only then re-sorted by `start` (`:1911-1915`). **Corrected in Task 18:** with more than 96, wire order decides which survive — send at most 96, the newest (the popup asks for `max_transitions` 96, `:2549-2553`) |
 | `activity` | array of `{timestamp, state}` | Individual state-change log entries, capped at `kBinaryMaxActivityEntries=96` (`:61`). The firmware reads from the **end of the array backward** (`:1923-1926`) and keeps only the last (highest-index) 96 entries, storing them newest-first. **This means the wire array must be ordered oldest→newest** for the truncation to keep the most recent events; sending newest-first would cause the oldest events to be kept instead. Entries with a zero/unparseable `timestamp` are dropped (`:1930`) |
 
 `state` strings inside `segments`/`activity` are mapped by `binary_state_code`
 (`:854-865`): `"on"→1`, `"off"→0`, `"unavailable"` string or `available=false`→3,
 empty/anything else→2 (unknown). Trim + lowercase before matching.
+
+**Added in Task 18:** the bar is drawn from the decoded timeline whenever it
+has any bins, and from `segments` only when it has none (`:1110-1171`, over a
+background in the unavailable colour, `:1604-1606`); a live change while the
+popup is open moves only the timeline (`:1389-1418`). Segments alone cover just
+the newest 96 runs of a busy window, so the adapter always sends the timeline
+(`src/protocol/history.ts`). The response dispatcher reads `entity_id`, `kind`
+and `hours` by first substring match anywhere in the text
+(`mqtt_handlers.cpp:326-375`, `:1839-1853`): they must come before any free
+text, or the pending request is not cleared and the panel's own 8 s
+"history unavailable" (`:541-553`) replaces the reply.
 
 ### 4.3 State/categorical (`"kind":"state"`) response — `apply_state_history_payload`, `sensor_popup.cpp:2089-2250`
 
@@ -270,9 +281,11 @@ rules as §4.2 (`:2121-2140`). Differences from binary:
 | `segments[].state` | string | Raw label text (not a 0-3 code), passed through `normalize_state_history_value` (`:2172-2173`) |
 | `activity[].state` | string | Same, raw label text (`:2200-2201`) |
 
-Same truncation/ordering caveats for `segments` (sorted after load, order
-doesn't matter) and `activity` (last-96-by-index, wire order must be
-oldest→newest) as §4.2.
+Same truncation/ordering caveats for `segments` (first 96 valid in wire order,
+then sorted — corrected in Task 18, see §4.2) and `activity` (last-96-by-index,
+wire order must be oldest→newest) as §4.2. Every label is renamed by
+`normalize_state_history_value` (`:928-953`): trimmed of ASCII blanks, cut to
+255 bytes, and over 32 bytes cut to 23 plus `~` and 8 hex of its SHA-256.
 
 ### 4.4 Editable-value popups (Number / Select / DateTime)
 
@@ -291,6 +304,11 @@ Activity/segments/palette/timeline data, then, only if
 - For the numeric graph sub-path: `values` must be a JSON array, its size
   must be ≤ `kHistoryPoints24h=288`, and `period_minutes` must match, else the
   response is dropped (`:2287-2289`) before the range-id check even runs.
+- **Corrected in Task 18:** for a Number the `kind` does matter. After the
+  state history the popup falls into the `kind` switch (`:2303-2313`): a
+  response claiming `"binary"` or `"state"` returns there, before the graph,
+  so a Number's `values` are never drawn. The Bridge sends `"number"`
+  (`editable_helpers.py:188`), and `"state"` for a Select or Date/Time.
 
 ## 5. Correlation — definitive answer
 
@@ -517,7 +535,9 @@ by which request function was originally called.
 Editable-value popups (§4.4) are a hybrid: they always consume the
 categorical shape (segments/activity/palette) for their Activity list
 regardless of the response's `kind`, and, only for Number tiles, additionally
-consume a numeric `values` array from the *same* response object.
+consume a numeric `values` array from the *same* response object — unless its
+`kind` is `"binary"` or `"state"`, which skips the graph (corrected in Task 18,
+§4.4).
 
 ## 9. Special values — null / empty / "unavailable" / "unknown"
 
@@ -543,7 +563,7 @@ consume a numeric `values` array from the *same* response object.
 | Concurrent pending numeric-history timeout slots | 8 | `mqtt_handlers.cpp:67` | Oldest evicted (bookkeeping only, not the eventual response) |
 | Concurrent pending discrete-history requests | 1 (global) | `mqtt_handlers.cpp:86-94` | New request unconditionally replaces old bookkeeping |
 | Binary/state timeline points | 768 | `sensor_popup.cpp:60` | Whole timeline rejected (not truncated) if exceeded or if hex length mismatches |
-| Binary/state segments | 96 | `sensor_popup.cpp:59` | Extra segments truncated; order-independent (re-sorted) |
+| Binary/state segments | 96 | `sensor_popup.cpp:59` | The first 96 valid in wire order kept, then re-sorted (corrected in Task 18: order decides which survive) |
 | Binary/state activity entries | 96 | `sensor_popup.cpp:61` | Extra entries truncated by array-tail; **requires oldest→newest wire order** to keep the right ones |
 | State palette entries | 16 | `sensor_popup.cpp:62` | Whole palette discarded if exceeded or if any entry isn't a string |
 | Editable-number history points | 288 | `sensor_popup.cpp:2288, 2342` | Whole response dropped if exceeded |
