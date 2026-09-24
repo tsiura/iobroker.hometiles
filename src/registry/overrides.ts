@@ -88,7 +88,8 @@ export function detectedRows(
  * The picker's rows after a refresh (Task 21b): every detected device, a new
  * one unticked; a row the user has keeps its include, name and forced domain,
  * with what detection found brought up to date; a row whose device is
- * detected no more stays as it was.
+ * detected no more stays, its detected name marked `notDetected` once
+ * (Ruling 117) -- main.ts passes the text in the system's language.
  *
  * The form's rows stay where they are, and new devices follow them ordered by
  * object id in code units, the same under every locale: an empty table fills
@@ -99,9 +100,18 @@ export function detectedRows(
  * dropped; of two rows for one device the last is kept, the one
  * applyOverrides reads.
  */
-export function mergeDetected(rows: readonly DeviceOverride[], detected: readonly Detected[]): DeviceOverride[] {
+export function mergeDetected(
+  rows: readonly DeviceOverride[],
+  detected: readonly Detected[],
+  notDetected = '(not detected)',
+): DeviceOverride[] {
   const merged = new Map<string, DeviceOverride>();
-  for (const row of rows) if (row.objectId.trim()) merged.set(row.objectId, row);
+  for (const row of rows) {
+    if (!row.objectId.trim()) continue;
+    // Marked once; a device detected again takes detection's name below.
+    const name = row.detectedName ?? '';
+    merged.set(row.objectId, name.endsWith(notDetected) ? row : { ...row, detectedName: name ? `${name} ${notDetected}` : notDetected });
+  }
   const byObjectId = (a: Detected, b: Detected): number => (a.objectId < b.objectId ? -1 : a.objectId > b.objectId ? 1 : 0);
   // A key already there keeps its place; a new one goes last.
   for (const found of [...detected].sort(byObjectId)) {

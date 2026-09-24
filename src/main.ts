@@ -1,7 +1,9 @@
 import * as utils from '@iobroker/adapter-core';
+import { readFileSync } from 'node:fs';
+import path from 'node:path';
 import { validateOptions, type AdapterOptions, type DeviceOverride } from './config/options';
 import { AnnounceError } from './protocol/announce';
-import { MAX_EDITABLES, splitEditables } from './protocol/apply';
+import { listsAnyEntity, MAX_EDITABLES, splitEditables } from './protocol/apply';
 import { ENTITY_ID_RE } from './protocol/commands';
 import { buildStatePublish } from './protocol/state-payload';
 import {
@@ -30,8 +32,31 @@ const ENTITY_ID_STATE = 'info.entityIds';
 const ROOT_ANCHOR_STATE = 'info.rootAnchors';
 /** The entities the panels were given, kept across the restart a saved selection causes (Task 21b). */
 const PUBLISHED_STATE = 'info.publishedIds';
-/** Task 21b rule 5, once per rebuild that hands the registry nothing. */
+/** Task 21b rule 5 and Ruling 116, once per rebuild that holds the apply back because nothing is picked. */
 const NOTHING_SELECTED = 'No devices selected yet — pick devices in the adapter settings (Devices tab)';
+/** Ruling 116, once per rebuild that holds the apply back although something is picked. */
+const NOTHING_LISTED =
+  'Nothing picked shows in a panel list: a scene needs none, and no entity could be made of the rest. ' +
+  'Panels keep their last configuration until something is picked that does';
+
+/**
+ * A text from the admin's own translations (admin/i18n), in `language`, else
+ * in English: what the adapter writes into the admin form is translated like
+ * the form's labels (Ruling 117). The key itself when neither file has it.
+ */
+function adminText(key: string, language: string): string {
+  for (const lang of [language, 'en']) {
+    // Only a language code names a file: never a path.
+    if (!/^[a-z]{2}(-[a-z]{2,4})?$/i.test(lang)) continue;
+    try {
+      const text: unknown = JSON.parse(readFileSync(path.join(__dirname, '..', 'admin', 'i18n', `${lang}.json`), 'utf8'))[key];
+      if (typeof text === 'string') return text;
+    } catch {
+      // No translation file for this language: try the next.
+    }
+  }
+  return key;
+}
 /** A failed discovery is retried after 5 s, 10 s, 20 s ... and at most every 5 minutes. */
 const DISCOVERY_RETRY_FIRST_MS = 5_000;
 const DISCOVERY_RETRY_MAX_MS = 300_000;
@@ -201,10 +226,15 @@ class HomeTiles extends utils.Adapter {
   /**
    * The entities panels may be given: none until a discovery has succeeded
    * (Ruling 56), nor once the adapter stops, when the registry is emptied
-   * (Ruling 62 B).
+   * (Ruling 62 B), nor while none of them lands in a list (Ruling 116):
+   * nothing picked yet, or everything un-picked. An apply with every list
+   * empty would make each panel drop its layout and save that. Null holds
+   * back every push -- apply, icons, states and clears -- so each panel
+   * keeps its last configuration, and the broker its retained one.
    */
   private panelEntities(): VirtualEntity[] | null {
-    return this.discovered && !this.unloading ? this.registry.all() : null;
+    const entities = this.discovered && !this.unloading ? this.registry.all() : [];
+    return listsAnyEntity(entities) ? entities : null;
   }
 
   private pushEverything(session: PanelSession): void {
@@ -358,11 +388,14 @@ class HomeTiles extends utils.Adapter {
     // one of them would be given.
     this.detected = detected;
     this.devices = [...applyOverrides(detected, this.options.deviceOverrides), ...manual.devices];
-    if (this.devices.length === 0) this.log.info(`[Registry] ${NOTHING_SELECTED}`);
     this.rootAnchors = anchors;
     await this.saveJsonMap(ROOT_ANCHOR_STATE, 'Root anchors: the state each root id stays with', anchors);
 
     const result = this.registry.rebuild(this.devices, this.persistedIds);
+    // Ruling 116: while no entity lands in a list, the panels are given
+    // nothing (panelEntities), and the log says why instead.
+    const holding = !listsAnyEntity(this.registry.all());
+    if (holding) this.log.info(`[Registry] ${this.devices.length === 0 ? NOTHING_SELECTED : NOTHING_LISTED}`);
     if (result.skipped.length > 0) {
       const skipped = result.skipped.map(({ objectId, reason }) => `${objectId} (${reason})`);
       this.log.warn(`[Registry] Devices left out, no entity could be made of them: ${skipped.join(', ')}`);
@@ -424,20 +457,24 @@ class HomeTiles extends utils.Adapter {
     // What the panels were given before and are not now. Saving a selection
     // restarts the adapter, so the registry starts empty and its own removed
     // list never names an entity the user un-picked: the record of the last
-    // rebuild, which outlives the restart, does (Task 21b rule 6).
-    const now = new Set(this.registry.all().map((entity) => entity.entityId));
-    const gone = Object.values(this.published).filter((entityId) => !now.has(entityId));
-    this.published = Object.fromEntries(Object.entries(result.entityIds).filter(([, entityId]) => now.has(entityId)));
-    await this.saveJsonMap(PUBLISHED_STATE, 'Entity ids the panels were given', this.published);
-    this.unpublished = [...new Set([...this.unpublished, ...gone])].filter((entityId) => !now.has(entityId));
-
-    // Only a panel that was given a configuration is told an entity left it
-    // (Ruling 56); one that announces later is told by its first push.
-    if (this.discovered) {
-      for (const entityId of gone) {
-        for (const session of this.panels.sessions()) session.clearEntityState(entityId);
+    // rebuild, which outlives the restart, does (Task 21b rule 6). While the
+    // apply is held back the panels are given nothing new and keep showing
+    // what the record names: it stays, and nothing is cleared until an apply
+    // goes out (Ruling 116).
+    if (!holding) {
+      const now = new Set(this.registry.all().map((entity) => entity.entityId));
+      const gone = Object.values(this.published).filter((entityId) => !now.has(entityId));
+      this.published = Object.fromEntries(Object.entries(result.entityIds).filter(([, entityId]) => now.has(entityId)));
+      this.unpublished = [...new Set([...this.unpublished, ...gone])].filter((entityId) => !now.has(entityId));
+      // Only a panel that was given a configuration is told an entity left it
+      // (Ruling 56); one that announces later is told by its first push.
+      if (this.discovered) {
+        for (const entityId of gone) {
+          for (const session of this.panels.sessions()) session.clearEntityState(entityId);
+        }
       }
     }
+    await this.saveJsonMap(PUBLISHED_STATE, 'Entity ids the panels were given', this.published);
 
     await this.setState('info.entities', this.registry.all().length, true);
   }
@@ -570,7 +607,7 @@ class HomeTiles extends utils.Adapter {
         // admin writes `native` into the form (useNative) and shows the
         // `result` text, filled with `args` (json-config ConfigSendto).
         return reply({
-          native: { deviceOverrides: mergeDetected(rows, found) },
+          native: { deviceOverrides: mergeDetected(rows, found, adminText('not_detected', language)) },
           result: 'refreshed',
           args: [String(found.length), String(found.filter((row) => !known.has(row.objectId)).length)],
         });

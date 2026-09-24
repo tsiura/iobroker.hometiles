@@ -114,10 +114,19 @@ describe('admin/jsonConfig', () => {
     expect(Object.keys(button.result)).to.deep.equal(['refreshed']);
   });
 
-  it("shows what detection found read-only beside the user's choices, filterable and sortable, and adds or deletes no row (Task 21b)", () => {
+  it("shows what detection found read-only beside the user's choices, filterable and sortable, and lets a row be deleted (Task 21b, Ruling 117)", () => {
     const table = config.items.devices.items.deviceOverrides;
-    expect(table).to.include({ type: 'table', noDelete: true });
+    expect(table.type).to.equal('table');
+    // noDelete would take the delete button with the add button (json-config ConfigTable).
+    expect(table.noDelete, 'rows can be deleted').to.not.equal(true);
     const byAttr = columns(table);
+    // A row added by hand holds a text object id, which selects nothing and
+    // costs no warning (validateOptions), rather than null.
+    expect(byAttr.objectId!.default).to.equal('');
+    expect(validateOptions({ deviceOverrides: [{ objectId: byAttr.objectId!.default as string, include: false }] }).warnings).to.deep.equal([]);
+    // The adapter marks a row whose device is detected no more in the
+    // system's language (Ruling 117): every language has the text.
+    for (const [language, strings] of Object.entries(translations)) expect(strings, language).to.have.property('not_detected');
     // Exactly the fields a refreshed row holds.
     const [row] = mergeDetected([], [{ objectId: 'hue.0.a', detectedName: 'A', detectedDomain: 'light', room: 'Flur' }]);
     expect(Object.keys(byAttr)).to.have.members(Object.keys(row!));

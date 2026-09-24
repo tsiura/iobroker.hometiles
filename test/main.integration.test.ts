@@ -812,7 +812,7 @@ if (process.env.HOMETILES_INTEGRATION === '1') {
         });
       });
 
-      // One broker for the four suites: what a run retained on it survives the
+      // One broker for these suites: what a run retained on it survives the
       // restart that saving a selection causes (js-controller restarts an
       // instance whose object changes). The harness restores the database for
       // each suite, so the stores a run leaves are carried into the next.
@@ -820,41 +820,75 @@ if (process.env.HOMETILES_INTEGRATION === '1') {
         const port = 18858;
         const { applies, panel } = withBrokerAndPanel(port);
         const HINT = 'No devices selected yet — pick devices in the adapter settings (Devices tab)';
+        const ICONS_TOPIC = `tab5_lvgl/config/${PANEL}/bridge/icons`;
         const BALKON_STATE = 'ha/e2e/sensor/balkon/state';
         const LISTS = ['sensors', 'binary_sensors', 'lights', 'switches', 'media_players', 'climates', 'covers', 'weathers', 'numbers', 'selects', 'datetimes', 'energy'];
         const EMPTY = Object.fromEntries(LISTS.map((key) => [key, []]));
-        const lists = (apply: string): Record<string, unknown> => {
-          const parsed = JSON.parse(apply) as Record<string, unknown>;
+        const lists = (apply: string | undefined): Record<string, unknown> => {
+          expect(apply, 'an apply').to.be.a('string');
+          const parsed = JSON.parse(apply as string) as Record<string, unknown>;
           return Object.fromEntries(LISTS.map((key) => [key, parsed[key]]));
         };
-        /** Every payload on the sensor's state topic, in order, across the runs. */
+        /** The icons of the panel's last layout, retained beside LAST_GOOD_APPLY: a Home Assistant bridge's, say. */
+        const OLD_ICONS = '{"light.flur":"mdi:ceiling-light"}';
+        /** Every payload on the sensor's state topic and on bridge/icons, in order, across the runs. */
         const balkonState: string[] = [];
+        const icons: string[] = [];
         /** The id and publish stores the last run left, which the next one starts from. */
         const stores: Record<string, string> = {};
 
         before(async () => {
           panel().on('message', (topic, payload) => {
             if (topic === BALKON_STATE) balkonState.push(payload.toString());
+            if (topic === ICONS_TOPIC) icons.push(payload.toString());
           });
-          await panel().subscribeAsync(BALKON_STATE);
+          await panel().subscribeAsync([BALKON_STATE, ICONS_TOPIC]);
+          await panel().publishAsync(APPLY_TOPIC, LAST_GOOD_APPLY, { retain: true });
+          await panel().publishAsync(ICONS_TOPIC, OLD_ICONS, { retain: true });
+          for (let tries = 0; tries < 50 && !(applies.includes(LAST_GOOD_APPLY) && icons.includes(OLD_ICONS)); tries++) {
+            await new Promise((resolve) => setTimeout(resolve, 100));
+          }
         });
 
-        /** Starts a run on these rows, from the stores the last run left: its logs and its apply. */
+        /** What the broker retains on these topics, as a panel subscribing now would get it. */
+        async function retained(...topics: string[]): Promise<Record<string, string>> {
+          const late = await mqtt.connectAsync(`mqtt://127.0.0.1:${port}`);
+          try {
+            const got: Record<string, string> = {};
+            late.on('message', (topic, payload, packet) => {
+              if (packet.retain) got[topic] = payload.toString();
+            });
+            await late.subscribeAsync(topics);
+            await new Promise((resolve) => setTimeout(resolve, 500));
+            return got;
+          } finally {
+            late.end(true);
+          }
+        }
+
+        /**
+         * Starts a run on these rows, from the stores the last run left, and
+         * waits until the panel's session is set up: its first push made or
+         * held back. Its logs, and its apply if it published one.
+         */
         async function run(
           harness: IntegrationTestHarness,
           deviceOverrides: object[],
           objects: Record<string, object> = SENSOR_OBJECTS,
-        ): Promise<{ logs: LogRecord[]; apply: string }> {
+        ): Promise<{ logs: LogRecord[]; apply: string | undefined }> {
           const logs = await captureLogs(harness);
           await harness.changeAdapterConfig('hometiles', { native: { brokerHost: '127.0.0.1', brokerPort: port, deviceOverrides } });
           await setObjects(harness, { ...objects, ...KAFFEE_OBJECTS, ...ROOM_OBJECTS });
           await harness.states.setStateAsync(`${SENSOR}.temperature`, { val: 21.5, ack: true });
           for (const [id, val] of Object.entries(stores)) await harness.states.setStateAsync(`hometiles.0.${id}`, { val, ack: true });
+          const panels = valuesOf(harness, 'hometiles.0.info.panels');
           const seen = applies.length;
           await harness.startAdapterAndWait(true);
-          const apply = await waitFor(harness, () => applies[seen], 'the apply');
           await waitFor(harness, () => ready(logs), 'onReady to finish');
-          return { logs, apply };
+          // info.panels counts the session once its first push is done (panel-manager.ts).
+          await waitFor(harness, () => (panels.includes(1) ? true : undefined), 'the panel session');
+          await new Promise((resolve) => setTimeout(resolve, 500));
+          return { logs, apply: applies[seen] };
         }
 
         /** The stores this run left, parsed, kept for the next run. */
@@ -874,23 +908,25 @@ if (process.env.HOMETILES_INTEGRATION === '1') {
           return waitFor(harness, () => answer, `the answer to ${command}`);
         }
 
+        const hints = (logs: LogRecord[]): string[][] =>
+          logs.filter((log) => log.message.includes(HINT)).map((log) => [log.severity, log.message.slice(log.message.indexOf('[Registry]'))]);
+
         suite('nothing picked yet', (getHarness) => {
           withCleanFixtures(getHarness);
 
-          it('publishes empty lists and no value, and logs the hint once', async function () {
+          it('publishes no apply and no icons, leaves what the broker retains, and logs the hint once (Ruling 116)', async function () {
             this.timeout(120000);
             const harness = getHarness();
+            const seenIcons = icons.length;
             const { logs, apply } = await run(harness, []);
-            expect(lists(apply)).to.deep.equal(EMPTY);
-            const hints = logs.filter((log) => log.message.includes(HINT));
-            expect(hints.map((log) => [log.severity, log.message.slice(log.message.indexOf('[Registry]'))])).to.deep.equal([
-              ['info', `[Registry] ${HINT}`],
-            ]);
+            expect(apply, 'no apply').to.equal(undefined);
+            expect(icons.slice(seenIcons), 'no icons').to.deep.equal([]);
+            expect(hints(logs)).to.deep.equal([['info', `[Registry] ${HINT}`]]);
             expect(ready(logs)!.message).to.include('Ready. 2 devices detected, 0 picked (manual entities included), 0 entities published');
             expect(await keepStores(harness)).to.deep.equal({ 'info.entityIds': {}, 'info.publishedIds': {} });
-            // The sensor holds a value, and nothing subscribed to it publishes it.
-            await new Promise((resolve) => setTimeout(resolve, 500));
             expect(balkonState).to.deep.equal([]);
+            // The panel keeps its layout: the broker retains what it had.
+            expect(await retained(APPLY_TOPIC, ICONS_TOPIC)).to.deep.equal({ [APPLY_TOPIC]: LAST_GOOD_APPLY, [ICONS_TOPIC]: OLD_ICONS });
           });
 
           it('fills the picker from detection: each device unticked, with its name, domain and room, by object id', async function () {
@@ -908,18 +944,22 @@ if (process.env.HOMETILES_INTEGRATION === '1') {
             });
           });
 
-          it("keeps the form's choices and a row whose device is gone, adds only what is new, and publishes nothing", async function () {
+          it("keeps the form's choices, marks a row whose device is gone in the system's language, adds what is new, and publishes nothing", async function () {
             this.timeout(60000);
+            const harness = getHarness();
+            // The adapter reads its own admin translations (Ruling 117).
+            const system = (await harness.objects.getObjectAsync('system.config')) as { common: Record<string, unknown> } & Record<string, unknown>;
+            await harness.objects.setObjectAsync('system.config', { ...system, common: { ...system.common, language: 'de' } });
             const seen = applies.length;
             const rows = [
               { objectId: SENSOR, include: true, name: 'Draußen', forcedDomain: '' },
               { objectId: 'zigbee.0.weg', include: true, name: '', forcedDomain: '' },
             ];
-            const reply = (await ask(getHarness(), 'refreshDetected', { rows })) as { native: { deviceOverrides: object[] }; args: string[] };
+            const reply = (await ask(harness, 'refreshDetected', { rows })) as { native: { deviceOverrides: object[] }; args: string[] };
             // The form's rows where they were, the new device after them.
             expect(reply.native.deviceOverrides).to.deep.equal([
               { objectId: SENSOR, include: true, name: 'Draußen', forcedDomain: '', detectedName: 'Balkon', detectedDomain: 'sensor', room: 'Balkon' },
-              { objectId: 'zigbee.0.weg', include: true, name: '', forcedDomain: '' },
+              { objectId: 'zigbee.0.weg', include: true, name: '', forcedDomain: '', detectedName: '(nicht erkannt)' },
               { objectId: KAFFEE, include: false, name: '', forcedDomain: '', detectedName: 'Kaffee', detectedDomain: 'switch', room: '' },
             ]);
             expect(reply.args).to.deep.equal(['2', '1']);
@@ -946,13 +986,15 @@ if (process.env.HOMETILES_INTEGRATION === '1') {
         suite('one device picked', (getHarness) => {
           withCleanFixtures(getHarness);
 
-          it('publishes exactly that entity, with its value, and no hint', async function () {
+          it('publishes exactly that entity, its icons and its value, and no hint', async function () {
             this.timeout(120000);
             const harness = getHarness();
+            const seenIcons = icons.length;
             const { logs, apply } = await run(harness, picked(SENSOR));
             expect(lists(apply)).to.deep.equal({ ...EMPTY, sensors: ['sensor.balkon'] });
+            expect(icons.slice(seenIcons).map((payload) => JSON.parse(payload))).to.deep.equal([{ 'sensor.balkon': '' }]);
             await waitFor(harness, () => (balkonState.includes('21.5') ? true : undefined), "the sensor's value");
-            expect(logs.filter((log) => log.message.includes(HINT))).to.deep.equal([]);
+            expect(hints(logs)).to.deep.equal([]);
             expect(ready(logs)!.message).to.include('Ready. 2 devices detected, 1 picked (manual entities included), 1 entities published');
             expect(await keepStores(harness)).to.deep.equal({
               'info.entityIds': { [SENSOR]: 'sensor.balkon' },
@@ -961,40 +1003,52 @@ if (process.env.HOMETILES_INTEGRATION === '1') {
           });
         });
 
-        suite('un-picked, after the restart its save causes', (getHarness) => {
+        suite('everything un-picked, after the restart its save causes', (getHarness) => {
           withCleanFixtures(getHarness);
 
-          it('takes the entity off the panel, clears its retained state, and keeps its id for a later pick', async function () {
+          it('holds the apply back again: the panel keeps its layout and values, the broker what it retains, the id stays stored (Ruling 116)', async function () {
             this.timeout(120000);
             const harness = getHarness();
-            const seen = balkonState.length;
+            const before = await retained(APPLY_TOPIC, ICONS_TOPIC, BALKON_STATE);
+            // "unavailable": the last suite's cleanup deleted the state while its run still watched it.
+            expect(before[BALKON_STATE], 'a retained state').to.be.a('string').and.not.equal('');
+            const seenStates = balkonState.length;
+            const seenIcons = icons.length;
+            const { logs, apply } = await run(harness, [{ objectId: SENSOR, include: false }]);
+            expect(apply, 'no apply').to.equal(undefined);
+            expect(icons.slice(seenIcons), 'no icons').to.deep.equal([]);
+            // No clear either: the panel still shows the sensor.
+            expect(balkonState.slice(seenStates), 'no clear').to.deep.equal([]);
+            expect(await retained(APPLY_TOPIC, ICONS_TOPIC, BALKON_STATE)).to.deep.equal(before);
+            expect(hints(logs)).to.deep.equal([['info', `[Registry] ${HINT}`]]);
+            // The record still names what the panels hold, to clear it once an apply goes out.
+            expect(await keepStores(harness)).to.deep.equal({
+              'info.entityIds': { [SENSOR]: 'sensor.balkon' },
+              'info.publishedIds': { [SENSOR]: 'sensor.balkon' },
+            });
+          });
+        });
+
+        suite('another device picked', (getHarness) => {
+          withCleanFixtures(getHarness);
+
+          it('publishes that one, and only now clears the retained state of the one un-picked before', async function () {
+            this.timeout(120000);
+            const harness = getHarness();
+            const seenStates = balkonState.length;
             // And a hand edit that is no entity id: it must not stop the panel's start (Ruling 51).
             stores['info.publishedIds'] = JSON.stringify({ ...JSON.parse(stores['info.publishedIds'] ?? '{}'), 'zigbee.0.weg': 'kaputt' });
-            const panels = valuesOf(harness, 'hometiles.0.info.panels');
-            const { logs, apply } = await run(harness, [{ objectId: SENSOR, include: false }]);
-            expect(lists(apply)).to.deep.equal(EMPTY);
-            await waitFor(harness, () => (balkonState.slice(seen).includes('') ? true : undefined), 'the cleared state');
-            // The session's start ran to its end: its objects are synced.
-            await waitFor(harness, () => (panels.includes(1) ? true : undefined), 'the panel objects');
+            const { logs, apply } = await run(harness, picked(KAFFEE));
+            expect(lists(apply)).to.deep.equal({ ...EMPTY, switches: ['switch.kaffee'] });
+            await waitFor(harness, () => (balkonState.slice(seenStates).includes('') ? true : undefined), 'the cleared state');
             const failed = logs.filter((log) => log.message.includes('failed'));
             expect(failed.map((log) => log.message)).to.deep.equal([]);
             expect(await keepStores(harness)).to.deep.equal({
-              'info.entityIds': { [SENSOR]: 'sensor.balkon' },
-              'info.publishedIds': {},
+              'info.entityIds': { [SENSOR]: 'sensor.balkon', [KAFFEE]: 'switch.kaffee' },
+              'info.publishedIds': { [KAFFEE]: 'switch.kaffee' },
             });
             // Nothing is left retained for a panel that subscribes later.
-            const late = await mqtt.connectAsync(`mqtt://127.0.0.1:${port}`);
-            try {
-              const retained: string[] = [];
-              late.on('message', (_topic, payload, packet) => {
-                if (packet.retain) retained.push(payload.toString());
-              });
-              await late.subscribeAsync(BALKON_STATE);
-              await new Promise((resolve) => setTimeout(resolve, 500));
-              expect(retained).to.deep.equal([]);
-            } finally {
-              late.end(true);
-            }
+            expect(await retained(BALKON_STATE)).to.deep.equal({});
           });
         });
 
@@ -1006,6 +1060,19 @@ if (process.env.HOMETILES_INTEGRATION === '1') {
             const renamed = { ...SENSOR_OBJECTS, [SENSOR]: { type: 'device', common: { name: 'Terrasse' } } };
             const { apply } = await run(getHarness(), picked(SENSOR), renamed);
             expect(lists(apply)).to.deep.equal({ ...EMPTY, sensors: ['sensor.balkon'] });
+          });
+        });
+
+        suite('only a scene picked', (getHarness) => {
+          withCleanFixtures(getHarness);
+
+          it('holds the apply back as well, a scene being in no list, and says why', async function () {
+            this.timeout(120000);
+            const { logs, apply } = await run(getHarness(), [{ objectId: KAFFEE, include: true, forcedDomain: 'scene' }]);
+            expect(apply, 'no apply').to.equal(undefined);
+            const held = logs.filter((log) => log.message.includes('[Registry] Nothing picked shows in a panel list'));
+            expect(held.map((log) => log.severity)).to.deep.equal(['info']);
+            expect(hints(logs)).to.deep.equal([]);
           });
         });
       });

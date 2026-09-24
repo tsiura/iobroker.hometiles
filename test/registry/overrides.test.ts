@@ -112,12 +112,27 @@ describe('registry/overrides', () => {
       ]);
     });
 
-    it('keeps the row of a device detected no more, exactly as it was', () => {
+    it('keeps the row of a device detected no more, its choices as they were, and marks it in its detected name (Ruling 117)', () => {
       const gone: DeviceOverride = { objectId: 'hm-rpc.0.weg', include: true, name: 'Weg', forcedDomain: '', detectedName: 'Weg', detectedDomain: 'switch', room: 'Keller' };
       expect(mergeDetected([gone], [found('hue.0.decke', 'Decke', 'light')])).to.deep.equal([
-        { objectId: 'hm-rpc.0.weg', include: true, name: 'Weg', forcedDomain: '', detectedName: 'Weg', detectedDomain: 'switch', room: 'Keller' },
+        { objectId: 'hm-rpc.0.weg', include: true, name: 'Weg', forcedDomain: '', detectedName: 'Weg (not detected)', detectedDomain: 'switch', room: 'Keller' },
         { objectId: 'hue.0.decke', include: false, name: '', forcedDomain: '', detectedName: 'Decke', detectedDomain: 'light', room: '' },
       ]);
+    });
+
+    it('marks a missing device once, in the text it is given, and unmarks it once it is detected again (Ruling 117)', () => {
+      // A row typed by hand, never detected, has no name to mark: the mark is all it shows.
+      const rows: DeviceOverride[] = [
+        { objectId: 'hm-rpc.0.weg', include: true, detectedName: 'Weg' },
+        { objectId: 'knx.0.alt', include: false, name: 'Alt' },
+      ];
+      const once = mergeDetected(rows, [], '(nicht erkannt)');
+      expect(once.map((row) => row.detectedName)).to.deep.equal(['Weg (nicht erkannt)', '(nicht erkannt)']);
+      // A second refresh adds no second mark.
+      expect(mergeDetected(once, [], '(nicht erkannt)')).to.deep.equal(once);
+      // Back again: detection's name, and nothing else changed.
+      const back = mergeDetected(once, [found('hm-rpc.0.weg', 'Weg', 'switch', 'Keller')], '(nicht erkannt)');
+      expect(back[0]).to.deep.equal({ objectId: 'hm-rpc.0.weg', include: true, detectedName: 'Weg', detectedDomain: 'switch', room: 'Keller' });
     });
 
     it("moves none of the form's rows and puts new devices after them by object id, whatever order detection found them in", () => {
@@ -159,7 +174,10 @@ describe('registry/overrides', () => {
     });
 
     it('changes none of the rows it is given', () => {
-      const rows: DeviceOverride[] = [{ objectId: 'hue.0.a', include: true, name: 'A', detectedName: 'Alt' }];
+      const rows: DeviceOverride[] = [
+        { objectId: 'hue.0.a', include: true, name: 'A', detectedName: 'Alt' },
+        { objectId: 'hue.0.weg', include: true, detectedName: 'Weg' },
+      ];
       const copy = JSON.parse(JSON.stringify(rows)) as DeviceOverride[];
       mergeDetected(rows, [found('hue.0.a', 'Neu', 'light')]);
       expect(rows).to.deep.equal(copy);

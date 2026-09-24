@@ -49,7 +49,6 @@
         "deviceOverrides": {
           "type": "table",
           "label": "detected_devices",
-          "noDelete": true,
           "newLine": true,
           "sm": 12,
           "md": 12,
@@ -74,7 +73,7 @@
               ]
             },
             { "type": "text", "attr": "room", "title": "column_room", "width": "15%", "readOnly": true, "filter": true, "sort": true },
-            { "type": "text", "attr": "objectId", "title": "column_object_id", "width": "22%", "readOnly": true, "filter": true, "sort": true }
+            { "type": "text", "attr": "objectId", "title": "column_object_id", "width": "22%", "readOnly": true, "filter": true, "sort": true, "default": "" }
           ]
         },
         "_manualInfo": { "type": "staticText", "text": "manual_info", "newLine": true, "sm": 12, "md": 12, "lg": 12 },

@@ -187,6 +187,17 @@ function byEntityId(a: VirtualEntity, b: VirtualEntity): number {
   return a.entityId < b.entityId ? -1 : a.entityId > b.entityId ? 1 : 0;
 }
 
+/**
+ * Whether any entity lands in one of the apply's lists; a scene lands in
+ * none (Ruling 116). An apply whose every list is empty makes the panel
+ * drop each sensor slot no list names and save that to flash
+ * (ha_bridge_config.cpp:685-691, :701-703): it would wipe the panel's layout
+ * over the adapter's own empty world, so none is sent.
+ */
+export function listsAnyEntity(entities: readonly VirtualEntity[]): boolean {
+  return entities.some((entity) => entity.domain !== 'scene');
+}
+
 export function buildApplyPayload(input: ApplyInput): string {
   // Deterministic ordering is what makes the config signature meaningful: a
   // registry that did not change must serialise byte-identically.

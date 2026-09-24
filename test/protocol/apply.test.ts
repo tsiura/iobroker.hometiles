@@ -1,6 +1,6 @@
 import { expect } from 'chai';
-import { buildApplyPayload, buildIconsPayload, configSignature, splitEditables } from '../../src/protocol/apply';
-import type { VirtualEntity } from '../../src/registry/types';
+import { buildApplyPayload, buildIconsPayload, configSignature, listsAnyEntity, splitEditables } from '../../src/protocol/apply';
+import { DOMAINS, type VirtualEntity } from '../../src/registry/types';
 import { panelBinaryMeta, panelIconMap, panelIconUpdate, panelIcons, panelList, panelNameIndex, panelNames, panelSensorMeta } from './panel-scan';
 
 function e(over: Partial<VirtualEntity>): VirtualEntity {
@@ -449,5 +449,25 @@ describe('protocol/apply: what the panel can parse (Task 21 fix round 1)', () =>
       expect(parsed.sensor_meta[0]).to.include({ entity_id: 'sensor.raum_{1}', name: 'Raum (1)' });
       expect(parsed.scene_map).to.deep.equal({ '[kino] "laut"': 'scene.kino' });
     });
+  });
+});
+
+describe('protocol/apply: an apply with every list empty (Ruling 116)', () => {
+  /** The entity lists of a payload: every array but the *_meta sections. */
+  const lists = (payload: string): unknown[][] =>
+    Object.entries(JSON.parse(payload) as Record<string, unknown>)
+      .filter(([key, value]) => Array.isArray(value) && !key.endsWith('_meta'))
+      .map(([, value]) => value as unknown[]);
+
+  it('says, for every domain, whether its entity lands in one of the lists the panel prunes its slots against', () => {
+    // Such an apply makes the panel prune and save (ha_bridge_config.cpp:685-691, :701-703).
+    for (const domain of DOMAINS) {
+      const entity = e({ entityId: `${domain}.x`, domain });
+      const listed = lists(buildApplyPayload({ entities: [entity], sceneMap: {} })).some((list) => list.length > 0);
+      expect(listsAnyEntity([entity]), domain).to.equal(listed);
+    }
+    expect(listsAnyEntity([e({ entityId: 'scene.nacht', domain: 'scene' })])).to.equal(false);
+    expect(listsAnyEntity([])).to.equal(false);
+    expect(listsAnyEntity(ENTITIES)).to.equal(true);
   });
 });
