@@ -33,7 +33,7 @@ function rawOnly(adapter: string, options: Options): void {
 
 /**
  * What js-controller does before it sends the message (adapter.js _getHistory,
- * 7.2.3 :6021-6025 and 8.0.0-alpha :6145-6148): an end of now + 5000 s, and
+ * 7.2.3 :6023-6025 and 8.0.0-alpha :6146-6148): an end of now + 5000 s, and
  * a week's start when neither count nor start is given.
  */
 function asked(options: Options): Options & { end: number } {
@@ -517,7 +517,7 @@ describe('runtime/history-provider', () => {
 
     it('reads an answer without a list of rows as no history', async () => {
       // js-controller resolves with no result when the message could not be
-      // sent (adapter.js 7.2.3 :4797-4799 with :6040-6042).
+      // sent (adapter.js 7.2.3 :4793-4795 with :6041-6042).
       for (const reply of [{}, { result: 'rows' }, { result: { 0: {} } }]) {
         const fake = sqlFake(STORED);
         fake.replyNext(async () => reply);
