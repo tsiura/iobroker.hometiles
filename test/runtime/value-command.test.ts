@@ -651,47 +651,89 @@ describe('runtime/panel-session value commands (Task 15)', () => {
     });
   });
 
-  describe('the clock warning (Ruling 102)', () => {
+  describe('the clock warning (Rulings 102, 105)', () => {
     // The panel sends now + 10 in whole seconds (value_control.cpp:295, :309),
-    // and a command is taken while 0 < deadline - now <= 15: the clocks may
-    // be about 5 s apart one way and 10 s the other (review m3). Far outside
-    // that window every command expires, which one warning an hour names.
+    // and a command is taken while 0 < deadline - now <= 15: the panel's clock
+    // may be about 5 s ahead of this host's and 10 s behind (review m3). 2 s or
+    // more beyond either edge, every command expires, which one warning an
+    // hour per panel names. Transit and the panel's whole seconds only ever
+    // make its clock look further behind; the margin keeps one borderline
+    // expiry quiet.
     const warnings = (p: ReturnType<typeof panel>): string[] => p.logs.filter((line) => line.level === 'warn').map((line) => line.message);
+    const debugs = (p: ReturnType<typeof panel>): string[] => p.logs.filter((line) => line.level === 'debug').map((line) => line.message);
     const off = (seconds: number, at = NOW): number => at / 1000 + 10 + seconds;
+    const warning = (apart: string): string =>
+      `[Panel a1] Value commands on hometiles/cmnd/value expire: their deadline puts the sending panel's clock about ${apart} ` +
+      "this host's. A command is accepted only while it is at most about 5 s ahead or 10 s behind: check the time sync (NTP) " +
+      'of the panel and of this host';
 
-    it('warns once an hour when a deadline puts the clocks 30 s or more apart, with the offset, the topic and the time sync', async () => {
+    it('warns once for a panel 8 s ahead, with the offset, the topic and the time sync, and not again within the hour', async () => {
       const p = panel([SOLL]);
-      expect(await p.status(command(SOLL, 22, { deadline: off(3600) }))).to.equal('expired');
-      expect(warnings(p)).to.deep.equal([
-        "[Panel a1] Value commands on hometiles/cmnd/value expire: their deadline puts the sending panel's clock about 3600 s " +
-          "ahead of this host's. A command is accepted only while it is at most about 5 s ahead or 10 s behind: " +
-          'check the time sync (NTP) of the panel and of this host',
-      ]);
-      // No second line within the hour, however many expire.
+      expect(await p.status(command(SOLL, 22, { deadline: off(8) }))).to.equal('expired');
+      expect(warnings(p)).to.deep.equal([warning('8 s ahead of')]);
       p.tick(3_599_999);
-      expect(await p.status(command(SOLL, 22, { deadline: off(-3600, NOW + 3_599_999) }))).to.equal('expired');
+      expect(await p.status(command(SOLL, 22, { deadline: off(8, NOW + 3_599_999) }))).to.equal('expired');
       expect(warnings(p)).to.have.length(1);
       p.tick(1);
-      expect(await p.status(command(SOLL, 22, { deadline: off(-3600, NOW + 3_600_000) }))).to.equal('expired');
-      expect(warnings(p)).to.have.length(2);
-      expect(warnings(p)[1]).to.include('about 3600 s behind this host');
+      expect(await p.status(command(SOLL, 22, { deadline: off(8, NOW + 3_600_000) }))).to.equal('expired');
+      expect(warnings(p)).to.deep.equal([warning('8 s ahead of'), warning('8 s ahead of')]);
       expect(p.writes).to.deep.equal([]);
     });
 
-    it('warns from 30 s either way, and not for a command just outside the window', async () => {
-      for (const [seconds, warned] of [
-        [30, true],
-        [-30, true],
-        [29, false],
-        [-29, false],
-        // Just outside: expired, and no warning.
-        [6, false],
-        [-10, false],
+    it('warns for a panel 13 s behind', async () => {
+      const p = panel([SOLL]);
+      expect(await p.status(command(SOLL, 22, { deadline: off(-13) }))).to.equal('expired');
+      expect(warnings(p)).to.deep.equal([warning('13 s behind')]);
+    });
+
+    it('does not warn for a panel 6 s ahead or 11 s behind: expired, but within 2 s of the window', async () => {
+      for (const seconds of [6, -11]) {
+        const p = panel([SOLL]);
+        expect(await p.status(command(SOLL, 22, { deadline: off(seconds) })), String(seconds)).to.equal('expired');
+        expect(warnings(p), String(seconds)).to.deep.equal([]);
+      }
+    });
+
+    it('warns from 2 s beyond either edge: 7 s ahead and 12 s behind', async () => {
+      for (const [seconds, apart] of [
+        [7, '7 s ahead of'],
+        [-12, '12 s behind'],
       ] as const) {
         const p = panel([SOLL]);
         expect(await p.status(command(SOLL, 22, { deadline: off(seconds) })), String(seconds)).to.equal('expired');
-        expect(warnings(p).length, String(seconds)).to.equal(warned ? 1 : 0);
+        expect(warnings(p), String(seconds)).to.deep.equal([warning(apart)]);
       }
+    });
+
+    it('does not warn in the window, not even where a session from before a restart expires the command', async () => {
+      const p = panel([SOLL]);
+      for (const seconds of [5, 0, -9]) {
+        expect(await p.status(command(SOLL, 22, { deadline: off(seconds) })), String(seconds)).to.equal('ok');
+        expect(await p.status(command(SOLL, 22, { deadline: off(seconds), session: '0123456789abcdef0123456789abcdef' })), String(seconds)).to.equal('expired');
+      }
+      expect(warnings(p)).to.deep.equal([]);
+    });
+
+    it('limits the warning per panel: another panel still warns within the hour', async () => {
+      const first = panel([SOLL]);
+      const second = panel([SOLL]);
+      for (const p of [first, second, first]) expect(await p.status(command(SOLL, 22, { deadline: off(8) }))).to.equal('expired');
+      expect(warnings(first)).to.deep.equal([warning('8 s ahead of')]);
+      expect(warnings(second)).to.deep.equal([warning('8 s ahead of')]);
+    });
+
+    it('names the estimated offset in the debug line of every expired command', async () => {
+      const p = panel([SOLL]);
+      await p.send(command(SOLL, 22, { deadline: off(6) }));
+      await p.send(command(SOLL, 22, { deadline: off(-11) }));
+      await p.send(command(SOLL, 22, { session: '0123456789abcdef0123456789abcdef' }));
+      await p.send(command(SOLL, 22, { deadline: 'soon' }));
+      expect(debugs(p)).to.deep.equal([
+        "[Panel a1] Value command for number.test refused: expired (by its deadline, the panel's clock is about 6 s ahead of this host's)",
+        "[Panel a1] Value command for number.test refused: expired (by its deadline, the panel's clock is about 11 s behind this host's)",
+        "[Panel a1] Value command for number.test refused: expired (by its deadline, the panel's clock is in step with this host's)",
+        '[Panel a1] Value command for number.test refused: expired (its deadline is no number)',
+      ]);
     });
 
     it('does not warn for a session from before a restart, nor a deadline that is no time in seconds (T7, T12)', async () => {

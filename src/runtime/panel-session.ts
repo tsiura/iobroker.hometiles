@@ -47,12 +47,16 @@ const WEATHER_REQUEST_REPEAT_MS = 1000;
 const MAX_DEADLINE_AHEAD_S = 15;
 /** What the panel adds to its clock for a deadline (value_control.cpp:309). */
 const PANEL_DEADLINE_S = 10;
+/** The window as a clock offset, the panel's less this host's: accepted while -10 s < offset <= 5 s. */
+const AHEAD_LIMIT_S = MAX_DEADLINE_AHEAD_S - PANEL_DEADLINE_S;
+const BEHIND_LIMIT_S = PANEL_DEADLINE_S;
 /**
- * Clocks this far apart, either way, are named in a warning (Ruling 102):
- * far beyond the window above and any transit delay, so a command that is
- * just outside it never warns.
+ * An offset this far beyond either edge is named in a warning (Rulings 102,
+ * 105): 7 s ahead, or 12 s behind. Transit, and the panel's whole seconds,
+ * only ever make its clock look further behind; the margin keeps a single
+ * borderline expiry quiet.
  */
-const CLOCK_WARN_OFFSET_S = 30;
+const CLOCK_WARN_MARGIN_S = 2;
 /** No clock is this far off: such a deadline is no Unix time in seconds (review T12). */
 const MAX_CLOCK_OFFSET_S = 1e9;
 /** The clock warning, at most once in this long per panel. */
@@ -66,6 +70,11 @@ const FAILURE_LOG_INTERVAL_MS = 60_000;
 const VALUE_REFUSALS: ReadonlySet<string> = new Set(['changed', 'unavailable', 'invalid_value', 'invalid_step', 'invalid_option']);
 /** Text from the wire for a log line: JSON-escaped, so no line break gets through, and cut short (review m6). */
 const quoted = (text: string): string => JSON.stringify(text).slice(0, 100);
+/** A clock offset in words, for a log line: "about 8 s ahead of this host's". */
+function apart(offset: number): string {
+  const seconds = Math.round(Math.abs(offset));
+  return seconds === 0 ? "in step with this host's" : `about ${seconds} s ${offset > 0 ? 'ahead of' : 'behind'} this host's`;
+}
 
 export class PanelSession {
   private lastSignature: string | null = null;
@@ -346,8 +355,9 @@ export class PanelSession {
    * a deadline not 0-15 s ahead of now, in epoch seconds (MAX_DEADLINE_AHEAD_S),
    * or another session; then the dispatcher (valueWrite). Every answer goes
    * out on stat/value, and the entity's /control after it. Refusals are
-   * logged at debug only: the answer carries them. A deadline far outside
-   * the window is also named in a warning (warnClock).
+   * logged at debug only: the answer carries them, and an expiry the clock
+   * offset its deadline gives. A deadline 2 s or more beyond the window is
+   * also named in a warning (warnClock).
    */
   private async executeValueCommand(payload: string): Promise<void> {
     let call: Extract<ServiceCall, { kind: 'set_value' }>;
@@ -366,9 +376,13 @@ export class PanelSession {
     const { deadline } = call;
     const timely = typeof deadline === 'number' && deadline - now > 0 && deadline - now <= MAX_DEADLINE_AHEAD_S;
     let status: ValueStatus;
+    let why = '';
     if (!timely || call.session !== CONTROL_SESSION) {
-      // A session from before a restart of the adapter is no clock problem (review T7).
-      if (!timely) this.warnClock(deadline, now);
+      // The panel's clock less this host's, as the deadline gives it (Ruling
+      // 105); in the window when only the session is from before a restart.
+      const offset = typeof deadline === 'number' && Number.isFinite(deadline) ? deadline - PANEL_DEADLINE_S - now : undefined;
+      if (offset !== undefined) this.warnClock(offset);
+      why = offset === undefined ? ' (its deadline is no number)' : ` (by its deadline, the panel's clock is ${apart(offset)})`;
       status = 'expired';
     } else {
       for (const [id, expiry] of this.commandIds) if (expiry <= now) this.commandIds.delete(id);
@@ -379,7 +393,7 @@ export class PanelSession {
       this.commandIds.set(call.id, deadline);
       status = await this.dispatchValue(call);
     }
-    if (status !== 'ok') this.log.debug(`[Panel ${this.deviceId}] Value command for ${call.entityId} refused: ${status}`);
+    if (status !== 'ok') this.log.debug(`[Panel ${this.deviceId}] Value command for ${call.entityId} refused: ${status}${why}`);
     this.transport.publish(buildValueAck(this.baseTopic, call.entityId, call.id, status));
     // As the Bridge does after every answer (__init__.py:1586): the panel re-reads it.
     const entity = this.editables.get(call.entityId);
@@ -402,26 +416,24 @@ export class PanelSession {
   }
 
   /**
-   * Ruling 102: a deadline far outside the window means the panel's clock
-   * and this host's disagree, and every command expires. Named at most once
-   * an hour, the first time at once, with the offset and its sign, and with
-   * the topic: a panel sharing a base topic is answered by another's session
-   * (review T11), and either clock can be the wrong one (T9). A deadline that
-   * is no finite number, or no Unix time in seconds, says nothing of a clock
-   * (T7, T12).
+   * Rulings 102 and 105: an offset 2 s or more beyond the window means the
+   * panel's clock and this host's disagree, and every command expires. Named
+   * at most once an hour per panel, the first time at once, with the offset
+   * and its sign, and with the topic: a panel sharing a base topic is
+   * answered by another's session (review T11), and either clock can be the
+   * wrong one (T9). A deadline that is no Unix time in seconds says nothing
+   * of a clock (T12).
    */
-  private warnClock(deadline: unknown, now: number): void {
-    if (typeof deadline !== 'number' || !Number.isFinite(deadline)) return;
-    const offset = deadline - PANEL_DEADLINE_S - now;
-    if (Math.abs(offset) < CLOCK_WARN_OFFSET_S || Math.abs(offset) >= MAX_CLOCK_OFFSET_S) return;
+  private warnClock(offset: number): void {
+    const inside = offset < AHEAD_LIMIT_S + CLOCK_WARN_MARGIN_S && offset > -(BEHIND_LIMIT_S + CLOCK_WARN_MARGIN_S);
+    if (inside || Math.abs(offset) >= MAX_CLOCK_OFFSET_S) return;
     const at = this.now();
     if (at - this.clockWarnedAt < CLOCK_WARN_INTERVAL_MS) return;
     this.clockWarnedAt = at;
     this.log.warn(
       `[Panel ${this.deviceId}] Value commands on ${commandTopic(this.baseTopic, 'value')} expire: their deadline puts the ` +
-        `sending panel's clock about ${Math.round(Math.abs(offset))} s ${offset > 0 ? 'ahead of' : 'behind'} this host's. ` +
-        'A command is accepted only while it is at most about 5 s ahead or 10 s behind: check the time sync (NTP) of the ' +
-        'panel and of this host',
+        `sending panel's clock ${apart(offset)}. A command is accepted only while it is at most about ${AHEAD_LIMIT_S} s ahead ` +
+        `or ${BEHIND_LIMIT_S} s behind: check the time sync (NTP) of the panel and of this host`,
     );
   }
 

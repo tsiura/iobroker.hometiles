@@ -362,10 +362,14 @@ adapter follows it (Ruling 99; `src/runtime/panel-session.ts`,
    the panel's clock is at most about 5 s ahead of the receiver's, or up to
    about 10 s behind it, less the time in transit; a panel or host whose
    clock is off by more gets `"expired"` for every command.** This adapter
-   warns about it, at most once an hour per panel, when a deadline puts the
-   two clocks 30 s or more apart either way (Ruling 102); a session from
-   before a restart of the adapter, a deadline that is no number, and one
-   that is no time in seconds (over 1e9 s away) never warn.
+   estimates the offset of an expired command as `deadline - now - 10` and
+   warns, at most once an hour per panel, when it lies 2 s or more beyond
+   either edge: the panel 7 s or more ahead, or 12 s or more behind
+   (Rulings 102, 105). Transit and the panel's whole seconds only ever make
+   its clock look further behind, and the margin keeps a single borderline
+   expiry quiet. A deadline that is no number, and one that is no time in
+   seconds (over 1e9 s away), never warn. The debug line of every expired
+   command names the estimate.
 3. **Dropped, no answer**: an `id` seen before whose deadline has not
    passed, or any command while 128 such ids are held. Each accepted id is
    held until its deadline.
