@@ -3,6 +3,7 @@ import { expect } from 'chai';
 import sinon from 'sinon';
 import {
   HistoryProvider,
+  MAX_CACHED_READINGS,
   MAX_HISTORY_ROWS,
   PANEL_QUERIES,
   PANEL_QUEUE,
@@ -10,242 +11,10 @@ import {
   type HistoryKind,
   type HistoryResult,
   type HistorySource,
+  type Readings,
 } from '../../src/runtime/history-provider';
 import type { Logger } from '../../src/runtime/mqtt-client';
-
-// ---- Ports of the three history adapters' getHistory, aggregate "none" only ----
-//
-// Read from the published packages (npm pack): iobroker.history 5.0.1,
-// iobroker.sql 4.1.5, iobroker.influxdb 5.0.3 and the @iobroker/aggregate 1.0.1
-// they share; js-controller-adapter 7.2.3 and 8.0.0-alpha for the message.
-
-/** A row as a history adapter stores it. */
-type Stored = { ts: number; val: unknown; ack?: boolean; q?: number };
-type Options = ioBroker.GetHistoryOptions;
-
-const byTs = (a: Stored, b: Stored): number => a.ts - b.ts;
-const newestFirst = (a: Stored, b: Stored): number => b.ts - a.ts;
-
-/** Only raw reads are ported: any other aggregate fails loudly, as a wrong query should. */
-function rawOnly(adapter: string, options: Options): void {
-  if (options.aggregate !== 'none') throw new Error(`the ${adapter} port reads raw rows only, not ${String(options.aggregate)}`);
-}
-
-/**
- * What js-controller does before it sends the message (adapter.js _getHistory,
- * 7.2.3 :6023-6025 and 8.0.0-alpha :6146-6148): an end of now + 5000 s, and
- * a week's start when neither count nor start is given.
- */
-function asked(options: Options): Options & { end: number } {
-  const o = { ...options };
-  o.end ||= Date.now() + 5e6;
-  if (!o.count && !o.start) o.start ||= Date.now() - 6048e5;
-  return o as Options & { end: number };
-}
-
-/**
- * beautify for aggregate none (@iobroker/aggregate aggregate.js:1183-1344):
- * nulls per ignoreNull (:1207-1220), rows before start and after end dropped
- * (:1224-1234), no border values (:1241), the newest `count` kept (:1340-1344).
- */
-function beautifyNone(rows: Stored[], start: number | undefined, end: number, count: number, ignoreNull: boolean | 0): Stored[] {
-  let out = rows;
-  if (ignoreNull === true) out = out.filter((row) => row.val !== null);
-  else if (ignoreNull === 0) out = out.map((row) => (row.val === null ? { ...row, val: 0 } : row));
-  if (start) out = out.filter((row) => row.ts >= start);
-  const after = out.findIndex((row) => row.ts > end);
-  if (after >= 0) out = out.slice(0, after);
-  return out.length > count ? out.slice(out.length - count) : out;
-}
-
-/** ts2day (iobroker.history getHistory.js:122-136): the local day a row's file is named after. */
-function day(ts: number): number {
-  const date = new Date(ts);
-  return date.getFullYear() * 10000 + (date.getMonth() + 1) * 100 + date.getDate();
-}
-
-/**
- * iobroker.history handleGetHistory, aggregate none (main.js:1097-1308). `cache`
- * is the in-memory list of rows not yet written, the newest; `files` the rows
- * in its day files.
- */
-function historyAdapter(cache: Stored[], files: Stored[], options: Options): Stored[] {
-  rawOnly('history', options);
-  const o = asked(options);
-  const count = o.count || o.limit || 2000; // :1110, :1116-1119, :1139-1146
-  const start = o.start;
-  const newest = !!o.returnNewestEntries || (!start && !!count); // :1122, :1181-1183
-  const ignoreNull = o.ignoreNull === true || o.ignoreNull === 0 ? o.ignoreNull : false; // :1214-1229
-  // applyOptions (:1074-1096): ack and q only when asked for, ack as a boolean (:932-934, :1013-1015).
-  const shaped = (rows: Stored[]): Stored[] =>
-    rows.map(({ ts, val, ack, q }) => ({ ts, val, ...(o.ack ? { ack: !!ack } : {}), ...(o.q && q !== undefined ? { q } : {}) }));
-  // getOneCachedData (:915-968): newest first, with one row before start and one after end.
-  const cached: Stored[] = [];
-  let after: Stored | undefined;
-  for (let i = cache.length - 1; i >= 0; i--) {
-    const row = cache[i]!;
-    if (start && row.ts < start) {
-      cached.unshift(row);
-      break;
-    }
-    if (row.ts > o.end) {
-      after = row;
-      continue;
-    }
-    if (after) cached.unshift(after);
-    after = undefined;
-    cached.unshift(row);
-    if (newest && cached.length >= count) break;
-  }
-  // The cache alone fills the request: sent as it is, no beautify (:983, :1244-1256).
-  if (newest && cached.length >= count) return shaped(cached).sort(byTs).slice(-count);
-  // getFileData (:1050-1073) and getOneFileData (:985-1049): each day file read
-  // newest first, with no end check, until count; the days newest first when newest.
-  const fileCount = newest ? count - cached.length : count; // :1258-1261
-  const days = [...new Set(files.map((row) => day(row.ts)))]
-    .filter((d) => d >= (start ? day(start) : 0) && d <= day(o.end))
-    .sort((a, b) => (newest ? b - a : a - b));
-  const read: Stored[] = [];
-  for (const d of days) {
-    let last = false;
-    for (const row of files.filter((r) => day(r.ts) === d).sort(newestFirst)) {
-      read.push(row);
-      if (read.length >= fileCount) break;
-      if (last) break;
-      if (start && row.ts < start) last = true;
-    }
-    if (read.length >= fileCount) break;
-  }
-  let rows = [...shaped(cached), ...shaped(read)].sort(byTs);
-  if (rows.length > count && !newest) {
-    // The OLDEST count rows from start on (:1271-1291).
-    const cut = start ? Math.max(0, rows.findIndex((row) => row.ts >= start)) : 0;
-    rows = rows.slice(cut, cut + count);
-  }
-  return beautifyNone(rows, start, o.end, count, ignoreNull); // :1295
-}
-
-/**
- * iobroker.sql getHistorySql, aggregate none (main.js:2549-2787), its database
- * read as SQLite words it (lib/sqlite.js:136-205; mysql.js and postgresql.js
- * alike). Rows it has not yet written are not ported.
- */
-function sqlAdapter(stored: Stored[], options: Options): Stored[] {
-  rawOnly('sql', options);
-  const o = asked(options);
-  const count = o.count || o.limit || 2000; // :2573, :2576, :2600-2607
-  const start = o.start;
-  const newest = !!o.returnNewestEntries || (!start && !!count); // :2582, :2628-2630
-  const ignoreNull = o.ignoreNull === true ? true : o.ignoreNull === 0 ? 0 : false; // :2557-2566
-  let rows = stored.filter((row) => row.ts < o.end && (!start || row.ts >= start)); // sqlite.js:145-149
-  if (start) {
-    // With a start: the last row before it and the first at or after end (sqlite.js:150-188).
-    const before = stored.filter((row) => row.ts < start).at(-1);
-    const next = stored.find((row) => row.ts >= o.end);
-    rows = [...(before ? [before] : []), ...rows, ...(next ? [next] : [])];
-  }
-  // ORDER BY ts DESC when newest, LIMIT count + 2 (sqlite.js:192-202).
-  rows = rows.sort(newest ? newestFirst : byTs).slice(0, count + 2).sort(byTs); // main.js:2776
-  if (rows.length > count && !newest) {
-    // The OLDEST count rows from start on (main.js:2756-2775).
-    const cut = start ? Math.max(0, rows.findIndex((row) => row.ts >= start)) : 0;
-    rows = rows.slice(cut, cut + count);
-  }
-  // sendResponse (aggregate.js:1383-1385) without a start: the newest count.
-  if (!start && rows.length > count) rows = rows.slice(rows.length - count);
-  // Columns ack and q only when asked for (sqlite.js:137); ack as a boolean (main.js:2474-2476).
-  const shaped = rows.map(({ ts, val, ack, q }) => ({ ts, val, ...(o.ack ? { ack: !!ack } : {}), ...(o.q ? { q } : {}) }));
-  return beautifyNone(shaped, start || shaped[0]?.ts, o.end, count, ignoreNull); // aggregate.js:1388, :1407-1410
-}
-
-/** iobroker.influxdb getHistoryV1, aggregate none (main.js:2258-2581). */
-function influxAdapter(stored: Stored[], options: Options): Stored[] {
-  rawOnly('influxdb', options);
-  const o = asked(options);
-  const count = o.count || o.limit || 2000; // :2272-2277, :2298-2305
-  const start = o.start;
-  const newest = !!o.returnNewestEntries || (!start && !!count); // :2281, :2327-2329
-  // SELECT * ... time > start AND time < end ORDER BY time DESC|ASC LIMIT count (:2442-2468).
-  const main = stored
-    .filter((row) => (!start || row.ts > start) && row.ts < o.end)
-    .sort(newest ? newestFirst : byTs)
-    .slice(0, count);
-  // The border rows, `value` only: the last at or before start, the first at or after end (:2470-2478).
-  const border: Stored[] = [];
-  const before = start ? stored.filter((row) => row.ts <= start).at(-1) : undefined;
-  if (before) border.push({ ts: before.ts, val: before.val });
-  const next = stored.find((row) => row.ts >= o.end);
-  if (next) border.push({ ts: next.ts, val: next.val });
-  let rows = [...main.map((row) => ({ ...row })), ...border].sort(byTs); // :2496-2560
-  if (!start && rows.length > count) rows = rows.slice(rows.length - count); // aggregate.js:1383-1385
-  return beautifyNone(rows, start || rows[0]?.ts, o.end, count, true); // ignoreNull is forced true (:2279)
-}
-
-/**
- * An adapter as the provider sees it. getHistory runs one of the ports; like
- * js-controller, it sends the message whether or not the instance runs, and a
- * stopped instance never answers.
- */
-class FakeAdapter implements HistorySource {
-  readonly calls: Array<{ id: string; options: Options }> = [];
-  alive = true;
-  logged = true;
-  defaultHistory: unknown = '';
-  private readonly scripted: Array<() => Promise<{ result?: unknown }>> = [];
-
-  constructor(
-    readonly instance: string,
-    private readonly read: (options: Options) => Stored[],
-  ) {}
-
-  get lastCall(): { id: string; options: Options } {
-    return this.calls.at(-1)!;
-  }
-
-  rejectNext(error: Error): void {
-    this.scripted.push(() => Promise.reject(error));
-  }
-
-  replyNext(reply: () => Promise<{ result?: unknown }>): void {
-    this.scripted.push(reply);
-  }
-
-  hangNext(): void {
-    this.scripted.push(() => new Promise(() => undefined));
-  }
-
-  getHistoryAsync(id: string, options: Options): Promise<{ result?: unknown }> {
-    this.calls.push({ id, options: { ...options } });
-    const scripted = this.scripted.shift();
-    if (scripted) return scripted();
-    if (!this.alive) return new Promise(() => undefined);
-    try {
-      return Promise.resolve({ result: this.read(options) });
-    } catch (error) {
-      return Promise.reject(error);
-    }
-  }
-
-  async getForeignObjectAsync(id: string): Promise<unknown> {
-    if (id === 'system.config') return { common: { defaultHistory: this.defaultHistory } };
-    return { type: 'state', common: { custom: this.logged ? { [this.instance]: { enabled: true } } : {} } };
-  }
-
-  async getForeignStateAsync(id: string): Promise<unknown> {
-    return id === `system.adapter.${this.instance}.alive` ? { val: this.alive } : null;
-  }
-}
-
-const historyFake = (cache: Stored[], files: Stored[]): FakeAdapter =>
-  new FakeAdapter('history.0', (options) => historyAdapter(cache, files, options));
-const sqlFake = (rows: Stored[]): FakeAdapter => new FakeAdapter('sql.0', (options) => sqlAdapter(rows, options));
-const influxFake = (rows: Stored[]): FakeAdapter => new FakeAdapter('influxdb.0', (options) => influxAdapter(rows, options));
-
-function logger(): Logger & { lines: string[] } {
-  const lines: string[] = [];
-  const add = (level: string) => (message: string) => void lines.push(`${level}: ${message}`);
-  return { lines, info: add('info'), warn: add('warn'), error: add('error'), debug: add('debug') };
-}
+import { day, FakeAdapter, historyFake, influxFake, logger, sqlAdapter, sqlFake, type Stored } from './history-ports';
 
 const MINUTE = 60_000;
 const HOUR = 60 * MINUTE;
@@ -600,6 +369,221 @@ describe('runtime/history-provider', () => {
         await settle();
       }
       for (const result of queued) expect((await result).available).to.equal(true);
+    });
+  });
+
+  describe('readings before bucket boundaries (Task 20b)', () => {
+    const METER = 'shelly.0.shellyem3.Total';
+    /** Local midnight of NOW's day; NOW is 06:00. */
+    const TODAY = new Date(2026, 8, 24).getTime();
+    /** The week's local midnights: 6 days ago to today. */
+    const MIDNIGHTS = Array.from({ length: 7 }, (_, i) => new Date(2026, 8, 18 + i).getTime());
+    /** 01:00 to 05:00: every hour of the day so far but the current one. */
+    const HOURS = [1, 2, 3, 4, 5].map((h) => TODAY + h * HOUR);
+    /** A kWh counter read every 10 minutes, from 5 past a midnight eight days ago to 05:55 today: 144 rows a day. */
+    const COUNTER = series(new Date(2026, 8, 16).getTime() + 5 * MINUTE, 10 * MINUTE, 8 * 144 + 36, (i) => 1000 + i / 10);
+    /** The newest good numeric reading stamped before `t`. */
+    const expected = (rows: Stored[], t: number): number | null => {
+      const row = rows.filter((r) => r.ts < t && (r.q ?? 0) === 0 && typeof r.val === 'number').at(-1);
+      return row ? (row.val as number) : null;
+    };
+    const before = (provider: HistoryProvider, times: number[], panel = 'panel-a', id = METER): Promise<Readings> =>
+      provider.readingsBefore(id, times, panel);
+
+    for (const [name, make] of flavours) {
+      it(`${name}: reads the newest good reading before each midnight and each hour, however many rows follow it`, async () => {
+        const times = [...MIDNIGHTS, ...HOURS];
+        const result = await before(provide(make(COUNTER)), times);
+        expect(result.available).to.equal(true);
+        expect(result.readings).to.deep.equal(times.map((t) => expected(COUNTER, t)));
+        expect(result.readings.every((reading) => reading !== null)).to.equal(true);
+      });
+
+      it(`${name}: reads a row stamped on a boundary as the next bucket's, and passes over bad quality`, async () => {
+        const rows: Stored[] = [
+          { ts: TODAY - HOUR, val: 10, q: 0 },
+          { ts: TODAY - MINUTE, val: null, q: 0x40 },
+          { ts: TODAY, val: 11, q: 0 },
+          { ts: TODAY + HOUR - 1, val: 12, q: 0 },
+          { ts: TODAY + HOUR, val: 13, q: 0 },
+          { ts: TODAY + 90 * MINUTE, val: 'n/a', q: 0 },
+          { ts: TODAY + 100 * MINUTE, val: 14, q: 0x42 },
+        ];
+        const result = await before(provide(make(rows)), [TODAY, TODAY + HOUR, TODAY + 2 * HOUR]);
+        expect(result.readings).to.deep.equal([10, 12, 13]);
+      });
+
+      it(`${name}: reads null before the first reading, which stays null`, async () => {
+        const late = COUNTER.filter((row) => row.ts > MIDNIGHTS[3]! + 2 * HOUR);
+        const fake = make(late);
+        const provider = provide(fake);
+        const result = await before(provider, [...MIDNIGHTS, HOURS[0]!]);
+        expect(result.readings).to.deep.equal([null, null, null, null, ...MIDNIGHTS.slice(4).map((t) => expected(late, t)), expected(late, HOURS[0]!)]);
+        const calls = fake.calls.length;
+        await before(provider, MIDNIGHTS);
+        expect(fake.calls).to.have.length(calls);
+      });
+    }
+
+    it('asks for a midnight as the newest rows up to the millisecond before it, however old, and for the hours as one window from the first', async () => {
+      const fake = sqlFake(COUNTER);
+      await before(provide(fake), [MIDNIGHTS[0]!, ...HOURS]);
+      const common = { instance: 'sql.0', aggregate: 'none', returnNewestEntries: true, ignoreNull: false, ack: true, q: true };
+      const [midnight, window, prior] = fake.calls.map((call) => call.options);
+      // iobroker.history's day file of the day before holds no later row to count against `count`.
+      expect(midnight).to.deep.include({ ...common, end: MIDNIGHTS[0]! - 1, count: 3 });
+      expect(midnight).to.not.have.property('start');
+      // The query's own window and the reading before it: its count covers the rows after it in its day file.
+      expect(window).to.deep.include({ ...common, start: HOURS[0]! - 1, count: MAX_HISTORY_ROWS });
+      expect(window).to.not.have.property('end');
+      const windowRows = COUNTER.filter((row) => row.ts >= HOURS[0]! - 1).length;
+      expect(prior).to.deep.include({ ...common, end: HOURS[0]! - 1, count: windowRows + 3 });
+      expect(fake.calls).to.have.length(3);
+    });
+
+    it('history: reads the hours from a window, since a day file counts its rows after an hour against `count`', async () => {
+      // Written to file up to 04:00, in memory since: an hour's question as a
+      // midnight's (newest 3 up to it) would get 01:05 onwards and drop them.
+      const fake = historyFake(inMemory(COUNTER, NOW - 2 * HOUR), inFiles(COUNTER, NOW - 2 * HOUR));
+      const result = await before(provide(fake), HOURS);
+      expect(result.readings).to.deep.equal(HOURS.map((t) => expected(COUNTER, t)));
+    });
+
+    it('looks further back, once, for a reading behind rows that are none', async () => {
+      // Three bad rows right before the midnight, the reading two days older.
+      const rows: Stored[] = [
+        { ts: MIDNIGHTS[0]! - 2 * DAY, val: 7, q: 0 },
+        ...series(MIDNIGHTS[0]! - 3 * MINUTE, MINUTE, 3, () => null).map((row) => ({ ...row, q: 0x42 })),
+        ...COUNTER.filter((row) => row.ts >= MIDNIGHTS[0]!),
+      ];
+      for (const [name, make] of flavours.filter(([flavour]) => flavour !== 'influxdb')) {
+        const fake = make(rows);
+        const result = await before(provide(fake), [MIDNIGHTS[0]!]);
+        expect(result.readings, name).to.deep.equal([7]);
+        expect(fake.calls.map((call) => call.options.count), name).to.deep.equal([3, MAX_HISTORY_ROWS]);
+      }
+    });
+
+    describe('the cache: a boundary a minute old never changes', () => {
+      it('asks nothing again for the boundaries it read', async () => {
+        const fake = sqlFake(COUNTER);
+        const provider = provide(fake);
+        const first = await before(provider, [TODAY, ...HOURS]);
+        const calls = fake.calls.length;
+        const again = await before(provider, [TODAY, ...HOURS]);
+        expect(fake.calls).to.have.length(calls);
+        expect(again).to.deep.equal(first);
+      });
+
+      it('asks only for a boundary it has not read, the next hour, with a window from it', async () => {
+        const fake = sqlFake(COUNTER);
+        const provider = provide(fake);
+        await before(provider, [TODAY, ...HOURS.slice(0, 4)]);
+        const calls = fake.calls.length;
+        const result = await before(provider, [TODAY, ...HOURS]);
+        // The window from 04:59:59.999, and the reading before it.
+        expect(fake.calls.slice(calls).map((call) => call.options.start ?? call.options.end)).to.deep.equal([HOURS[4]! - 1, HOURS[4]! - 1]);
+        expect(result.readings).to.deep.equal([TODAY, ...HOURS].map((t) => expected(COUNTER, t)));
+      });
+
+      it('asks again for a boundary less than a minute old: the history adapter may log a reading before it late', async () => {
+        const fake = sqlFake(COUNTER);
+        const provider = provide(fake);
+        const fresh = NOW - 30_000;
+        await before(provider, [fresh]);
+        await before(provider, [fresh]);
+        expect(fake.calls.filter((call) => call.options.start === fresh - 1)).to.have.length(2);
+        clock.tick(MINUTE);
+        await before(provider, [fresh]);
+        const calls = fake.calls.length;
+        await before(provider, [fresh]);
+        expect(fake.calls).to.have.length(calls);
+      });
+
+      it('keeps nothing it could not read: an instance that is not logging, or a failed question', async () => {
+        const fake = sqlFake(COUNTER);
+        fake.unlogged.add(METER);
+        const provider = provide(fake);
+        expect(await before(provider, [TODAY, HOURS[0]!])).to.deep.equal({ readings: [null, null], available: false, reason: 'not_logged' });
+        fake.unlogged.delete(METER);
+        fake.rejectNext(new Error('database locked'));
+        const asked = fake.calls.length;
+        const failed = await before(provider, [TODAY, HOURS[0]!]);
+        // A question that failed would fail again: nothing more is asked this time, and nothing kept.
+        expect(failed).to.deep.equal({ readings: [null, null], available: false, reason: 'failed' });
+        expect(fake.calls).to.have.length(asked + 1);
+        const calls = fake.calls.length;
+        expect((await before(provider, [TODAY, HOURS[0]!])).readings).to.deep.equal([expected(COUNTER, TODAY), expected(COUNTER, HOURS[0]!)]);
+        // The midnight, the window from the hour and the reading before it; kept from now on.
+        expect(fake.calls.slice(calls).map((call) => call.options.end ?? call.options.start)).to.deep.equal([TODAY - 1, HOURS[0]! - 1, HOURS[0]! - 1]);
+        const kept = fake.calls.length;
+        await before(provider, [TODAY, HOURS[0]!]);
+        expect(fake.calls).to.have.length(kept);
+      });
+
+      it('keeps no hour whose reading the question before the window failed to bring', async () => {
+        const fake = sqlFake(COUNTER);
+        const provider = provide(fake);
+        fake.replyNext(async () => ({ result: sqlAdapter(COUNTER, { ...fake.lastCall.options }) }));
+        fake.rejectNext(new Error('timeout'));
+        const first = await before(provider, HOURS);
+        expect(first.readings).to.deep.equal([null, ...HOURS.slice(1).map((t) => expected(COUNTER, t))]);
+        const second = await before(provider, HOURS);
+        expect(second.readings).to.deep.equal(HOURS.map((t) => expected(COUNTER, t)));
+      });
+
+      it('keeps an hour before the newest MAX_HISTORY_ROWS rows as null: the window only grows', async () => {
+        // A reading every second from 00:30: the window from 01:00 holds 6200 rows.
+        const busy = series(TODAY + 30 * MINUTE, 1_000, MAX_HISTORY_ROWS + 3000, (i) => 5000 + i);
+        const fake = sqlFake(busy);
+        const provider = provide(fake);
+        const oldest = busy.at(-MAX_HISTORY_ROWS)!.ts;
+        expect(oldest).to.be.greaterThan(HOURS[0]!).and.lessThan(HOURS[1]!);
+        const result = await before(provider, HOURS);
+        expect(result.readings).to.deep.equal(HOURS.map((t) => (t - 1 >= oldest ? expected(busy, t) : null)));
+        expect(result.readings[0]).to.equal(null);
+        expect(result.readings.slice(1).every((reading) => reading !== null)).to.equal(true);
+        const calls = fake.calls.length;
+        await before(provider, HOURS);
+        expect(fake.calls).to.have.length(calls);
+      });
+
+      it(`holds at most ${MAX_CACHED_READINGS} readings, the oldest read going first`, async () => {
+        const fake = sqlFake([{ ts: 0, val: 1, q: 0 }]);
+        const provider = provide(fake);
+        const days = Array.from({ length: MAX_CACHED_READINGS + 1 }, (_, i) => new Date(2026, 8, 24 - i).getTime());
+        await before(provider, days);
+        const calls = fake.calls.length;
+        expect(calls).to.equal(days.length);
+        // The newest boundary was read first, so it went first.
+        await before(provider, days.slice(1));
+        expect(fake.calls).to.have.length(calls);
+        await before(provider, [days[0]!]);
+        expect(fake.calls).to.have.length(calls + 1);
+      });
+    });
+
+    it("waits for one of the panel's query slots", async () => {
+      const fake = sqlFake(COUNTER);
+      const provider = provide(fake);
+      const asked: string[] = [];
+      const waiting: Array<() => void> = [];
+      const answer = fake.getHistoryAsync.bind(fake);
+      fake.getHistoryAsync = (id, options) => {
+        asked.push(id);
+        return new Promise((resolve) => waiting.push(() => resolve(answer(id, options))));
+      };
+      const held = [ask(provider, 'numeric', START, 'panel-a', `${ID}1`), ask(provider, 'numeric', START, 'panel-a', `${ID}2`)];
+      const readings = before(provider, [TODAY]);
+      await settle();
+      expect(asked).to.deep.equal([`${ID}1`, `${ID}2`]);
+      for (let i = 0; i < 20 && waiting.length > 0; i++) {
+        waiting.shift()!();
+        await settle();
+      }
+      await Promise.all(held);
+      expect(asked.filter((id) => id === METER)).to.have.length(1);
+      expect((await readings).readings).to.deep.equal([expected(COUNTER, TODAY)]);
     });
   });
 });
