@@ -14,7 +14,7 @@ import {
 import { energyResponseTopic } from '../protocol/topics';
 import { lastSegment, objectMeta, type IoBrokerObject, type ObjectMeta } from '../registry/detector';
 import { ENERGY_KEY, resolveEnergyIds } from '../registry/entity-id';
-import type { HistoryProvider } from './history-provider';
+import { isLogged, type HistoryProvider } from './history-provider';
 import type { Logger } from './mqtt-client';
 
 /**
@@ -92,8 +92,7 @@ export function energyMeters(
     if (row.price !== undefined) meter.price = row.price;
     return meter;
   });
-  type Custom = { common?: { custom?: Record<string, { enabled?: unknown } | null> | null } };
-  const unlogged = instance ? meters.filter((m) => (objects[m.stateId] as Custom).common?.custom?.[instance]?.enabled !== true).map((m) => m.stateId) : [];
+  const unlogged = instance ? meters.filter((m) => !isLogged(objects[m.stateId], instance)).map((m) => m.stateId) : [];
   return { meters, ids, rejected, unlogged };
 }
 

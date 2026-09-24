@@ -298,6 +298,9 @@ class HomeTiles extends utils.Adapter {
 
   private async onUnload(callback: () => void): Promise<void> {
     try {
+      // First: in compact mode the process lives on, and so would queued
+      // history questions and their timers (Task 19 review I-2).
+      this.history?.close();
       this.clearTimeout(this.discoveryRetry);
       // The newest values go out while every entity is still there. Then,
       // before anything is torn down, publishing stops: the registry is

@@ -184,6 +184,8 @@ export class FakeAdapter implements HistorySource {
   readonly calls: Array<{ id: string; options: Options }> = [];
   alive = true;
   logged = true;
+  /** `enabled` of the custom settings of a logged state, as a script may leave it. */
+  enabled: unknown = true;
   /** States this instance does not log, when `logged` is true. */
   readonly unlogged = new Set<string>();
   /** Live states by id, as getForeignStateAsync reads them. */
@@ -227,7 +229,7 @@ export class FakeAdapter implements HistorySource {
   async getForeignObjectAsync(id: string): Promise<unknown> {
     if (id === 'system.config') return { common: { defaultHistory: this.defaultHistory } };
     const logged = this.logged && !this.unlogged.has(id);
-    return { type: 'state', common: { custom: logged ? { [this.instance]: { enabled: true } } : {} } };
+    return { type: 'state', common: { custom: logged ? { [this.instance]: { enabled: this.enabled } } : {} } };
   }
 
   async getForeignStateAsync(id: string): Promise<unknown> {

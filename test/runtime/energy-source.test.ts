@@ -118,9 +118,16 @@ describe('runtime/energy-source', () => {
     });
 
     it('names each meter the history instance does not log, and none when there is no instance', () => {
-      const objects = { 'a.0.logged': counter(logged), 'a.0.other': counter({ custom: { 'sql.0': { enabled: true } } }), 'a.0.off': counter() };
+      const objects = {
+        'a.0.logged': counter(logged),
+        // `enabled` as truthy as the history adapters read it (Task 19 M-3).
+        'a.0.script': counter({ custom: { 'history.0': { enabled: 'true' } } }),
+        'a.0.other': counter({ custom: { 'sql.0': { enabled: true } } }),
+        'a.0.disabled': counter({ custom: { 'history.0': { enabled: 0 } } }),
+        'a.0.off': counter(),
+      };
       const rows = Object.keys(objects).map((stateId) => ({ stateId, category: 'device' as EnergyCategory, sign: 1 as const }));
-      expect(energyMeters(rows, objects, {}, 'hometiles.0', 'history.0').unlogged).to.deep.equal(['a.0.other', 'a.0.off']);
+      expect(energyMeters(rows, objects, {}, 'hometiles.0', 'history.0').unlogged).to.deep.equal(['a.0.other', 'a.0.disabled', 'a.0.off']);
       expect(energyMeters(rows, objects, {}, 'hometiles.0', '').unlogged).to.deep.equal([]);
     });
   });
@@ -501,7 +508,7 @@ describe('runtime/energy-source', () => {
         expect(JSON.parse(second!.payload).entries[0].values.slice(0, -1)).to.deep.equal(JSON.parse(first!.payload).entries[0].values.slice(0, -1));
         clock.tick(10 * MINUTE); // 15:05: the 15:00 boundary is new
         await source.answer('a1', '{"period":"day"}');
-        const next = fake.calls.slice(asked).map((call) => call.options.start ?? call.options.end);
+        const next = fake.calls.slice(asked).map((call) => call.options.end ?? call.options.start);
         expect(next).to.deep.equal([at(2026, 9, 25, 15) - 1, at(2026, 9, 25, 15) - 1]);
       });
 
