@@ -2,8 +2,12 @@ import Aedes from 'aedes';
 import { expect } from 'chai';
 import { tests, type IntegrationTestHarness } from '@iobroker/testing';
 import mqtt, { type MqttClient } from 'mqtt';
+import { execFileSync, spawn, type ChildProcess } from 'node:child_process';
+import { closeSync, existsSync, lstatSync, mkdirSync, openSync, readFileSync, rmSync, symlinkSync, unlinkSync, writeFileSync } from 'node:fs';
 import { createServer, type Server } from 'node:net';
+import os from 'node:os';
 import path from 'node:path';
+import { HistoryProvider, MAX_HISTORY_ROWS, type HistoryResult, type HistorySource } from '../src/runtime/history-provider';
 
 /** A log line as js-controller forwards it (js-controller-common-db logger.js). */
 interface LogRecord {
@@ -304,6 +308,62 @@ async function breakDeviceView(harness: IntegrationTestHarness): Promise<DesignD
   await harness.objects.setObjectAsync('_design/system', { ...design, views });
   return design;
 }
+
+/**
+ * A real iobroker.history beside the harness's js-controller (Task 19): the
+ * provider's queries meet the adapter itself, not a port of it. It is
+ * installed once under the harness's test directory but outside its
+ * node_modules, which the harness's own `npm i` would prune; its adapter-core
+ * finds the harness's js-controller further up. js-controller looks for an
+ * adapter's directory beside itself only (js-controller-common-db tools.js
+ * getAdapterDir), so the suite links it there while it runs.
+ */
+const HISTORY_VERSION = '5.0.1';
+const HISTORY_DIR = path.join(os.tmpdir(), 'test-iobroker.hometiles', 'history-adapter');
+const HISTORY_STORE = path.join(HISTORY_DIR, 'store');
+const HISTORY_PACKAGE = path.join(HISTORY_DIR, 'node_modules', 'iobroker.history');
+const HISTORY_MAIN = path.join(HISTORY_PACKAGE, 'build', 'main.js');
+const HISTORY_LINK = path.join(os.tmpdir(), 'test-iobroker.hometiles', 'node_modules', 'iobroker.history');
+
+type HistoryRow = { ts: number; val: unknown; ack: boolean; q: number };
+
+/** Rows written where iobroker.history reads them: one JSON file per local day (getHistory.js:119-136). */
+function plantHistory(id: string, rows: HistoryRow[]): void {
+  const days = new Map<string, HistoryRow[]>();
+  for (const row of rows) {
+    const date = new Date(row.ts);
+    const day = [date.getFullYear(), date.getMonth() + 1, date.getDate()].map((part) => String(part).padStart(2, '0')).join('');
+    days.set(day, [...(days.get(day) ?? []), row]);
+  }
+  for (const [day, dayRows] of days) {
+    mkdirSync(path.join(HISTORY_STORE, day), { recursive: true });
+    writeFileSync(path.join(HISTORY_STORE, day, `history.${id}.json`), JSON.stringify(dayRows));
+  }
+}
+
+/**
+ * The adapter's getHistoryAsync as js-controller runs it (adapter.js
+ * _getHistory): a getHistory message to the instance named, `end` now + 5000 s
+ * when not given, an `error` in the answer a rejection. The harness sends it
+ * in the adapter's place.
+ */
+function harnessHistory(harness: IntegrationTestHarness): HistorySource {
+  return {
+    getHistoryAsync: (id, options) =>
+      new Promise((resolve, reject) => {
+        const message = { id, options: { ...options, end: options.end || Date.now() + 5e6 } };
+        harness.sendTo(options.instance ?? '', 'getHistory', message, (reply: unknown) => {
+          const answer = reply as { result?: unknown; error?: unknown } | undefined;
+          if (answer?.error) reject(new Error(String(answer.error)));
+          else resolve({ result: answer?.result });
+        });
+      }),
+    getForeignObjectAsync: (id) => harness.objects.getObjectAsync(id),
+    getForeignStateAsync: (id) => harness.states.getStateAsync(id),
+  };
+}
+
+const pause = (ms: number): Promise<void> => new Promise((resolve) => setTimeout(resolve, ms));
 
 // Opt-in: this downloads and runs a real js-controller, so it stays out of the
 // default suite. Run it with HOMETILES_INTEGRATION=1 npm test.
@@ -1203,6 +1263,149 @@ if (process.env.HOMETILES_INTEGRATION === '1') {
             expect(ready(logs)!.message).to.include('1 picked (manual entities included), 0 entities published');
             expect(await reported(harness)).to.equal(0);
           });
+        });
+      });
+
+      suite('the history provider against iobroker.history (Task 19)', (getHarness) => {
+        const HOUR = 3_600_000;
+        const now = Date.now();
+        const start = now - 24 * HOUR;
+        /** Local 06:00 of the day the window starts in. */
+        const morning = new Date(start).setHours(6, 0, 0, 0);
+        const row = (ts: number, val: unknown, q = 0, ack = true): HistoryRow => ({ ts, val, ack, q });
+        const every = (first: number, step: number, count: number): HistoryRow[] =>
+          Array.from({ length: count }, (_, i) => row(first + i * step, 20 + i / 10));
+        const ID = {
+          window: '0_userdata.0.t19.window',
+          sameDay: '0_userdata.0.t19.sameday',
+          busy: '0_userdata.0.t19.busy',
+          marked: '0_userdata.0.t19.marked',
+          unlogged: '0_userdata.0.t19.unlogged',
+        };
+        const WINDOW = [row(start - 72 * HOUR, 18.5), ...every(start + HOUR / 4, HOUR / 2, 48)];
+        const SAME_DAY = [row(morning - 5 * HOUR, 3), row(morning - 60_000, 7), ...every(morning + 60_000, 120_000, 400)];
+        /** Three days back: its 42.5 hours of rows cross a midnight whatever the hour, so two day files hold them. */
+        const busyStart = start - 48 * HOUR;
+        const BUSY = [row(busyStart - HOUR, 1), ...every(busyStart + HOUR, 30_000, MAX_HISTORY_ROWS + 100)];
+        const MARKED = [
+          row(start - 72 * HOUR, 18.5),
+          row(start - HOUR, null, 0x40),
+          row(start + HOUR, 21),
+          row(start + 2 * HOUR, null, 0x40),
+          row(start + 3 * HOUR, 22, 0x42, false),
+          row(start + 4 * HOUR, 'n/a'),
+          row(start + 5 * HOUR, 23),
+        ];
+        let adapter: ChildProcess | undefined;
+        let systemConfig: Record<string, unknown> | null | undefined;
+
+        const ask = (provider: HistoryProvider, id: string, kind: 'numeric' | 'discrete' = 'numeric', from = start): Promise<HistoryResult> =>
+          provider.query(id, { start: from, kind, panel: 'e2e' });
+
+        before(async function () {
+          this.timeout(300000);
+          if (!existsSync(HISTORY_MAIN)) {
+            mkdirSync(HISTORY_DIR, { recursive: true });
+            execFileSync('npm', ['install', '--prefix', HISTORY_DIR, '--omit=dev', '--no-audit', '--no-fund', `iobroker.history@${HISTORY_VERSION}`], { stdio: 'ignore' });
+          }
+          if (!lstatSync(HISTORY_LINK, { throwIfNoEntry: false })) symlinkSync(HISTORY_PACKAGE, HISTORY_LINK, 'dir');
+          rmSync(HISTORY_STORE, { recursive: true, force: true });
+          plantHistory(ID.window, WINDOW);
+          plantHistory(ID.sameDay, SAME_DAY);
+          plantHistory(ID.busy, BUSY);
+          plantHistory(ID.marked, MARKED);
+
+          const harness = getHarness();
+          systemConfig = await harness.objects.getObjectAsync('system.config');
+          const custom = { 'history.0': { enabled: true, changesOnly: true, debounce: 0, retention: 31536000, maxLength: 960 } };
+          for (const id of Object.values(ID)) {
+            const common = { name: id, type: 'mixed', role: 'value', read: true, write: false, ...(id === ID.unlogged ? {} : { custom }) };
+            await harness.objects.setObjectAsync(id, { _id: id, type: 'state', common, native: {} });
+          }
+          const io = JSON.parse(readFileSync(path.join(HISTORY_PACKAGE, 'io-package.json'), 'utf8'));
+          await harness.objects.setObjectAsync('system.adapter.history.0', {
+            _id: 'system.adapter.history.0',
+            type: 'instance',
+            common: { ...io.common, enabled: true },
+            native: { ...io.native, storeDir: HISTORY_STORE, writeNulls: false },
+          });
+          const log = openSync(path.join(HISTORY_DIR, 'history.0.log'), 'w');
+          adapter = spawn(process.execPath, [HISTORY_MAIN, '--force', '--console'], { cwd: HISTORY_DIR, stdio: ['ignore', log, log] });
+          closeSync(log);
+
+          // Alive comes before its ready handler has set the store directory:
+          // asked earlier, it reads nothing, so wait for a first real answer.
+          const provider = new HistoryProvider(harnessHistory(harness), { info() {}, warn() {}, error() {}, debug() {} }, 'history.0');
+          const deadline = Date.now() + 60000;
+          for (;;) {
+            if (adapter.exitCode !== null) throw new Error(`iobroker.history exited with ${adapter.exitCode}; see ${HISTORY_DIR}/history.0.log`);
+            const result = await ask(provider, ID.window);
+            if (result.available && result.rows.length > 0) break;
+            if (Date.now() > deadline) throw new Error(`iobroker.history never answered (${result.reason ?? 'no rows'})`);
+            await pause(500);
+          }
+        });
+
+        after(async function () {
+          this.timeout(30000);
+          if (adapter && adapter.exitCode === null) {
+            const exited = new Promise((resolve) => adapter!.once('exit', resolve));
+            adapter.kill('SIGTERM');
+            await Promise.race([exited, pause(10000)]);
+            if (adapter.exitCode === null) adapter.kill('SIGKILL');
+          }
+          if (lstatSync(HISTORY_LINK, { throwIfNoEntry: false })?.isSymbolicLink()) unlinkSync(HISTORY_LINK);
+          // The next run's database starts from what the last suite leaves.
+          const harness = getHarness();
+          for (const id of [...Object.values(ID), 'system.adapter.history.0']) await harness.objects.delObjectAsync(id).catch(() => undefined);
+          if (systemConfig) await harness.objects.setObjectAsync('system.config', systemConfig);
+        });
+
+        const provide = (instance = 'history.0', lines: string[] = []): HistoryProvider => {
+          const add = (message: string): void => void lines.push(message);
+          return new HistoryProvider(harnessHistory(getHarness()), { info: add, warn: add, error: add, debug: add }, instance);
+        };
+
+        it('reads the window and, asked for on its own, the reading in effect at its start, however old', async function () {
+          this.timeout(60000);
+          const result = await ask(provide(), ID.window);
+          expect(result.available).to.equal(true);
+          expect(result.rows.map((r) => [r.ts, r.val])).to.deep.equal(WINDOW.map((r) => [r.ts, r.val]));
+        });
+
+        it("reads the system's default history instance, which the adapter set for itself, when none is configured", async function () {
+          this.timeout(60000);
+          const config = await getHarness().objects.getObjectAsync('system.config');
+          expect(config?.common).to.include({ defaultHistory: 'history.0' });
+          const result = await ask(provide(''), ID.window);
+          expect(result.rows.map((r) => r.val)).to.deep.equal(WINDOW.map((r) => r.val));
+        });
+
+        it('finds the reading in effect behind the 400 later rows of its own day file', async function () {
+          this.timeout(60000);
+          const result = await ask(provide(), ID.sameDay, 'numeric', morning);
+          expect(result.rows.map((r) => r.val)).to.deep.equal(SAME_DAY.slice(1).map((r) => r.val));
+        });
+
+        it(`keeps the newest ${MAX_HISTORY_ROWS} rows of a busier window, with no reading carried over the rest`, async function () {
+          this.timeout(60000);
+          const lines: string[] = [];
+          const result = await ask(provide('history.0', lines), ID.busy, 'numeric', busyStart);
+          expect(result.rows.map((r) => r.ts)).to.deep.equal(BUSY.slice(-MAX_HISTORY_ROWS).map((r) => r.ts));
+          expect(lines.join('\n')).to.include(ID.busy).and.include(`newest ${MAX_HISTORY_ROWS}`);
+        });
+
+        it('keeps only good numeric readings for a graph, and every row with its quality for a timeline', async function () {
+          this.timeout(60000);
+          const numeric = await ask(provide(), ID.marked, 'numeric');
+          expect(numeric.rows.map((r) => r.val)).to.deep.equal([18.5, 21, 23]);
+          const discrete = await ask(provide(), ID.marked, 'discrete');
+          expect(discrete.rows.map((r) => [r.val, r.q, r.ack])).to.deep.equal(MARKED.slice(1).map((r) => [r.val, r.q, r.ack]));
+        });
+
+        it('asks nothing for a state the instance does not log', async function () {
+          this.timeout(60000);
+          expect(await ask(provide(), ID.unlogged)).to.deep.include({ rows: [], available: false, reason: 'not_logged' });
         });
       });
     },

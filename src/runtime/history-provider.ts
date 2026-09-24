@@ -3,6 +3,19 @@ import { usableNumber } from '../protocol/climate';
 import type { SourceValue } from '../registry/types';
 import type { Logger } from './mqtt-client';
 
+/** The getHistory options the provider sends, a part of @iobroker/types' GetHistoryOptions (shared.d.ts:321). */
+export interface HistoryOptions {
+  instance: string;
+  start?: number;
+  end?: number;
+  count: number;
+  aggregate: 'none';
+  returnNewestEntries: boolean;
+  ignoreNull: boolean;
+  ack: boolean;
+  q: boolean;
+}
+
 /**
  * What the provider asks of the adapter: its own history API and two reads.
  * The adapter itself is one. getHistoryAsync goes to the instance named in the
@@ -10,7 +23,7 @@ import type { Logger } from './mqtt-client';
  * adapter.js _getHistory).
  */
 export interface HistorySource {
-  getHistoryAsync(id: string, options: ioBroker.GetHistoryOptions): Promise<{ result?: unknown }>;
+  getHistoryAsync(id: string, options: HistoryOptions): Promise<{ result?: unknown }>;
   getForeignObjectAsync(id: string): Promise<unknown>;
   getForeignStateAsync(id: string): Promise<unknown>;
 }
@@ -196,7 +209,7 @@ export class HistoryProvider {
       timer = setTimeout(() => resolve('timeout'), QUERY_TIMEOUT_MS);
     });
     try {
-      const options: ioBroker.GetHistoryOptions = {
+      const options: HistoryOptions = {
         instance,
         ...range,
         aggregate: 'none',
