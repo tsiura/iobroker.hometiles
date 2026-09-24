@@ -41,7 +41,8 @@ a silent bug.
 | --- | --- | --- |
 | sensor, binary_sensor, switch, light | per-field, see `docs/protocol.md` | per-field |
 | **climate, cover** | **snaps to a hardcoded default** — never "unchanged" | safe for cover; **unsafe for climate strings** |
-| **history, energy responses** | preserves the cached value | **explicitly clears** the cached value |
+| **history responses** (binary/state header: `current`, `available`, `last_changed`, `device_class`) | preserves the popup's value | **explicitly clears** it (`sensor_popup.cpp:1845-1866`) |
+| **energy responses** | `total` shows 0.000; `cost` absent means no cost | **identical to omitted** — `total.isNull()` is 0.0 and each period's cache is replaced wholesale (`energy_data.cpp:249-255`, Ruling 128) |
 | **editable `/control`** | a missing `state` key **rejects the whole message** | `state: null` is valid and renders `--` |
 
 Concretely, for climate and cover you must publish the **complete set of
