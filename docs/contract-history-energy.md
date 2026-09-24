@@ -441,6 +441,40 @@ Tile display value: `format_energy_total(total, is_cost)` (`:151-154`) — 3
 decimal places normally, 2 for cost entries, or the literal string `"--"` if
 the value is not finite.
 
+**Verified by Tasks 20/20b (2026-09-25), what v0.6.12 actually consumes:**
+
+- **`period` is found twice.** `queue_energy_response` picks the answer's queue
+  with `response_period` (`energy_data.cpp:65-80`): the FIRST `"period"`
+  anywhere in the raw text, the next `:`, the next quoted token. Put `period`
+  first, or an entry's text can route the answer to the wrong queue.
+- **`total` null and absent are the same, 0.000**, and the whole period cache
+  is replaced by the parsed entries (`cache_for_period(period) = parsed`,
+  `:279`). There is no "absent keeps the cached total": the global
+  constraints' row "history, energy responses: an omitted key preserves, null
+  clears" is wrong for energy. JSON has no NaN, so an unknown total cannot
+  show `"--"`; the adapter omits it.
+- **`start` is read**: the popup takes `%d-%d-%dT%d` of it
+  (`energy_popup.cpp:224-227`) and names the week's days from it
+  (`:229-255`). Send the period's local start in ISO 8601, as the Bridge's
+  `start.isoformat()` (`__init__.py:2949`).
+- **Read by nothing after parsing:** `category` (`icon_for_energy`,
+  `energy_data.cpp:161-171`, has no caller), `name`, `is_total`, `cost` /
+  `has_cost`. A tile's title comes from the tile or `findSensorName`
+  (`energy/renderer.cpp:112`), its icon from `findEntityIcon` (`:94`): both
+  from the apply's `energy` catalog (§6.4). The unit is read (`:192`, popup
+  `:385`, `:471`), and `is_cost` picks 2 decimals.
+- **The popup draws 24 day slots and 7 week slots** (`kDaySlotCount`,
+  `kWeekSlotCount`, `energy_popup.cpp:50-51`): a 25th hourly value (the
+  autumn clock change) counts in the total but is not drawn. It asks for day
+  and week only (`:740-746`, `:957`, `:1048`, `renderer.cpp:220`); month is
+  never requested by v0.6.12.
+- **An energy tile also subscribes to `<haPrefix>/<id, dots as slashes>/state`**
+  (`tileTypeSubscribesDynamicState`, `tile_type_policy.h:46-50`;
+  `mqtt_handlers.cpp:1325-1330`) and shows any payload arriving there as its
+  value (`tab_tiles_unified.cpp:2283-2296`). An id that is also an entity
+  with a published state would alternate between the two; the adapter's
+  energy ids (`energy.<name>`) belong to no entity.
+
 ### 6.3 What "overflow" means for energy
 
 - More than 32 `values` per entry: silently truncated, no error (see table
@@ -470,7 +504,19 @@ exactly three keys:
 | `category` | Optional; used **only** to pick an icon via `energyIconForCategory` (`:1083-1099`, near-duplicate of `icon_for_energy` in §6.2's table but a separate function in a separate file) — same category vocabulary (`grid`/`solar`/`battery`/`gas`/`water`/`device_water`), same `"_cost"`-id-suffix-or-`eur`/`euro`-unit ⇒ currency icon rule (`:1092`) |
 
 None of `total`, `cost`, `values`, `is_cost`, `is_total`, `sign`, or `period`
-exist in this message. If you are implementing the responder for
+exist in this message.
+
+**Verified by Task 20b (2026-09-25):** `applyJson` takes the FIRST `"energy"`
+in the whole payload (`:594`), and `parseEnergySection` the first `[` after
+it, the first `]` after that, and each `{` to the first `}` as one entry
+(`:1114-1168`). Names and units go into the maps every tile reads its title
+and unit from (`:1153-1161`), after sensor_meta has reset them (`:1189-1192`),
+and each id gets its category's icon (`:1163-1165`): this catalog, not the
+response, is what names an energy tile and draws its icon. The adapter
+therefore lists every id a response carries -- meters, their `_cost`
+entries, category totals -- as the Bridge's catalog does
+(`__init__.py:3981-4234`), after the entity lists and before `scene_map`,
+whose unsanitised aliases could spell `"energy"`. If you are implementing the responder for
 `energy/request`/`energy/response`, use §6.1/§6.2, not this section — this
 section only matters if you also need to advertise which energy entities
 exist for the Web Admin entity picker.
@@ -582,12 +628,8 @@ consume a numeric `values` array from the *same* response object — unless its
 - The full member list of `hardwareIo.isLocalEntityId(...)`
   (`mqtt_handlers.cpp:2388`) — only its call site and effect (no MQTT request
   at all) were confirmed; `src/io/hardware_io.cpp` itself was not read.
-- Exact display/business-logic difference `is_total=true` makes versus
-  `false` beyond being stored on `EnergyEntryData` (`energy_data.cpp:233`) —
-  `src/ui/popups/energy/energy_popup.cpp` was not read for this task.
-- Expected format/consumption of the energy response's top-level `"start"`
-  string (`energy_data.cpp:211,228`) beyond "stored verbatim, not parsed as a
-  timestamp here" — same file not read.
+- ~~`is_total`~~ and ~~`"start"`~~: settled by Task 20b, §6.2 (`is_total` is
+  never read; `start` labels the week).
 - Maximum practical `entries` count for an energy response — bounded only by
   the 32768-byte document size, not an explicit count field; not computed.
 - Whether a real Home Assistant Bridge ever sends its own `"error"` key on a
