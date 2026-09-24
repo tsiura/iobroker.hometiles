@@ -1,4 +1,5 @@
 import { expect } from 'chai';
+import { parseAnnouncement } from '../../src/protocol/announce';
 import { parseLightCommand, parseMediaCommand, type ServiceCall } from '../../src/protocol/commands';
 import { buildStatePublish } from '../../src/protocol/state-payload';
 import { createIoBrokerDetector, discoverDevices, type RootAnchors } from '../../src/registry/detector';
@@ -9,6 +10,9 @@ import { synthDatetime, valueChannel } from '../../src/registry/synth/editable';
 import { synthesise } from '../../src/registry/synth/index';
 import type { DeviceInput, SourceValue, VirtualEntity } from '../../src/registry/types';
 import { Dispatcher } from '../../src/runtime/dispatcher';
+import type { PublishRequest } from '../../src/runtime/mqtt-client';
+import { PanelSession } from '../../src/runtime/panel-session';
+import { panelIcons, panelList, panelNames } from '../protocol/panel-scan';
 
 /*
  * Every other test hand-builds the detector's output. This suite feeds
@@ -2235,6 +2239,89 @@ describe('number, select and datetime (Task 13)', () => {
       expect(detectDevices(userdata)).to.deep.equal([]);
       // 4. An unmapped detection holds it: a fan's mode (FANCOIL_SET's fan).
       expect(backedBy(run(FANCOIL_SET), `${FANCOIL}.fan`)).to.deep.equal([]);
+    });
+  });
+});
+
+describe('bridge/apply from real detections (Task 21)', () => {
+  // One entity of each v0.2 domain as the real detector finds it; the select
+  // and the datetime by a forced domain, their only way in (Task 13). Icons
+  // sit on the roots, where discovery reads them (detector.ts:420).
+  const MODE = 'alias.0.Heizung.Modus';
+  const ALARM = 'alias.0.Schlafzimmer.Wecker';
+  const withIcon = (all: IoObjects, id: string, icon: string): IoObjects => ({ ...all, [id]: { ...all[id]!, common: { ...all[id]!.common, icon } } });
+  const TREE: IoObjects = {
+    ...withIcon(AC_SET, AC, 'mdi:air-conditioner'),
+    ...BLIND_SET,
+    ...withIcon(SONOS_SET, SONOS, 'mdi:speaker'),
+    ...withIcon(WEATHER_SET, STATION, 'mdi:weather-partly-cloudy'),
+    ...FLOW_SET,
+    ...objects(
+      channel(MODE, 'Heizmodus', { icon: 'mdi:tune' }),
+      state(`${MODE}.SET`, { role: 'level.mode', type: 'number', min: 0, max: 2, write: true, states: { 0: 'Aus', 1: 'Eco', 2: 'Komfort' } }),
+      channel(ALARM, 'Weckzeit'),
+      state(`${ALARM}.SET`, { role: 'state', type: 'string', write: true }),
+    ),
+  };
+
+  it('lists, names and gives the icon of each one in the apply a panel session publishes', () => {
+    const devices = applyOverrides(detectDevices(TREE), [
+      { objectId: MODE, include: true, forcedDomain: 'select' },
+      { objectId: ALARM, include: true, forcedDomain: 'datetime' },
+    ]);
+    const registry = new EntityRegistry({ onEntityChanged: () => undefined, onMembershipChanged: () => undefined }, 0);
+    registry.rebuild(devices, {});
+    const published: PublishRequest[] = [];
+    const session = new PanelSession(
+      parseAnnouncement('p1', '{"base_topic":"ht","ha_prefix":"ha"}'),
+      { publish: (request) => void published.push(request), subscribe: async () => undefined, unsubscribe: async () => undefined },
+      new Dispatcher({ byId: () => undefined, bySceneAlias: () => undefined }, async () => undefined, silentLog),
+      silentLog,
+    );
+    expect(session.pushConfig(registry.all(), true)).to.equal(true);
+    const apply = published.find((p) => p.topic === 'tab5_lvgl/config/p1/bridge/apply')!.payload;
+
+    const lists = ['sensors', 'climates', 'covers', 'media_players', 'weathers', 'numbers', 'selects', 'datetimes'];
+    expect(Object.fromEntries(lists.map((key) => [key, panelList(apply, key)]))).to.deep.equal({
+      // The weather station's outside channel is a temperature of its own (Ruling 46).
+      sensors: ['sensor.au_en'],
+      climates: ['climate.klima_wohnzimmer'],
+      covers: ['cover.rollladen_wohnzimmer'],
+      media_players: ['media_player.wohnzimmer'],
+      weathers: ['weather.wetterstation'],
+      numbers: ['number.vorlauf_soll'],
+      selects: ['select.heizmodus'],
+      datetimes: ['datetime.weckzeit'],
+    });
+    expect(panelList(apply, 'cameras')).to.equal(undefined);
+
+    expect(JSON.parse(apply)).to.deep.include({
+      climate_meta: [{ entity_id: 'climate.klima_wohnzimmer', name: 'Klima Wohnzimmer', icon: 'mdi:air-conditioner' }],
+      cover_meta: [{ entity_id: 'cover.rollladen_wohnzimmer', name: 'Rollladen Wohnzimmer' }],
+      media_player_meta: [{ entity_id: 'media_player.wohnzimmer', name: 'Wohnzimmer', icon: 'mdi:speaker' }],
+      weather_meta: [{ entity_id: 'weather.wetterstation', name: 'Wetterstation', icon: 'mdi:weather-partly-cloudy' }],
+      editable_meta: [
+        { entity_id: 'datetime.weckzeit', name: 'Weckzeit' },
+        { entity_id: 'number.vorlauf_soll', name: 'Vorlauf Soll' },
+        { entity_id: 'select.heizmodus', name: 'Heizmodus', icon: 'mdi:tune' },
+      ],
+    });
+    // And what the panel's own scanner makes of them.
+    const names = Object.assign({}, ...['media_player_meta', 'climate_meta', 'cover_meta', 'editable_meta'].map((key) => panelNames(apply, key)));
+    expect(names).to.deep.equal({
+      'climate.klima_wohnzimmer': 'Klima Wohnzimmer',
+      'cover.rollladen_wohnzimmer': 'Rollladen Wohnzimmer',
+      'media_player.wohnzimmer': 'Wohnzimmer',
+      'datetime.weckzeit': 'Weckzeit',
+      'number.vorlauf_soll': 'Vorlauf Soll',
+      'select.heizmodus': 'Heizmodus',
+    });
+    const icons = Object.assign({}, ...['media_player_meta', 'climate_meta', 'cover_meta', 'weather_meta', 'editable_meta'].map((key) => panelIcons(apply, key)));
+    expect(icons).to.deep.equal({
+      'climate.klima_wohnzimmer': 'mdi:air-conditioner',
+      'media_player.wohnzimmer': 'mdi:speaker',
+      'weather.wetterstation': 'mdi:weather-partly-cloudy',
+      'select.heizmodus': 'mdi:tune',
     });
   });
 });

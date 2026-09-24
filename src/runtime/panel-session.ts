@@ -1,5 +1,5 @@
 import type { Announcement, LocalIoChannel } from '../protocol/announce';
-import { buildApplyPayload, buildIconsPayload, configSignature } from '../protocol/apply';
+import { buildApplyPayload, buildIconsPayload, configSignature, MAX_APPLY_BYTES } from '../protocol/apply';
 import { CommandError, parseCommand, parseValueCommand, requireEntityId, type ServiceCall } from '../protocol/commands';
 import { buildValueAck, CONTROL_SESSION, MAX_CONTROL_BYTES, type ValueStatus } from '../protocol/editable';
 import { buildStateClear, buildStatePublish } from '../protocol/state-payload';
@@ -70,6 +70,15 @@ const FAILURE_LOG_INTERVAL_MS = 60_000;
 const VALUE_REFUSALS: ReadonlySet<string> = new Set(['changed', 'unavailable', 'invalid_value', 'invalid_step', 'invalid_option']);
 /** Text from the wire for a log line: JSON-escaped, so no line break gets through, and cut short (review m6). */
 const quoted = (text: string): string => JSON.stringify(text).slice(0, 100);
+/** An apply payload's three largest sections with their sizes, for a log line: "sensor_meta 20113 bytes, ...". */
+function largestSections(payload: string): string {
+  return Object.entries(JSON.parse(payload) as Record<string, unknown>)
+    .map(([key, value]): [string, number] => [key, Buffer.byteLength(JSON.stringify(value), 'utf8')])
+    .sort(([, a], [, b]) => b - a)
+    .slice(0, 3)
+    .map(([key, size]) => `${key} ${size} bytes`)
+    .join(', ');
+}
 /** A clock offset in words, for a log line: "about 8 s ahead of this host's". */
 function apart(offset: number): string {
   const seconds = Math.round(Math.abs(offset));
@@ -78,6 +87,8 @@ function apart(offset: number): string {
 
 export class PanelSession {
   private lastSignature: string | null = null;
+  /** The last configuration refused as too large, so each is named in one error only (Ruling 108). */
+  private refusedSignature: string | null = null;
   private lastIconsPayload: string | null = null;
   private started = false;
   /** The weather entities pushed to this panel, as last pushed: what its weather request is answered with. */
@@ -196,11 +207,29 @@ export class PanelSession {
    * every list empty would make the firmware prune the panel's tile bindings
    * and save that to flash; the panel keeps its last configuration instead
    * (Ruling 56).
+   *
+   * Nor is a configuration over MAX_APPLY_BYTES published (Ruling 108): the
+   * panel would apply a cut copy of it at every reconnect. The broker keeps
+   * the last good retained apply and icons, and the panel its configuration;
+   * one error names each configuration that does not fit.
    */
   pushConfig(entities: VirtualEntity[] | null, force = false): boolean {
     if (!entities) return false;
     const payload = buildApplyPayload({ entities, sceneMap: this.sceneMap });
     const signature = configSignature(payload);
+    const bytes = Buffer.byteLength(payload, 'utf8');
+    if (bytes > MAX_APPLY_BYTES) {
+      if (signature !== this.refusedSignature) {
+        this.refusedSignature = signature;
+        this.log.error(
+          `[Panel ${this.deviceId}] Configuration not pushed: it is ${bytes} bytes, over the ${MAX_APPLY_BYTES} bytes a ` +
+            `panel takes in one bridge/apply (largest sections: ${largestSections(payload)}). Exclude devices under ` +
+            'Device overrides in the adapter configuration until it fits; the panel keeps its last configuration meanwhile',
+        );
+      }
+      return false;
+    }
+    this.refusedSignature = null;
     if (!force && signature === this.lastSignature) return false;
 
     this.lastSignature = signature;

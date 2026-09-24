@@ -6,6 +6,20 @@ export interface ApplyInput {
   sceneMap: Record<string, string>;
 }
 
+/**
+ * The largest bridge/apply payload a panel applies whole, in UTF-8 bytes
+ * (Ruling 108). processMqttMessage copies it into a 32768-byte buffer, its
+ * NUL included, and cuts anything longer -- then applies the cut text all
+ * the same (mqtt_handlers.cpp:1497, :1729-1742): every section past the cut
+ * is lost, and a cut inside sensor_meta loses every sensor's name and unit
+ * (ha_bridge_config.cpp:1189-1201). This binds before the MQTT packet does:
+ * whatever buffer size the panel runs with (16, 24 or 32 KiB,
+ * network_manager.cpp:34-41), reception grows it for any PUBLISH of up to
+ * 65535 bytes (mqtt_packet_safety.h:13, PubSubClient.cpp:397-413), and the
+ * topic and framing add fewer than 70 bytes.
+ */
+export const MAX_APPLY_BYTES = 32767;
+
 function text(attributes: Record<string, unknown>, key: string): string | undefined {
   const value = attributes[key];
   return typeof value === 'string' && value.length ? value : undefined;
@@ -97,6 +111,26 @@ function simpleMeta(entities: VirtualEntity[], domain: Domain): Record<string, u
     });
 }
 
+/**
+ * climate_meta, cover_meta, media_player_meta, weather_meta and
+ * editable_meta: the panel reads a name from each but weather_meta
+ * (ha_bridge_config.cpp:657-661) and an icon from each (:1386-1393), and
+ * nothing else (Ruling 106). State travels on the entity's own topic.
+ */
+function nameMeta(entities: VirtualEntity[], domains: readonly Domain[]): Record<string, unknown>[] {
+  return entities
+    .filter((entity) => domains.includes(entity.domain))
+    .map((entity) => {
+      const meta: Record<string, unknown> = {
+        entity_id: entity.entityId,
+        name: text(entity.attributes, 'friendly_name') ?? entity.entityId,
+      };
+      const icon = text(entity.attributes, 'icon');
+      if (icon) meta.icon = icon;
+      return meta;
+    });
+}
+
 function byEntityId(a: VirtualEntity, b: VirtualEntity): number {
   return a.entityId < b.entityId ? -1 : a.entityId > b.entityId ? 1 : 0;
 }
@@ -112,22 +146,32 @@ export function buildApplyPayload(input: ApplyInput): string {
     if (target) sceneMap[alias.toLowerCase()] = target;
   }
 
+  // The panel finds each section at the FIRST occurrence of its quoted key
+  // (applyJson, ha_bridge_config.cpp:567-636), so every list comes before
+  // the first free text -- scene aliases, names, states, icons -- which
+  // could otherwise spell a key. Entity ids cannot: each holds a dot.
+  // Every list goes out, an empty one too: the panel keeps all but
+  // media_players when the key is absent (:581-629), goes on offering their
+  // entities, and subscribes to every number, select and datetime listed
+  // (mqtt_handlers.cpp:1306-1314). No cameras (Ruling 107): the adapter
+  // serves none, and the panel clears its list whether the key is absent or
+  // empty (:631-636).
   const payload = {
     sensors: idsFor(entities, 'sensor'),
     binary_sensors: idsFor(entities, 'binary_sensor'),
     lights: idsFor(entities, 'light'),
     switches: idsFor(entities, 'switch'),
-    // Domains outside v0.1. Emitted empty so the firmware's scan finds a
-    // well-formed section instead of falling back to a stale stored value.
-    media_players: [] as string[],
-    climates: [] as string[],
-    covers: [] as string[],
-    cameras: [] as string[],
-    weathers: [] as string[],
-    // Unlike the other unimplemented domains above, the firmware keeps STALE
-    // energy configuration when this key is absent (ha_bridge_config.cpp
-    // scans for "energy" specifically), so a panel migrated from Home
-    // Assistant would otherwise keep old energy sources forever.
+    media_players: idsFor(entities, 'media_player'),
+    climates: idsFor(entities, 'climate'),
+    covers: idsFor(entities, 'cover'),
+    weathers: idsFor(entities, 'weather'),
+    numbers: idsFor(entities, 'number'),
+    selects: idsFor(entities, 'select'),
+    datetimes: idsFor(entities, 'datetime'),
+    // Not served yet, and sent empty all the same: the firmware keeps a STALE
+    // energy configuration while this key is absent (:594-597, :669-675), so
+    // a panel migrated from Home Assistant would keep old energy sources
+    // forever.
     energy: [] as string[],
     scene_map: sceneMap,
     sensor_meta: sensorMeta(entities),
@@ -135,6 +179,12 @@ export function buildApplyPayload(input: ApplyInput): string {
     light_meta: simpleMeta(entities, 'light'),
     switch_meta: simpleMeta(entities, 'switch'),
     scene_meta: simpleMeta(entities, 'scene'),
+    media_player_meta: nameMeta(entities, ['media_player']),
+    climate_meta: nameMeta(entities, ['climate']),
+    cover_meta: nameMeta(entities, ['cover']),
+    weather_meta: nameMeta(entities, ['weather']),
+    // One section for all three: there is no number_meta (:661).
+    editable_meta: nameMeta(entities, ['number', 'select', 'datetime']),
   };
 
   return JSON.stringify(payload);

@@ -1,5 +1,6 @@
 import { expect } from 'chai';
 import { parseAnnouncement } from '../../src/protocol/announce';
+import { buildApplyPayload } from '../../src/protocol/apply';
 import { CONTROL_SESSION, controlRevision } from '../../src/protocol/editable';
 import { buildWeatherPayload } from '../../src/protocol/weather';
 import type { PublishRequest } from '../../src/runtime/mqtt-client';
@@ -7,6 +8,7 @@ import { Dispatcher } from '../../src/runtime/dispatcher';
 import { PanelSession, type PanelTransport } from '../../src/runtime/panel-session';
 import { synthMediaPlayer } from '../../src/registry/synth/media_player';
 import type { DeviceInput, VirtualEntity } from '../../src/registry/types';
+import { panelIcons, panelList, panelNames } from '../protocol/panel-scan';
 
 const ANNOUNCE = JSON.stringify({
   device_id: 'a1',
@@ -58,9 +60,14 @@ function harness(now: () => number = Date.now) {
     silentLog,
   );
   const warnings: string[] = [];
-  const capturingLog = { ...silentLog, warn: (message: string): void => void warnings.push(message) };
+  const errors: string[] = [];
+  const capturingLog = {
+    ...silentLog,
+    warn: (message: string): void => void warnings.push(message),
+    error: (message: string): void => void errors.push(message),
+  };
   const session = new PanelSession(parseAnnouncement('a1', ANNOUNCE), transport, dispatcher, capturingLog, now);
-  return { session, published, subscribed, writes, registryEntities, warnings };
+  return { session, published, subscribed, writes, registryEntities, warnings, errors };
 }
 
 describe('runtime/panel-session', () => {
@@ -208,6 +215,122 @@ describe('runtime/panel-session', () => {
     expect(apply).to.not.equal(undefined);
     // The republished config is the handler's current list, not a cached one.
     expect(JSON.parse(apply!.payload).sensors).to.deep.equal(['sensor.fresh', 'sensor.t']);
+  });
+
+  it('publishes every v0.2 list and meta section on the apply topic (Task 21)', () => {
+    const { session, published } = harness();
+    session.pushConfig([
+      entity({}),
+      entity({ entityId: 'climate.bad', domain: 'climate', attributes: { friendly_name: 'Bad', icon: 'mdi:radiator' } }),
+      entity({ entityId: 'cover.tor', domain: 'cover', attributes: { friendly_name: 'Tor' } }),
+      entity({ entityId: 'media_player.tv', domain: 'media_player', attributes: { friendly_name: 'TV' } }),
+      entity({ entityId: 'weather.home', domain: 'weather', attributes: { friendly_name: 'Zuhause' } }),
+      entity({ entityId: 'number.soll', domain: 'number', attributes: { friendly_name: 'Soll' } }),
+      entity({ entityId: 'select.modus', domain: 'select', attributes: { friendly_name: 'Modus' } }),
+      entity({ entityId: 'datetime.wecker', domain: 'datetime', attributes: { friendly_name: 'Wecker' } }),
+    ]);
+    const apply = published.find((p) => p.topic === 'tab5_lvgl/config/a1/bridge/apply')!;
+    expect(apply.retain).to.equal(true);
+    const lists = Object.fromEntries(
+      ['sensors', 'climates', 'covers', 'media_players', 'weathers', 'numbers', 'selects', 'datetimes'].map((key) => [key, panelList(apply.payload, key)]),
+    );
+    expect(lists).to.deep.equal({
+      sensors: ['sensor.t'],
+      climates: ['climate.bad'],
+      covers: ['cover.tor'],
+      media_players: ['media_player.tv'],
+      weathers: ['weather.home'],
+      numbers: ['number.soll'],
+      selects: ['select.modus'],
+      datetimes: ['datetime.wecker'],
+    });
+    expect(panelNames(apply.payload, 'climate_meta')).to.deep.equal({ 'climate.bad': 'Bad' });
+    expect(panelIcons(apply.payload, 'climate_meta')).to.deep.equal({ 'climate.bad': 'mdi:radiator' });
+    expect(panelNames(apply.payload, 'cover_meta')).to.deep.equal({ 'cover.tor': 'Tor' });
+    expect(panelNames(apply.payload, 'media_player_meta')).to.deep.equal({ 'media_player.tv': 'TV' });
+    expect(panelNames(apply.payload, 'editable_meta')).to.deep.equal({ 'datetime.wecker': 'Wecker', 'number.soll': 'Soll', 'select.modus': 'Modus' });
+    expect(JSON.parse(apply.payload).weather_meta).to.deep.equal([{ entity_id: 'weather.home', name: 'Zuhause' }]);
+  });
+
+  describe('the bridge/apply size limit (Ruling 108)', () => {
+    const APPLY = 'tab5_lvgl/config/a1/bridge/apply';
+    // A panel copies the apply into a 32768-byte buffer and cuts anything
+    // longer to 32767 bytes, then applies the cut text anyway
+    // (mqtt_handlers.cpp:1497, :1729-1742).
+    const LIMIT = 32767;
+    /**
+     * One sensor whose name pads this session's apply payload to exactly
+     * `bytes` UTF-8 bytes: 1000 of them two-byte umlauts, so the payload is
+     * 1000 characters shorter than it is long in bytes.
+     */
+    function sized(session: PanelSession, bytes: number): VirtualEntity[] {
+      const one = (name: string): VirtualEntity[] => [entity({ attributes: { friendly_name: name } })];
+      const size = (name: string): number => Buffer.byteLength(buildApplyPayload({ entities: one(name), sceneMap: session.sceneMap }));
+      const name = 'ü'.repeat(1000) + 'x'.repeat(1 + bytes - size('x') - 2000);
+      expect(size(name)).to.equal(bytes);
+      return one(name);
+    }
+
+    it('publishes an apply of exactly the panel limit', () => {
+      const { session, published, errors } = harness();
+      expect(session.pushConfig(sized(session, LIMIT))).to.equal(true);
+      expect(Buffer.byteLength(published.find((p) => p.topic === APPLY)!.payload)).to.equal(LIMIT);
+      expect(errors).to.deep.equal([]);
+    });
+
+    it('publishes nothing one byte over, and says so once in English with the size and the largest sections', () => {
+      const { session, published, errors } = harness();
+      expect(session.pushConfig(sized(session, LIMIT + 1))).to.equal(false);
+      // Not the icons either: the broker keeps the last good pair.
+      expect(published).to.deep.equal([]);
+      expect(errors).to.have.length(1);
+      expect(errors[0]).to.include('[Panel a1]').and.to.include(`${LIMIT + 1} bytes`).and.to.include(`${LIMIT}`);
+      expect(errors[0]).to.match(/sensor_meta \d+ bytes/);
+      expect(errors[0]).to.match(/exclude/i);
+    });
+
+    it('does not repeat the error for the same configuration, forced or not', () => {
+      const { session, published, errors } = harness();
+      const big = sized(session, LIMIT + 1);
+      session.pushConfig(big);
+      expect(session.pushConfig(big, true)).to.equal(false);
+      expect(session.pushConfig(big)).to.equal(false);
+      expect(published).to.deep.equal([]);
+      expect(errors).to.have.length(1);
+    });
+
+    it('names a different oversized configuration in an error of its own', () => {
+      const { session, errors } = harness();
+      session.pushConfig(sized(session, LIMIT + 1));
+      session.pushConfig(sized(session, LIMIT + 50));
+      expect(errors).to.have.length(2);
+      expect(errors[1]).to.include(`${LIMIT + 50} bytes`);
+    });
+
+    it('recovers once the configuration fits again, and names the next oversized one anew', () => {
+      const { session, published, errors } = harness();
+      const big = sized(session, LIMIT + 1);
+      session.pushConfig(big);
+      expect(session.pushConfig([entity({})])).to.equal(true);
+      expect(JSON.parse(published.find((p) => p.topic === APPLY)!.payload).sensors).to.deep.equal(['sensor.t']);
+      published.length = 0;
+      session.pushConfig(big);
+      expect(published).to.deep.equal([]);
+      expect(errors).to.have.length(2);
+    });
+
+    it('compares a later push with the configuration last published, not the one refused', () => {
+      // A refused apply never reached the broker: going back to the published
+      // one needs no publish, and a forced push still sends it.
+      const { session, published } = harness();
+      const good = [entity({})];
+      session.pushConfig(good);
+      session.pushConfig(sized(session, LIMIT + 1));
+      published.length = 0;
+      expect(session.pushConfig(good)).to.equal(false);
+      expect(session.pushConfig(good, true)).to.equal(true);
+      expect(published.filter((p) => p.topic === APPLY)).to.have.length(1);
+    });
   });
 
   it('warns instead of silently doing nothing when no refresh handler is wired', async () => {
