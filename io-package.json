@@ -34,7 +34,8 @@
     "maxPublishQueue": 2000,
     "protocolTrace": false,
     "deviceOverrides": [],
-    "manualEntities": []
+    "manualEntities": [],
+    "historyInstance": ""
   },
   "objects": [],
   "instanceObjects": [

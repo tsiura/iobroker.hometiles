@@ -99,6 +99,29 @@ describe('config/options', () => {
     }
   });
 
+  it("keeps the history instance the admin picked, '' for none, and drops one that names no instance, with a warning (Task 19)", () => {
+    expect(DEFAULTS.historyInstance).to.equal('');
+    for (const historyInstance of ['history.0', 'sql.1', 'influxdb.0', 'my-history_2.10']) {
+      const { options, warnings } = validateOptions({ historyInstance });
+      expect(options.historyInstance).to.equal(historyInstance);
+      expect(warnings).to.deep.equal([]);
+    }
+    // No select leaves spaces around it; a hand edit can.
+    expect(validateOptions({ historyInstance: ' sql.0 ' }).options.historyInstance).to.equal('sql.0');
+    for (const historyInstance of ['', null, undefined]) {
+      const { options, warnings } = validateOptions({ historyInstance } as unknown as Partial<AdapterOptions>);
+      expect(options.historyInstance, String(historyInstance)).to.equal('');
+      expect(warnings, String(historyInstance)).to.deep.equal([]);
+    }
+    for (const historyInstance of ['history', 'system.adapter.history.0', 'History.0', 'sql.0; x', 5, {}, true]) {
+      const { options, warnings } = validateOptions({ historyInstance } as unknown as Partial<AdapterOptions>);
+      expect(options.historyInstance, String(historyInstance)).to.equal('');
+      expect(warnings, String(historyInstance)).to.deep.equal([
+        "historyInstance names no instance like history.0; using the system's default history instance",
+      ]);
+    }
+  });
+
   it('keeps only well-formed manual entities, with a warning naming each one dropped (Task 13b)', () => {
     // The shape only: whether the domain suits the state is manualDevices'
     // to judge, against the object itself.

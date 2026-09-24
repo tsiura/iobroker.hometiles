@@ -47,6 +47,8 @@
   "preview_entity_help": "Zeigt Topic und Payload, die dieses Objekt an ein Panel senden würde.",
   "pair_info": "Ein Panel ohne Broker-Zugangsdaten kann sich nicht über MQTT melden. IP-Adresse oder Hostname eintragen, um die oben konfigurierten Zugangsdaten zu übertragen und das Panel neu zu starten. Bereits gemeldete Panels lassen sich über ihren Button control.pair erneut koppeln.",
   "pair_panel": "Panel über Adresse koppeln",
+  "history_instance": "History-Instanz",
+  "history_instance_help": "Die History-, SQL- oder InfluxDB-Instanz, aus der die Panels Verläufe und Zeitleisten lesen. Ist keine gewählt, wird die Standard-History-Instanz des Systems verwendet, falls eine eingestellt ist.",
   "coalesce_ms": "Sammelfenster für Statusänderungen (ms)",
   "coalesce_ms_help": "Änderungen innerhalb dieses Fensters werden einmal gesendet. Der letzte Wert wird immer zugestellt.",
   "max_publish_queue": "Maximale Warteschlange",

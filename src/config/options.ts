@@ -22,7 +22,16 @@ export interface AdapterOptions {
    * keys io-package.json has).
    */
   pickerArmed: boolean;
+  /**
+   * The history, sql or influxdb instance panel history is read from (Task 19),
+   * as the admin's instance select stores it; '' is the system's default
+   * history instance, if one is set.
+   */
+  historyInstance: string;
 }
+
+/** An instance id as js-controller names one: an adapter name, a dot, a number (history.0, sql.1). */
+export const INSTANCE_ID_RE = /^[a-z0-9_-]+\.\d+$/;
 
 /**
  * What this picker's Refresh writes under native.pickerArmed. 4cbb6d3 wrote
@@ -85,6 +94,7 @@ export const DEFAULTS: AdapterOptions = {
   deviceOverrides: [],
   manualEntities: [],
   pickerArmed: false,
+  historyInstance: '',
 };
 
 export function normaliseTopic(value: string | undefined, fallback: string): string {
@@ -178,6 +188,14 @@ function manualEntities(value: unknown, warnings: string[]): ManualEntity[] {
   return entries;
 }
 
+/** The admin's instance select, or a hand edit: anything but an instance id is none, never a guess. */
+function historyInstance(value: unknown, warnings: string[]): string {
+  if (value === undefined || value === null || value === '') return '';
+  if (typeof value === 'string' && INSTANCE_ID_RE.test(value.trim())) return value.trim();
+  warnings.push("historyInstance names no instance like history.0; using the system's default history instance");
+  return '';
+}
+
 function clamp(value: number, min: number, max: number): number {
   if (!Number.isFinite(value)) return min;
   return Math.min(max, Math.max(min, Math.round(value)));
@@ -217,6 +235,7 @@ export function validateOptions(raw: Partial<AdapterOptions>): {
     manualEntities: manualEntities(raw.manualEntities, warnings),
     // Only this picker's Refresh arms: not a hand edit's "2", nor 4cbb6d3's true.
     pickerArmed: (raw.pickerArmed as unknown) === PICKER_VERSION,
+    historyInstance: historyInstance(raw.historyInstance, warnings),
   };
 
   return { options, errors, warnings };

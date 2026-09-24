@@ -173,6 +173,21 @@ describe('admin/jsonConfig', () => {
     );
   });
 
+  it('offers the instances that answer getHistory as the history instance, none meaning the system default (Task 19)', () => {
+    const field = config.items.advanced.items.historyInstance;
+    // json-config 10.0.6 ConfigInstanceSelect: `_dataSources` lists every
+    // instance whose common.getHistory is set (:17-25), and unless
+    // allowDeactivate is false a "none" choice stores ConfigGeneric.NONE_VALUE,
+    // '' (:54-56; ConfigGeneric.js:57), the value validateOptions keeps as none.
+    expect(field).to.include({ type: 'instance', adapter: '_dataSources' });
+    expect(field.allowDeactivate).to.not.equal(false);
+    expect(field).to.not.have.property('long');
+    expect(field).to.not.have.property('short');
+    expect(ioPackage.native.historyInstance).to.equal('');
+    const { options, warnings } = validateOptions({ historyInstance: ioPackage.native.historyInstance });
+    expect([options.historyInstance, warnings]).to.deep.equal(['', []]);
+  });
+
   it('wires each action button to a command the adapter implements', () => {
     // Read from main.ts itself, so a command it stops answering fails here.
     expect([...handled]).to.include.members(['listDetected', 'refreshDetected', 'testBroker', 'previewEntity', 'pairPanel']);
