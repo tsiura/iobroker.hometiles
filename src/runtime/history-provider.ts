@@ -317,8 +317,9 @@ export class HistoryProvider {
   /**
    * The newest row at or before `end` that suits `kind`, however old, from
    * the newest `count` rows up to `end`. When rows come back and none suits
-   * -- bad quality, or only rows of a day file after `end` -- it looks back
-   * once more, as far as the bound allows (Task 20b).
+   * -- each of bad quality, or no number -- it looks back once more, as far
+   * as the bound allows (Task 20b). An empty answer is final: the rows a day
+   * file spills past `end` are dropped before it is sent.
    */
   private async prior(instance: string, id: string, end: number, count: number, kind: HistoryKind): Promise<SourceValue | undefined | HistoryFailure> {
     const rows = await this.ask(instance, id, { end, count });
