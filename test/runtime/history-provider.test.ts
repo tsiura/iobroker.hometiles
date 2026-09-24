@@ -897,6 +897,36 @@ describe('runtime/history-provider', () => {
         expect(result.readings).to.deep.equal([TODAY, ...HOURS].map((t) => expected(COUNTER, t)));
       });
 
+      it('keeps the readings of each state apart, and serves a second round of both from the cache (review I2)', async () => {
+        const A = COUNTER;
+        const B = COUNTER.map((row) => ({ ...row, val: 5000 + (row.val as number) * 2 }));
+        const fake = new FakeAdapter('sql.0', (options, id) => sqlAdapter(id === 'a.0.m1' ? A : B, options));
+        const provider = provide(fake);
+        const times = [MIDNIGHTS[0]!, TODAY, ...HOURS];
+        const round = async (): Promise<Readings[]> => [await before(provider, times, 'panel-a', 'a.0.m1'), await before(provider, times, 'panel-a', 'a.0.m2')];
+        const first = await round();
+        expect(first.map((result) => result.readings)).to.deep.equal([times.map((t) => expected(A, t)), times.map((t) => expected(B, t))]);
+        expect(new Set(fake.calls.map((call) => call.id))).to.deep.equal(new Set(['a.0.m1', 'a.0.m2']));
+        const calls = fake.calls.length;
+        expect(await round()).to.deep.equal(first);
+        expect(fake.calls).to.have.length(calls);
+      });
+
+      it('asks again for a midnight less than a minute old, however exact a midnight question is (review m2)', async () => {
+        clock.setSystemTime(TODAY + 45_000);
+        const fake = sqlFake(COUNTER);
+        const provider = provide(fake);
+        await before(provider, [TODAY]);
+        await before(provider, [TODAY]);
+        // A reading stamped 23:59:59.9 that the history adapter logs late would otherwise be lost.
+        expect(fake.calls.filter((call) => call.options.end === TODAY - 1)).to.have.length(2);
+        clock.tick(MINUTE);
+        await before(provider, [TODAY]);
+        const calls = fake.calls.length;
+        await before(provider, [TODAY]);
+        expect(fake.calls).to.have.length(calls);
+      });
+
       it('asks again for a boundary less than a minute old: the history adapter may log a reading before it late', async () => {
         const fake = sqlFake(COUNTER);
         const provider = provide(fake);

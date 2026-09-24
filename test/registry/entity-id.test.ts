@@ -162,6 +162,12 @@ describe('registry/entity-id', () => {
       expect(resolveEnergyIds([meter('shelly.0.em.total', 'Netzbezug')], stored)).to.deep.equal(stored);
     });
 
+    it('keeps a stored id for its meter though a new row above it takes the same name (review m1)', () => {
+      // One pass in row order would hand energy.strom to the new row: B's tile would show A's consumption.
+      const ids = resolveEnergyIds([meter('x.0.a', 'Strom'), meter('x.0.b', 'Strom')], { 'energy:x.0.b': 'energy.strom' });
+      expect(ids).to.deep.equal({ 'energy:x.0.a': 'energy.strom_2', 'energy:x.0.b': 'energy.strom' });
+    });
+
     it("never gives a meter another meter's id or its cost entry's id, <id>_cost", () => {
       const ids = resolveEnergyIds([meter('a.0.grid', 'Grid'), meter('a.0.cost', 'Grid cost'), meter('a.0.again', 'Grid')], {});
       expect(ids).to.deep.equal({ 'energy:a.0.grid': 'energy.grid', 'energy:a.0.cost': 'energy.grid_cost_2', 'energy:a.0.again': 'energy.grid_2' });
