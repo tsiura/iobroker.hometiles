@@ -1,7 +1,7 @@
 import type { Announcement, LocalIoChannel } from '../protocol/announce';
 import { buildApplyPayload, buildIconsPayload, configSignature } from '../protocol/apply';
-import { CommandError, parseCommand, requireEntityId } from '../protocol/commands';
-import { MAX_CONTROL_BYTES } from '../protocol/editable';
+import { CommandError, parseCommand, parseValueCommand, requireEntityId, type ServiceCall } from '../protocol/commands';
+import { buildValueAck, CONTROL_SESSION, MAX_CONTROL_BYTES, type ValueStatus } from '../protocol/editable';
 import { buildStateClear, buildStatePublish } from '../protocol/state-payload';
 import {
   applyTopic,
@@ -27,13 +27,28 @@ export interface PanelTransport {
 /**
  * Command leaves this adapter implements. Everything else is deliberately not
  * subscribed. Each is the firmware's own topic leaf (mqtt_topics.cpp:9-14):
- * media_player's is "media".
+ * media_player's is "media", and number, select and datetime share "value"
+ * (value_control.cpp:311).
  */
-const COMMAND_LEAVES = ['light', 'switch', 'scene', 'climate', 'cover', 'media'] as const;
+const COMMAND_LEAVES = ['light', 'switch', 'scene', 'climate', 'cover', 'media', 'value'] as const;
 type CommandLeaf = (typeof COMMAND_LEAVES)[number];
 
 /** A weather request repeated within this long of its answer is not answered again. */
 const WEATHER_REQUEST_REPEAT_MS = 1000;
+
+/**
+ * A value command's deadline, epoch seconds, must lie ahead by at most this
+ * much (__init__.py:1562-1566); the panel sends now + 10 (value_control.cpp:
+ * 309). A panel whose clock is off by more gets "expired" for every command.
+ */
+const MAX_DEADLINE_AHEAD_S = 15;
+/** Command ids held against a replay, at most (__init__.py:1567-1570). */
+const MAX_HELD_COMMAND_IDS = 128;
+const EDITABLE_DOMAINS: ReadonlySet<string> = new Set(['number', 'select', 'datetime']);
+/** A failed value command is logged at most once in this long per panel, with how many failed meanwhile: each is answered. */
+const FAILURE_LOG_INTERVAL_MS = 60_000;
+/** What the dispatcher refuses a value with that is itself an answer; any other refusal means it cannot be written. */
+const VALUE_REFUSALS: ReadonlySet<string> = new Set(['changed', 'unavailable', 'invalid_value', 'invalid_step', 'invalid_option']);
 
 export class PanelSession {
   private lastSignature: string | null = null;
@@ -49,6 +64,16 @@ export class PanelSession {
    * payload that fits or the entity's removal.
    */
   private readonly oversized = new Set<string>();
+  /**
+   * The numbers, selects and datetimes pushed to this panel, as last pushed:
+   * a value command for any other entity is dropped (__init__.py:1557), and
+   * the /control published after an answer is this one.
+   */
+  private readonly editables = new Map<string, VirtualEntity>();
+  /** Value command id -> its deadline, epoch seconds: a replay while it runs is dropped (Ruling 99). */
+  private readonly commandIds = new Map<string, number>();
+  private failureLoggedAt = -Infinity;
+  private failuresUnlogged = 0;
 
   online = false;
   ip: string | null = null;
@@ -178,11 +203,13 @@ export class PanelSession {
       );
     }
     if (entity.domain === 'weather') this.weathers.set(entity.entityId, entity);
+    if (EDITABLE_DOMAINS.has(entity.domain)) this.editables.set(entity.entityId, entity);
     this.transport.publish(request);
   }
 
   clearEntityState(entityId: string): void {
     this.weathers.delete(entityId);
+    this.editables.delete(entityId);
     this.oversized.delete(entityId);
     this.transport.publish(buildStateClear(this.haPrefix, entityId));
   }
@@ -196,9 +223,10 @@ export class PanelSession {
    * stop after the first match: command topics are keyed by BASE TOPIC, not
    * device id, so two panels sharing a base topic would otherwise both execute
    * the same press — one physical tap becoming two writes, and a toggle
-   * netting to no visible change at all.
+   * netting to no visible change at all. `retain`: the broker replayed the
+   * message on a new subscription (MQTT 3.1.1 §3.3.1.3).
    */
-  async handleMessage(topic: string, payload: string): Promise<boolean> {
+  async handleMessage(topic: string, payload: string, retain = false): Promise<boolean> {
     if (topic === bridgeRequestTopic(this.deviceId)) {
       // Signature reset makes the next pushConfig unconditional.
       this.lastSignature = null;
@@ -243,7 +271,8 @@ export class PanelSession {
     const leaf = COMMAND_LEAVES.find((candidate) => topic === commandTopic(this.baseTopic, candidate));
     if (!leaf) return false;
 
-    await this.executeCommand(leaf, payload);
+    if (leaf === 'value') await this.executeValueCommand(payload, retain);
+    else await this.executeCommand(leaf, payload);
     return true;
   }
 
@@ -276,7 +305,81 @@ export class PanelSession {
     this.pushEntityState(entity);
   }
 
-  private async executeCommand(leaf: CommandLeaf, payload: string): Promise<void> {
+  /**
+   * A number, select or datetime command, taken as the Bridge takes one
+   * (Ruling 99, __init__.py:1549-1590). Dropped without an answer: a retained
+   * one, which every new subscription would run again; one that is no
+   * command (parseValueCommand); one for an entity not pushed to this panel;
+   * an id seen while its deadline runs, or any while 128 are held. "expired"
+   * for a deadline not within 15 s ahead, in epoch seconds, or another
+   * session; then the dispatcher (valueWrite). Every answer goes out on
+   * stat/value, and the entity's /control after it. Refusals are logged at
+   * debug only: the answer carries them.
+   */
+  private async executeValueCommand(payload: string, retain: boolean): Promise<void> {
+    if (retain) return;
+    let call: Extract<ServiceCall, { kind: 'set_value' }>;
+    try {
+      call = parseValueCommand(payload);
+    } catch (error) {
+      const code = error instanceof CommandError ? error.code : (error as Error).message;
+      this.log.debug(`[Panel ${this.deviceId}] Value command dropped: ${code}`);
+      return;
+    }
+    if (!this.editables.has(call.entityId)) {
+      this.log.debug(`[Panel ${this.deviceId}] Value command dropped: ${call.entityId} is no editable value of this panel`);
+      return;
+    }
+    const now = this.now() / 1000;
+    const { deadline } = call;
+    let status: ValueStatus;
+    if (typeof deadline !== 'number' || !(deadline - now > 0 && deadline - now <= MAX_DEADLINE_AHEAD_S) || call.session !== CONTROL_SESSION) {
+      status = 'expired';
+    } else {
+      for (const [id, expiry] of this.commandIds) if (expiry <= now) this.commandIds.delete(id);
+      if (this.commandIds.has(call.id) || this.commandIds.size >= MAX_HELD_COMMAND_IDS) {
+        this.log.debug(`[Panel ${this.deviceId}] Value command ${call.id} dropped: seen, or ${MAX_HELD_COMMAND_IDS} held`);
+        return;
+      }
+      this.commandIds.set(call.id, deadline);
+      status = await this.dispatchValue(call);
+    }
+    if (status !== 'ok') this.log.debug(`[Panel ${this.deviceId}] Value command for ${call.entityId} refused: ${status}`);
+    this.transport.publish(buildValueAck(this.baseTopic, call.entityId, call.id, status));
+    // As the Bridge does after every answer (__init__.py:1586): the panel re-reads it.
+    const entity = this.editables.get(call.entityId);
+    if (entity) this.pushEntityState(entity);
+  }
+
+  /** The dispatcher's outcome as an answer: a failed write, or anything thrown, is "failed" (__init__.py:1581-1583). */
+  private async dispatchValue(call: Extract<ServiceCall, { kind: 'set_value' }>): Promise<ValueStatus> {
+    let cause: string;
+    try {
+      const result = await this.dispatcher.dispatch(call);
+      if (result.ok) return 'ok';
+      if (result.reason !== 'write_failed') return VALUE_REFUSALS.has(result.reason) ? (result.reason as ValueStatus) : 'unavailable';
+      cause = result.cause ?? 'the write failed';
+    } catch (error) {
+      cause = (error as Error).message;
+    }
+    this.logFailure(call.entityId, cause);
+    return 'failed';
+  }
+
+  /** One English line per failure, at most once a minute, then with how many failed meanwhile. */
+  private logFailure(entityId: string, cause: string): void {
+    const now = this.now();
+    if (now - this.failureLoggedAt < FAILURE_LOG_INTERVAL_MS) {
+      this.failuresUnlogged++;
+      return;
+    }
+    const more = this.failuresUnlogged > 0 ? ` (and ${this.failuresUnlogged} more since the last such line)` : '';
+    this.failureLoggedAt = now;
+    this.failuresUnlogged = 0;
+    this.log.error(`[Panel ${this.deviceId}] Value command for ${entityId} failed: ${cause}${more}`);
+  }
+
+  private async executeCommand(leaf: Exclude<CommandLeaf, 'value'>, payload: string): Promise<void> {
     try {
       const call = parseCommand(leaf, payload);
       const result = await this.dispatcher.dispatch(call);

@@ -58,11 +58,16 @@ async function setObjects(harness: IntegrationTestHarness, objects: Record<strin
 /**
  * The harness backs its database up once per run, from whatever the previous
  * run's last suite left behind (prepareTestDir never clears it), so a suite
- * that writes objects removes every fixture before and after itself.
+ * that writes objects removes every fixture before and after itself -- its
+ * value too: a helper a panel command wrote (Task 15) would otherwise hold
+ * that value in the next run, where a test expects none yet.
  */
 function withCleanFixtures(getHarness: () => IntegrationTestHarness): void {
   const removeAll = async (): Promise<void> => {
-    for (const id of FIXTURE_IDS) await getHarness().objects.delObjectAsync(id).catch(() => undefined);
+    for (const id of FIXTURE_IDS) {
+      await getHarness().objects.delObjectAsync(id).catch(() => undefined);
+      await Promise.resolve(getHarness().states.delState(id)).catch(() => undefined);
+    }
   };
   before(removeAll);
   after(removeAll);
@@ -539,6 +544,37 @@ if (process.env.HOMETILES_INTEGRATION === '1') {
           } finally {
             late.end(true);
           }
+        });
+
+        it("confirms a panel's command on a 0_userdata helper that no adapter acks (Task 15, Ruling 100)", async function () {
+          // Longer than one wait, so a wait that runs out says what it waited for.
+          this.timeout(120000);
+          const harness = getHarness();
+          const topic = 'ha/e2e/number/soll/control';
+          const acks: Array<Record<string, unknown>> = [];
+          panel().on('message', (messageTopic, payload) => {
+            if (messageTopic === 'hometiles-e2e/stat/value') acks.push(JSON.parse(payload.toString()) as Record<string, unknown>);
+          });
+          await panel().subscribeAsync('hometiles-e2e/stat/value');
+          const shown = (): Record<string, unknown> => JSON.parse(controls.get(topic) ?? '{}') as Record<string, unknown>;
+
+          // The second command carries the revision of the /control the first one's change produced.
+          for (const [value, id] of [
+            [21, '1a2b3c4d-0002b1c8-00000001'],
+            [22, '1a2b3c4d-0002b1c8-00000002'],
+          ] as const) {
+            const { session, revision } = shown();
+            const deadline = Math.floor(Date.now() / 1000) + 10;
+            await panel().publishAsync('hometiles-e2e/cmnd/value', JSON.stringify({ entity_id: 'number.soll', session, revision, value, id, deadline }));
+            const ack = await waitFor(harness, () => acks.find((answer) => answer.id === id), `the answer to ${value}`);
+            expect(ack).to.deep.equal({ entity_id: 'number.soll', id, status: 'ok' });
+            // Written as a command, and nothing acks a 0_userdata state.
+            expect(await harness.states.getStateAsync(SOLL)).to.include({ val: value, ack: false });
+            // That change reached the entity (main.ts:277): the /control the panel waits for.
+            await waitFor(harness, () => (shown().state === String(value) ? true : undefined), `the /control showing ${value}`);
+          }
+          const noisy = logs.filter((log) => log.message.startsWith('hometiles.0 ') && log.severity !== 'debug' && log.message.includes('number.soll'));
+          expect(noisy.map((log) => log.message)).to.deep.equal([]);
         });
 
         /** The adapter's own warnings that contain `text`, from their `[Registry]` tag on. */

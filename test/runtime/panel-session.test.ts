@@ -70,6 +70,9 @@ describe('runtime/panel-session', () => {
     expect(subscribed).to.include('hometiles/cmnd/switch');
     expect(subscribed).to.include('hometiles/cmnd/scene');
     expect(subscribed).to.include('hometiles/cmnd/climate');
+    // One leaf for number, select and datetime (value_control.cpp:311), not their domains (Ruling 16).
+    expect(subscribed).to.include('hometiles/cmnd/value');
+    for (const domain of ['number', 'select', 'datetime']) expect(subscribed).to.not.include(`hometiles/cmnd/${domain}`);
     expect(subscribed).to.include('hometiles/stat/connected');
     expect(subscribed).to.include('hometiles/stat/ip');
     expect(subscribed).to.include('tab5_lvgl/config/a1/bridge/request');

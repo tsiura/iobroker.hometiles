@@ -284,12 +284,13 @@ is easy to misread as a request/ack exchange. It is not one. Precisely:
   the next `cmnd/value` command (`value_control.cpp:298`). The
   accept/reject decision based on that echoed pair — i.e. detecting that a
   command was issued against state the Bridge already knows is stale — is
-  **not implemented in this firmware**; see UNVERIFIED.
+  **not implemented in this firmware**. The receiver makes it: see "How the
+  receiver checks a command" below.
 - **`deadline`** appears **only** in the outbound `cmnd/value` command
   (§4) — it is never present in the inbound `EditableValue` (the struct has
   no such field at all, `value_control.h:9-15`) and is never echoed back.
-  The device computes it, sends it, and forgets it. Whether/how the
-  receiving side enforces it is outside this firmware; see UNVERIFIED.
+  The device computes it, sends it, and forgets it. The receiver enforces
+  it (below).
 - The device's own staleness handling of its own outstanding command is a
   **separate, local 30-second timeout**, independent of the `deadline` it
   sent: if no ack/matching state arrives within 30 s
@@ -335,6 +336,64 @@ is easy to misread as a request/ack exchange. It is not one. Precisely:
   command is cleared immediately and an error status is shown
   (`value_control.cpp:926-927`). The firmware defines no specific rejection
   string/enum; it only checks "is this literally `\"ok\"`".
+
+### How the receiver checks a command (Bridge, and this adapter: Task 15)
+
+Read from the Bridge, `_async_handle_value_command` (`__init__.py:1549-1590`)
+and `build_editable_service_call` (`editable_helpers.py:100-152`); this
+adapter follows it (Ruling 99; `src/runtime/panel-session.ts`,
+`src/protocol/editable.ts` `valueWrite`). In this order:
+
+1. **Dropped, no answer**: a retained command (it would run again at every
+   subscription; a broker marks retained only what it replays on a new one);
+   one over 2048 bytes (the Bridge counts characters, this adapter bytes);
+   no JSON object; an `entity_id` that is no number, select or datetime of
+   this panel (compared exactly); an `id` that is no string of 1-48
+   characters (code points).
+2. **`"expired"`**: `deadline` not a number (a boolean is none), or not
+   `0 < deadline - now <= 15` in epoch seconds, or a `session` other than
+   the receiver's own. **A panel whose clock is more than 15 s off gets
+   `"expired"` for every command.**
+3. **Dropped, no answer**: an `id` seen before whose deadline has not
+   passed, or any command while 128 such ids are held. Each accepted id is
+   held until its deadline.
+4. **`"changed"`**: `revision` other than the one the entity's `/control`
+   has now.
+5. **`"unavailable"`**: the `/control` says `writable: false` — which
+   includes an unavailable value (`writable` is `available && …`).
+6. The value: a number must be a JSON number within `min`..`max`
+   (`"invalid_value"`) and on the step grid anchored at `min`, within 1e-6
+   of a step (`"invalid_step"`); a select option must be one of `options`
+   exactly (`"invalid_option"`); a date, time or date-time must be text in
+   the kind's shape — `YYYY-MM-DD`, `HH:MM[:SS]`, the date, `' '` or `'T'`,
+   the time — and a real calendar value (`"invalid_value"`).
+7. A write or service call that throws: **`"failed"`**, logged.
+8. The answer, `{entity_id, id, status}`, on `<device_base>/stat/value`, not
+   retained; then the entity's current `/control` is published again.
+
+Where this adapter differs, the firmware decides:
+
+- **The panel's numbers are not the published ones.** ArduinoJson 7.4.3
+  parses a decimal whose digits fit 23 bits (at most 8388607) as a *float*
+  (`parseNumber.hpp:217-229`) and prints a float with 6 decimals, a double
+  with 9, fewer as the integral part grows (`TextFormatter.hpp:67-104`,
+  `FloatParts.hpp:56-93`); `finite_json` reads `min`, `max` and `step` back
+  through that print (`value_control.cpp:28-34`). A step of `0.08197082`
+  is `0.081971` on the panel, and its grid drifts from ours by 2.2e-6 of a
+  step per step. The command's value, a double, is printed the same way
+  (`:306`), and a double a float holds exactly is kept as a float
+  (`VariantImpl.hpp:73-98`): `1234567.5` goes out as `1234568`. This adapter
+  checks the value on the panel's own numbers (`src/protocol/arduinojson.ts`,
+  checked against the library on 180,000 numbers) and writes the panel's own
+  draft for that step, printed `%.15g` as the panel prints it (`:317-318`),
+  within the object's range. The Bridge checks on its own grid and refuses
+  such a panel's commands.
+- **The repeated autumn hour** is written as its first instant, summer
+  time; the Bridge refuses it (`ambiguous_time`, which becomes
+  `"invalid_value"`). Both instants read back as the same text, and the
+  panel cannot tell them apart either. A time the zone skips is refused by
+  both.
+- An epoch date is written in the adapter host's zone (Ruling 84).
 
 ## 6. Select options — delivery, limits, encoding
 
@@ -444,6 +503,10 @@ they ride inside the same `/control` JSON payload as everything else in
 | each option string | 1–255 bytes, no `\n`/`\r`, unique | `value_control.cpp:97-98` |
 | local command timeout (device-side, independent of `deadline`) | 30 s from publish | `value_control.cpp:801` |
 | `deadline` the device requests | `now + 10` s | `value_control.cpp:309` |
+| `deadline` the receiver accepts | `0 < deadline - now <= 15` s | `__init__.py:1562-1566` |
+| `cmnd/value` payload the receiver reads | ≤ 2048 (Bridge: characters; this adapter: bytes) | `__init__.py:1550` |
+| command `id` | 1–48 characters | `__init__.py:1557-1559` |
+| command ids held against replay | 128, each until its deadline | `__init__.py:1567-1570` |
 
 Cached editable state is pruned whenever an entity drops out of the current
 `numbers_text`/`selects_text`/`datetimes_text` lists, which also bumps the
@@ -454,24 +517,15 @@ generation counter so every visible tile re-renders
 
 ## UNVERIFIED
 
-- **What `status` string(s) the Bridge is expected to send on rejection.**
-  The firmware only distinguishes the exact string `"ok"` from everything
-  else (`value_control.cpp:922-927`); it defines no rejection vocabulary.
-  HomeTiles Bridge is a separate repository (per `PROJECT_CONTEXT.md`) and
-  was not available to inspect from here.
+- ~~What `status` string(s) the Bridge sends on rejection~~ — resolved from
+  the Bridge source: see "How the receiver checks a command" in §5.
 - ~~How `session` and `revision` are generated~~ — resolved from the Bridge
   source: see "How the tokens are made" in §5.
-- **Whether/how the Bridge enforces the `deadline` the device sends.** No
-  code path in this firmware depends on it being honored — it is emitted
-  and never read back. Not verifiable without the Bridge source.
-- **Exact `ArduinoJson` float serialization precision** used when the
-  firmware writes `doc["value"] = number` for a `number` command
-  (`value_control.cpp:306`). No project-level precision override
-  (`ARDUINOJSON_DECIMAL_PLACES` or similar) was found in this checkout, so
-  the library default applies, but that default was not independently
-  pinned down here. For a `step` finer than a couple of decimal places,
-  verify the actual bytes on the wire rather than assuming full precision
-  survives serialization.
+- ~~Whether/how the Bridge enforces the `deadline`~~ — resolved: see "How
+  the receiver checks a command" in §5.
+- ~~Exact `ArduinoJson` float serialization precision~~ — resolved from the
+  library (7.4.3, `firmware.yml:96`, no override in the firmware): see
+  "Where this adapter differs" in §5.
 - **MQTT QoS level** used for any of these topics. The publish/subscribe
   wrapper signatures seen (`mqttEnqueuePublish(topic, payload, retain)`,
   `network_manager.h:55-56`) expose no QoS parameter; not chased further as

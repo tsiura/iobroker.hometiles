@@ -87,12 +87,13 @@ export class PanelManager {
     await this.deps.onSessionsChanged();
   }
 
-  async handleMessage(topic: string, payload: string): Promise<void> {
+  /** `retain`: the broker replayed it on a new subscription; a value command then is ignored (Task 15). */
+  async handleMessage(topic: string, payload: string, retain = false): Promise<void> {
     // First match wins. A command carries the entity and the desired state, so
     // it does not matter which panel sent it — but executing it once per
     // session would turn one tap into N writes.
     for (const session of this.panels.values()) {
-      if (await session.handleMessage(topic, payload)) return;
+      if (await session.handleMessage(topic, payload, retain)) return;
     }
   }
 

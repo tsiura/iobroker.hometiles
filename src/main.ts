@@ -127,7 +127,7 @@ class HomeTiles extends utils.Adapter {
       void this.setState('info.connection', connected, true);
       if (connected) void this.mqtt.subscribe(ANNOUNCE_TOPIC_PATTERN);
     });
-    this.mqtt.onMessage((topic, payload) => void this.onMqttMessage(topic, payload));
+    this.mqtt.onMessage((topic, payload, retain) => void this.onMqttMessage(topic, payload, retain));
 
     await this.discover();
     await this.subscribeStatesAsync('panels.*');
@@ -214,7 +214,7 @@ class HomeTiles extends utils.Adapter {
 
   // ---- MQTT ----
 
-  private async onMqttMessage(topic: string, payload: string): Promise<void> {
+  private async onMqttMessage(topic: string, payload: string, retain: boolean): Promise<void> {
     const announceDeviceId = deviceIdFromAnnounceTopic(topic);
     if (announceDeviceId) {
       try {
@@ -228,7 +228,7 @@ class HomeTiles extends utils.Adapter {
 
     // The manager owns command routing; main only mirrors the panel's own
     // retained echoes into the object tree afterwards.
-    await this.panels.handleMessage(topic, payload);
+    await this.panels.handleMessage(topic, payload, retain);
     for (const session of this.panels.sessions()) {
       await this.mirrorPanelStat(session, topic, payload);
     }

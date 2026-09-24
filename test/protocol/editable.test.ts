@@ -1,6 +1,14 @@
 import { expect } from 'chai';
 import { createHash } from 'node:crypto';
-import { buildControlPayload, CONTROL_SESSION, controlRevision, MAX_CONTROL_BYTES, type ControlPayload } from '../../src/protocol/editable';
+import {
+  buildControlPayload,
+  buildValueAck,
+  CONTROL_SESSION,
+  controlRevision,
+  MAX_CONTROL_BYTES,
+  type ControlPayload,
+} from '../../src/protocol/editable';
+import { MAX_ENTITY_ID_LENGTH } from '../../src/registry/entity-id';
 import type { VirtualEntity } from '../../src/registry/types';
 
 /*
@@ -417,5 +425,36 @@ describe('protocol/editable: the /control payload (Task 14)', () => {
       const payload = expectWithoutOptions(withAttributes(change(SELECT, { state }), { options }));
       expect(utf8(payload)).to.be.below(2_000);
     });
+  });
+});
+
+describe('protocol/editable: the answer to a value command (Task 15)', () => {
+  // The panel reads it at value_control.cpp:913-930: <base>/stat/value, at
+  // most 1024 bytes, entity_id and id exactly as it sent them, and only the
+  // literal string "ok" as accepted. The Bridge sends the same three keys,
+  // not retained (__init__.py:1584-1585).
+  const REFUSALS = ['expired', 'changed', 'unavailable', 'invalid_value', 'invalid_step', 'invalid_option', 'failed'] as const;
+
+  it('goes to <base>/stat/value, not retained, with exactly the three keys the panel reads', () => {
+    expect(buildValueAck('hometiles', 'number.soll', '1a2b3c4d-0002b1c8-00000007', 'ok')).to.deep.equal({
+      topic: 'hometiles/stat/value',
+      payload: '{"entity_id":"number.soll","id":"1a2b3c4d-0002b1c8-00000007","status":"ok"}',
+      retain: false,
+    });
+  });
+
+  it('says ok as the literal string, and every refusal as another', () => {
+    for (const status of REFUSALS) {
+      const ack = JSON.parse(buildValueAck('hometiles', 'number.soll', 'abc', status).payload) as Record<string, unknown>;
+      expect(ack).to.deep.equal({ entity_id: 'number.soll', id: 'abc', status });
+      expect(ack.status).to.not.equal('ok');
+    }
+  });
+
+  it('stays within the 1024 bytes the panel reads, for the longest entity id, id and status there are', () => {
+    // An id of 48 characters that each escape to 6 bytes, the longest status.
+    const entityId = `number.${'x'.repeat(MAX_ENTITY_ID_LENGTH - 'number.'.length)}`;
+    const { payload } = buildValueAck('hometiles', entityId, '\u0001'.repeat(48), 'invalid_option');
+    expect(Buffer.byteLength(payload)).to.be.at.most(1024);
   });
 });

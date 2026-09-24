@@ -190,6 +190,7 @@ describe('runtime/dispatcher', () => {
       ok: false,
       reason: 'write_failed',
       applied: 0,
+      cause: 'object not writable',
     });
   });
 
@@ -215,7 +216,7 @@ describe('runtime/dispatcher', () => {
     };
     const d = new Dispatcher(lookup([LIGHT]), failSecond, silentLog);
     const result = await d.dispatch({ kind: 'set_light', entityId: 'light.d', state: 'on', brightnessPct: 42 });
-    expect(result).to.deep.equal({ ok: false, reason: 'write_failed', applied: 1 });
+    expect(result).to.deep.equal({ ok: false, reason: 'write_failed', applied: 1, cause: 'not writable' });
     expect(writes).to.deep.equal([['hue.0.d.on', true]]);
   });
 
@@ -223,6 +224,15 @@ describe('runtime/dispatcher', () => {
   // write flag, so a read-only object (e.g. a KNX switch status, common.write
   // false) was written and reported ok:true. Entities come from the REAL
   // synths, so the flag has to travel DeviceInput -> baseEntity -> channelMeta.
+  it('sends a value command to number, select and datetime alone: the allow-list is the boundary (Task 15)', async () => {
+    const d = new Dispatcher(lookup([SWITCH, SENSOR]), write, silentLog);
+    for (const entityId of ['switch.k', 'sensor.t']) {
+      const call: ServiceCall = { kind: 'set_value', entityId, id: 'x', session: '', revision: '', deadline: 0, value: true };
+      expect(await d.dispatch(call), entityId).to.deep.equal({ ok: false, reason: 'call_not_allowed_for_domain', applied: 0 });
+    }
+    expect(writes).to.deep.equal([]);
+  });
+
   describe('read-only channels (Ruling 38)', () => {
     const at = (val: unknown): SourceValue => ({ val, ack: true, q: 0, ts: 1 });
     const onOff = (objectId: string, write?: boolean): ChannelInput => ({ objectId, type: 'boolean', write });

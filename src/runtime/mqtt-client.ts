@@ -20,7 +20,7 @@ const DROP_WARN_INTERVAL_MS = 10_000;
 export class HomeTilesMqttClient {
   private client: MqttClient | null = null;
   private queue: PublishRequest[] = [];
-  private messageHandler: ((topic: string, payload: string) => void) | null = null;
+  private messageHandler: ((topic: string, payload: string, retain: boolean) => void) | null = null;
   private connectionHandler: ((connected: boolean) => void) | null = null;
   private isConnected = false;
   private dropped = 0;
@@ -44,7 +44,12 @@ export class HomeTilesMqttClient {
     return this.queue.length;
   }
 
-  onMessage(handler: (topic: string, payload: string) => void): void {
+  /**
+   * `retain` is true only for a message the broker replays on a new
+   * subscription; a live one arrives without it, however it was published
+   * (MQTT 3.1.1 §3.3.1.3).
+   */
+  onMessage(handler: (topic: string, payload: string, retain: boolean) => void): void {
     this.messageHandler = handler;
   }
 
@@ -75,9 +80,9 @@ export class HomeTilesMqttClient {
     // the adapter process. The protocol parsers these handlers feed THROW by
     // design on malformed input, and that input arrives from the network, so
     // this is the difference between one rejected payload and a crash loop.
-    client.on('message', (topic, payload) => {
+    client.on('message', (topic, payload, packet) => {
       try {
-        this.messageHandler?.(topic, payload.toString('utf8'));
+        this.messageHandler?.(topic, payload.toString('utf8'), packet.retain);
       } catch (error) {
         this.log.error(`[MQTT] Message handler failed for ${topic}: ${(error as Error).message}`);
       }

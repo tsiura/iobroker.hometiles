@@ -40,7 +40,13 @@ export type ServiceCall =
   /** `value`: the slider's whole percent, 0..100 -- the wire's 0..1 volume_level times 100. */
   | { kind: 'media_set_volume'; entityId: string; value: number }
   /** `position`: seconds into the track, as the panel sends them. */
-  | { kind: 'media_seek'; entityId: string; position: number };
+  | { kind: 'media_seek'; entityId: string; position: number }
+  /**
+   * A number, select or datetime's value (Task 15), with what the panel sent
+   * beside it: its command id, and the session, revision and deadline the
+   * panel session and the dispatcher check as they came (Ruling 99).
+   */
+  | { kind: 'set_value'; entityId: string; id: string; session: unknown; revision: unknown; deadline: unknown; value: unknown };
 
 export class CommandError extends Error {
   constructor(public readonly code: string) {
@@ -325,6 +331,31 @@ export function parseMediaCommand(raw: string): ServiceCall {
     default:
       throw new CommandError('unsupported_media_command');
   }
+}
+
+/** A value command longer than this is no command (__init__.py:1550). */
+const MAX_VALUE_COMMAND_BYTES = 2048;
+/** The Bridge's bound on a command id, in characters as Python counts them: code points (__init__.py:1557-1559). */
+const MAX_COMMAND_ID_LENGTH = 48;
+
+/**
+ * cmnd/value, one topic for number, select and datetime (value_control.cpp:
+ * 293-312; docs/contract-editable.md §4). Only what makes it a command at
+ * all is checked here, each failure a silent drop as the Bridge's
+ * (__init__.py:1550-1559): at most 2048 bytes, a JSON object, an entity_id
+ * text -- taken exactly, since the answer must echo what the panel compares
+ * (value_control.cpp:919) -- and an id of 1 to 48 characters. Session,
+ * revision, deadline and value come through as they are, for the checks
+ * that answer (Ruling 99).
+ */
+export function parseValueCommand(raw: string): Extract<ServiceCall, { kind: 'set_value' }> {
+  if (Buffer.byteLength(raw, 'utf8') > MAX_VALUE_COMMAND_BYTES) throw new CommandError('command_too_long');
+  const payload = parseObject(raw);
+  const { entity_id: entityId, id } = payload;
+  if (typeof entityId !== 'string') throw new CommandError('missing_entity_id');
+  const length = typeof id === 'string' ? [...id].length : 0;
+  if (typeof id !== 'string' || length < 1 || length > MAX_COMMAND_ID_LENGTH) throw new CommandError('invalid_command_id');
+  return { kind: 'set_value', entityId, id, session: payload.session, revision: payload.revision, deadline: payload.deadline, value: payload.value };
 }
 
 export function parseCommand(leaf: 'light' | 'switch' | 'scene' | 'climate' | 'cover' | 'media', raw: string): ServiceCall {

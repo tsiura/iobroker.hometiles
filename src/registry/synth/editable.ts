@@ -1,4 +1,4 @@
-import type { ChannelInput, DatetimeKind, DeviceInput, Domain, VirtualEntity } from '../types';
+import type { ChannelCodec, ChannelInput, DatetimeKind, DeviceInput, Domain, VirtualEntity } from '../types';
 import { STATE_UNAVAILABLE, STATE_UNKNOWN } from '../types';
 import {
   baseEntity,
@@ -312,6 +312,54 @@ export function epochToCalendar(raw: unknown): string | undefined {
     `${date.getFullYear()}-${two(date.getMonth() + 1)}-${two(date.getDate())} ` +
     `${two(date.getHours())}:${two(date.getMinutes())}:${two(date.getSeconds())}`
   );
+}
+
+/**
+ * What the panel sends back, as the Bridge reads it (editable_helpers.py:
+ * 127-137): zero-padded fields, one 'T' or ' ', seconds optional. The panel
+ * itself always sends them, with a space (value_control.cpp:398-406).
+ */
+const SENT: Readonly<Record<DatetimeKind, RegExp>> = {
+  date: /^(?<date>\d{4}-\d{2}-\d{2})$/,
+  time: /^(?<time>\d{2}:\d{2})(?::(?<second>\d{2}))?$/,
+  datetime: /^(?<date>\d{4}-\d{2}-\d{2})[ T](?<time>\d{2}:\d{2})(?::(?<second>\d{2}))?$/,
+};
+
+/**
+ * The value a date, time or date-time the panel sends is written as (Task 15,
+ * T84-4), or none: a text of another kind, outside the grammar or the
+ * calendar, or a time the source cannot hold.
+ *
+ * - An epoch channel gets the milliseconds of that local time in the host
+ *   zone, the inverse of epochToCalendar, which must read it back as the same
+ *   text. A time the zone skips (the spring gap) moves when Date builds it, so
+ *   it is refused: the panel would wait in vain for its six fields
+ *   (value_control.cpp:330-334). A repeated autumn time is its first instant,
+ *   summer time: both read back as the same text, and the panel cannot tell
+ *   them apart either.
+ * - A text channel keeps its own shape: a 'T' when it has one, seconds only
+ *   when it has them, and with no value yet the panel's own shape. Seconds a
+ *   text without them cannot hold are refused, never dropped.
+ */
+export function calendarValue(codec: ChannelCodec | undefined, kind: DatetimeKind, sent: unknown): number | string | undefined {
+  // The pattern is the kind's own; calendarKind adds the calendar's ranges.
+  const fields = typeof sent === 'string' ? SENT[kind].exec(sent)?.groups : undefined;
+  if (!fields || !calendarKind(sent as string)) return undefined;
+  const { date = '', time = '', second = '00' } = fields;
+  if (codec?.type === 'number') {
+    if (kind !== 'datetime') return undefined;
+    const [year = 0, month = 0, day = 0] = date.split('-').map(Number);
+    const [hour = 0, minute = 0] = time.split(':').map(Number);
+    const ms = new Date(year, month - 1, day, hour, minute, Number(second)).getTime();
+    return epochToCalendar(ms) === `${date} ${time}:${second}` ? ms : undefined;
+  }
+  const current = typeof codec?.current === 'string' ? codec.current.trim() : '';
+  const seconds = !current || /:\d{1,2}:\d{1,2}$/.test(current);
+  if (!seconds && second !== '00') return undefined;
+  const clock = seconds ? `${time}:${second}` : time;
+  if (kind === 'date') return date;
+  if (kind === 'time') return clock;
+  return `${date}${current.includes('T') ? 'T' : ' '}${clock}`;
 }
 
 /**

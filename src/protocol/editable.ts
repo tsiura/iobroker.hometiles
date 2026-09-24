@@ -1,8 +1,11 @@
 import { createHash, randomBytes } from 'node:crypto';
-import { UNSHOWABLE } from '../registry/synth/editable';
-import type { VirtualEntity } from '../registry/types';
+import { encodeChannelValue } from '../registry/synth/common';
+import { calendarValue, UNSHOWABLE, valueChannel } from '../registry/synth/editable';
+import type { DatetimeKind, VirtualEntity } from '../registry/types';
 import { STATE_UNKNOWN } from '../registry/types';
 import { unixSeconds } from './apply';
+import { readByPanel, sentByPanel } from './arduinojson';
+import { stateTopic } from './topics';
 
 /**
  * The /control payload of number, select and datetime
@@ -146,4 +149,78 @@ export function buildControlPayload(entity: VirtualEntity, session: string): Con
   // fields. Null is only there so that a payload the panel would drop is
   // never sent.
   return bytes(text) > MAX_CONTROL_BYTES ? null : { payload: text, degraded };
+}
+
+/**
+ * The status the panel is answered with: the Bridge's words (__init__.py:
+ * 1562-1583, editable_helpers.py:100-152). The panel takes the literal "ok"
+ * alone as accepted and every other text as a refusal (value_control.cpp:
+ * 922-927); even "ok" is confirmed only by a /control that shows the value.
+ */
+export type ValueStatus = 'ok' | 'expired' | 'changed' | 'unavailable' | 'invalid_value' | 'invalid_step' | 'invalid_option' | 'failed';
+
+/** What the entity itself refuses, once the command's session, deadline and id passed. */
+export type ValueRefusal = Extract<ValueStatus, 'changed' | 'unavailable' | 'invalid_value' | 'invalid_step' | 'invalid_option'>;
+
+/** The answer to a value command: <base>/stat/value, never retained (value_control.cpp:913-930; __init__.py:1584-1585). */
+export function buildValueAck(baseTopic: string, entityId: string, id: string, status: ValueStatus): { topic: string; payload: string; retain: false } {
+  return { topic: stateTopic(baseTopic, 'value'), payload: JSON.stringify({ entity_id: entityId, id, status }), retain: false };
+}
+
+type Written = { channel: string; raw: unknown } | { refusal: ValueRefusal };
+
+/**
+ * A number on the grid the panel works on: its min, max and step as its
+ * ArduinoJson reads them back (arduinojson.ts, Task 14 O4), the panel's own
+ * checks (value_control.cpp:301-305, within 1e-6 of a step), and the print
+ * its value was sent in, which can move it further (:306). Written is the
+ * panel's own draft for that step (:462, :504) as it prints it, %.15g
+ * (:317-318) -- the value it then waits to see -- kept inside the object's
+ * range. Nothing else: no tolerance of our own.
+ */
+function numberWrite(published: Record<string, unknown>, value: unknown): { raw: number } | { refusal: ValueRefusal } {
+  const { min, max, step } = published;
+  if (typeof min !== 'number' || typeof max !== 'number' || typeof step !== 'number') return { refusal: 'unavailable' };
+  const [low, high, grid] = [readByPanel(min), readByPanel(max), readByPanel(step)];
+  // The panel edits nothing else (value_control.cpp:82-86).
+  if (!(low < high && grid > 0 && Number.isFinite(high - low))) return { refusal: 'unavailable' };
+  if (typeof value !== 'number' || !Number.isFinite(value) || value < low || value > high) return { refusal: 'invalid_value' };
+  const steps = Math.round((value - low) / grid);
+  const draft = Number(Math.min(high, low + steps * grid).toPrecision(15));
+  if (Math.abs((value - low) / grid - steps) > 1e-6 && sentByPanel(draft) !== value) return { refusal: 'invalid_step' };
+  return { raw: Math.min(max, Math.max(min, draft)) };
+}
+
+/**
+ * What a panel's value command writes, or why not (Ruling 99): checked as
+ * the Bridge checks one (build_editable_service_call, editable_helpers.py:
+ * 100-152), against the /control payload the entity has now -- the revision
+ * the panel must hold (controlRevision's, one build), and whether it may
+ * edit at all, which needs the value available (Task 13 O3), and its range,
+ * options or kind, all as published:
+ *
+ * - number: numberWrite;
+ * - select: an exact option, written as the raw value behind it, without the
+ *   current label (Task 13 report §7): the panel never sends its placeholder
+ *   (value_control.cpp:497-498);
+ * - date and time: calendarValue (T84-4).
+ */
+export function valueWrite(entity: VirtualEntity, revision: unknown, value: unknown): Written {
+  const { text, revision: current } = build(entity, CONTROL_SESSION);
+  if (revision !== current) return { refusal: 'changed' };
+  const published = JSON.parse(text) as Record<string, unknown>;
+  const channel = valueChannel(entity.source);
+  if (published.writable !== true || !channel) return { refusal: 'unavailable' };
+  const codec = entity.channelMeta?.[channel];
+  if (published.kind === 'number') {
+    const number = numberWrite(published, value);
+    return 'raw' in number ? { channel, raw: number.raw } : number;
+  }
+  if (published.kind === 'select') {
+    const options = published.options;
+    const raw = typeof value === 'string' && Array.isArray(options) && options.includes(value) ? encodeChannelValue(codec, value) : undefined;
+    return raw === undefined ? { refusal: 'invalid_option' } : { channel, raw };
+  }
+  const raw = calendarValue(codec, published.kind as DatetimeKind, value);
+  return raw === undefined ? { refusal: 'invalid_value' } : { channel, raw };
 }

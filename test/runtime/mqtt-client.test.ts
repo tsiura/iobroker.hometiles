@@ -1,5 +1,6 @@
 import Aedes from 'aedes';
 import { expect } from 'chai';
+import mqtt from 'mqtt';
 import { createServer, type Server } from 'node:net';
 import { DEFAULTS } from '../../src/config/options';
 import { HomeTilesMqttClient, type Logger } from '../../src/runtime/mqtt-client';
@@ -66,6 +67,34 @@ describe('runtime/mqtt-client', () => {
 
     expect(received).to.deep.equal([['test/topic', 'hello']]);
     await client.disconnect();
+  });
+
+  it('tells a retained message, replayed on subscribing, from a live one (Task 15)', async () => {
+    // A retained cmnd/value would run again at every subscription; the value
+    // command ignores it, as the Bridge does (__init__.py:1550). MQTT 3.1.1
+    // marks retained only what a new subscription replays (§3.3.1.3).
+    const other = await mqtt.connectAsync(`mqtt://127.0.0.1:${PORT}`);
+    const client = new HomeTilesMqttClient({ ...DEFAULTS, brokerPort: PORT }, silentLogger());
+    // Closed however the test ends: an open connection keeps the broker from closing.
+    try {
+      await other.publishAsync('kept/topic', 'stale', { retain: true });
+      const received: Array<[string, string, boolean]> = [];
+      client.onMessage((topic, payload, retain) => received.push([topic, payload, retain]));
+      await client.connect();
+      await client.subscribe('kept/topic');
+      await waitUntil(() => received.length > 0);
+      await other.publishAsync('kept/topic', 'live, retained', { retain: true });
+      await other.publishAsync('kept/topic', 'live', { retain: false });
+      await waitUntil(() => received.length > 2);
+      expect(received).to.deep.equal([
+        ['kept/topic', 'stale', true],
+        ['kept/topic', 'live, retained', false],
+        ['kept/topic', 'live', false],
+      ]);
+    } finally {
+      await other.endAsync(true);
+      await client.disconnect();
+    }
   });
 
   it('reports connection changes', async () => {

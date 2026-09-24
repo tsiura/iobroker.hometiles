@@ -1,4 +1,5 @@
 import type { ServiceCall } from '../protocol/commands';
+import { valueWrite } from '../protocol/editable';
 import type { Domain, VirtualEntity } from '../registry/types';
 import { STATE_OFF, STATE_ON } from '../registry/types';
 import {
@@ -34,8 +35,9 @@ export type DispatchResult =
    * left half-configured — turned on but not dimmed — must be distinguishable
    * from one that was never touched, because those are different things to
    * debug and the panel's own display cannot tell them apart either.
+   * `cause`: what the writer threw, when a write failed.
    */
-  | { ok: false; reason: string; applied: number };
+  | { ok: false; reason: string; applied: number; cause?: string };
 
 type CallKind = ServiceCall['kind'];
 
@@ -79,9 +81,10 @@ const ALLOWED_CALLS: Record<Domain, ReadonlySet<CallKind>> = {
   // What the panel's media controls send (protocol/commands.ts parseMediaCommand).
   media_player: new Set<CallKind>(['media_previous', 'media_play_pause', 'media_next', 'media_set_volume', 'media_seek']),
   weather: new Set<CallKind>(),
-  number: new Set<CallKind>(),
-  select: new Set<CallKind>(),
-  datetime: new Set<CallKind>(),
+  // One command for all three, cmnd/value (Task 15).
+  number: new Set<CallKind>(['set_value']),
+  select: new Set<CallKind>(['set_value']),
+  datetime: new Set<CallKind>(['set_value']),
 };
 
 export class Dispatcher {
@@ -92,17 +95,23 @@ export class Dispatcher {
   ) {}
 
   async dispatch(call: ServiceCall): Promise<DispatchResult> {
+    // A value command is answered with its reason on stat/value, and its
+    // panel session logs a failure, rate-limited (Task 15): a flood of them
+    // must not fill the log. Every other command has no answer, so the log
+    // is the only place its refusal is seen.
+    const answered = call.kind === 'set_value';
+    const refuse = (message: string): void => (answered ? this.log.debug(message) : this.log.warn(message));
     const entity =
       call.kind === 'activate_scene' ? this.lookup.bySceneAlias(call.alias) : this.lookup.byId(call.entityId);
 
     if (!entity) {
       const reason = call.kind === 'activate_scene' ? 'unknown_scene' : 'unknown_entity';
-      this.log.warn(`[Command] Rejected ${call.kind}: ${reason}`);
+      refuse(`[Command] Rejected ${call.kind}: ${reason}`);
       return { ok: false, reason, applied: 0 };
     }
 
     if (!ALLOWED_CALLS[entity.domain].has(call.kind)) {
-      this.log.warn(`[Command] Rejected ${call.kind} for ${entity.entityId}: not allowed for ${entity.domain}`);
+      refuse(`[Command] Rejected ${call.kind} for ${entity.entityId}: not allowed for ${entity.domain}`);
       return { ok: false, reason: 'call_not_allowed_for_domain', applied: 0 };
     }
 
@@ -121,7 +130,7 @@ export class Dispatcher {
       // when it was really the value that didn't fit it. A cover toggle adds
       // a third: its direction depends on a state nobody knows.
       const reason = failureReason ?? 'no_writable_channel';
-      this.log.warn(`[Command] Rejected ${call.kind} for ${entity.entityId}: ${reason}`);
+      refuse(`[Command] Rejected ${call.kind} for ${entity.entityId}: ${reason}`);
       return { ok: false, reason, applied: 0 };
     }
 
@@ -134,11 +143,11 @@ export class Dispatcher {
         // Name the channel and the count: "failed on dimmer after 1 applied"
         // tells an operator the lamp is on but not dimmed. "write_failed"
         // alone sends them looking for a problem that never happened.
-        this.log.error(
-          `[Command] Write failed for ${entity.entityId} on channel ${channel} ` +
-            `after ${applied} of ${writes.length} writes: ${(error as Error).message}`,
-        );
-        return { ok: false, reason: 'write_failed', applied };
+        const cause = (error as Error).message;
+        const line = `[Command] Write failed for ${entity.entityId} on channel ${channel} after ${applied} of ${writes.length} writes: ${cause}`;
+        if (answered) this.log.debug(line);
+        else this.log.error(line);
+        return { ok: false, reason: 'write_failed', applied, cause };
       }
     }
 
@@ -153,8 +162,8 @@ export class Dispatcher {
     // [channelName, objectId, value] — the channel name is carried so a failure
     // can say which capability did not apply.
     const writes: Array<[string, string, unknown]> = [];
-    // Set only by pushEncoded, the two cover toggles, media play_pause and
-    // media seek, and only consulted by dispatch() when `writes` ends up
+    // Set only by pushEncoded, the two cover toggles, media play_pause,
+    // media seek and set_value, and only consulted by dispatch() when `writes` ends up
     // empty — every command below sets it at most once per plan(), so there
     // is no ordering ambiguity between an earlier success and a later failure
     // to worry about.
@@ -469,6 +478,14 @@ export class Dispatcher {
           if (entity.writable?.mute) push('mute', false);
           else this.log.warn(`[Command] Not unmuting ${entity.entityId}: mute takes no write`);
         }
+        break;
+      }
+      case 'set_value': {
+        // Checked against the /control the entity has now (Ruling 99); the
+        // refusal is the Bridge's status, which the panel is answered with.
+        const written = valueWrite(entity, call.revision, call.value);
+        if ('refusal' in written) failureReason = written.refusal;
+        else push(written.channel, written.raw);
         break;
       }
       case 'media_seek': {
