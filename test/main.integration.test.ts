@@ -3,7 +3,7 @@ import { expect } from 'chai';
 import { tests, type IntegrationTestHarness } from '@iobroker/testing';
 import mqtt, { type MqttClient } from 'mqtt';
 import { execFileSync, spawn, type ChildProcess } from 'node:child_process';
-import { closeSync, existsSync, lstatSync, mkdirSync, openSync, readFileSync, rmSync, symlinkSync, unlinkSync, writeFileSync } from 'node:fs';
+import { closeSync, lstatSync, mkdirSync, openSync, readFileSync, rmSync, symlinkSync, unlinkSync, writeFileSync } from 'node:fs';
 import { createServer, type Server } from 'node:net';
 import os from 'node:os';
 import path from 'node:path';
@@ -1346,8 +1346,11 @@ if (process.env.HOMETILES_INTEGRATION === '1') {
           marked: '0_userdata.0.t19.marked',
           unlogged: '0_userdata.0.t19.unlogged',
           meter: '0_userdata.0.t20.meter',
+          old: '0_userdata.0.t19.old',
         };
         const WINDOW = [row(start - 72 * HOUR, 18.5), ...every(start + HOUR / 4, HOUR / 2, 48)];
+        /** A reading a month old, older than the week the first question covers (fix round 1, M-8). */
+        const OLD = [row(start - 30 * 24 * HOUR, 17.5), ...every(start + HOUR / 4, HOUR / 2, 48)];
         const SAME_DAY = [row(morning - 5 * HOUR, 3), row(morning - 60_000, 7), ...every(morning + 60_000, 120_000, 400)];
         /** Three days back: its 42.5 hours of rows cross a midnight whatever the hour, so two day files hold them. */
         const busyStart = start - 48 * HOUR;
@@ -1376,9 +1379,26 @@ if (process.env.HOMETILES_INTEGRATION === '1') {
 
         before(async function () {
           this.timeout(300000);
-          if (!existsSync(HISTORY_MAIN)) {
+          // Installed once, and again for another version. Without the
+          // network the install fails: the suite is skipped, saying why (M-7).
+          const installed = (): unknown => {
+            try {
+              return JSON.parse(readFileSync(path.join(HISTORY_PACKAGE, 'package.json'), 'utf8')).version;
+            } catch {
+              return undefined;
+            }
+          };
+          if (installed() !== HISTORY_VERSION) {
             mkdirSync(HISTORY_DIR, { recursive: true });
-            execFileSync('npm', ['install', '--prefix', HISTORY_DIR, '--omit=dev', '--no-audit', '--no-fund', `iobroker.history@${HISTORY_VERSION}`], { stdio: 'ignore' });
+            try {
+              execFileSync('npm', ['install', '--prefix', HISTORY_DIR, '--omit=dev', '--no-audit', '--no-fund', `iobroker.history@${HISTORY_VERSION}`], {
+                stdio: 'pipe',
+              });
+            } catch (error) {
+              const reason = String((error as { stderr?: unknown }).stderr ?? error).trim().split('\n').slice(-3).join(' ');
+              process.stderr.write(`Skipping the iobroker.history suite: installing iobroker.history@${HISTORY_VERSION} failed: ${reason}\n`);
+              this.skip();
+            }
           }
           if (!lstatSync(HISTORY_LINK, { throwIfNoEntry: false })) symlinkSync(HISTORY_PACKAGE, HISTORY_LINK, 'dir');
           rmSync(HISTORY_STORE, { recursive: true, force: true });
@@ -1386,6 +1406,7 @@ if (process.env.HOMETILES_INTEGRATION === '1') {
           plantHistory(ID.sameDay, SAME_DAY);
           plantHistory(ID.busy, BUSY);
           plantHistory(ID.marked, MARKED);
+          plantHistory(ID.old, OLD);
           METER = meterRows(Date.now());
           plantHistory(ID.meter, METER);
 
@@ -1445,6 +1466,12 @@ if (process.env.HOMETILES_INTEGRATION === '1') {
           const result = await ask(provide(), ID.window);
           expect(result.available).to.equal(true);
           expect(result.rows.map((r) => [r.ts, r.val])).to.deep.equal(WINDOW.map((r) => [r.ts, r.val]));
+        });
+
+        it('reads a reading in effect a month old, asked for again with no start when the week before holds none', async function () {
+          this.timeout(60000);
+          const result = await ask(provide(), ID.old);
+          expect(result.rows.map((r) => [r.ts, r.val])).to.deep.equal(OLD.map((r) => [r.ts, r.val]));
         });
 
         it("reads the system's default history instance, which the adapter set for itself, when none is configured", async function () {
