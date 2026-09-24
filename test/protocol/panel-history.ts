@@ -256,9 +256,10 @@ export function scanUint16(json: string, key: string): number {
 
 /**
  * The history/response dispatch (mqtt_handlers.cpp:1832-1874): whether the
- * reply clears the one pending binary/state request -- entity, kind and a
- * non-zero hours must match (clear_pending_discrete_history_request,
- * :391-407) -- and whether it also goes to the tile graphs (non-discrete
+ * reply clears the one pending binary/state request -- entity and kind must
+ * match, and hours too unless it is absent or 0
+ * (clear_pending_discrete_history_request, :391-407, the hours check :402-405)
+ * -- and whether it also goes to the tile graphs (non-discrete
  * only). A pending request left uncleared is answered 8 s later by the
  * panel itself with history_available:false (:541-553), over the real reply.
  */

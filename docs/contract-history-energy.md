@@ -240,7 +240,7 @@ gated at `sensor_popup.cpp:2304-2307`). Keys:
 | `device_class` | string, nullable | HA device class; explicit JSON `null` clears the cached one, absent key keeps it (`:1846-1851`, see §7) |
 | `current` | string, nullable | Live state string; same explicit-null-vs-absent rule (`:1852-1856`) |
 | `available` | bool, nullable | Same explicit-null-vs-absent rule; null ⇒ treated as unavailable (`:1857-1861`) |
-| `last_changed` | epoch **seconds** | via `extract_epoch` (`:836-852`, accepts an integer or a numeric string; a negative, a fraction or null is 0 — every epoch in this payload must be a whole number); explicit null clears it to 0, absent keeps the old value (`:1862-1870`) |
+| `last_changed` | epoch **seconds** | via `extract_epoch` (`:836-852`, accepts an integer or a numeric string; a negative number, a fractional number or null is 0 — every epoch sent as a JSON number must be a whole number, while a numeric string keeps its integer part, since `strtoull` stops at the `.`, `:844-849`); explicit null clears it to 0, absent keeps the old value (`:1862-1870`) |
 | `error` | any | If present at all (any value), forces `history_available=false` (`:1873-1874`) |
 | `history_available` | bool | Default `true` if absent and no `error` key (`:1873-1874`) |
 | `range_start`, `range_end` | epoch seconds | If `range_end` absent, uses device's current time; if `range_start` absent, computed as `range_end - hours*3600` (`:1877-1885`) — **confirms epoch is in seconds**, not milliseconds (3600 s/hour arithmetic) |
@@ -290,12 +290,13 @@ wire order must be oldest→newest) as §4.2. Every label is renamed by
 ### 4.4 Editable-value popups (Number / Select / DateTime)
 
 Gated by `ctx->editable` at the very top of `apply_history_payload`
-(`sensor_popup.cpp:2282-2302`), **checked before** the `doc["kind"]` switch —
-i.e. for an editable popup the firmware does not care what `kind` the
-response claims; it always runs `apply_state_history_payload` for the shared
-Activity/segments/palette/timeline data, then, only if
-`ctx->editable_kind == "number"`, additionally falls through into the numeric
-`values` path of §4.1 for the graph. Two extra gates apply only here:
+(`sensor_popup.cpp:2282-2302`), **checked before** the `doc["kind"]` switch.
+Whatever `kind` the response claims, an editable popup runs
+`apply_state_history_payload` for the shared Activity/segments/palette/timeline
+data. A Select or Date/Time stops there, so its `kind` is never read. Only if
+`ctx->editable_kind == "number"` does the popup fall through into the numeric
+`values` path of §4.1 for the graph, and there the `kind` matters (last bullet
+below). Two extra gates apply only here:
 - `accept_editable_history_range` (`sensor_popup.cpp:2252-2261`) requires
   `doc["request_id"]` to equal the locally stored `ctx->editable_history_id`
   **and** `doc["hours"]` to equal the requested range's hours, or the response

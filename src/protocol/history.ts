@@ -4,6 +4,7 @@ import { STATE_UNAVAILABLE, STATE_UNKNOWN } from '../registry/types';
 import { unixSeconds } from './apply';
 import { usableNumber } from './climate';
 import { requireEntityId } from './commands';
+import { showable } from './editable';
 
 /**
  * The four shapes that arrive on the single `<base>/history/request` topic
@@ -52,6 +53,9 @@ function maxTransitions(value: unknown): number | null {
   if (value === undefined || value === null) return 48;
   return typeof value === 'number' && Number.isInteger(value) && value >= 2 ? Math.min(value, MAX_TRANSITIONS) : null;
 }
+
+/** The longest request_id answered; the Bridge cuts at 48 (__init__.py:1637). */
+const MAX_REQUEST_ID_BYTES = 64;
 
 /**
  * Parses one `history/request` payload into a typed request, or `null` if
@@ -105,8 +109,11 @@ export function parseHistoryRequest(payload: string): HistoryRequest | null {
       const limit = maxTransitions(parsed.max_transitions);
       if (hours === null || limit === null) return null;
       if (kind !== 'editable') return { kind, entityId, hours, maxTransitions: limit };
+      // Every reply echoes it. The panel's has 26 characters
+      // (value_control.cpp:36-42); a far longer one would make a reply the
+      // panel cuts at 32767 bytes and cannot parse (review M2b).
       const requestId = parsed.request_id;
-      if (typeof requestId !== 'string' || requestId.length === 0) return null;
+      if (typeof requestId !== 'string' || requestId.length === 0 || Buffer.byteLength(requestId) > MAX_REQUEST_ID_BYTES) return null;
       return { kind, entityId, hours, maxTransitions: limit, requestId };
     }
 
@@ -310,6 +317,27 @@ function transitions(rows: StateSample[], fallback: string, startS: number, labe
 }
 
 /**
+ * An editable Number's graph (Ruling 127): Task 17's buckets -- `count` of
+ * `periodMs`, the last ending at `now` -- each holding the reading in effect
+ * at its end, the latest row at or before it, as the Bridge samples the value
+ * in effect (editable_helpers.py:178-187). So no bucket shows a value the
+ * number never held, and the live row, one row among the others, never
+ * weighs twice. A row that is no number (unavailable, unknown) is a gap until
+ * the next number, as is the time before the first row: an editable graph
+ * draws a gap as a gap (sensor_popup.cpp:2369).
+ */
+function valuesInEffect(rows: readonly StateSample[], now: number, periodMs: number, count: number): Array<number | null> {
+  const start = now - count * periodMs;
+  let next = 0;
+  let inEffect: number | null = null;
+  return Array.from({ length: count }, (_, bucket) => {
+    const end = start + (bucket + 1) * periodMs;
+    for (; next < rows.length && rows[next]!.ts <= end; next++) inEffect = usableNumber(rows[next]!.state) ?? null;
+    return inEffect;
+  });
+}
+
+/**
  * The bar in TIMELINE_POINTS bins over the window, each the code of the
  * segment that wins it, by the Bridge's bin arithmetic
  * (binary_history.py:305-330). The segments cover the window end to end, so
@@ -409,46 +437,56 @@ function stateTimeline(segments: Segment[], startS: number, endS: number): Recor
  *   last_changed of 0 is left out, since null would clear it. state: current
  *   (:2111-2119). An editable popup reads neither.
  * - editable (Ruling 121): the popup runs the state history whatever the
- *   kind (:2282-2291). A number adds Task 17's graph values over the range's
- *   period (:2287-2289) under kind "number" -- "state" returns before the
- *   graph (:2309-2310) -- and, like the Bridge, no bar or palette, which its
- *   popup hides (:2071; editable_helpers.py:188-190). A select or date/time
- *   goes as "state", which keeps it off the tile graphs (mqtt_handlers.cpp:
- *   1870-1871).
+ *   kind (:2282-2291), and a state goes by the name /control gives it
+ *   (`showable`), which its live Activity uses (:3099). A number adds its
+ *   graph, the reading in effect at each bucket end (Ruling 127), over the
+ *   range's period (:2287-2289) under kind "number" -- "state" returns before
+ *   the graph (:2309-2310) -- and, like the Bridge, no bar or palette, which
+ *   its popup hides (:2071; editable_helpers.py:188-190). A select or
+ *   date/time goes as "state", which keeps it off the tile graphs
+ *   (mqtt_handlers.cpp:1870-1871).
  *
- * A reply over 32767 bytes -- only texts full of control characters get
- * there -- would be cut and dropped, leaving the popup on "Loading"; it
- * becomes "history unavailable" instead.
+ * `historyAvailable` false (Ruling 126: the provider read no history) makes
+ * the popup say "History unavailable" at once: history_available false and an
+ * error, which forces it whatever the flag says (:1873-1874 and :1967-1976,
+ * :2121-2122 and :2237-2246, :2283 and :2301), under the same head. An
+ * editable popup has no timeout of its own (value_control.cpp:179-189), so it
+ * always gets this reply. It carries no values, which the tile graphs would
+ * take (tile_renderer.cpp:4498-4526). A reply over 32767 bytes -- only texts
+ * full of control characters get there -- would be cut and dropped, leaving
+ * the popup on "Loading"; it gets the same reply.
  */
 export function buildDiscreteHistoryResponse(
   req: Extract<HistoryRequest, { kind: 'binary' | 'state' | 'editable' }>,
   samples: readonly StateSample[],
   now: number,
   current: CurrentState,
+  historyAvailable: boolean,
 ): string | null {
   const { entityId, hours, maxTransitions: limit } = req;
   if ((hours !== 24 && hours !== 168) || !Number.isInteger(limit) || limit < 2 || limit > MAX_TRANSITIONS) return null;
-  const endS = unixSeconds(now);
-  const startS = endS - hours * 3600;
   const binary = req.kind === 'binary';
   const number = req.kind === 'editable' && entityId.startsWith('number.');
-  const label = binary ? binaryLabel : stateLabel;
-  const rows = historyRows(samples, current, endS);
-  const { initial, changes } = transitions(rows, rows.length ? STATE_UNKNOWN : label(current.state), startS, label);
-
   const head = {
     kind: binary ? 'binary' : number ? 'number' : 'state',
     entity_id: entityId,
     hours,
     ...(req.kind === 'editable' ? { request_id: req.requestId } : {}),
   };
+  const unavailable = (error: string): string => JSON.stringify({ ...head, history_available: false, error });
+  if (!historyAvailable) return unavailable('history_unavailable');
+
+  const endS = unixSeconds(now);
+  const startS = endS - hours * 3600;
+  const label = binary ? binaryLabel : req.kind === 'editable' ? (text: string) => stateLabel(showable(text)) : stateLabel;
+  const rows = historyRows(samples, current, endS);
+  const { initial, changes } = transitions(rows, rows.length ? STATE_UNKNOWN : label(current.state), startS, label);
   const window = { range_start: startS, range_end: endS, history_available: true };
   const activity = changes.slice(-limit).map(([timestamp, state]) => ({ timestamp, state }));
   let body: Record<string, unknown>;
   if (number) {
     const periodMinutes = hours === 24 ? 5 : 60;
-    const series = rows.map(({ ts, state }) => ({ ts, val: state }));
-    const values = bucketValues(series, now, periodMinutes * 60_000, (hours * 60) / periodMinutes);
+    const values = valuesInEffect(rows, now, periodMinutes * 60_000, (hours * 60) / periodMinutes);
     body = { ...head, period_minutes: periodMinutes, ...window, values, activity };
   } else {
     const edges = [startS, ...changes.map(([second]) => second), endS];
@@ -467,7 +505,5 @@ export function buildDiscreteHistoryResponse(
     body = { ...head, ...window, ...live, ...timeline, segments: segments.slice(-limit), activity };
   }
   const text = JSON.stringify(body);
-  return Buffer.byteLength(text) <= MAX_RESPONSE_BYTES
-    ? text
-    : JSON.stringify({ ...head, history_available: false, error: 'response_too_large' });
+  return Buffer.byteLength(text) <= MAX_RESPONSE_BYTES ? text : unavailable('response_too_large');
 }

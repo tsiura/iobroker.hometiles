@@ -253,6 +253,19 @@ describe('protocol/history', () => {
       ).to.equal(null);
     });
 
+    it('returns null for a request_id over 64 bytes, which every reply would have to echo', () => {
+      // The panel's ids have 26 characters (value_control.cpp:36-42); the
+      // Bridge cuts at 48 (__init__.py:1637). A 40 KB id would make a reply
+      // the panel cuts at 32767 bytes and cannot parse (review M2b).
+      const request = (id: string) =>
+        parseHistoryRequest(`{"entity_id":"number.x","kind":"editable","version":1,"hours":24,"max_transitions":96,"request_id":${JSON.stringify(id)}}`);
+      expect(request('a'.repeat(64))).to.include({ requestId: 'a'.repeat(64) });
+      expect(request('a'.repeat(65))).to.equal(null);
+      expect(request('ä'.repeat(32))).to.include({ requestId: 'ä'.repeat(32) }); // 64 bytes
+      expect(request('ä'.repeat(33))).to.equal(null); // 33 characters, 66 bytes
+      expect(request('x'.repeat(40_000))).to.equal(null);
+    });
+
     it('returns null when an editable request asks for a range the popup never shows (only 24 or 168)', () => {
       // The popup asks with its range's hours (sensor_popup.cpp:2536-2540,
       // :249-257) and drops a reply whose hours differ (:2255); the number
@@ -585,7 +598,7 @@ describe('protocol/history', () => {
       discrete(`{"entity_id":"${entity}","kind":"editable","version":1,"hours":${hours},"max_transitions":96,"request_id":"${REQUEST_ID}"}`);
 
     function respond(req: DiscreteRequest, samples: Sample[], current: Current, now = NOW): string {
-      const out: string | null = buildDiscreteHistoryResponse(req, samples, now, current);
+      const out: string | null = buildDiscreteHistoryResponse(req, samples, now, current, true);
       if (out === null) throw new Error('no response');
       return out;
     }
@@ -714,7 +727,8 @@ describe('protocol/history', () => {
       it('lets a short active moment win its bin: on over unavailable over unknown over off', () => {
         // The Bridge's priority (binary_history.py:26, :305-330) and the
         // panel's own (sensor_popup.cpp:876-883, :1126-1134): a ten-second
-        // motion inside a 112.5 s bin still shows.
+        // motion inside a 112.5 s bin still shows. The panel ranks the bins
+        // again when it draws them, so they must agree with it.
         const samples: Sample[] = [
           { ts: ms(DAY_S - 60), state: 'off' },
           { ts: ms(DAY_S + 11260), state: 'on' }, // bin 100
@@ -726,10 +740,13 @@ describe('protocol/history', () => {
           { ts: ms(DAY_S + 33780), state: 'off' },
           { ts: ms(DAY_S + 45010), state: 'unknown' }, // bin 400
           { ts: ms(DAY_S + 45020), state: 'off' },
+          { ts: ms(DAY_S + 56260), state: 'unknown' }, // bin 500: unknown, then unavailable
+          { ts: ms(DAY_S + 56270), state: 'unavailable' },
+          { ts: ms(DAY_S + 56280), state: 'off' },
         ];
-        const out = respond(binaryRequest(), samples, { state: 'off', available: true, lastChanged: ms(DAY_S + 45020) });
+        const out = respond(binaryRequest(), samples, { state: 'off', available: true, lastChanged: ms(DAY_S + 56280) });
         expect(panelBinary(out, 24)?.bins).to.deep.equal(
-          bins([0, 100], [1, 1], [0, 99], [3, 1], [0, 99], [1, 1], [0, 99], [2, 1], [0, 367]),
+          bins([0, 100], [1, 1], [0, 99], [3, 1], [0, 99], [1, 1], [0, 99], [2, 1], [0, 99], [3, 1], [0, 267]),
         );
       });
 
@@ -1081,6 +1098,22 @@ describe('protocol/history', () => {
         expect(dispatch(out, { entityId: 'sensor.vacuum_status', kind: 'state', hours: 24 }).clearsPending).to.equal(true);
       });
 
+      it('sends a reply of exactly 32767 bytes whole, and one of 32768 as "history unavailable"', () => {
+        // copy_len = min(length, 32767) (mqtt_handlers.cpp:1836): 32767 bytes
+        // arrive whole, the 32768th is cut. 100 changes between two texts of 20
+        // control characters (six bytes apiece on the wire) come close; the
+        // current value, one byte a character, makes up the rest.
+        const samples: Sample[] = [{ ts: ms(DAY_S - 60), state: 'A' }];
+        for (let k = 1; k <= 100; k++) samples.push({ ts: ms(DAY_S + BIN2 * k), state: '\u0001'.repeat(20) + (k % 2 ? 'B' : 'C') });
+        const reply = (current: string): string => respond(stateRequest('sensor.x'), samples, { state: current, available: true, lastChanged: 0 });
+        const fill = 'c'.repeat(1 + 32767 - Buffer.byteLength(reply('c')));
+        expect(fill.length).to.be.within(2, 255);
+        const whole = reply(fill);
+        expect(Buffer.byteLength(whole)).to.equal(32767);
+        expect(JSON.parse(whole)).to.include({ history_available: true, current: fill });
+        expect(reply(`${fill}c`)).to.equal('{"kind":"state","entity_id":"sensor.x","hours":24,"history_available":false,"error":"response_too_large"}');
+      });
+
       it('keeps the largest realistic reply inside the 32767 bytes', () => {
         // The longest entity id, 96 changes among 20 states of 32 quote-heavy
         // bytes (each doubled by escaping), a 255-byte current value.
@@ -1141,12 +1174,15 @@ describe('protocol/history', () => {
         expect(panelEditable(out, { ...popup, hours: 168 })).to.equal(null);
       });
 
-      it('answers a number popup with Task 17 graph values beside its Activity, and nothing it would drop', () => {
+      it('answers a number popup with the reading in effect at each bucket end beside its Activity (Ruling 127)', () => {
+        // Bucket k of 288 ends at DAY_S + 300(k + 1) and carries the latest row
+        // at or before that end; a non-numeric one is a gap, which the popup
+        // draws as a gap (no gap fill for an editable, sensor_popup.cpp:2369).
         const setpoint = statesOf(synthNumber, SETPOINT, [
           { ts: ms(DAY_S - 600), val: 20 },
-          { ts: ms(DAY_S + 3600), val: 21.5 }, // bucket 12 of 288
-          { ts: ms(DAY_S + 7200), val: 21.5, q: 0x42 }, // unavailable: no reading
-          { ts: ms(DAY_S + 9000), val: 22 }, // bucket 30
+          { ts: ms(DAY_S + 3600), val: 21.5 }, // the end of bucket 11
+          { ts: ms(DAY_S + 7200), val: 21.5, q: 0x42 }, // unavailable: the end of bucket 23
+          { ts: ms(DAY_S + 9000), val: 22 }, // the end of bucket 29
         ]);
         const out = respond(editableRequest('number.living_room_setpoint'), setpoint, { state: '22', available: true, lastChanged: ms(DAY_S + 9000) });
         // kind "number", never "state": for "state" the popup returns before its
@@ -1154,7 +1190,7 @@ describe('protocol/history', () => {
         // palette or bar: a number's bar is hidden (:2071), as the Bridge
         // leaves them out (editable_helpers.py:188-190). values before any text:
         // the tile graph takes the first "values" (tile_renderer.cpp:4521).
-        const values = [...new Array(12).fill(20), ...new Array(18).fill(21.5), ...new Array(258).fill(22)];
+        const values = [...new Array(11).fill(20), ...new Array(12).fill(21.5), ...new Array(6).fill(null), ...new Array(259).fill(22)];
         expect(out).to.equal(
           JSON.stringify({
             kind: 'number',
@@ -1177,6 +1213,89 @@ describe('protocol/history', () => {
         const shown = panelEditable(out, popup);
         expect(shown?.values).to.deep.equal(values);
         expect(shown?.history.activity.map((entry) => entry.state)).to.deep.equal(['22', 'unavailable', '21.5']);
+      });
+
+      it('never draws a value the number did not hold, and a repeated live row weighs nothing (review M1)', () => {
+        const number = editableRequest('number.living_room_setpoint');
+        // 20, then 22 at +3610 and back to 20 at +3700, the live row repeating
+        // the last: bucket 12 of means was 20.667.
+        const stepped = statesOf(synthNumber, SETPOINT, [
+          { ts: ms(DAY_S - 600), val: 20 },
+          { ts: ms(DAY_S + 3610), val: 22 },
+          { ts: ms(DAY_S + 3700), val: 20 },
+        ]);
+        const flat = JSON.parse(respond(number, stepped, { state: '20', available: true, lastChanged: ms(DAY_S + 3700) }));
+        expect(flat.values).to.deep.equal(new Array(288).fill(20));
+        expect(flat.activity).to.deep.equal([
+          { timestamp: DAY_S + 3610, state: '22' },
+          { timestamp: DAY_S + 3700, state: '20' },
+        ]);
+        // The live row repeats the row at +3650: means gave 21.833 in bucket 12.
+        const repeated = statesOf(synthNumber, SETPOINT, [
+          { ts: ms(DAY_S - 600), val: 20 },
+          { ts: ms(DAY_S + 3600), val: 21.5 }, // at the end of bucket 11: in effect there
+          { ts: ms(DAY_S + 3650), val: 22 },
+        ]);
+        const live = JSON.parse(respond(number, repeated, { state: '22', available: true, lastChanged: ms(DAY_S + 3650) }));
+        expect(live.values).to.deep.equal([...new Array(11).fill(20), 21.5, ...new Array(276).fill(22)]);
+        // The sensor graph keeps Task 17's means and carry for the same rows.
+        const sensor = buildNumericHistoryResponse(
+          { kind: 'numeric', entityId: 'sensor.x', hours: 24, periodMinutes: 5 },
+          stepped.map(({ ts, state }) => ({ ts, val: state })),
+          NOW,
+        );
+        expect(JSON.parse(sensor!).values).to.deep.equal([...new Array(12).fill(20), 21, ...new Array(275).fill(20)]);
+      });
+
+      it('shows an unavailable or unknown stretch as a gap, and a bucket ends in whichever reading came last', () => {
+        const number = editableRequest('number.living_room_setpoint');
+        const current: Current = { state: '22', available: true, lastChanged: 0 };
+        // Bad quality reads unavailable; a null with good quality reads
+        // unknown (Ruling 88). Either is no number: a gap, as the Bridge sends
+        // one (editable_helpers.py:155-188).
+        const outage = statesOf(synthNumber, SETPOINT, [
+          { ts: ms(DAY_S - 600), val: 20 },
+          { ts: ms(DAY_S + 3000), val: 20, q: 0x42 },
+          { ts: ms(DAY_S + 4500), val: 21 },
+          { ts: ms(DAY_S + 6000), val: null },
+          { ts: ms(DAY_S + 7500), val: 22 },
+        ]);
+        expect(outage.map(({ state }) => state)).to.deep.equal(['20', 'unavailable', '21', 'unknown', '22']);
+        expect(JSON.parse(respond(number, outage, current)).values).to.deep.equal([
+          ...new Array(9).fill(20),
+          ...new Array(5).fill(null),
+          ...new Array(5).fill(21),
+          ...new Array(5).fill(null),
+          ...new Array(264).fill(22),
+        ]);
+        // The sensor graph still carries the last number over the same stretch (Ruling 78).
+        const sensor = buildNumericHistoryResponse(
+          { kind: 'numeric', entityId: 'sensor.x', hours: 24, periodMinutes: 5 },
+          outage.map(({ ts, state }) => ({ ts, val: state })),
+          NOW,
+        );
+        expect(JSON.parse(sensor!).values).to.not.include(null);
+        // A window that opens on no number opens as a gap.
+        const opensOut = statesOf(synthNumber, SETPOINT, [
+          { ts: ms(DAY_S - 600), val: 20 },
+          { ts: ms(DAY_S - 60), val: 20, q: 0x42 },
+          { ts: ms(DAY_S + 3000), val: 21 },
+        ]);
+        expect(JSON.parse(respond(number, opensOut, current)).values).to.deep.equal([...new Array(9).fill(null), ...new Array(279).fill(21)]);
+        // Within bucket 10 ([+3000, +3300)): a number then no number ends it as
+        // a gap; no number then a number ends it on the number.
+        const endsOut = statesOf(synthNumber, SETPOINT, [
+          { ts: ms(DAY_S - 600), val: 20 },
+          { ts: ms(DAY_S + 3010), val: 21 },
+          { ts: ms(DAY_S + 3100), val: 21, q: 0x42 },
+        ]);
+        expect(JSON.parse(respond(number, endsOut, current)).values).to.deep.equal([...new Array(10).fill(20), ...new Array(278).fill(null)]);
+        const endsIn = statesOf(synthNumber, SETPOINT, [
+          { ts: ms(DAY_S - 600), val: 20 },
+          { ts: ms(DAY_S + 3010), val: 21, q: 0x42 },
+          { ts: ms(DAY_S + 3100), val: 21 },
+        ]);
+        expect(JSON.parse(respond(number, endsIn, current)).values).to.deep.equal([...new Array(10).fill(20), ...new Array(278).fill(21)]);
       });
 
       it('gives a number popup 168 hourly values for the seven-day range', () => {
@@ -1202,6 +1321,27 @@ describe('protocol/history', () => {
         expect(panelEditable(out, popup)?.history.activity).to.deep.equal([{ timestamp: DAY_S + 7200, state: '2026-09-23 07:00:00' }]);
       });
 
+      it('names an editable state as /control shows it: a text it cannot show is unknown in its history too (review M5)', () => {
+        // /control sends "unknown" for a state over 255 bytes or holding CR, LF,
+        // NUL or a lone surrogate (showable, src/protocol/editable.ts), and the
+        // popup's live Activity uses that state (sensor_popup.cpp:3099): one
+        // name, one palette entry.
+        const samples: Sample[] = [
+          { ts: ms(DAY_S - 60), state: 'Eco' },
+          { ts: ms(DAY_S + 1000), state: 'Line1\nLine2' }, // a raw value without a label
+          { ts: ms(DAY_S + 2000), state: 'Eco' },
+          { ts: ms(DAY_S + 3000), state: 'x'.repeat(256) },
+        ];
+        const current: Current = { state: 'x'.repeat(256), available: true, lastChanged: ms(DAY_S + 3000) };
+        const doc = JSON.parse(respond(editableRequest('select.heating_mode'), samples, current));
+        expect(doc.activity.map((entry: { state: string }) => entry.state)).to.deep.equal(['unknown', 'Eco', 'unknown']);
+        expect(doc.palette).to.deep.equal(['unknown', 'unavailable', 'Eco']);
+        // A sensor's text has no such rule: the panel's own names.
+        const sensor = JSON.parse(respond(stateRequest(), samples, current));
+        expect(sensor.activity[0].state).to.equal('Line1\nLine2');
+        expect(sensor.activity[2].state).to.match(/^x{23}~[0-9a-f]{8}$/);
+      });
+
       it('answers an editable with no history with an empty graph and no Activity, never a stale one', () => {
         const out = respond(editableRequest('number.living_room_setpoint'), [], { state: '21', available: true, lastChanged: ms(DAY_S + 100) });
         const doc = JSON.parse(out);
@@ -1223,14 +1363,66 @@ describe('protocol/history', () => {
       });
     });
 
+    describe('history unavailable (Ruling 126)', () => {
+      // Rows the provider did read are ignored once it says no history was.
+      const rows: Sample[] = [
+        { ts: ms(DAY_S - 60), state: 'off' },
+        { ts: ms(DAY_S + 100), state: 'on' },
+      ];
+      const unavailable = (req: DiscreteRequest, state = 'on'): string => {
+        const out = buildDiscreteHistoryResponse(req, rows, NOW, { state, available: true, lastChanged: ms(DAY_S + 100) }, false);
+        if (out === null) throw new Error('no response');
+        return out;
+      };
+
+      it('makes a binary or state popup say "History unavailable" at once, not after its own 8 s', () => {
+        // history_available false, and an error key, which forces it whatever
+        // the flag says (sensor_popup.cpp:1873-1874 and :1967-1976 binary,
+        // :2121-2122 and :2237-2246 state). The head clears the pending request
+        // (mqtt_handlers.cpp:1839-1853, :391-407) before its 8 s run out (:541-553).
+        const binary = unavailable(binaryRequest());
+        expect(binary).to.equal('{"kind":"binary","entity_id":"binary_sensor.front_door","hours":24,"history_available":false,"error":"history_unavailable"}');
+        expect(panelBinary(binary, 24)).to.deep.include({ available: false, segments: [], activity: [], bins: [] });
+        expect(dispatch(binary, { entityId: 'binary_sensor.front_door', kind: 'binary', hours: 24 }).clearsPending).to.equal(true);
+        const state = unavailable(stateRequest());
+        expect(state).to.equal('{"kind":"state","entity_id":"sensor.vacuum_status","hours":24,"history_available":false,"error":"history_unavailable"}');
+        expect(panelState(state, 24)).to.deep.include({ available: false, segments: [], activity: [], bins: [] });
+        expect(dispatch(state, { entityId: 'sensor.vacuum_status', kind: 'state', hours: 24 }).clearsPending).to.equal(true);
+      });
+
+      it('answers an editable popup, which has no timeout of its own, with its request_id and no values at all', () => {
+        // editable_request_history marks nothing pending (value_control.cpp:179-189):
+        // unanswered, the popup says "Loading" until it closes. A Number's reply
+        // also reaches the tile graphs (mqtt_handlers.cpp:1870-1871), which take
+        // any values, even [] (tile_renderer.cpp:4498-4526): so none. The popup
+        // clears its own chart (sensor_popup.cpp:2301).
+        const number = unavailable(editableRequest('number.living_room_setpoint'), '21');
+        expect(number).to.equal(
+          `{"kind":"number","entity_id":"number.living_room_setpoint","hours":24,"request_id":"${REQUEST_ID}","history_available":false,"error":"history_unavailable"}`,
+        );
+        const numberPopup = { entityId: 'number.living_room_setpoint', kind: 'number' as const, requestId: REQUEST_ID, hours: 24 as const };
+        expect(panelEditable(number, numberPopup)).to.deep.include({ values: [] });
+        expect(panelEditable(number, numberPopup)!.history.available).to.equal(false);
+        const select = unavailable(editableRequest('select.heating_mode'), 'Eco');
+        const selectPopup = { entityId: 'select.heating_mode', kind: 'select' as const, requestId: REQUEST_ID, hours: 24 as const };
+        expect(JSON.parse(select)).to.include({ request_id: REQUEST_ID, history_available: false });
+        expect(panelEditable(select, selectPopup)!.history.available).to.equal(false);
+      });
+
+      it('still refuses a malformed request with no response', () => {
+        const odd = { kind: 'binary', entityId: 'binary_sensor.x', hours: 24, maxTransitions: 1 } as DiscreteRequest;
+        expect(buildDiscreteHistoryResponse(odd, rows, NOW, { state: 'on', available: true, lastChanged: 0 }, false)).to.equal(null);
+      });
+    });
+
     it('refuses a request the parser would have refused, with no response at all', () => {
       const current: Current = { state: 'on', available: true, lastChanged: 0 };
       for (const maxTransitions of [0, 1, 97, 2.5, Number.NaN]) {
         const req: DiscreteRequest = { kind: 'binary', entityId: 'binary_sensor.x', hours: 24, maxTransitions };
-        expect(buildDiscreteHistoryResponse(req, [], NOW, current), String(maxTransitions)).to.equal(null);
+        expect(buildDiscreteHistoryResponse(req, [], NOW, current, true), String(maxTransitions)).to.equal(null);
       }
       const odd = { kind: 'state', entityId: 'sensor.x', hours: 12, maxTransitions: 96 } as unknown as DiscreteRequest;
-      expect(buildDiscreteHistoryResponse(odd, [], NOW, current)).to.equal(null);
+      expect(buildDiscreteHistoryResponse(odd, [], NOW, current, true)).to.equal(null);
     });
   });
 });

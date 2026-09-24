@@ -44,8 +44,10 @@ const bytes = (text: string): number => Buffer.byteLength(text, 'utf8');
  * placeholder row above the options (:844-845); a line break makes that two
  * rows while the offset stays one, so every tap would submit the option
  * below the one tapped (:497-498). NUL ends the panel's copy (:73).
+ * The history reply names an editable state by this rule too, so its
+ * Activity and the live one agree (protocol/history.ts).
  */
-const showable = (state: string): string => (bytes(state) <= 255 && !UNSHOWABLE.test(state) ? state : STATE_UNKNOWN);
+export const showable = (state: string): string => (bytes(state) <= 255 && !UNSHOWABLE.test(state) ? state : STATE_UNKNOWN);
 
 /** The list complete by the panel's rules, or none: 1-64 unique options of 1-255 bytes (§6; :92-98). */
 function completeOptions(options: unknown): string[] | undefined {
