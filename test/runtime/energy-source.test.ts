@@ -213,6 +213,16 @@ describe('runtime/energy-source', () => {
     it('reads noise below 1e-9 as no change, as the Bridge does (__init__.py:2729-2730)', () => {
       expect(consumption([0.1 + 0.2, 0.3], 0.3).values).to.deep.equal([0, 0]);
     });
+
+    it('spans a gap in the total: the increase between each two readings known, the bars null where unknown (review I1)', () => {
+      expect(consumption([1000, null, 1002], 1003)).to.deep.equal({ values: [null, null, 1], total: 3 });
+      // Every bucket unknown, both ends known.
+      expect(consumption([1000, null, null], 1005)).to.deep.equal({ values: [null, null, null], total: 5 });
+      // A reset inside the gap counts as one: only increases.
+      expect(consumption([1000, null, 5], 7)).to.deep.equal({ values: [null, null, 2], total: 2 });
+      // One reading known is no increase.
+      expect(consumption([null, 5], null)).to.deep.equal({ values: [null, null], total: null });
+    });
   });
 
   describe('energyEntries: the Bridge\'s entries (__init__.py:2770-2880)', () => {
@@ -258,6 +268,13 @@ describe('runtime/energy-source', () => {
       const panel = panelEnergy(JSON.stringify({ period: 'day', entries }))!.entries;
       // 1.7345 is 1.734 to Python, as its binary value lies below the tie.
       expect(panel.map((e) => panelTotalText(e.total, e.isCost))).to.deep.equal(['1.734', '0.52']);
+    });
+
+    it('spans the gaps in a cost total too, at the same price, and prices the rounded values as the Bridge where there is none (review I1)', () => {
+      const [, spanned] = energyEntries([meter({ price: 0.3 })], 'EUR', TOTALS, series([['energy.netzbezug', { values: [1, null, null, 1], total: 5 }]]));
+      expect(spanned).to.deep.include({ values: [0.3, null, null, 0.3], total: 1.5 });
+      const [, unknown] = energyEntries([meter({ price: 0.3 })], 'EUR', TOTALS, series([['energy.netzbezug', { values: [null, null], total: 5 }]]));
+      expect(unknown).to.deep.include({ values: [null, null], total: 1.5 });
     });
 
     it('prices an export meter as the Bridge does: its values as they are, its total signed', () => {
@@ -524,6 +541,31 @@ describe('runtime/energy-source', () => {
         // 2880 readings a day, 0.001 kWh each.
         expect(entry!.values.slice(0, 6)).to.deep.equal(Array(6).fill(2.88));
         expect(fake.calls.every((call) => call.options.count === 3)).to.equal(true);
+      });
+
+      it("keeps a dense meter's day total whole after a restart: live less the reading before midnight (review I1)", async () => {
+        // +0.001 kWh every 10 s since 20:00; asked first at 15:00:30. The window
+        // from 01:00 keeps its newest 5000 rows, from 01:07:10: 01:00 reads null.
+        const first = at(2026, 9, 24, 20);
+        const now = at(2026, 9, 25, 15) + 30_000;
+        const rows: Stored[] = Array.from({ length: (now - first) / 10_000 }, (_, i) => ({ ts: first + i * 10_000, val: 900 + i / 1000, ack: true, q: 0 }));
+        const live = (rows.at(-1)!.val as number) + 0.001;
+        const beforeMidnight = rows.filter((row) => row.ts < at(2026, 9, 25)).at(-1)!.val as number;
+        const split = at(2026, 9, 25, 13);
+        for (const fake of [sqlFake(rows), historyFake(rows.filter((row) => row.ts >= split), rows.filter((row) => row.ts < split))]) {
+          clock.setSystemTime(now);
+          fake.states['shelly.0.em.total'] = { val: live, q: 0 };
+          const source = new EnergySource(new HistoryProvider(fake, logger(), fake.instance), fake, logger());
+          source.configure(configured());
+          const day = async (): Promise<EnergyEntry> => (JSON.parse((await source.answer('a1', '{"period":"day"}'))!.payload).entries as EnergyEntry[])[0]!;
+          const entry = await day();
+          expect(entry.values, fake.instance).to.deep.equal([null, null, ...Array(13).fill(0.36), 0.004]);
+          expect(entry.total, fake.instance).to.equal(5.404);
+          expect(entry.total, fake.instance).to.equal(Math.round((live - beforeMidnight) * 1000) / 1000);
+          // A minute later the nulls are kept, and the total stays whole.
+          clock.tick(MINUTE);
+          expect((await day()).total, fake.instance).to.equal(5.404);
+        }
       });
 
       it('sums a day to its total from real rows, whichever history adapter answers', async () => {

@@ -129,32 +129,38 @@ export function localIso(ms: number): string {
   );
 }
 
+/** A counter's increase: a decrease is a reset and counts 0; noise below 1e-9 is 0, as the Bridge's (__init__.py:2729-2730). */
+const increase = (from: number, to: number): number => (to - from > 1e-9 ? to - from : 0);
+
 /**
  * Each bucket's consumption: the counter's increase from the reading before
  * its start to the reading before the next bucket's, the last to the live
- * reading. A decrease is a reset: that bucket is 0 and the next counts from
- * the new reading. A bucket with no reading on either side is null. Noise
- * below 1e-9 is 0, as the Bridge's (__init__.py:2729-2730).
+ * reading. After a reset the next bucket counts from the new reading. A
+ * bucket with no reading on either side is null. The total spans those gaps
+ * (review I1): the increase between each two readings known, as HA's
+ * statistics telescope across a missing hour. An hour a window could not
+ * reach costs its bars, not the day's total.
  */
 export function consumption(readings: ReadonlyArray<number | null>, live: number | null): Consumption {
   const values = readings.map((from, i) => {
     const to = i + 1 < readings.length ? readings[i + 1]! : live;
-    if (from === null || to === null) return null;
-    return to - from > 1e-9 ? to - from : 0;
+    return from === null || to === null ? null : increase(from, to);
   });
-  const known = values.filter((value): value is number => value !== null);
-  return { values, total: known.length > 0 ? known.reduce((sum, value) => sum + value, 0) : null };
+  const known = [...readings, live].filter((reading): reading is number => reading !== null);
+  return { values, total: known.length > 1 ? known.slice(1).reduce((total, to, i) => total + increase(known[i]!, to), 0) : null };
 }
 
 const sum = (values: readonly number[]): number => values.reduce((total, value) => total + value, 0);
+const known = (values: ReadonlyArray<number | null>): number[] => values.filter((value): value is number => value !== null);
 
 /**
  * The entries of an answer, shaped as the Bridge's (__init__.py:2770-2880):
  * per meter its own, and a cost entry when it has a price; then each
  * category of two or more a total, one of energy and one of cost. Values and
  * totals are rounded as the Bridge rounds them: a meter's values to 3
- * decimals and its total from their unrounded sum; costs priced from the
- * rounded values, to 4 decimals, their total to 2; a category's slots to 3
+ * decimals and its total from their unrounded sum, spanning any gap
+ * (consumption); costs priced from the rounded values, to 4 decimals, their
+ * total to 2, the gap at the same price; a category's slots to 3
  * (or 4) and its total, the sum of its members', to 3 (or 2). A meter's
  * values go out as measured and its total signed, so the panel, which turns
  * a positive value negative for sign -1, signs each once (applyEnergySign);
@@ -177,7 +183,6 @@ export function energyEntries(
     entries.push(own);
     if (meter.price === undefined) continue;
     const costs = values.map((value) => (value === null ? null : Math.abs(value) * meter.price!));
-    const priced = costs.filter((cost): cost is number => cost !== null);
     const cost: EnergyEntry = {
       id: `${meter.id}_cost`,
       category: meter.category,
@@ -187,7 +192,12 @@ export function energyEntries(
       is_cost: true,
       name: `${meter.name} (${currency})`,
     };
-    if (priced.length > 0) cost.total = bridgeRound(applyEnergySign(sum(priced), meter.sign), 2);
+    // The rounded values priced, as the Bridge's (:2749-2765); the increase
+    // the total spans across a gap in them (review I1) at the same price.
+    if (used && used.total !== null) {
+      const gap = used.total - sum(known(used.values));
+      cost.total = bridgeRound(applyEnergySign(sum(known(costs)) + gap * meter.price, meter.sign), 2);
+    }
     entries.push(cost);
   }
   for (const isCost of [false, true]) {
