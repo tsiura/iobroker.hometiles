@@ -1,10 +1,11 @@
 /**
  * The numbers of an editable value as the panel's JSON library handles them:
  * ArduinoJson 7.4.3 (HomeTiles .github/workflows/firmware.yml:96), ported line
- * by line and checked against the library itself on 180,000 numbers
- * (task-15-report.md). A value command is checked against the range and step
- * the panel works with, which are not always the ones published (Task 15,
- * Task 14 O4):
+ * by line. test/fixtures/arduinojson-golden.json holds what the library itself
+ * printed, run by tools/arduinojson-probe.cpp (tools/arduinojson-fixture.cjs
+ * regenerates it). A value command is checked against the range and step the
+ * panel works with, which are not always the ones published (Task 15, Task 14
+ * O4):
  *
  * - A decimal whose digits fit 23 bits and whose exponent fits a float is
  *   parsed as a float (parseNumber.hpp:217-229), a double a float holds
@@ -15,6 +16,8 @@
  *   (value_control.cpp:28-34): a step of 0.08197082 is 0.081971 on the panel.
  * - A command's value is a double, printed the same way (value_control.cpp:306):
  *   1234567.5, which a float holds, goes out as 1234568.
+ * - A float past its range prints null, which strtod reads as 0: a max of
+ *   5e38 is 0 on the panel.
  */
 
 /** FloatTraits.hpp: the binary powers of ten, 1e1 to 1e256, and their inverses. */
@@ -151,7 +154,10 @@ function print(number: number, places: 6 | 9): string {
 /** The number the panel works with for one we publish: finite_json's re-read (value_control.cpp:28-34). */
 export function readByPanel(published: number): number {
   const { value, decimals } = parse(JSON.stringify(published));
-  return decimals === 0 ? value : Number(print(value, decimals));
+  if (decimals === 0) return value;
+  const text = print(value, decimals);
+  // strtod reads nothing of "null": 0.
+  return text === 'null' ? 0 : Number(text);
 }
 
 /** The number a command carries for a double the panel holds (value_control.cpp:306), as JSON.parse reads it. */

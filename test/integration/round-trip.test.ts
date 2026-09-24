@@ -367,6 +367,79 @@ describe('integration round trip', function () {
     });
   });
 
+  it('after a restart: the retained announcement starts the session, retained presence is read, and no retained command runs (Ruling 101)', async () => {
+    // The adapter goes down ...
+    await manager.stopAll();
+    await adapterMqtt.disconnect();
+    // ... while the broker keeps what the panel retained, and a command on
+    // every leaf that some client published retained.
+    const soll = registry.byId('number.soll')!;
+    const value = {
+      entity_id: 'number.soll',
+      session: CONTROL_SESSION,
+      revision: controlRevision(soll, CONTROL_SESSION),
+      value: 27,
+      id: 'retained-00000002',
+      deadline: Math.floor(Date.now() / 1000) + 10,
+    };
+    const retained: Array<[string, string]> = [
+      ['tab5_lvgl/config/e2e1/bridge', ANNOUNCE],
+      ['hometiles-e2e/stat/connected', 'online'],
+      ['hometiles-e2e/stat/ip', '192.168.1.40'],
+      ['hometiles-e2e/cmnd/switch', '{"entity_id":"switch.kaffee","state":"on"}'],
+      ['hometiles-e2e/cmnd/light', '{"entity_id":"light.decke","state":"off"}'],
+      ['hometiles-e2e/cmnd/scene', 'gute nacht'],
+      ['hometiles-e2e/cmnd/climate', '{"entity_id":"light.decke","command":"set_hvac_mode","hvac_mode":"heat"}'],
+      ['hometiles-e2e/cmnd/cover', '{"entity_id":"light.decke","command":"open_cover"}'],
+      ['hometiles-e2e/cmnd/media', '{"entity_id":"light.decke","command":"next"}'],
+      ['hometiles-e2e/cmnd/value', JSON.stringify(value)],
+    ];
+    for (const [topic, payload] of retained) {
+      await new Promise<void>((resolve) => panelMqtt.publish(topic, payload, { retain: true }, () => resolve()));
+    }
+
+    // The adapter comes back: a new client and manager, as a new process has.
+    const warnings: string[] = [];
+    const log = { ...silentLog, warn: (message: string): void => void warnings.push(message) };
+    const dispatcher = new Dispatcher(
+      { byId: (id) => registry.byId(id), bySceneAlias: (alias) => registry.bySceneAlias(alias) },
+      async (objectId, written) => {
+        writes.push([objectId, written]);
+      },
+      log,
+    );
+    adapterMqtt = new HomeTilesMqttClient({ ...DEFAULTS, brokerPort: PORT, coalesceMs: 0 }, log);
+    manager = new PanelManager({
+      transport: {
+        publish: (request) => adapterMqtt.publish(request),
+        subscribe: (topic) => adapterMqtt.subscribe(topic),
+        unsubscribe: (topic) => adapterMqtt.unsubscribe(topic),
+      },
+      dispatcher,
+      log,
+      entities: () => registry.all(),
+      onSessionsChanged: async () => undefined,
+      onPanelRemoved: async () => undefined,
+    });
+    adapterMqtt.onMessage((topic, payload, retain) => {
+      const deviceId = deviceIdFromAnnounceTopic(topic);
+      if (deviceId) void manager.handleAnnouncement(deviceId, payload);
+      else void manager.handleMessage(topic, payload, retain);
+    });
+    await adapterMqtt.connect();
+    await adapterMqtt.subscribe(ANNOUNCE_TOPIC_PATTERN);
+
+    const session = await waitFor(() => manager.get('e2e1'));
+    // Presence and IP are subscribed after every command leaf, so every
+    // retained command was replayed before them.
+    await waitFor(() => (session.online && session.ip === '192.168.1.40' ? true : undefined));
+    // A live command after them runs: the retained ones, replayed first, did not.
+    panelMqtt.publish('hometiles-e2e/cmnd/switch', '{"entity_id":"switch.kaffee","state":"off"}');
+    await waitFor(() => (writes.length ? true : undefined));
+    expect(writes).to.deep.equal([['shelly.0.plug.on', false]]);
+    expect(warnings).to.deep.equal([]);
+  });
+
   it('ignores a malformed announcement without creating a session', async () => {
     // Waiting for something NOT to happen cannot be polled, so instead publish
     // a valid announcement afterwards and wait for THAT session to appear. MQTT

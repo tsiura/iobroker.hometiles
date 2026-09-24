@@ -93,7 +93,7 @@ describe('runtime/panel-manager', () => {
     await manager.handleAnnouncement('a1', announcement('a1', 'panel-a'));
     expect(manager.get('a1')).to.not.equal(undefined);
     // Neither does the panel's own refresh request.
-    await manager.handleMessage('tab5_lvgl/config/a1/bridge/request', 'force');
+    await manager.handleMessage('tab5_lvgl/config/a1/bridge/request', 'force', false);
     expect(published).to.deep.equal([]);
   });
 
@@ -146,8 +146,24 @@ describe('runtime/panel-manager', () => {
     await manager.handleAnnouncement('a2', announcement('a2', 'shared'));
     expect(warnings.some((w) => w.includes('already used by panel'))).to.equal(true);
 
-    await manager.handleMessage('shared/cmnd/switch', '{"entity_id":"switch.k","state":"on"}');
+    await manager.handleMessage('shared/cmnd/switch', '{"entity_id":"switch.k","state":"on"}', false);
     expect(writes).to.deep.equal([['shelly.0.on', true]]);
+  });
+
+  it('ignores a retained command, yet a retained announcement starts the session and retained presence is read (Ruling 101, T1)', async () => {
+    // What an adapter restart replays: the panel's retained announcement and
+    // presence, and a command some client left retained. The manager never
+    // sees an announcement's retain flag, and must not drop the rest.
+    const { manager, writes, warnings } = harness();
+    await manager.handleAnnouncement('a1', announcement('a1', 'panel-a'));
+    await manager.handleMessage('panel-a/stat/connected', 'online', true);
+    await manager.handleMessage('panel-a/stat/ip', '192.168.1.40', true);
+    await manager.handleMessage('panel-a/cmnd/switch', '{"entity_id":"switch.k","state":"on"}', true);
+    expect(manager.get('a1')).to.include({ online: true, ip: '192.168.1.40' });
+    expect(writes).to.deep.equal([]);
+    await manager.handleMessage('panel-a/cmnd/switch', '{"entity_id":"switch.k","state":"on"}', false);
+    expect(writes).to.deep.equal([['shelly.0.on', true]]);
+    expect(warnings).to.deep.equal([]);
   });
 
   it('releases subscriptions for every panel on stopAll', async () => {

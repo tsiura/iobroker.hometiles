@@ -165,11 +165,20 @@ const HELPER_OBJECTS: Record<string, object> = {
 /** More missing states than one warning lists (Task 13b round 1, m6). */
 const MISSING = Array.from({ length: 21 }, (_, index) => `0_userdata.0.Heizung.Fehlt_${index + 1}`);
 
+/** A socket, as type-detector finds one: a channel with one writable switch state. */
+const KAFFEE = 'shelly.0.Kaffee';
+const KAFFEE_SWITCH = `${KAFFEE}.Switch`;
+const KAFFEE_OBJECTS: Record<string, object> = {
+  [KAFFEE]: { type: 'channel', common: { name: 'Kaffee' } },
+  [KAFFEE_SWITCH]: { type: 'state', common: { name: 'Schalten', role: 'switch', type: 'boolean', read: true, write: true } },
+};
+
 const FIXTURE_IDS = [
   ...Object.keys(SENSOR_OBJECTS),
   ...Object.keys(CORRUPT_ENUM_OBJECTS),
   ...Object.keys(BAD_OBJECTS),
   ...Object.keys(HELPER_OBJECTS),
+  ...Object.keys(KAFFEE_OBJECTS),
 ];
 
 /** A panel as the firmware announces itself: retained on the broker, like its last configuration. */
@@ -215,6 +224,42 @@ function withBrokerAndPanel(port: number): { applies: string[]; panel: () => Mqt
     broker.close();
   });
   return { applies, panel: () => panel };
+}
+
+/**
+ * Commands some client left retained, one per leaf (Ruling 101). The switch
+ * and light ones would switch the socket on (a light's on reaches a switch
+ * too); the others name no scene, or a call a switch does not take, and
+ * would be refused with a warning.
+ */
+const RETAINED_COMMANDS: Array<[string, string]> = [
+  ['switch', '{"entity_id":"switch.kaffee","state":"on"}'],
+  ['light', '{"entity_id":"switch.kaffee","state":"on"}'],
+  ['scene', 'gute nacht'],
+  ['climate', '{"entity_id":"switch.kaffee","command":"set_hvac_mode","hvac_mode":"heat"}'],
+  ['cover', '{"entity_id":"switch.kaffee","command":"open_cover"}'],
+  ['media', '{"entity_id":"switch.kaffee","command":"next"}'],
+];
+
+/** A state change as the harness reports it. */
+type Change = { val: unknown; ack: boolean } | null | undefined;
+
+/** Every value written to `id` as a command (ack false), in order, from now on. */
+function commandsTo(harness: IntegrationTestHarness, id: string): unknown[] {
+  const written: unknown[] = [];
+  harness.on('stateChange', (changed: string, state: Change) => {
+    if (changed === id && state && !state.ack) written.push(state.val);
+  });
+  return written;
+}
+
+/** Every value `id` takes from now on. */
+function valuesOf(harness: IntegrationTestHarness, id: string): unknown[] {
+  const values: unknown[] = [];
+  harness.on('stateChange', (changed: string, state: Change) => {
+    if (changed === id && state) values.push(state.val);
+  });
+  return values;
 }
 
 /**
@@ -599,6 +644,66 @@ if (process.env.HOMETILES_INTEGRATION === '1') {
             `[Registry] Manual entities shown read-only: ${STUFE} (no min/max), ${MODUS} (no states), ` +
               `${DATUM} (a value that is no date or time)`,
           ]);
+        });
+      });
+
+      // One broker for both suites: what the panel and a client retained
+      // survives the adapter's restart between them.
+      describe('retained panel messages across an adapter restart (Task 15, Ruling 101)', () => {
+        const port = 18856;
+        const { applies, panel } = withBrokerAndPanel(port);
+        const commandWarnings = (logs: LogRecord[]): string[] =>
+          logs
+            .filter((log) => log.message.startsWith('hometiles.0 ') && log.severity === 'warn' && /command/i.test(log.message))
+            .map((log) => log.message);
+
+        async function start(harness: IntegrationTestHarness): Promise<{ logs: LogRecord[]; written: unknown[] }> {
+          const logs = await captureLogs(harness);
+          await harness.changeAdapterConfig('hometiles', { native: { brokerHost: '127.0.0.1', brokerPort: port } });
+          await setObjects(harness, KAFFEE_OBJECTS);
+          await harness.states.setStateAsync(KAFFEE_SWITCH, { val: false, ack: true });
+          const written = commandsTo(harness, KAFFEE_SWITCH);
+          const seen = applies.length;
+          await harness.startAdapterAndWait(true);
+          await waitFor(harness, () => applies.slice(seen).find((payload) => payload.includes('switch.kaffee')), 'the apply');
+          return { logs, written };
+        }
+
+        suite('before the restart', (getHarness) => {
+          withCleanFixtures(getHarness);
+
+          it('runs a command a client publishes retained while the adapter listens: it arrives live, once', async function () {
+            this.timeout(120000);
+            const harness = getHarness();
+            const { written } = await start(harness);
+            for (const [leaf, payload] of RETAINED_COMMANDS) {
+              await panel().publishAsync(`hometiles-e2e/cmnd/${leaf}`, payload, { retain: true });
+            }
+            await panel().publishAsync('hometiles-e2e/stat/connected', 'online', { retain: true });
+            await panel().publishAsync('hometiles-e2e/stat/ip', '192.168.1.40', { retain: true });
+            await waitFor(harness, () => (written.length >= 2 ? true : undefined), 'the switch and light commands');
+            expect(written).to.deep.equal([true, true]);
+          });
+        });
+
+        suite('after the restart', (getHarness) => {
+          withCleanFixtures(getHarness);
+
+          it('starts from the replayed announcement, reads the replayed presence and IP, and runs no replayed command', async function () {
+            this.timeout(120000);
+            const harness = getHarness();
+            const connected = valuesOf(harness, `hometiles.0.panels.${PANEL}.info.connected`);
+            const ip = valuesOf(harness, `hometiles.0.panels.${PANEL}.info.ip`);
+            const { logs, written } = await start(harness);
+            await waitFor(harness, () => (connected.includes(true) ? true : undefined), 'the replayed presence');
+            await waitFor(harness, () => (ip.includes('192.168.1.40') ? true : undefined), 'the replayed IP');
+            // Every command leaf is subscribed before presence, so each retained
+            // command was replayed by now; a live one after them runs.
+            await panel().publishAsync('hometiles-e2e/cmnd/switch', '{"entity_id":"switch.kaffee","state":"off"}');
+            await waitFor(harness, () => (written.length ? true : undefined), 'the live command');
+            expect(written).to.deep.equal([false]);
+            expect(commandWarnings(logs)).to.deep.equal([]);
+          });
         });
       });
 

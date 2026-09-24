@@ -37,11 +37,26 @@ type CommandLeaf = (typeof COMMAND_LEAVES)[number];
 const WEATHER_REQUEST_REPEAT_MS = 1000;
 
 /**
- * A value command's deadline, epoch seconds, must lie ahead by at most this
- * much (__init__.py:1562-1566); the panel sends now + 10 (value_control.cpp:
- * 309). A panel whose clock is off by more gets "expired" for every command.
+ * A value command's deadline, epoch seconds, must lie ahead of now by more
+ * than 0 and at most this much (__init__.py:1562-1566). The panel sends its
+ * own now + 10, in whole seconds (value_control.cpp:295, :309), so its clock
+ * may run at most about 5 s ahead of this host's, or up to about 10 s behind,
+ * less the time in transit (review m3): a panel or host whose clock is off by
+ * more gets "expired" for every command.
  */
 const MAX_DEADLINE_AHEAD_S = 15;
+/** What the panel adds to its clock for a deadline (value_control.cpp:309). */
+const PANEL_DEADLINE_S = 10;
+/**
+ * Clocks this far apart, either way, are named in a warning (Ruling 102):
+ * far beyond the window above and any transit delay, so a command that is
+ * just outside it never warns.
+ */
+const CLOCK_WARN_OFFSET_S = 30;
+/** No clock is this far off: such a deadline is no Unix time in seconds (review T12). */
+const MAX_CLOCK_OFFSET_S = 1e9;
+/** The clock warning, at most once in this long per panel. */
+const CLOCK_WARN_INTERVAL_MS = 3_600_000;
 /** Command ids held against a replay, at most (__init__.py:1567-1570). */
 const MAX_HELD_COMMAND_IDS = 128;
 const EDITABLE_DOMAINS: ReadonlySet<string> = new Set(['number', 'select', 'datetime']);
@@ -49,6 +64,8 @@ const EDITABLE_DOMAINS: ReadonlySet<string> = new Set(['number', 'select', 'date
 const FAILURE_LOG_INTERVAL_MS = 60_000;
 /** What the dispatcher refuses a value with that is itself an answer; any other refusal means it cannot be written. */
 const VALUE_REFUSALS: ReadonlySet<string> = new Set(['changed', 'unavailable', 'invalid_value', 'invalid_step', 'invalid_option']);
+/** Text from the wire for a log line: JSON-escaped, so no line break gets through, and cut short (review m6). */
+const quoted = (text: string): string => JSON.stringify(text).slice(0, 100);
 
 export class PanelSession {
   private lastSignature: string | null = null;
@@ -74,6 +91,7 @@ export class PanelSession {
   private readonly commandIds = new Map<string, number>();
   private failureLoggedAt = -Infinity;
   private failuresUnlogged = 0;
+  private clockWarnedAt = -Infinity;
 
   online = false;
   ip: string | null = null;
@@ -224,9 +242,10 @@ export class PanelSession {
    * device id, so two panels sharing a base topic would otherwise both execute
    * the same press — one physical tap becoming two writes, and a toggle
    * netting to no visible change at all. `retain`: the broker replayed the
-   * message on a new subscription (MQTT 3.1.1 §3.3.1.3).
+   * message on a new subscription (MQTT 3.1.1 §3.3.1.3). The panel's own
+   * topics are read either way; a command is ignored (Ruling 101).
    */
-  async handleMessage(topic: string, payload: string, retain = false): Promise<boolean> {
+  async handleMessage(topic: string, payload: string, retain: boolean): Promise<boolean> {
     if (topic === bridgeRequestTopic(this.deviceId)) {
       // Signature reset makes the next pushConfig unconditional.
       this.lastSignature = null;
@@ -271,7 +290,20 @@ export class PanelSession {
     const leaf = COMMAND_LEAVES.find((candidate) => topic === commandTopic(this.baseTopic, candidate));
     if (!leaf) return false;
 
-    if (leaf === 'value') await this.executeValueCommand(payload, retain);
+    // Ruling 101: a retained command is replayed at every (re)subscription,
+    // so it would run again at every reconnect and restart -- a switch
+    // toggling by itself. The panel retains none (retain false at
+    // mqtt_handlers.cpp:1976-2377 and value_control.cpp:312). Ignored on
+    // every leaf, where the Bridge ignores only value, switch and scene
+    // (__init__.py:1550, :2999, :3082), and before parsing, so a malformed
+    // one warns at no reconnect either. Only after the leaf match: the
+    // panel's retained presence and IP above, and its announcement in the
+    // manager, must still be read (review T1).
+    if (retain) {
+      this.log.debug(`[Panel ${this.deviceId}] Retained command on ${topic} ignored`);
+      return true;
+    }
+    if (leaf === 'value') await this.executeValueCommand(payload);
     else await this.executeCommand(leaf, payload);
     return true;
   }
@@ -307,17 +339,17 @@ export class PanelSession {
 
   /**
    * A number, select or datetime command, taken as the Bridge takes one
-   * (Ruling 99, __init__.py:1549-1590). Dropped without an answer: a retained
-   * one, which every new subscription would run again; one that is no
-   * command (parseValueCommand); one for an entity not pushed to this panel;
-   * an id seen while its deadline runs, or any while 128 are held. "expired"
-   * for a deadline not within 15 s ahead, in epoch seconds, or another
-   * session; then the dispatcher (valueWrite). Every answer goes out on
-   * stat/value, and the entity's /control after it. Refusals are logged at
-   * debug only: the answer carries them.
+   * (Ruling 99, __init__.py:1549-1590), a retained one ignored before
+   * (handleMessage). Dropped without an answer: one that is no command
+   * (parseValueCommand); one for an entity not pushed to this panel; an id
+   * seen while its deadline runs, or any while 128 are held. "expired" for
+   * a deadline not 0-15 s ahead of now, in epoch seconds (MAX_DEADLINE_AHEAD_S),
+   * or another session; then the dispatcher (valueWrite). Every answer goes
+   * out on stat/value, and the entity's /control after it. Refusals are
+   * logged at debug only: the answer carries them. A deadline far outside
+   * the window is also named in a warning (warnClock).
    */
-  private async executeValueCommand(payload: string, retain: boolean): Promise<void> {
-    if (retain) return;
+  private async executeValueCommand(payload: string): Promise<void> {
     let call: Extract<ServiceCall, { kind: 'set_value' }>;
     try {
       call = parseValueCommand(payload);
@@ -327,18 +359,21 @@ export class PanelSession {
       return;
     }
     if (!this.editables.has(call.entityId)) {
-      this.log.debug(`[Panel ${this.deviceId}] Value command dropped: ${call.entityId} is no editable value of this panel`);
+      this.log.debug(`[Panel ${this.deviceId}] Value command dropped: ${quoted(call.entityId)} is no editable value of this panel`);
       return;
     }
     const now = this.now() / 1000;
     const { deadline } = call;
+    const timely = typeof deadline === 'number' && deadline - now > 0 && deadline - now <= MAX_DEADLINE_AHEAD_S;
     let status: ValueStatus;
-    if (typeof deadline !== 'number' || !(deadline - now > 0 && deadline - now <= MAX_DEADLINE_AHEAD_S) || call.session !== CONTROL_SESSION) {
+    if (!timely || call.session !== CONTROL_SESSION) {
+      // A session from before a restart of the adapter is no clock problem (review T7).
+      if (!timely) this.warnClock(deadline, now);
       status = 'expired';
     } else {
       for (const [id, expiry] of this.commandIds) if (expiry <= now) this.commandIds.delete(id);
       if (this.commandIds.has(call.id) || this.commandIds.size >= MAX_HELD_COMMAND_IDS) {
-        this.log.debug(`[Panel ${this.deviceId}] Value command ${call.id} dropped: seen, or ${MAX_HELD_COMMAND_IDS} held`);
+        this.log.debug(`[Panel ${this.deviceId}] Value command ${quoted(call.id)} dropped: seen, or ${MAX_HELD_COMMAND_IDS} held`);
         return;
       }
       this.commandIds.set(call.id, deadline);
@@ -364,6 +399,30 @@ export class PanelSession {
     }
     this.logFailure(call.entityId, cause);
     return 'failed';
+  }
+
+  /**
+   * Ruling 102: a deadline far outside the window means the panel's clock
+   * and this host's disagree, and every command expires. Named at most once
+   * an hour, the first time at once, with the offset and its sign, and with
+   * the topic: a panel sharing a base topic is answered by another's session
+   * (review T11), and either clock can be the wrong one (T9). A deadline that
+   * is no finite number, or no Unix time in seconds, says nothing of a clock
+   * (T7, T12).
+   */
+  private warnClock(deadline: unknown, now: number): void {
+    if (typeof deadline !== 'number' || !Number.isFinite(deadline)) return;
+    const offset = deadline - PANEL_DEADLINE_S - now;
+    if (Math.abs(offset) < CLOCK_WARN_OFFSET_S || Math.abs(offset) >= MAX_CLOCK_OFFSET_S) return;
+    const at = this.now();
+    if (at - this.clockWarnedAt < CLOCK_WARN_INTERVAL_MS) return;
+    this.clockWarnedAt = at;
+    this.log.warn(
+      `[Panel ${this.deviceId}] Value commands on ${commandTopic(this.baseTopic, 'value')} expire: their deadline puts the ` +
+        `sending panel's clock about ${Math.round(Math.abs(offset))} s ${offset > 0 ? 'ahead of' : 'behind'} this host's. ` +
+        'A command is accepted only while it is at most about 5 s ahead or 10 s behind: check the time sync (NTP) of the ' +
+        'panel and of this host',
+    );
   }
 
   /** One English line per failure, at most once a minute, then with how many failed meanwhile. */

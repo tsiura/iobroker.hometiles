@@ -87,8 +87,12 @@ export class PanelManager {
     await this.deps.onSessionsChanged();
   }
 
-  /** `retain`: the broker replayed it on a new subscription; a value command then is ignored (Task 15). */
-  async handleMessage(topic: string, payload: string, retain = false): Promise<void> {
+  /**
+   * `retain`: the broker replayed it on a new subscription. The session
+   * ignores a command then, and reads everything else (Ruling 101); an
+   * announcement never comes here.
+   */
+  async handleMessage(topic: string, payload: string, retain: boolean): Promise<void> {
     // First match wins. A command carries the entity and the desired state, so
     // it does not matter which panel sent it — but executing it once per
     // session would turn one tap into N writes.

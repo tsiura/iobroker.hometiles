@@ -1,5 +1,6 @@
 import { expect } from 'chai';
 import { parseAnnouncement } from '../../src/protocol/announce';
+import { sentByPanel } from '../../src/protocol/arduinojson';
 import { CONTROL_SESSION, controlRevision } from '../../src/protocol/editable';
 import { synthDatetime, synthNumber, synthSelect } from '../../src/registry/synth/editable';
 import type { ChannelInput, DatetimeKind, DeviceInput, SourceValue, VirtualEntity } from '../../src/registry/types';
@@ -245,6 +246,26 @@ describe('runtime/panel-session value commands (Task 15)', () => {
       expect(p.writes).to.deep.equal([[ID, 22]]);
     });
 
+    it('a duplicate that arrives while the first is still being written: one write, one answer (review m5)', async () => {
+      // The id is held before the write is awaited: held after it, the
+      // duplicate would find it free and write again.
+      const written: unknown[] = [];
+      let release = (): void => undefined;
+      const slow = new Promise<void>((resolve) => {
+        release = resolve;
+      });
+      const p = panel([SOLL], async (_objectId, value) => {
+        written.push(value);
+        await slow;
+      });
+      const first = command(SOLL, 22);
+      const both = Promise.all([p.send(first), p.send(first)]);
+      release();
+      await both;
+      expect(written).to.deep.equal([22]);
+      expect(p.published.filter((request) => request.topic === ACK).map((request) => JSON.parse(request.payload).status)).to.deep.equal(['ok']);
+    });
+
     it('any command while 128 ids are held; one again once their deadlines pass', async () => {
       const p = panel([SOLL]);
       for (let i = 0; i < 128; i++) expect(await p.status(command(SOLL, 15 + (i % 26) / 2))).to.equal('ok');
@@ -413,7 +434,7 @@ describe('runtime/panel-session value commands (Task 15)', () => {
       // ArduinoJson 7.4.3 on the panel re-reads min, max and step with 9
       // decimals as a double, or 6 as a float (value_control.cpp:28-34), and
       // prints the commanded value the same way (:306). Each value below is
-      // what the library itself produces (task-15-report.md, the probe).
+      // what the library itself produces (tools/arduinojson-probe.cpp).
       it('at the upper bound: a max of 0.9999999996 is 1 on the panel', async () => {
         const top = number({ min: 0, max: 0.9999999996, step: 0.1 }, 0);
         // Written as the object's own bound, never past it.
@@ -442,6 +463,26 @@ describe('runtime/panel-session value commands (Task 15)', () => {
         // One unit further in the last digit is no print of any step.
         expect(await outcome(thirds, 8833.333325)).to.deep.equal(['invalid_step', undefined]);
       });
+
+      it('writes the grid point the panel printed, not the one it held, when a float holds it with more than 7 digits (review m1)', async () => {
+        // The panel keeps such a double as a float and prints 6 decimals
+        // (value_control.cpp:306): it sends another grid point, which is
+        // written and answered "ok", as the Bridge does. The panel then
+        // waits in vain for its own and shows an error after 30 s (:801).
+        // Documented, not refused: no text tells the two apart (contract §5).
+        expect(sentByPanel(20000002)).to.equal(20000000);
+        expect(await outcome(number({ min: 0, max: 33554432, step: 1 }, 0), 20000000)).to.deep.equal(['ok', 20000000]);
+        // Four steps away.
+        expect(sentByPanel(10307966)).to.equal(10307970);
+        expect(await outcome(number({ min: 0, max: 4294967295, step: 1 }, 0), 10307970)).to.deep.equal(['ok', 10307970]);
+      });
+    });
+
+    it('refuses a value whose step count is no finite number, as the panel does (value_control.cpp:305, review m2)', async () => {
+      // A step the synth publishes, with a range too wide for it to count.
+      const fine = number({ min: 0, max: 1e10, step: 1e-300 }, 0);
+      expect(fine.writable).to.deep.equal({ value: true });
+      expect(await outcome(fine, 5e9)).to.deep.equal(['invalid_step', undefined]);
     });
   });
 
@@ -608,6 +649,106 @@ describe('runtime/panel-session value commands (Task 15)', () => {
       expect(loud(p.logs).map((line) => line.level)).to.deep.equal(['error']);
       expect(loud(p.logs)[0]!.message).to.include('number.test').and.include('registry exploded');
     });
+  });
+
+  describe('the clock warning (Ruling 102)', () => {
+    // The panel sends now + 10 in whole seconds (value_control.cpp:295, :309),
+    // and a command is taken while 0 < deadline - now <= 15: the clocks may
+    // be about 5 s apart one way and 10 s the other (review m3). Far outside
+    // that window every command expires, which one warning an hour names.
+    const warnings = (p: ReturnType<typeof panel>): string[] => p.logs.filter((line) => line.level === 'warn').map((line) => line.message);
+    const off = (seconds: number, at = NOW): number => at / 1000 + 10 + seconds;
+
+    it('warns once an hour when a deadline puts the clocks 30 s or more apart, with the offset, the topic and the time sync', async () => {
+      const p = panel([SOLL]);
+      expect(await p.status(command(SOLL, 22, { deadline: off(3600) }))).to.equal('expired');
+      expect(warnings(p)).to.deep.equal([
+        "[Panel a1] Value commands on hometiles/cmnd/value expire: their deadline puts the sending panel's clock about 3600 s " +
+          "ahead of this host's. A command is accepted only while it is at most about 5 s ahead or 10 s behind: " +
+          'check the time sync (NTP) of the panel and of this host',
+      ]);
+      // No second line within the hour, however many expire.
+      p.tick(3_599_999);
+      expect(await p.status(command(SOLL, 22, { deadline: off(-3600, NOW + 3_599_999) }))).to.equal('expired');
+      expect(warnings(p)).to.have.length(1);
+      p.tick(1);
+      expect(await p.status(command(SOLL, 22, { deadline: off(-3600, NOW + 3_600_000) }))).to.equal('expired');
+      expect(warnings(p)).to.have.length(2);
+      expect(warnings(p)[1]).to.include('about 3600 s behind this host');
+      expect(p.writes).to.deep.equal([]);
+    });
+
+    it('warns from 30 s either way, and not for a command just outside the window', async () => {
+      for (const [seconds, warned] of [
+        [30, true],
+        [-30, true],
+        [29, false],
+        [-29, false],
+        // Just outside: expired, and no warning.
+        [6, false],
+        [-10, false],
+      ] as const) {
+        const p = panel([SOLL]);
+        expect(await p.status(command(SOLL, 22, { deadline: off(seconds) })), String(seconds)).to.equal('expired');
+        expect(warnings(p).length, String(seconds)).to.equal(warned ? 1 : 0);
+      }
+    });
+
+    it('does not warn for a session from before a restart, nor a deadline that is no time in seconds (T7, T12)', async () => {
+      const p = panel([SOLL]);
+      for (const over of [
+        // The first command after every restart of the adapter: the clocks are fine.
+        { session: '0123456789abcdef0123456789abcdef' },
+        { deadline: String(off(3600)) },
+        { deadline: true },
+        { deadline: null },
+        // Milliseconds: a broken sender, not a clock 57,000 years off.
+        { deadline: NOW + 10_000 },
+      ]) {
+        expect(await p.status(command(SOLL, 22, over)), JSON.stringify(over)).to.equal('expired');
+      }
+      // JSON.parse reads 1e400 as Infinity.
+      const infinite = JSON.stringify(command(SOLL, 22)).replace(/"deadline":[0-9.]+/, '"deadline":1e400');
+      expect(await p.status(infinite)).to.equal('expired');
+      expect(loud(p.logs)).to.deep.equal([]);
+    });
+
+    it('does not warn for a command it drops first: retained, malformed, or no editable of this panel (T13)', async () => {
+      const p = panel([SOLL]);
+      await p.send(command(SOLL, 22, { deadline: off(3600) }), true);
+      await p.send(JSON.stringify(command(SOLL, 22, { deadline: off(3600) })).slice(0, -1));
+      await p.send(command(SOLL, 22, { deadline: off(3600), entity_id: 'number.unknown' }));
+      expect(p.published).to.deep.equal([]);
+      expect(loud(p.logs)).to.deep.equal([]);
+    });
+
+    it("keeps its hour apart from the failures' minute (T10)", async () => {
+      const p = panel([SOLL], async () => {
+        throw new Error('permission denied');
+      });
+      expect(await p.status(command(SOLL, 22))).to.equal('failed');
+      expect(await p.status(command(SOLL, 22, { deadline: off(3600) }))).to.equal('expired');
+      expect(await p.status(command(SOLL, 22))).to.equal('failed');
+      expect(loud(p.logs).map((line) => line.level)).to.deep.equal(['error', 'warn']);
+    });
+  });
+
+  it('logs an id or entity_id from the wire escaped and cut short (review m6)', async () => {
+    const p = panel([SOLL]);
+    // Long, yet within the 2048 bytes a command may have.
+    const forged = `number.x\n[Panel a1] Value command for number.test failed: forged ${'y'.repeat(1500)}`;
+    await p.send(command(SOLL, 22, { entity_id: forged }));
+    const replayed = command(SOLL, 22, { id: 'id\nforged line' });
+    await p.send(replayed);
+    await p.send(replayed);
+    const lines = p.logs.filter((line) => line.level === 'debug').map((line) => line.message);
+    expect(lines).to.have.length(2);
+    for (const line of lines) {
+      expect(line).to.not.match(/[\r\n]/);
+      expect(line.length).to.be.below(200);
+    }
+    expect(lines[0]).to.include('"number.x\\n[Panel a1]');
+    expect(lines[1]).to.include('"id\\nforged line"');
   });
 
   it('logs no refusal and no drop above debug: the answer says it, and a flood must not fill the log', async () => {

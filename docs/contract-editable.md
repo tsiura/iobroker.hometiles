@@ -346,14 +346,26 @@ adapter follows it (Ruling 99; `src/runtime/panel-session.ts`,
 
 1. **Dropped, no answer**: a retained command (it would run again at every
    subscription; a broker marks retained only what it replays on a new one);
-   one over 2048 bytes (the Bridge counts characters, this adapter bytes);
+   this adapter ignores a retained command on **every** command leaf —
+   light, switch, scene, climate, cover, media and value — where the Bridge
+   ignores only value, switch and scene (`__init__.py:1550`, `:2999`,
+   `:3082`; Ruling 101), and still reads the panel's retained announcement,
+   presence and IP; one over 2048 bytes (the Bridge counts characters, this
+   adapter bytes);
    no JSON object; an `entity_id` that is no number, select or datetime of
    this panel (compared exactly); an `id` that is no string of 1-48
    characters (code points).
 2. **`"expired"`**: `deadline` not a number (a boolean is none), or not
    `0 < deadline - now <= 15` in epoch seconds, or a `session` other than
-   the receiver's own. **A panel whose clock is more than 15 s off gets
-   `"expired"` for every command.**
+   the receiver's own. The panel sends its own now + 10 in whole seconds
+   (`value_control.cpp:295`, `:309`), so **a command is accepted only while
+   the panel's clock is at most about 5 s ahead of the receiver's, or up to
+   about 10 s behind it, less the time in transit; a panel or host whose
+   clock is off by more gets `"expired"` for every command.** This adapter
+   warns about it, at most once an hour per panel, when a deadline puts the
+   two clocks 30 s or more apart either way (Ruling 102); a session from
+   before a restart of the adapter, a deadline that is no number, and one
+   that is no time in seconds (over 1e9 s away) never warn.
 3. **Dropped, no answer**: an `id` seen before whose deadline has not
    passed, or any command while 128 such ids are held. Each accepted id is
    held until its deadline.
@@ -382,12 +394,31 @@ Where this adapter differs, the firmware decides:
   is `0.081971` on the panel, and its grid drifts from ours by 2.2e-6 of a
   step per step. The command's value, a double, is printed the same way
   (`:306`), and a double a float holds exactly is kept as a float
-  (`VariantImpl.hpp:73-98`): `1234567.5` goes out as `1234568`. This adapter
-  checks the value on the panel's own numbers (`src/protocol/arduinojson.ts`,
-  checked against the library on 180,000 numbers) and writes the panel's own
+  (`VariantImpl.hpp:73-98`): `1234567.5` goes out as `1234568`. A float
+  past its range prints `null`, which `strtod` reads as 0: a published max
+  of `5e38` is 0 on the panel. This adapter checks the value on the panel's
+  own numbers (`src/protocol/arduinojson.ts`) and writes the panel's own
   draft for that step, printed `%.15g` as the panel prints it (`:317-318`),
   within the object's range. The Bridge checks on its own grid and refuses
-  such a panel's commands.
+  such a panel's commands. What the library itself prints is kept in
+  `test/fixtures/arduinojson-golden.json`, which the unit tests hold the port
+  to; `tools/arduinojson-probe.cpp` produces it, and
+  `node tools/arduinojson-fixture.cjs` regenerates it (it needs g++ and the
+  ArduinoJson 7.4.3 source, `ARDUINOJSON_SRC`, so CI does not run it).
+- **A value a float holds exactly, with more than 7 significant digits, is
+  sent rounded** (review m1): integers from 1e7, halves from 1e6, quarters
+  from 1e5, eighths from 1e4. The panel keeps such a double as a float and
+  prints it with 6 decimals (`:306`, `VariantImpl.hpp:79-84`,
+  `TextFormatter.hpp:69`): 20000002 goes out as `2e7`, 10307966 as
+  `1.030797e7`, 12345.125 on a step of 0.001 as `12345.13`. That is another
+  point of the grid, possibly several steps away, and it is written and
+  answered `"ok"` — the Bridge writes the same. The panel then waits in vain
+  for its own value and shows an error after 30 s (`:801-803`); the device
+  keeps the written one, at most about 5e-7 of the value off. Nothing on the
+  wire tells such a command from one for that grid point, so refusing it
+  would also refuse the grid point's own commands (all of 1e6..1.3e6 on a
+  step of 0.5). Sending the `%.15g` text at `:306` would end it in the
+  firmware.
 - **The repeated autumn hour** is written as its first instant, summer
   time; the Bridge refuses it (`ambiguous_time`, which becomes
   `"invalid_value"`). Both instants read back as the same text, and the
@@ -503,7 +534,7 @@ they ride inside the same `/control` JSON payload as everything else in
 | each option string | 1–255 bytes, no `\n`/`\r`, unique | `value_control.cpp:97-98` |
 | local command timeout (device-side, independent of `deadline`) | 30 s from publish | `value_control.cpp:801` |
 | `deadline` the device requests | `now + 10` s | `value_control.cpp:309` |
-| `deadline` the receiver accepts | `0 < deadline - now <= 15` s | `__init__.py:1562-1566` |
+| `deadline` the receiver accepts | `0 < deadline - now <= 15` s: the panel's clock at most about 5 s ahead, or 10 s behind | `__init__.py:1562-1566`; `value_control.cpp:295`, `:309` |
 | `cmnd/value` payload the receiver reads | ≤ 2048 (Bridge: characters; this adapter: bytes) | `__init__.py:1550` |
 | command `id` | 1–48 characters | `__init__.py:1557-1559` |
 | command ids held against replay | 128, each until its deadline | `__init__.py:1567-1570` |

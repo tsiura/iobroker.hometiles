@@ -185,6 +185,8 @@ function numberWrite(published: Record<string, unknown>, value: unknown): { raw:
   // The panel edits nothing else (value_control.cpp:82-86).
   if (!(low < high && grid > 0 && Number.isFinite(high - low))) return { refusal: 'unavailable' };
   if (typeof value !== 'number' || !Number.isFinite(value) || value < low || value > high) return { refusal: 'invalid_value' };
+  // A step count past a double's range is no step, as the panel checks (:305, review m2).
+  if (!Number.isFinite((value - low) / grid)) return { refusal: 'invalid_step' };
   const steps = Math.round((value - low) / grid);
   const draft = Number(Math.min(high, low + steps * grid).toPrecision(15));
   if (Math.abs((value - low) / grid - steps) > 1e-6 && sentByPanel(draft) !== value) return { refusal: 'invalid_step' };

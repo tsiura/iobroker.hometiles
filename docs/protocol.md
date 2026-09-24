@@ -78,6 +78,15 @@ Topic is built by lowercasing the entity id and replacing `.` with `/`.
 
 ### Commands — panel publishes to `{baseTopic}/cmnd/{leaf}`
 
+The panel publishes every command with retain false (current firmware:
+`src/network/mqtt/mqtt_handlers.cpp:1976-2377`,
+`src/types/value/value_control.cpp:312`). This adapter ignores a retained
+command on every leaf (Ruling 101): the broker replays it at every
+subscription, so it would run again at every reconnect and restart. The
+HomeTiles Bridge ignores only retained `value`, `switch` and `scene` commands
+(`__init__.py:1550`, `:2999`, `:3082`). The panel's retained announcement and
+`stat/*` topics are read as always.
+
 `cmnd/light`, built by `mqttPublishLightCommand`. Optional members are omitted when absent:
 
 ```json
