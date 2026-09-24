@@ -1,5 +1,6 @@
 import { expect } from 'chai';
 import sinon from 'sinon';
+import { buildApplyPayload } from '../../src/protocol/apply';
 import { MAX_ENERGY_BYTES, MAX_ENERGY_VALUES, type EnergyCategory, type EnergyEntry, type EnergyPeriod } from '../../src/protocol/energy';
 import type { IoBrokerObject } from '../../src/registry/detector';
 import {
@@ -17,6 +18,7 @@ import {
 } from '../../src/runtime/energy-source';
 import { HistoryProvider, type Readings } from '../../src/runtime/history-provider';
 import { panelEnergy, panelTotalText } from '../protocol/panel-energy';
+import { panelEnergyCatalog } from '../protocol/panel-scan';
 import { historyFake, logger, sqlFake, type Stored } from './history-ports';
 
 const HOUR = 3_600_000;
@@ -115,6 +117,13 @@ describe('runtime/energy-source', () => {
         { stateId: 'x.0.flag', reason: 'a meter is a number, not a boolean' },
         { stateId: 'hometiles.0.info.entities', reason: "the adapter's own state" },
       ]);
+    });
+
+    it('draws a kWh meter named "... cost" with its category icon, never the currency (review m3)', () => {
+      const objects = { 'x.0.grid': counter({ name: 'Grid cost' }) };
+      const { meters } = energyMeters([{ stateId: 'x.0.grid', category: 'grid', sign: 1 }], objects, {}, 'hometiles.0', '');
+      const apply = buildApplyPayload({ entities: [], sceneMap: {}, energy: energyCatalog(meters, 'EUR', TOTALS) });
+      expect(Object.fromEntries(panelEnergyCatalog(apply)!.icons)).to.deep.equal({ 'energy.grid_cost_meter': 'transmission-tower' });
     });
 
     it('names each meter the history instance does not log, and none when there is no instance', () => {

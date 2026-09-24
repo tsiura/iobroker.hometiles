@@ -170,20 +170,56 @@ describe('registry/entity-id', () => {
 
     it("never gives a meter another meter's id or its cost entry's id, <id>_cost", () => {
       const ids = resolveEnergyIds([meter('a.0.grid', 'Grid'), meter('a.0.cost', 'Grid cost'), meter('a.0.again', 'Grid')], {});
-      expect(ids).to.deep.equal({ 'energy:a.0.grid': 'energy.grid', 'energy:a.0.cost': 'energy.grid_cost_2', 'energy:a.0.again': 'energy.grid_2' });
+      expect(ids).to.deep.equal({ 'energy:a.0.grid': 'energy.grid', 'energy:a.0.cost': 'energy.grid_cost_meter', 'energy:a.0.again': 'energy.grid_2' });
       // Nor, the other way round, one whose own cost id is a meter's.
-      const reverse = resolveEnergyIds([meter('a.0.cost', 'Grid cost'), meter('a.0.grid', 'Grid')], {});
-      expect(reverse).to.deep.equal({ 'energy:a.0.cost': 'energy.grid_cost', 'energy:a.0.grid': 'energy.grid_2' });
+      const reverse = resolveEnergyIds([meter('a.0.again', 'Grid'), meter('a.0.grid', 'Grid')], { 'energy:a.0.grid': 'energy.grid_2' });
+      expect(reverse).to.deep.equal({ 'energy:a.0.again': 'energy.grid', 'energy:a.0.grid': 'energy.grid_2' });
       for (const all of [ids, reverse]) {
         const taken = Object.values(all).flatMap((id) => [id, `${id}_cost`]);
         expect(new Set(taken).size).to.equal(taken.length);
       }
     });
 
-    it('gives a new id where a stored one is no energy id, or is already given to a meter or its cost entry', () => {
-      const stored = { 'energy:a.0.x': 'sensor.x', 'energy:a.0.y': 'energy.z', 'energy:a.0.z': 'energy.z', 'energy:a.0.w': 'energy.z_cost' };
-      const ids = resolveEnergyIds([meter('a.0.x', 'X'), meter('a.0.y', 'Y'), meter('a.0.z', 'Z'), meter('a.0.w', 'W')], stored);
-      expect(ids).to.deep.equal({ 'energy:a.0.x': 'energy.x', 'energy:a.0.y': 'energy.z', 'energy:a.0.z': 'energy.z_2', 'energy:a.0.w': 'energy.w' });
+    it('never gives a meter an id ending in _cost, which the panel draws with the currency icon (review m3)', () => {
+      // energyIconForCategory tests the id first (ha_bridge_config.cpp:1092): a kWh
+      // meter named "Grid cost" would be drawn as money.
+      const ids = resolveEnergyIds([meter('a.0.a', 'Grid cost'), meter('a.0.b', 'Heizung Cost'), meter('a.0.c', 'Grid cost')], {});
+      expect(ids).to.deep.equal({
+        'energy:a.0.a': 'energy.grid_cost_meter',
+        'energy:a.0.b': 'energy.heizung_cost_meter',
+        'energy:a.0.c': 'energy.grid_cost_meter_2',
+      });
+      for (const id of Object.values(ids)) expect(id).to.not.match(/_cost$/);
+    });
+
+    it('gives a new id where a stored one is no energy id, is already given, or is no id the panel can take (review m4)', () => {
+      const stored = {
+        'energy:a.0.x': 'sensor.x',
+        'energy:a.0.y': 'energy.z',
+        'energy:a.0.z': 'energy.z',
+        'energy:a.0.w': 'energy.z_cost',
+        // A hand edit: a bracket would end the panel's catalog (ha_bridge_config.cpp:1115-1116).
+        'energy:a.0.v': 'energy.a]b',
+        'energy:a.0.u': 'energy.Strom',
+        'energy:a.0.t': 'energy.grid_cost',
+        'energy:a.0.s': `energy.${'s'.repeat(245)}`,
+        'energy:a.0.r': 'energy.',
+      };
+      const rows = ['x', 'y', 'z', 'w', 'v', 'u', 't', 's', 'r'].map((name) => meter(`a.0.${name}`, name.toUpperCase()));
+      expect(resolveEnergyIds(rows, stored)).to.deep.equal({
+        'energy:a.0.x': 'energy.x',
+        'energy:a.0.y': 'energy.z',
+        'energy:a.0.z': 'energy.z_2',
+        'energy:a.0.w': 'energy.w',
+        'energy:a.0.v': 'energy.v',
+        'energy:a.0.u': 'energy.u',
+        'energy:a.0.t': 'energy.t',
+        'energy:a.0.s': 'energy.s',
+        'energy:a.0.r': 'energy.r',
+      });
+      // The longest a stored id may be: with _cost, 255.
+      const longest = `energy.${'s'.repeat(243)}`;
+      expect(resolveEnergyIds([meter('a.0.s', 'S')], { 'energy:a.0.s': longest })).to.deep.equal({ 'energy:a.0.s': longest });
     });
 
     it('keeps an id and its cost id within the 255 characters of an entity id', () => {

@@ -260,6 +260,18 @@ function energyMeters(value: unknown, warnings: string[]): EnergyMeterRow[] {
   return meters;
 }
 
+/** The admin's field allows 8 characters; the currency goes into every cost name and unit (review m4). */
+const CURRENCY_CHARS = 8;
+
+/** The currency, trimmed, EUR when there is none, at most CURRENCY_CHARS characters (not UTF-16 units). */
+function currency(raw: Partial<AdapterOptions>, warnings: string[]): string {
+  const value = (text(raw, 'currency', warnings) ?? DEFAULTS.currency).trim() || DEFAULTS.currency;
+  const chars = Array.from(value);
+  if (chars.length <= CURRENCY_CHARS) return value;
+  warnings.push(`currency has more than ${CURRENCY_CHARS} characters; using its first ${CURRENCY_CHARS}`);
+  return chars.slice(0, CURRENCY_CHARS).join('');
+}
+
 /** The admin's instance select, or a hand edit: anything but an instance id is none, never a guess. */
 function historyInstance(value: unknown, warnings: string[]): string {
   if (value === undefined || value === null || value === '') return '';
@@ -309,7 +321,7 @@ export function validateOptions(raw: Partial<AdapterOptions>): {
     pickerArmed: (raw.pickerArmed as unknown) === PICKER_VERSION,
     historyInstance: historyInstance(raw.historyInstance, warnings),
     energyMeters: energyMeters(raw.energyMeters, warnings),
-    currency: (text(raw, 'currency', warnings) ?? DEFAULTS.currency).trim() || DEFAULTS.currency,
+    currency: currency(raw, warnings),
   };
 
   return { options, errors, warnings };

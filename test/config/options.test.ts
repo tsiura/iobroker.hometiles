@@ -257,5 +257,15 @@ describe('config/options', () => {
       const { options, warnings } = validateOptions({ currency: 5 } as unknown as Partial<AdapterOptions>);
       expect([options.currency, warnings]).to.deep.equal(['EUR', ['currency is not text but a number; using the default']]);
     });
+
+    it('cuts a currency of more than 8 characters, with a warning: it goes into every cost name and unit (review m4)', () => {
+      expect(validateOptions({ currency: 'Rappen €€' }).options.currency).to.equal('Rappen €');
+      const { options, warnings } = validateOptions({ currency: 'x'.repeat(4096) });
+      expect(options.currency).to.equal('xxxxxxxx');
+      expect(warnings).to.deep.equal(['currency has more than 8 characters; using its first 8']);
+      // Counted in characters, so no emoji is cut in half.
+      expect(validateOptions({ currency: '🪙'.repeat(9) }).options.currency).to.equal('🪙'.repeat(8));
+      expect(validateOptions({ currency: '12345678' }).warnings).to.deep.equal([]);
+    });
   });
 });

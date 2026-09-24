@@ -112,15 +112,30 @@ export function resolveEntityIds(
 
 /** The key an energy meter's id is stored under, `energy:<state id>` (Task 20b): no device's key starts so. */
 export const ENERGY_KEY = 'energy:';
-/** An energy meter's cost entry is `<id>_cost` (__init__.py:2814), which the panel draws with a currency icon. */
+/**
+ * An energy meter's cost entry is `<id>_cost` (__init__.py:2814), and the
+ * panel draws any id ending so with the currency icon, before it looks at
+ * the category (energyIconForCategory, ha_bridge_config.cpp:1092).
+ */
 const COST = '_cost';
+/** What a meter id whose name ends in "cost" gets instead (review m3). */
+const METER = '_meter';
+
+/**
+ * A meter id the panel can take: a lowercase slug the catalog's hand parser
+ * reads whole (ha_bridge_config.cpp:1115-1116, a ']' ends the section), no
+ * `_cost` at its end, and room for its cost id within MAX_ENTITY_ID_LENGTH.
+ * A stored one is hand-editable (review m4).
+ */
+const usableEnergyId = (id: string): boolean =>
+  /^energy\.[a-z0-9_]+$/.test(id) && !id.endsWith(COST) && id.length + COST.length <= MAX_ENTITY_ID_LENGTH;
 
 /**
  * Energy meter ids, stored like a manual entity's (Task 20b): `energy.` and
- * the name's slug, kept once given. No registry id is ever one -- none of
- * their domains is energy -- so a meter never shares an id, a name or a state
- * topic with an entity. An id and its cost entry's id are taken together, so
- * no meter's id is another's cost id either way round.
+ * the name's slug, kept once given; a stored id wins before any new one is
+ * made. No registry id is ever one -- none of their domains is energy -- so a
+ * meter never shares an id, a name or a state topic with an entity. No meter
+ * id ends in `_cost`, and every cost id does: none is another's.
  */
 export function resolveEnergyIds(
   meters: ReadonlyArray<{ stateId: string; name: string }>,
@@ -128,23 +143,22 @@ export function resolveEnergyIds(
 ): Record<string, string> {
   const ids: Record<string, string> = {};
   const taken = new Set<string>();
-  const free = (id: string): boolean => !taken.has(id) && !taken.has(`${id}${COST}`);
-  const take = (key: string, id: string): void => {
-    ids[key] = id;
-    taken.add(id).add(`${id}${COST}`);
-  };
   for (const { stateId } of meters) {
     const key = ENERGY_KEY + stateId;
     const stored = Object.hasOwn(persisted, key) ? persisted[key] : undefined;
-    if (stored?.startsWith('energy.') && free(stored)) take(key, stored);
+    if (stored === undefined || !usableEnergyId(stored) || taken.has(stored)) continue;
+    ids[key] = stored;
+    taken.add(stored);
   }
   for (const { stateId, name } of meters) {
     const key = ENERGY_KEY + stateId;
     if (ids[key]) continue;
-    const root = `energy.${slugify(name)}`.slice(0, MAX_ENTITY_ID_LENGTH - SUFFIX_ROOM - COST.length).replace(/_+$/, '');
+    let root = `energy.${slugify(name)}`.slice(0, MAX_ENTITY_ID_LENGTH - SUFFIX_ROOM - COST.length - METER.length).replace(/_+$/, '');
+    if (root.endsWith(COST)) root += METER;
     let id = root;
-    for (let suffix = 2; !free(id); suffix++) id = `${root}_${suffix}`;
-    take(key, id);
+    for (let suffix = 2; taken.has(id); suffix++) id = `${root}_${suffix}`;
+    ids[key] = id;
+    taken.add(id);
   }
   return ids;
 }
