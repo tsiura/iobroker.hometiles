@@ -51,19 +51,21 @@ Weather detection was checked against the object trees of OpenWeatherMap
 rebuilt from their published packages. OpenWeatherMap and Weather Underground
 each become one weather entity with its forecast days; AccuWeather becomes
 three entities and DasWetter five one-day entities, because their objects hold
-nothing that links the parts.
+nothing that links the parts. OpenWeatherMap's first forecast day covers only
+the rest of today, so today's high and low can fall during the afternoon; the
+adapter shows the provider's own values, as its own widgets do.
 
 ## What 0.2.0 does not cover
 
 - **Camera.** Deliberately absent. The adapter serves no camera, and each
   configuration it pushes clears the panel's camera list.
-- **Three firmware features deferred by the 0.2.0 plan: HomeSnapshot,
-  Discovery and DynamicSlotsReload** (`mqttPublishHomeSnapshot`,
-  `mqttPublishDiscovery`, `mqttRequestDynamicSlotsReload`). No contract was
-  extracted for them. In short: the panel's own outside and inside
-  temperatures and battery charge are not read into ioBroker, nothing
-  answers the panel's cleanup of old Home Assistant discovery entries, and
-  the dynamic-slot reload is internal to the panel.
+- **The panel's own telemetry, HomeSnapshot** (`mqttPublishHomeSnapshot`):
+  its outside and inside temperature and battery charge on
+  `<base>/sensor/{outside_c,inside_c,soc_pct}` are not read into ioBroker.
+  Needs nothing from the adapter: Discovery (`mqttPublishDiscovery`; the
+  panel only removes its own legacy Home Assistant discovery entries with
+  empty retained payloads) and DynamicSlotsReload
+  (`mqttRequestDynamicSlotsReload`; internal to the panel).
   [docs/protocol.md](docs/protocol.md#not-implemented) has what is known.
 - **Climate presets, humidity targets, power and boost.** No ioBroker climate
   pattern has a preset or a writable humidity target, and the panel sends no
@@ -81,30 +83,37 @@ nothing that links the parts.
   Such a light still works for on/off, brightness and colour temperature; only
   the colour picker is absent.
 - **Media:** a stop button (the panel has none), a seek bar for a SEEK state
-  whose unit is not `%`, and cover art that is not an absolute `http(s)://`
-  URL.
+  whose unit is neither empty nor `%`, and cover art that is not an absolute
+  `http(s)://` URL.
 - **Select and date/time are never detected on their own**: use a Forced type
   on the Devices tab, or a manual entity.
 
 ## Requirements
 
-- ioBroker js-controller 5.0.19 or newer, and Node.js 20 or newer.
+- ioBroker js-controller 6.0.11 or newer, and Node.js 20 or newer.
 - An MQTT broker reachable by both ioBroker and the panels. The ioBroker `mqtt`
-  adapter in broker mode works, as does any external broker.
+  adapter in broker mode, or any external broker, should work (not tested; the
+  tests use an in-process aedes broker).
 - HomeTiles firmware v0.6.12. The 0.2.0 wire contract was read from its source
   (commit `5d25167`); the v0.1 domains were first read at v0.6.9. Other
   versions were not checked.
 - For graphs, timelines and energy: a history, SQL or InfluxDB instance.
-- ioBroker admin 6.2.3 or newer, declared as a global dependency, so
-  js-controller refuses the installation beside an older admin. Older admins
-  encrypt the broker password in a form the 0.1.0 password migration cannot
-  tell from plain text.
+- ioBroker admin 7.6.17 or newer. It is declared as a global dependency, but
+  js-controller checks that only when the adapter is installed from the
+  ioBroker repository. An install or upgrade from GitHub or another URL, the
+  only way until the adapter is in the repository, is not checked. Make sure
+  admin is up to date before you upgrade. An admin older than 6.2.3 encrypts
+  the broker password in a form the adapter cannot tell from plain text:
+  beside such an admin the adapter migrates no password, logs an error at
+  each start, and uses the password as js-controller decrypts it. If the
+  broker then refuses it, enter the password again on the Connection tab and
+  save.
 - For the settings page, by the version of admin's json-config component:
   - json-config 8.1.10 or newer for the Preview dialog on the Devices tab.
     Older versions answer the button with a bare "Ok".
   - json-config 9.0.24 or newer for the Direction list on the Energy tab to
     follow a change of the row's Category at once. json-config 8.4.0 up to
-    9.0.24 offers the new choices only after the settings are saved and
+    9.0.23 offers the new choices only after the settings are saved and
     reopened.
   - Admin 8.0.11 was checked to contain both. For the other admin versions the
     json-config version is inferred from release dates, not read from the admin
@@ -154,8 +163,8 @@ unticked and ticked again. Rows of devices no longer detected are marked
 
 For a state no detection reaches, such as a helper in `0_userdata.0`: add a
 row under **Manual entities** on the Devices tab with the **State**, the
-**Type** and, optionally, a **Name**. Every row is published once the Devices
-tab has been refreshed and saved. What each type needs:
+**Type** and, optionally, a **Name override**. Every row is published once
+the Devices tab has been refreshed and saved. What each type needs:
 
 | Type | The state |
 | --- | --- |
@@ -168,7 +177,9 @@ tab has been refreshed and saved. What each type needs:
 
 **Date/time kind** matters only for a text state that holds no value yet:
 choose Date, Time or Date and time, so the panel knows which editor to show
-before anything is written. Otherwise the value's own shape decides.
+before anything is written. Leave it at From the value otherwise: the value's
+own shape decides, and a kind that differs from that shape makes the tile
+read-only, which the log says.
 
 The log names each row the adapter cannot use, and why, and each manual value
 that comes out read-only, with what it lacks (such as "no min/max"). The
@@ -199,8 +210,8 @@ adapter cannot use, and why. Only the mode is mapped, not the running action.
 
 Add one row per meter: an ioBroker **State** holding a **cumulative** counter,
 such as a kWh or m³ total, with its **Category** (grid, solar, battery, gas,
-water, device, water device), **Direction**, an optional **Name** and an
-optional **Price per unit** in the **Currency** below (default EUR).
+water, device, water device), **Direction**, an optional **Name override**
+and an optional **Price per unit** in the **Currency** below (default EUR).
 
 - **Cumulative counters only.** A counter that resets every day, such as
   "energy today" or a daily yield, is not supported: its weeks and months
@@ -240,7 +251,8 @@ history instance is used, if one is set.
 **Enable logging in that instance for every state a panel should show history
 for**, in the state's custom settings in the admin's Objects tab: each picked
 sensor, binary sensor, number, select and date/time, and each energy meter.
-Without it a graph shows only the current value, a popup says "History
+Without it a graph (tile or sensor popup) shows only the current value, a
+timeline popup (binary, text, number, select, date/time) says "History
 unavailable", and an energy tile shows 0.000.
 
 The history adapter was run for real in the tests; SQL and InfluxDB were
@@ -256,7 +268,10 @@ A panel that already has broker credentials announces itself and appears
 under `hometiles.0.panels.<deviceId>` automatically. A brand-new panel has
 none:
 
-1. Save the Connection tab first: pairing sends the saved values.
+1. Save the Connection tab first: pairing sends the saved values. The broker
+   host must be an address the panel can reach, not 127.0.0.1 or localhost.
+   Pairing sends nothing while the adapter is not connected to the broker:
+   it sends only credentials the adapter itself connects with.
 2. Enter the panel's IP address or host name in **Panel address** and click
    **Pair a panel by address**.
 3. The adapter posts the broker address, port, user, password, panel base
@@ -275,14 +290,14 @@ panel, change **Panel base topic** on the Connection tab and save.
   stored in plain text is migrated automatically at the first start: the
   adapter stores it encrypted, which restarts it once, and logs one line
   saying so.
-  - **After upgrading to 0.2.0, start the adapter once before you open its
-    settings page**, so it can migrate the stored password. A settings page
-    opened before that first start can save an unreadable value over the
-    password.
-  - If the stored password cannot be read (a settings page saved it too early,
-    or the configuration came from another system), the log says so, the
-    adapter connects to no broker, and pairing refuses: **enter the password
-    again on the Connection tab and save.**
+  - **Start the adapter once after upgrading, and wait for the log line
+    "…it is stored encrypted now" (the adapter restarts once), before you
+    open its settings page.** A settings page opened earlier can save an
+    unusable value over the password.
+  - **If the log then says the password could not be decrypted, or the broker
+    refuses the login ("Connection refused"), enter the password again on the
+    Connection tab and save.** Pairing sends nothing until the adapter shows
+    connected: it sends the password the adapter holds.
 - **Picks start over.** Nothing is published until you click Refresh detected
   devices, tick the devices again and save: rows and ticks saved by 0.1.0
   builds are shown unticked and publish nothing. Each panel keeps its layout
@@ -293,16 +308,18 @@ panel, change **Panel base topic** on the Connection tab and save.
 - **Secure the broker.** Anyone who can publish to a panel's `cmnd/*` topics
   can command every entity the adapter publishes, exactly as a panel can; the
   tokens in number, select and date/time commands are readable from their
-  retained state and prove nothing. Protect the broker with user names and an
-  ACL. The Home Assistant Bridge has the same exposure.
+  retained state and prove nothing. The Home Assistant Bridge has the same
+  exposure. Anyone who can publish a panel's `stat/ip` can also make its
+  `control.pair` send the broker password to a host of their choosing.
+  Protect the broker with user names and an ACL.
 - **Pairing sends the broker password over plain HTTP** to the panel's setup
   page. Pair on a network you trust.
 - **Clocks: keep the panel within about 5 s ahead of the ioBroker host's
   clock, or 10 s behind it.** Number, select and date/time commands carry a
   deadline from the panel's clock, and outside that window every one is
   refused as expired. Use NTP on both. The log warns, at most once an hour per
-  panel, naming the offset. A panel sends no such command before its clock is
-  set.
+  panel, once the offset reaches about 7 s ahead or 12 s behind. A panel sends
+  no such command before its clock is set.
 - **Editable numbers carry about 7 significant digits.** The panel handles
   them as 32-bit floats. A value with more digits (20000002, or 12345.125 on a
   step of 0.001) is sent by the panel already rounded, is written as sent, and
@@ -315,10 +332,12 @@ panel, change **Panel base topic** on the Connection tab and save.
   state. A Docker container without `TZ` runs in UTC: set `TZ`, for example
   `TZ=Europe/Berlin`, or the forecast shifts by a day and the energy day
   starts at the wrong hour.
-- **Only `mdi:` icons are shown.** An icon reaches a panel only when it is a
-  Material Design Icons name such as `mdi:lamp`. ioBroker's image paths and
-  data URIs are not sent, and such a tile shows its type's default icon. An
-  `mdi:` name the panel does not know shows as "?".
+- **Only `mdi:` icons are shown**, Material Design Icons names such as
+  `mdi:lamp`. Only `mdi:` names are used as tile icons: other icons are left
+  out of the configuration and the icon map, so such a tile shows its type's
+  default icon (light, climate and cover state payloads still carry the
+  object's icon text, which the panel ignores). An `mdi:` name the panel does
+  not know shows as "?".
 - **A panel takes one configuration of at most 32767 bytes.** It holds every
   picked entity's id, name and icon, the energy catalog and the scene list. A
   configuration over the limit is not published: the log names its size and
@@ -336,9 +355,18 @@ panel, change **Panel base topic** on the Connection tab and save.
   them, read-only, with a warning.
 - **A command a device cannot take is refused**, never reported as done: a
   read-only state, a value outside the declared range (never clamped), a mode
-  label the state cannot hold. Number, select and date/time refusals are
+  label the state cannot hold (a light's brightness or colour temperature, or
+  a player's volume, that the device cannot take is skipped and logged; the
+  rest of the command still lands). Number, select and date/time refusals are
   answered to the panel. Every other refusal is only in the adapter's log;
   the panel then shows the unchanged state.
+- **An alias whose target cannot be read is left out.** An alias with no
+  target, an invalid one, or one that is missing or not a state is neither
+  subscribed nor read: its device shows unavailable until the alias is
+  repaired and the adapter restarted, and the log names each such alias. A
+  js-controller call at start that is not answered within 5 s is given up the
+  same way: the log names it, and its device may show unavailable until the
+  adapter restarts.
 
 ## Objects
 
@@ -411,9 +439,9 @@ panel:
 16. Opt-in picking on a panel that already has a layout: nothing changes
     before the first Refresh and Save; afterwards the unpicked tiles go; the
     exported layout can be restored.
-17. The clock window: a panel whose clock is off by more than the window gets
-    "expired" for number, select and date/time commands, and the log names the
-    offset.
+17. The clock window: a panel whose clock is off by 7 s ahead or 12 s behind
+    or more gets "expired" for number, select and date/time commands, and the
+    log names the offset.
 18. Many editable values: up to 128 retained number, select and date/time
     states arrive together after a reconnect, against the panel's inbound
     queue of 64 messages; watch the panel's log for "Inbound queue full".
@@ -453,22 +481,53 @@ The wire contract this adapter implements is documented in
 
 ## Release blockers
 
-These are known gaps left open at the end of 0.2.0 development. Both must be
-resolved before this adapter is published to npm or submitted to the
-ioBroker repository.
+Before this adapter is published to npm or submitted to the ioBroker
+repository, the hardware checks above are outstanding, and so is whatever
+`npx @iobroker/repochecker` reports when run online against the pushed
+repository. Its io-package.json and README checks, run offline at the end of
+0.2.0 development, left these:
 
-- **`admin/hometiles.png` is a placeholder, not artwork.** It is a 1x1
-  transparent pixel, present only so `common.icon` in `io-package.json`
-  points at a file that exists. It must be replaced with a real icon before
-  release.
-- **The repository URLs are unverified.** `package.json` (`repository`,
-  `bugs`, `homepage`) and `io-package.json` (`common.extIcon`) all assume
-  this project lives at `github.com/GalusPeres/ioBroker.hometiles`, while
-  this repository's git remote is `github.com/tsiura/iobroker.hometiles`.
-  These fields need to point at the real repository before publishing:
-  `extIcon` in particular is fetched by the ioBroker admin UI from raw GitHub
-  content and will silently show a broken image if the URL is wrong.
+- **E1024:** the main file, `build/main.js`, is not in the git repository
+  (`build/` is ignored), and the checker reads it from GitHub.
+- **Warnings:** admin 7.6.20 is recommended over the declared 7.6.17
+  (W1056), and `titleLang`, `desc` and the news have no translations beyond
+  English and German (W1027, W1034, W1054).
+
+Its other checks (package.json, npm, the repository, the code, the tests,
+GitHub, the licence file and the ignore files) need the network and were not
+run.
+
+## Changelog
+
+### 0.2.0
+
+- First release that can serve a panel: 0.1.0 failed at startup and
+  restarted in a loop on any installation with ordinary detected devices.
+- New tile types: climate, cover, media player, weather, number, select and
+  date/time.
+- History for graphs and timelines from a history, SQL or InfluxDB instance;
+  energy tiles from cumulative energy meters on the Energy tab.
+- Opt-in device selection on the Devices tab, manual entities, a Climate
+  modes table and a per-row MQTT payload preview.
+- The broker password is stored encrypted; one that 0.1.0 stored in plain
+  text is migrated at the first start (see
+  [Upgrading from 0.1.0](#upgrading-from-010)).
+- Pairing sends credentials only while the adapter is connected to the
+  broker.
+- Each js-controller call at start is given up after 5 s, and an alias whose
+  target cannot be read is left out, each with a warning.
+- Requires js-controller 6.0.11 and admin 7.6.17 or newer.
+- Camera tiles are not supported. Not yet run on a physical panel.
+
+### 0.1.0
+
+- Initial release: sensor, binary sensor, switch, light and scene tiles,
+  panel control, local Hardware I/O and pairing.
 
 ## License
 
-MIT
+MIT License
+
+Copyright (c) 2026 Evgenij Cjura
+
+The full text is in [LICENSE](LICENSE).

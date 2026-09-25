@@ -101,7 +101,7 @@ rule the adapter follows. The contract documents hold the citations.
 | --- | --- | --- |
 | sensor, binary_sensor, switch, light | per field; see [Entity state](#entity-state) | per field; the adapter sends none |
 | **climate, cover** | **snaps to a hardcoded default, never "unchanged"**, and clears the field's presence flag: the panel replaces its whole cached state with each valid payload, never merges | safe for cover (same as omitted); **unsafe for climate strings** |
-| **media_player** | no value (no title, the volume slider disabled, the seek bar hidden), except that a missing `is_volume_muted` keeps the previous mute display and missing artwork keeps the previous cover, which only `""` clears | **unsafe for strings**: the panel reads the next quoted token after the colon |
+| **media_player** | no value (no title, the volume slider disabled, the seek bar hidden), except that a missing `is_volume_muted` keeps the previous mute display and missing artwork keeps the previous cover, which only an explicit `""` (or `null`, never sent) clears | **unsafe for strings**: the panel reads the next quoted token after the colon |
 | **weather** | while a `forecast` follows, the first forecast day's value is read in its place (the panel takes the first match of a key anywhere in the payload), so unknown current values go out as `""` | **unsafe for strings**, as for media |
 | **history responses** (binary/state header: `current`, `available`, `last_changed`, `device_class`) | preserves the popup's value | **explicitly clears** it (`sensor_popup.cpp:1845-1866`) |
 | **numeric history responses** | `values` missing drops the whole response | a `null` element is a gap, filled from its neighbours on graphs and sensor popups, drawn as a gap on an editable number's popup |
@@ -164,7 +164,8 @@ text, not JSON: `force` or the empty string. The adapter answers with a fresh
 apply, icon map and every entity state for that panel, whether or not
 anything changed, provided it has anything to publish (see the last rule
 under [Configuration push](#configuration-push-bridgeapply)). The same
-happens when `panels.<deviceId>.control.refresh` is pressed.
+happens when `panels.<deviceId>.control.refresh` is pressed, except that the
+icon map is re-sent only if it changed.
 
 ## Configuration push (bridge/apply)
 
@@ -280,7 +281,7 @@ detail in the port:**
 
 | Domain | Leaf | Payload | Evidence and rules |
 | --- | --- | --- | --- |
-| `sensor` | `state` | bare string, e.g. `23.4`, `Auto` or `unavailable` | `sync_external_temp_entity` publishes `dtostrf` output or the literal `unavailable`. A blank reading is `unknown`, never `0` |
+| `sensor` | `state` | bare string, e.g. `23.4`, `Auto` or `unavailable` | `sync_external_temp_entity` publishes `dtostrf` output or the literal `unavailable`. A blank numeric reading is `unknown`, never `0`; a text is sent as it is (an empty text is an empty payload, which also deletes the retained state) |
 | `binary_sensor` | `state` | bare string `on` / `off` / `unknown` / `unavailable` | consumed by `tiles_update_sensor_by_entity` as a raw value |
 | `switch` | `state` | bare string `on` / `off` / `unknown` / `unavailable` | `TILE_SWITCH` branch of `tiles_update_sensor_by_entity` |
 | `light` | `state` | JSON object with `state` plus attributes, e.g. `{"state":"on","brightness_pct":42}` | `sync_local_device_entities` publishes this shape for the panel's own display-brightness light. See below |
@@ -921,18 +922,22 @@ not armed.
 
 - **Camera.** Excluded by decision: no `camera` domain, no `cameras` list,
   no `camera_meta`.
-- **The three firmware entry points the 0.2.0 plan deferred**, which are no
-  entity domain. No contract was extracted for them; what follows is a first
-  reading of `src/network/mqtt/mqtt_handlers.cpp` at the same commit, enough
-  to say what the adapter leaves alone:
-  - `mqttPublishHomeSnapshot` (`:1909-1928`) publishes the panel's own
-    readings, retained, to `<baseTopic>/sensor/outside_c`,
-    `<baseTopic>/sensor/inside_c` and `<baseTopic>/sensor/soc_pct` (the
-    battery charge, `unavailable`, or an empty payload that removes it). The
-    adapter subscribes to none of them, so ioBroker gets no objects for them.
-  - `mqttPublishDiscovery` (`:2565-2597`) publishes empty retained payloads
-    to `homeassistant/sensor/<deviceId>_<leaf>/config` and
-    `homeassistant/button/<deviceId>_<leaf>/config`, removing Home Assistant
-    MQTT discovery entries of older firmware. Nothing answers it.
-  - `mqttRequestDynamicSlotsReload` (`:2664-2672`) only schedules the panel's
-    own re-subscription of its dynamic state topics; it publishes nothing.
+- **The panel's own telemetry, HomeSnapshot.** `mqttPublishHomeSnapshot`
+  (`src/network/mqtt/mqtt_handlers.cpp:1909-1928`) publishes the panel's own
+  readings, retained, to `<baseTopic>/sensor/outside_c`,
+  `<baseTopic>/sensor/inside_c` and `<baseTopic>/sensor/soc_pct` (the
+  battery charge, `unavailable`, or an empty payload that removes it). The
+  adapter subscribes to none of them: its outside and inside temperature and
+  battery charge are not read into ioBroker.
+
+Needs nothing from the adapter. No contract was extracted for these two
+firmware entry points; this is a first reading of the same file at the same
+commit:
+
+- `mqttPublishDiscovery` (`:2565-2597`): the panel only removes its own
+  legacy Home Assistant discovery entries, with empty retained payloads to
+  `homeassistant/sensor/<deviceId>_<leaf>/config` and
+  `homeassistant/button/<deviceId>_<leaf>/config`.
+- `mqttRequestDynamicSlotsReload` (`:2664-2672`): internal to the panel. It
+  only schedules the panel's own re-subscription of its dynamic state topics
+  and publishes nothing.

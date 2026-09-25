@@ -31,11 +31,14 @@ describe('release documentation and metadata (Task 25)', () => {
     expect(common.news[version]?.en, `the English news of ${version}`).to.be.a('string').that.is.not.empty;
   });
 
-  it('requires an admin that encrypts the broker password with a prefix the migration can tell apart (Ruling 146)', () => {
+  it('requires an admin that encrypts the broker password with a prefix the migration can tell apart, and the minimums the repository checker asks for (Rulings 146, 149)', () => {
     // Admin 6.2.2 and older encrypt encryptedNative by XOR with no prefix, which
     // the 0.1 plain-password migration (config/options.ts storedPassword) would
-    // take for plain text. js-controller checks this on install and upgrade.
-    const { common } = JSON.parse(read('io-package.json')) as { common: { globalDependencies?: unknown } };
-    expect(common.globalDependencies).to.deep.equal([{ admin: '>=6.2.3' }]);
+    // take for plain text. js-controller checks globalDependencies only when the
+    // adapter is installed from the ioBroker repository, never on an install or
+    // upgrade from a URL, so the adapter checks at start too (main.ts onReady).
+    const { common } = JSON.parse(read('io-package.json')) as { common: { dependencies?: unknown; globalDependencies?: unknown } };
+    expect(common.dependencies).to.deep.equal([{ 'js-controller': '>=6.0.11' }]);
+    expect(common.globalDependencies).to.deep.equal([{ admin: '>=7.6.17' }]);
   });
 });

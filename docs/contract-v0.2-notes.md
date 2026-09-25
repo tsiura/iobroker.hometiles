@@ -113,10 +113,14 @@ was wrong. Built in `network_manager.cpp:585-593`:
     <base>/weather/request
     <base>/energy/request      <base>/energy/response
 
-`weather/request` has no matching response topic: the firmware subscribes only
-to `bridge_apply_topic_`, `history_response_topic_`, `energy_response_topic_`
-and `bridge_icons_topic_`. Weather answers therefore arrive through
-`bridge/apply`, not a dedicated response topic. Confirm before implementing.
+`weather/request` has no matching response topic: of these config-plane
+topics the firmware subscribes to `bridge_apply_topic_`,
+`history_response_topic_`, `energy_response_topic_` and `bridge_icons_topic_`.
+Weather is not answered through `bridge/apply`: a panel reads each weather
+entity's payload on its weather leaf, `<ha_prefix>/weather/<object_id>/weather`,
+and a `weather/request` is answered by publishing that payload there again,
+retained ([contract-media-weather.md](contract-media-weather.md),
+[protocol.md](protocol.md#weather)).
 
 ## Service names the firmware emits
 

@@ -7,7 +7,8 @@ import { requireEntityId } from './commands';
 import { showable } from './editable';
 
 /**
- * The four shapes that arrive on the single `<base>/history/request` topic
+ * The four shapes that arrive on the single history request topic, under the
+ * config root rather than `<base>/`: `tab5_lvgl/config/<deviceId>/history/request`
  * (docs/contract-history-energy.md Sec. 2-3). There is no per-kind
  * sub-topic; payload shape is the only dispatch key the firmware itself
  * uses (contract Sec. 1, Sec. 8), so this parser never looks at a topic.
