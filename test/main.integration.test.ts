@@ -4,7 +4,7 @@ import { tests, type IntegrationTestHarness } from '@iobroker/testing';
 import mqtt, { type MqttClient } from 'mqtt';
 import { execFile, execFileSync, spawn, type ChildProcess } from 'node:child_process';
 import { createCipheriv, createDecipheriv, randomBytes } from 'node:crypto';
-import { closeSync, mkdirSync, openSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { closeSync, mkdirSync, openSync, readFileSync, renameSync, rmSync, writeFileSync } from 'node:fs';
 import { createServer as createHttpServer, type Server as HttpServer } from 'node:http';
 import { createServer, type AddressInfo, type Server } from 'node:net';
 import os from 'node:os';
@@ -22,58 +22,173 @@ async function freePorts(count: number): Promise<number[]> {
   return ports;
 }
 
-/** Two free ports written into iobroker.json, where every process of a run reads its databases' ports; none before an install made it. */
+/** A broker for a suite that needs none: on a port taken and let go, where nothing answers (Ruling 145, I1). */
+async function noBroker(): Promise<{ brokerHost: string; brokerPort: number }> {
+  return { brokerHost: '127.0.0.1', brokerPort: (await freePorts(1))[0]! };
+}
+
+/**
+ * The ports io-package.json's broker defaults to, plain and TLS: a real broker may listen there,
+ * and take a suite's retained applies to real panels (Ruling 145, I1).
+ */
+const DEFAULT_BROKER_PORTS: readonly number[] = [1883, 8883];
+
+/**
+ * Two free ports written into iobroker.json, where every process of a run reads its databases'
+ * ports; none before an install made it. Written whole or not at all, a temporary file renamed
+ * over it: a write the quota cut short left a truncated file, which reads as corrupt (m1).
+ */
 async function freshDatabasePorts(dataDir: string): Promise<{ objects: number; states: number } | undefined> {
   const file = path.join(dataDir, 'iobroker.json');
+  let text: string;
+  try {
+    text = readFileSync(file, 'utf8');
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === 'ENOENT') return undefined;
+    throw error;
+  }
   let config: { objects: { port: number }; states: { port: number } };
   try {
-    config = JSON.parse(readFileSync(file, 'utf8'));
-  } catch {
-    return undefined;
+    config = JSON.parse(text);
+    if (!config?.objects || !config?.states) throw new Error('no objects or states section');
+  } catch (error) {
+    throw new Error(`${file} is corrupt (${(error as Error).message}): delete ${path.dirname(dataDir)} to have js-controller installed afresh`);
   }
   [config.objects.port, config.states.port] = (await freePorts(2)) as [number, number];
-  writeFileSync(file, JSON.stringify(config, null, 2));
+  writeFileSync(`${file}.tmp`, JSON.stringify(config, null, 2));
+  renameSync(`${file}.tmp`, file);
   return { objects: config.objects.port, states: config.states.port };
 }
 
-/** What of @iobroker/testing's DBConnection (lib/dbConnection.js) the port fix reads and sets. */
+/** What of @iobroker/testing's DBConnection (lib/dbConnection.js) the fixes read and set. */
 interface HarnessDb {
   testDir: string;
   testControllerDir: string;
   testDataDir: string;
-  logger: unknown;
+  logger: Record<string, (message: string) => void>;
   objectsType: string;
   statesType: string;
   _isRunning: boolean;
   emit(event: string, ...args: unknown[]): boolean;
   start(): Promise<void>;
+  stop(): Promise<void>;
+  getObject(id: string): Promise<{ native: Record<string, unknown> } | null | undefined>;
+  setObject(id: string, obj: object): Promise<unknown>;
 }
 
-/** lib/dbConnection.js createObjectsDB and createStatesDB, on the port given: the server, then a client of it that hears every change. */
+/** How long a database may take to start: then the start fails naming its port, not a hook's timeout (m1). */
+const DATABASE_START_MS = 15_000;
+
+/**
+ * lib/dbConnection.js createObjectsDB and createStatesDB, on the port given: the server, then a
+ * client of it that hears every change. A server whose port was taken meanwhile never calls
+ * `connected`, it only logs "Error inMem-... listening on port N: ... EADDRINUSE" (js-controller's
+ * db-*-jsonl _initRedisServer): that line fails the start at once, with the code EADDRINUSE, and
+ * anything else that keeps a database from starting fails it after DATABASE_START_MS (m1).
+ */
 async function createDatabase(db: HarnessDb, kind: 'objects' | 'states', port: number): Promise<void> {
   const type = kind === 'objects' ? db.objectsType : db.statesType;
   const connection =
     kind === 'objects'
       ? { type, host: '127.0.0.1', port, user: '', pass: '', noFileCache: false, connectTimeout: 2000 }
       : { type, host: '127.0.0.1', port, options: { auth_pass: null, retry_max_delay: 15000 } };
-  const settings = { connection, logger: db.logger };
+  let fail: (error: Error) => void = () => undefined;
+  const failed = new Promise<never>((_, reject) => (fail = reject));
+  const logger = {
+    ...db.logger,
+    info: (message: string): void => {
+      if (message.includes(`listening on port ${port}`) && message.includes('EADDRINUSE')) {
+        fail(Object.assign(new Error(`Port ${port} of the ${kind} database was taken before it could listen`), { code: 'EADDRINUSE' }));
+      }
+      db.logger.info!(message);
+    },
+  };
+  const settings = { connection, logger };
   const paths = [path.join(db.testDir, 'node_modules'), path.join(db.testControllerDir, 'node_modules')];
   const { Server, Client } = require(require.resolve(`@iobroker/db-${kind}-${type}`, { paths }));
   const fields = db as unknown as Record<string, { subscribe(pattern: string): void }>;
-  await new Promise<void>((resolve) => {
-    fields[`_${kind}Server`] = new Server({ ...settings, connected: () => resolve() });
-  });
-  await new Promise<void>((resolve) => {
-    fields[`_${kind}Client`] = new Client({
-      ...settings,
-      connected: () => {
-        fields[`_${kind}Client`]!.subscribe('*');
-        resolve();
-      },
-      change: db.emit.bind(db, kind === 'objects' ? 'objectChange' : 'stateChange'),
-    });
-  });
+  const timer = setTimeout(() => fail(new Error(`The ${kind} database did not start on port ${port} within ${DATABASE_START_MS / 1000} s`)), DATABASE_START_MS);
+  try {
+    await Promise.race([
+      new Promise<void>((resolve) => {
+        fields[`_${kind}Server`] = new Server({ ...settings, connected: () => resolve() });
+      }),
+      failed,
+    ]);
+    await Promise.race([
+      new Promise<void>((resolve) => {
+        fields[`_${kind}Client`] = new Client({
+          ...settings,
+          connected: () => {
+            fields[`_${kind}Client`]!.subscribe('*');
+            resolve();
+          },
+          change: db.emit.bind(db, kind === 'objects' ? 'objectChange' : 'stateChange'),
+        });
+      }),
+      failed,
+    ]);
+  } finally {
+    clearTimeout(timer);
+  }
 }
+
+/** The @iobroker/testing version whose internals the fixes below were read in; package.json pins it exactly. */
+const HARNESS_VERSION = '5.3.0';
+
+/** An internal of @iobroker/testing: a class whose methods are patched, or a module whose exports are. */
+type Patchable = { prototype: Record<string, (...args: unknown[]) => Promise<unknown>> };
+
+/**
+ * The @iobroker/testing internals the fixes below replace or wrap (Ruling 145, C1). Another
+ * version, or a member that is no longer a function, fails the run here, at load: renamed or
+ * moved, a wrapper would stop applying without a word -- the npm check, the database ports, the
+ * broker guard.
+ */
+function harnessInternals(): {
+  DBConnection: Patchable;
+  ControllerSetup: Patchable;
+  AdapterSetup: Patchable;
+  TestHarness: Patchable;
+  runner: Record<string, unknown>;
+} {
+  const lib = '@iobroker/testing/build/tests/integration/lib';
+  const { version } = require('@iobroker/testing/package.json') as { version: string };
+  const internals = {
+    DBConnection: require(`${lib}/dbConnection`).DBConnection as Patchable,
+    ControllerSetup: require(`${lib}/controllerSetup`).ControllerSetup as Patchable,
+    AdapterSetup: require(`${lib}/adapterSetup`).AdapterSetup as Patchable,
+    TestHarness: require(`${lib}/harness`).TestHarness as Patchable,
+    runner: require('@iobroker/testing/build/lib/executeCommand') as Record<string, unknown>,
+  };
+  const members: Record<string, unknown> = {
+    'DBConnection.prototype.start': internals.DBConnection?.prototype?.start,
+    'DBConnection.prototype.stop': internals.DBConnection?.prototype?.stop,
+    // The start below copies these two; gone, the copy may no longer match what the library does.
+    'DBConnection.prototype.createObjectsDB': internals.DBConnection?.prototype?.createObjectsDB,
+    'DBConnection.prototype.createStatesDB': internals.DBConnection?.prototype?.createStatesDB,
+    'ControllerSetup.prototype.setupSystemConfig': internals.ControllerSetup?.prototype?.setupSystemConfig,
+    'ControllerSetup.prototype.prepareTestDir': internals.ControllerSetup?.prototype?.prepareTestDir,
+    'AdapterSetup.prototype.addAdapterInstance': internals.AdapterSetup?.prototype?.addAdapterInstance,
+    'TestHarness.prototype.startAdapter': internals.TestHarness?.prototype?.startAdapter,
+    'TestHarness.prototype.startAdapterAndWait': internals.TestHarness?.prototype?.startAdapterAndWait,
+    'lib/executeCommand executeCommand': internals.runner?.executeCommand,
+  };
+  const broken = Object.entries(members)
+    .filter(([, member]) => typeof member !== 'function')
+    .map(([name]) => name);
+  if (version !== HARNESS_VERSION || broken.length > 0) {
+    throw new Error(
+      `test/main.integration.test.ts replaces and wraps internals of @iobroker/testing ${HARNESS_VERSION}, and ${version} is installed` +
+        (broken.length > 0 ? `, where these are no functions: ${broken.join(', ')}` : '') +
+        '. Re-verify each patch against that version before moving the exact pin in package.json',
+    );
+  }
+  return internals;
+}
+
+/** The harness's database while it runs: the install's (lib/index.js prepareTests), then each suite's. */
+let runningDb: HarnessDb | undefined;
 
 /**
  * Ruling 137: no test takes a fixed port. @iobroker/testing 5 runs its databases on 19000 and
@@ -83,25 +198,33 @@ async function createDatabase(db: HarnessDb, kind: 'objects' | 'states', port: n
  * process held hung in `iobroker setup first` (Task 24). Each start of the databases now takes two
  * ports the system hands out, written into iobroker.json first; so does each install, whose
  * command line runs before any start. The servers take no port 0 (`port || 9000`): hence ports
- * known to be free a moment before.
+ * known to be free a moment before, and fresh ones, twice more at most, should another process
+ * take one in that moment (m1).
  */
-function useFreeDatabasePorts(): void {
-  const { DBConnection } = require('@iobroker/testing/build/tests/integration/lib/dbConnection') as { DBConnection: { prototype: HarnessDb } };
-  const { ControllerSetup } = require('@iobroker/testing/build/tests/integration/lib/controllerSetup') as {
-    ControllerSetup: { prototype: { testDataDir: string; setupSystemConfig(): void; prepareTestDir(...args: unknown[]): Promise<void> } };
-  };
+function useFreeDatabasePorts({ DBConnection, ControllerSetup }: ReturnType<typeof harnessInternals>): void {
   DBConnection.prototype.start = async function (this: HarnessDb): Promise<void> {
     if (this._isRunning) return;
-    const ports = await freshDatabasePorts(this.testDataDir);
-    if (!ports) throw new Error(`No iobroker.json in ${this.testDataDir}: js-controller is not installed there`);
-    await createDatabase(this, 'objects', ports.objects);
-    await createDatabase(this, 'states', ports.states);
-    this._isRunning = true;
+    for (let attempt = 1; ; attempt++) {
+      const ports = await freshDatabasePorts(this.testDataDir);
+      if (!ports) throw new Error(`No iobroker.json in ${this.testDataDir}: js-controller is not installed there`);
+      try {
+        await createDatabase(this, 'objects', ports.objects);
+        await createDatabase(this, 'states', ports.states);
+        this._isRunning = true;
+        runningDb = this;
+        return;
+      } catch (error) {
+        // The library's stop takes down what did start, each part if it exists.
+        this._isRunning = true;
+        await this.stop();
+        if ((error as { code?: string }).code !== 'EADDRINUSE' || attempt === 3) throw error;
+      }
+    }
   };
   // Each start has written its ports; 19001 and 19000 written after one would send the command line elsewhere.
-  ControllerSetup.prototype.setupSystemConfig = (): void => undefined;
-  const prepare = ControllerSetup.prototype.prepareTestDir;
-  ControllerSetup.prototype.prepareTestDir = async function (this: { testDataDir: string }, ...args: unknown[]): Promise<void> {
+  ControllerSetup.prototype.setupSystemConfig = async (): Promise<void> => undefined;
+  const prepare = ControllerSetup.prototype.prepareTestDir!;
+  ControllerSetup.prototype.prepareTestDir = async function (this: { testDataDir: string }, ...args: unknown[]): Promise<unknown> {
     await freshDatabasePorts(this.testDataDir);
     return prepare.apply(this, args);
   };
@@ -115,11 +238,10 @@ function useFreeDatabasePorts(): void {
  * not write in a full temp quota, EDQUOT). A failed npm install or uninstall now fails the run
  * where it happens, with npm's own last lines (Task 24).
  */
-function failOnNpmErrors(): void {
+function failOnNpmErrors({ runner }: ReturnType<typeof harnessInternals>): void {
   type Run = (command: string, args?: unknown, options?: unknown) => Promise<{ exitCode?: number; signal?: string; stderr?: string }>;
-  const runner = require('@iobroker/testing/build/lib/executeCommand') as { executeCommand: Run };
-  const run = runner.executeCommand;
-  runner.executeCommand = async (command, args, options) => {
+  const run = runner.executeCommand as Run;
+  runner.executeCommand = async (command: string, args?: unknown, options?: unknown) => {
     const result = await run(command, args, options);
     const argv = Array.isArray(args) ? args.map(String) : [];
     if (command === 'npm' && ['i', 'install', 'uninstall'].includes(argv[0] ?? '') && result.exitCode !== 0) {
@@ -128,6 +250,43 @@ function failOnNpmErrors(): void {
     }
     return result;
   };
+}
+
+/**
+ * Ruling 145, I1: no adapter a test starts may reach for io-package.json's broker, 127.0.0.1:1883.
+ * A real broker there would take a suite's retained applies to real panels, which then prune their
+ * tiles to the fixtures. `iobroker add` makes the instance with that broker, and every suite starts
+ * from the database the install leaves (lib/index.js prepareTests), the library's own startup test
+ * too: the new instance is pointed at a port taken and let go. And each adapter start refuses a
+ * configuration that still names 1883 or 8883, before the adapter runs.
+ */
+function refuseDefaultBroker({ AdapterSetup, TestHarness }: ReturnType<typeof harnessInternals>): void {
+  const add = AdapterSetup.prototype.addAdapterInstance!;
+  AdapterSetup.prototype.addAdapterInstance = async function (this: unknown, ...args: unknown[]): Promise<unknown> {
+    const added = await add.apply(this, args);
+    const id = 'system.adapter.hometiles.0';
+    const instance = await runningDb!.getObject(id);
+    if (!instance) throw new Error(`\`iobroker add\` made no ${id}`);
+    await runningDb!.setObject(id, { ...instance, native: { ...instance.native, brokerPort: (await freePorts(1))[0] } });
+    return added;
+  };
+  const refuse = async (harness: IntegrationTestHarness): Promise<void> => {
+    const instance = (await harness.objects.getObjectAsync('system.adapter.hometiles.0')) as { native?: Record<string, unknown> } | null;
+    const port = Number(instance?.native?.brokerPort);
+    if (DEFAULT_BROKER_PORTS.includes(port)) {
+      throw new Error(
+        `The adapter would connect to ${String(instance?.native?.brokerHost)}:${port}, where a real broker may take this suite's retained ` +
+          'applies to real panels (Ruling 145, I1): give the suite a broker port of its own, its broker\'s or one taken and let go (freePorts)',
+      );
+    }
+  };
+  for (const name of ['startAdapter', 'startAdapterAndWait']) {
+    const start = TestHarness.prototype[name]!;
+    TestHarness.prototype[name] = async function (this: IntegrationTestHarness, ...args: unknown[]): Promise<unknown> {
+      await refuse(this);
+      return start.apply(this, args);
+    };
+  }
 }
 
 /** A log line as js-controller forwards it (js-controller-common-db logger.js). */
@@ -511,6 +670,8 @@ const LAST_GOOD_APPLY = '{"marker":"the last good configuration"}';
 
 /** A topic of the panel's own, for settled(). */
 const BARRIER_TOPIC = 'hometiles-test/barrier';
+/** How long settled() waits for its mark: well inside every test's and hook's timeout (m2). */
+const SETTLED_MS = 30_000;
 
 /**
  * A broker, and a panel client on it that records every apply it receives.
@@ -525,7 +686,8 @@ function withBrokerAndPanel(): {
    * now: a message the panel sends itself comes back after it. Called once the
    * adapter has done what it would publish (a state it sets after, its log,
    * its exit), it says the panel has seen all of that, and that anything not
-   * seen was not sent. No fixed sleep (Task 24).
+   * seen was not sent. No fixed sleep (Task 24). A mark not back within
+   * SETTLED_MS fails, naming it: the panel's connection or the broker is gone (m2).
    */
   settled: () => Promise<void>;
   /** What the broker retains on these topics, from its own store: what a panel subscribing now is sent. */
@@ -563,9 +725,14 @@ function withBrokerAndPanel(): {
     panel: () => panel,
     port: () => bound,
     settled: () =>
-      new Promise<void>((resolve) => {
+      new Promise<void>((resolve, reject) => {
         const mark = String(++sent);
+        const timer = setTimeout(() => {
+          marks.delete(mark);
+          reject(new Error(`timed out waiting for the panel's own mark ${mark} to come back through the broker (settled)`));
+        }, SETTLED_MS);
         marks.set(mark, () => {
+          clearTimeout(timer);
           marks.delete(mark);
           resolve();
         });
@@ -708,9 +875,17 @@ const meterRows = (until: number): HistoryRow[] => {
 };
 
 /**
+ * What npm prints when it cannot reach the registry: no network, no DNS, a
+ * proxy down. Only then is an iobroker.history suite skipped (Ruling 145, I2).
+ */
+const NETWORK_ERRORS = /\b(ENOTFOUND|EAI_AGAIN|ETIMEDOUT|ECONNREFUSED|ECONNRESET|ENETUNREACH|EHOSTUNREACH|ENETDOWN)\b/;
+
+/**
  * A real iobroker.history for the suite it is called in (Task 19). Installed
- * once, and again for another version; without the network the install
- * fails and the suite is skipped, saying why (M-7). Run with NODE_PATH where
+ * once, and again for another version. Without the network the install fails
+ * and the suite is skipped, saying why (M-7); any other failure of the install,
+ * a full disk or quota among them (EDQUOT), fails the suite with npm's own
+ * words (Ruling 145, I2). Run with NODE_PATH where
  * js-controller finds it (HISTORY_DIR). The `planted()` rows go into its store,
  * each of those states and of `unlogged` gets its object, all but `unlogged`
  * logged by history.0, and it runs until it answers for the first planted
@@ -742,8 +917,10 @@ function withHistoryAdapter(
           stdio: 'pipe',
         });
       } catch (error) {
-        const reason = String((error as { stderr?: unknown }).stderr ?? error).trim().split('\n').slice(-3).join(' ');
-        process.stderr.write(`Skipping the iobroker.history suite: installing iobroker.history@${HISTORY_VERSION} failed: ${reason}\n`);
+        const said = String((error as { stderr?: unknown }).stderr ?? error).trim();
+        const reason = `installing iobroker.history@${HISTORY_VERSION} failed: ${said.split('\n').slice(-4).join(' ')}`;
+        if (!NETWORK_ERRORS.test(said)) throw new Error(reason);
+        process.stderr.write(`Skipping the iobroker.history suite, no network: ${reason}\n`);
         this.skip();
       }
     }
@@ -804,14 +981,17 @@ function withHistoryAdapter(
 // Opt-in: this downloads and runs a real js-controller, so it stays out of the
 // default suite. Run it with HOMETILES_INTEGRATION=1 npm test.
 if (process.env.HOMETILES_INTEGRATION === '1') {
-  useFreeDatabasePorts();
-  failOnNpmErrors();
+  const internals = harnessInternals();
+  useFreeDatabasePorts(internals);
+  failOnNpmErrors(internals);
+  refuseDefaultBroker(internals);
   tests.integration(path.join(__dirname, '..'), {
     defineAdditionalTests({ suite }) {
       suite('startup', (getHarness) => {
         it('starts with no reachable broker and reports info.connection false', async function () {
           this.timeout(120000);
           const harness = getHarness();
+          await harness.changeAdapterConfig('hometiles', { native: await noBroker() });
           await harness.startAdapterAndWait();
           const state = await harness.states.getStateAsync('hometiles.0.info.connection');
           expect(state?.val).to.equal(false);
@@ -826,7 +1006,7 @@ if (process.env.HOMETILES_INTEGRATION === '1') {
           const harness = getHarness();
           const logs = await captureLogs(harness);
           // A number where text belongs made validateOptions throw in onReady.
-          await harness.changeAdapterConfig('hometiles', { native: { clientId: 42, ...ARMED, deviceOverrides: picked(SENSOR) } });
+          await harness.changeAdapterConfig('hometiles', { native: { ...(await noBroker()), clientId: 42, ...ARMED, deviceOverrides: picked(SENSOR) } });
           await setObjects(harness, SENSOR_OBJECTS);
           // JSON null used to throw inside discovery; a non-string id would
           // throw in resolveEntityIds. Both stopped the adapter from starting.
@@ -1086,14 +1266,14 @@ if (process.env.HOMETILES_INTEGRATION === '1') {
         });
 
         it('publishes the new value when the state changes', async function () {
-          this.timeout(60000);
+          this.timeout(120000);
           const harness = getHarness();
           await harness.states.setStateAsync(HELPER, { val: 42, ack: true });
           await waitFor(harness, () => helperState.find((payload) => payload === '42'), 'the new value');
         });
 
         it('publishes each editable helper retained on its control leaf, "unknown" until it holds a value (Task 14)', async function () {
-          this.timeout(60000);
+          this.timeout(120000);
           const harness = getHarness();
           const control = async (entityId: string): Promise<Record<string, unknown>> => {
             const topic = `ha/e2e/${entityId.replace('.', '/')}/control`;
@@ -1592,7 +1772,7 @@ if (process.env.HOMETILES_INTEGRATION === '1') {
           });
 
           it('fills the picker from detection -- each device unticked, with its name, domain and room -- and arms publishing in the form', async function () {
-            this.timeout(60000);
+            this.timeout(120000);
             const reply = await ask(getHarness(), 'refreshDetected', { rows: [] });
             expect(reply).to.deep.equal({
               native: {
@@ -1608,7 +1788,7 @@ if (process.env.HOMETILES_INTEGRATION === '1') {
           });
 
           it("keeps the form's rows where they stand, marks a row whose device is gone in the system's language, adds what is new, and publishes nothing", async function () {
-            this.timeout(60000);
+            this.timeout(120000);
             const harness = getHarness();
             // The adapter reads its own admin translations (Ruling 117).
             const system = (await harness.objects.getObjectAsync('system.config')) as { common: Record<string, unknown> } & Record<string, unknown>;
@@ -1640,7 +1820,7 @@ if (process.env.HOMETILES_INTEGRATION === '1') {
           });
 
           it('still answers listDetected, testBroker and previewEntity, which shows a device before it is picked', async function () {
-            this.timeout(60000);
+            this.timeout(120000);
             const harness = getHarness();
             const found = (await ask(harness, 'listDetected', {})) as Array<{ objectId: string; entityId: string }>;
             expect(found.map((device) => [device.objectId, device.entityId])).to.have.deep.members([
@@ -1691,7 +1871,7 @@ if (process.env.HOMETILES_INTEGRATION === '1') {
           });
 
           it('shows the rows of the earlier version unticked after a Refresh, their names and forced types kept, and arms publishing', async function () {
-            this.timeout(60000);
+            this.timeout(120000);
             const reply = (await ask(getHarness(), 'refreshDetected', { rows: LEGACY_ROWS })) as { native: Record<string, unknown> };
             expect(reply.native).to.deep.equal({
               deviceOverrides: [
@@ -1731,7 +1911,7 @@ if (process.env.HOMETILES_INTEGRATION === '1') {
             });
 
             it('shows those rows unticked after a Refresh: no tick of an earlier version counts until the user ticks again', async function () {
-              this.timeout(60000);
+              this.timeout(120000);
               const reply = (await ask(getHarness(), 'refreshDetected', { rows: EARLIER_REFRESH, ...marker })) as { native: Record<string, unknown> };
               expect(reply.native).to.deep.equal({
                 deviceOverrides: EARLIER_REFRESH.map((row) => ({ ...row, include: false })),
@@ -1855,6 +2035,7 @@ if (process.env.HOMETILES_INTEGRATION === '1') {
           const forced = (objectId: string, detectedDomain: string, forcedDomain: string): object => ({ objectId, include: true, detectedDomain, forcedDomain });
           await harness.changeAdapterConfig('hometiles', {
             native: {
+              ...(await noBroker()),
               ...ARMED,
               deviceOverrides: [
                 // A switch has no temperature, a temperature no playback state.
@@ -1990,7 +2171,7 @@ if (process.env.HOMETILES_INTEGRATION === '1') {
         });
 
         it('tests the broker and credentials as typed, not the saved ones, and says it connected', async function () {
-          this.timeout(60000);
+          this.timeout(120000);
           const answer = await ask('testBroker', typed());
           // json-config shows a mapped result (schema.result) and, the native branch taken, nothing more.
           expect(answer).to.deep.equal({ connected: true, result: 'connected', args: [`127.0.0.1:${brokerPort}`], native: {} });
@@ -1998,7 +2179,7 @@ if (process.env.HOMETILES_INTEGRATION === '1') {
         });
 
         it('shows why it could not connect: the refusal, a port nobody listens on, a port that is none', async function () {
-          this.timeout(60000);
+          this.timeout(120000);
           const refused = await ask('testBroker', { ...typed(), brokerPassword: 'falsch' });
           expect(refused).to.include({ connected: false, error: 'failed' });
           expect(refused.args![0]).to.equal(`127.0.0.1:${brokerPort}`);
@@ -2013,7 +2194,7 @@ if (process.env.HOMETILES_INTEGRATION === '1') {
         });
 
         it('says so when the broker takes the connection and never answers it, after the 10 s the client waits', async function () {
-          this.timeout(60000);
+          this.timeout(120000);
           const started = Date.now();
           expect(await ask('testBroker', { ...typed(), brokerPort: silentPort })).to.deep.equal({
             connected: false,
@@ -2024,7 +2205,7 @@ if (process.env.HOMETILES_INTEGRATION === '1') {
         });
 
         it('gives up after 12 s on a broker that hangs up on each connection without a word, which mqtt.js would retry for ever, and says so (Ruling 143)', async function () {
-          this.timeout(60000);
+          this.timeout(120000);
           const started = Date.now();
           expect(await ask('testBroker', { ...typed(), brokerPort: droppingPort })).to.deep.equal({
             connected: false,
@@ -2035,7 +2216,7 @@ if (process.env.HOMETILES_INTEGRATION === '1') {
         });
 
         it('saves nothing it tested, and logs no password, typed or saved', async function () {
-          this.timeout(60000);
+          this.timeout(120000);
           const instance = (await getHarness().objects.getObjectAsync('system.adapter.hometiles.0')) as { native: Record<string, unknown> };
           expect(instance.native).to.include({ brokerPort: closedPort, brokerUser: 'gespeichert', brokerPassword: stored });
           const tested = logs.filter((log) => log.message.includes('[Admin] Broker test'));
@@ -2045,7 +2226,7 @@ if (process.env.HOMETILES_INTEGRATION === '1') {
         });
 
         it('keeps the broker password encrypted and hidden from other adapters, as io-package.json declares it (Ruling 143)', async function () {
-          this.timeout(60000);
+          this.timeout(120000);
           // `iobroker add` copies both lists from io-package.json (js-controller-cli setupUpload.js upgradeAdapterObjects).
           const instance = (await getHarness().objects.getObjectAsync('system.adapter.hometiles.0')) as Record<string, unknown>;
           expect(instance).to.deep.include({ encryptedNative: ['brokerPassword'], protectedNative: ['brokerPassword'] });
@@ -2053,7 +2234,7 @@ if (process.env.HOMETILES_INTEGRATION === '1') {
         });
 
         it('pairs the panel at the typed address with the saved credentials, the password as saved before admin encrypted it, and says so', async function () {
-          this.timeout(60000);
+          this.timeout(120000);
           const host = `127.0.0.1:${panelPort}`;
           expect(await ask('pairPanel', { host: ` ${host} ` })).to.deep.equal({ ok: true, result: 'paired', args: [host], native: {} });
           // js-controller hands the adapter its config decrypted (adapter.js, encryptedNative): the panel gets the password itself.
@@ -2066,7 +2247,7 @@ if (process.env.HOMETILES_INTEGRATION === '1') {
         });
 
         it('names why pairing failed: no address, a panel that does not answer, credentials it refused', async function () {
-          this.timeout(60000);
+          this.timeout(120000);
           expect(await ask('pairPanel', { host: '' })).to.deep.include({ ok: false, error: 'invalid_host' });
           // The old button's message: none at all.
           expect(await ask('pairPanel', null)).to.deep.include({ ok: false, error: 'invalid_host' });
@@ -2228,7 +2409,7 @@ if (process.env.HOMETILES_INTEGRATION === '1') {
           const harness = getHarness();
           const logs = await captureLogs(harness);
           // Armed, nothing picked: a row is previewed as it would publish, ticked or not. No broker is needed.
-          await harness.changeAdapterConfig('hometiles', { native: { ...ARMED } });
+          await harness.changeAdapterConfig('hometiles', { native: { ...(await noBroker()), ...ARMED } });
           await setObjects(harness, { ...SENSOR_OBJECTS, ...KAFFEE_OBJECTS, ...SENDER_OBJECTS });
           await harness.states.setStateAsync(`${SENSOR}.temperature`, { val: 21.5, ack: true });
           await harness.states.setStateAsync(SENDER_SET, { val: 's1', ack: true });
@@ -2240,7 +2421,7 @@ if (process.env.HOMETILES_INTEGRATION === '1') {
         });
 
         it('shows what a row publishes as it stands: its topic, retained payload and the id picking it gives, in the dialog admin opens', async function () {
-          this.timeout(60000);
+          this.timeout(120000);
           const answer = await preview(row(SENSOR));
           const publish = { topic: 'ha/statestream/sensor/balkon/state', payload: '21.5', retain: true };
           expect(answer.publish).to.deep.equal(publish);
@@ -2251,7 +2432,7 @@ if (process.env.HOMETILES_INTEGRATION === '1') {
         });
 
         it("shows the row's unsaved type and name as saving them would publish: another id, its topic and its payload", async function () {
-          this.timeout(60000);
+          this.timeout(120000);
           const answer = await preview(row(SENSOR, 'number', 'Terrasse'));
           expect(answer.entity).to.include({ entityId: 'number.terrasse' });
           expect(answer.publish).to.include({ topic: 'ha/statestream/number/terrasse/control', retain: true });
@@ -2265,7 +2446,7 @@ if (process.env.HOMETILES_INTEGRATION === '1') {
         });
 
         it("turns the internal degraded flag into a note: the list of choices, over the panel's limit, goes without its options (Task 14 N1)", async function () {
-          this.timeout(60000);
+          this.timeout(120000);
           const answer = await preview(row(SENDER, 'select'));
           expect(Object.keys(answer.publish!).sort()).to.deep.equal(['payload', 'retain', 'topic']);
           expect(answer.publish!.topic).to.equal('ha/statestream/select/sender/control');
@@ -2276,7 +2457,7 @@ if (process.env.HOMETILES_INTEGRATION === '1') {
         });
 
         it('says a scene publishes no state, where its payload would be', async function () {
-          this.timeout(60000);
+          this.timeout(120000);
           const answer = await preview(row(KAFFEE, 'scene'));
           expect(answer.entity).to.include({ entityId: 'scene.kaffee' });
           expect(answer.publish).to.equal(null);
@@ -2285,7 +2466,7 @@ if (process.env.HOMETILES_INTEGRATION === '1') {
         });
 
         it('answers with an error, which the button shows in words, for a type the device cannot serve and for a device it did not detect', async function () {
-          this.timeout(60000);
+          this.timeout(120000);
           // A temperature reading has no player state (synthMediaPlayer).
           // What the device lacks, as the synth tests it, the rebuild's warning too (Ruling 139).
           expect(await preview(row(SENSOR, 'media_player'))).to.deep.equal({ error: 'no_usable_channel', args: [en.lack_player_state] });
@@ -2318,7 +2499,7 @@ if (process.env.HOMETILES_INTEGRATION === '1') {
         /** Starts a run on these rows and this id store; its logs. */
         async function start(harness: IntegrationTestHarness, deviceOverrides: object[], store?: string): Promise<LogRecord[]> {
           const logs = await captureLogs(harness);
-          await setNative(harness, { ...ARMED, deviceOverrides });
+          await setNative(harness, { ...(await noBroker()), ...ARMED, deviceOverrides });
           await setObjects(harness, { ...SENSOR_OBJECTS, ...TWIN_OBJECTS, ...BAD_OBJECTS });
           await harness.states.setStateAsync(`${SENSOR}.temperature`, { val: 21.5, ack: true });
           await harness.states.setStateAsync(`${TWIN}.temperature`, { val: 19, ack: true });
@@ -2345,7 +2526,7 @@ if (process.env.HOMETILES_INTEGRATION === '1') {
           });
 
           it('shows a picked device switched back to Auto, not saved yet, as that saves it: the sensor, not the number saved (review m2)', async function () {
-            this.timeout(60000);
+            this.timeout(120000);
             const harness = getHarness();
             expect(await publishedIds(harness)).to.deep.equal({ [SENSOR]: 'number.balkon' });
             const publish = { topic: 'ha/statestream/sensor/balkon/state', payload: '21.5', retain: true };
@@ -2358,7 +2539,7 @@ if (process.env.HOMETILES_INTEGRATION === '1') {
           });
 
           it('gives each row the id saving the whole form gives it: two new devices of one name, ticked together, get two ids (review m1)', async function () {
-            this.timeout(60000);
+            this.timeout(120000);
             const harness = getHarness();
             previewed = await previewedIds(harness, FORM);
             expect([...previewed].sort()).to.deep.equal(['sensor.balkon', 'sensor.balkon_2']);
@@ -2368,7 +2549,7 @@ if (process.env.HOMETILES_INTEGRATION === '1') {
           });
 
           it('previews a device whose state cannot be read as the adapter publishes it, unavailable, not as an error (review m1 b)', async function () {
-            this.timeout(60000);
+            this.timeout(120000);
             // js-controller refuses to read an alias whose target id is malformed (adapter.js _getForeignState).
             const answer = await preview(getHarness(), { objectId: BAD_ALIAS, forcedDomain: '', name: '', rows: null });
             expect(answer).to.not.have.property('error');
@@ -2446,7 +2627,7 @@ if (process.env.HOMETILES_INTEGRATION === '1') {
         });
 
         it("lists MANU as heat and AUTO as auto, shows the current MANU as heat, and the panel's buttons write each one's raw value", async function () {
-          this.timeout(60000);
+          this.timeout(120000);
           const harness = getHarness();
           const shown = await waitFor(harness, () => states.at(-1), 'the thermostat state');
           expect(JSON.parse(shown)).to.include({ hvac_mode: 'heat' });
@@ -2461,7 +2642,7 @@ if (process.env.HOMETILES_INTEGRATION === '1') {
         });
 
         it('names each row it leaves out and why, in English, once per start: an unknown panel mode, and a device that is no picked thermostat', async function () {
-          this.timeout(60000);
+          this.timeout(120000);
           const warned = (text: string): string[] => logs.filter((log) => log.message.includes(text)).map((log) => `${log.severity} ${log.message.slice(log.message.indexOf('['))}`);
           expect(warned('climateModes entry')).to.deep.equal([`warn [Config] climateModes entry 4 (${TRV_ROOT}) has no panel mode of ${NAMES}; ignoring it`]);
           expect(warned('Climate modes left out')).to.deep.equal([
@@ -2470,12 +2651,12 @@ if (process.env.HOMETILES_INTEGRATION === '1') {
         });
 
         it("offers the detected thermostats for the table's device column, by name and object id", async function () {
-          this.timeout(60000);
+          this.timeout(120000);
           expect(await ask('climateDevices', null)).to.deep.equal([{ label: `Heizung Bad (${TRV_ROOT})`, value: TRV_ROOT }]);
         });
 
         it("previews the thermostat with the form's Climate modes, unsaved rows included", async function () {
-          this.timeout(60000);
+          this.timeout(120000);
           const rows = [{ objectId: TRV_ROOT, include: true, detectedDomain: 'climate', name: 'Heizung Bad' }];
           const answer = (await ask('previewEntity', {
             objectId: TRV_ROOT,
@@ -2576,44 +2757,61 @@ if (process.env.HOMETILES_INTEGRATION === '1') {
           });
         });
 
+        /** What each state of the devices and the helper holds as the adapter starts. */
+        const VALUES: Record<string, unknown> = {
+          [`${TRV_ROOT}.ACTUAL_TEMPERATURE`]: 20.5,
+          [`${TRV_ROOT}.SET_POINT_TEMPERATURE`]: 21,
+          [TRV_MODE]: 0,
+          [`${BLIND}.SET`]: 60,
+          [`${BLIND}.ACTUAL`]: 60,
+          [`${PLAYER}.state`]: 1,
+          [`${PLAYER}.Volume`]: 25,
+          [`${PLAYER}.Title`]: 'Hotel California',
+          [`${STATION}.icon`]: 'rain',
+          [`${STATION}.outside.temperature`]: 7.5,
+          [`${LEVEL}.Stufe`]: 1,
+          [`${PROGRAM}.SET`]: 1,
+          [`${CLOCK}.Zeit`]: '2026-09-24 08:15:00',
+          [SOLL]: 20,
+        };
+        /** Every payload the panel received, by topic, in order. */
+        const inbox = new Map<string, string[]>();
+        const got = (topic: string): string[] => inbox.get(topic) ?? [];
+        /** The newest payload the panel holds for an entity on this leaf, parsed. */
+        const shown = (entityId: string, leaf = 'state'): Record<string, unknown> | undefined => {
+          const last = got(`ha/e2e/${entityId.replace('.', '/')}/${leaf}`).at(-1);
+          return last === undefined ? undefined : (JSON.parse(last) as Record<string, unknown>);
+        };
+        before(async () => {
+          panel().on('message', (topic, payload) => void inbox.set(topic, [...got(topic), payload.toString()]));
+          await panel().subscribeAsync(['ha/e2e/#', 'hometiles-e2e/stat/value', `tab5_lvgl/config/${PANEL}/+/response`]);
+        });
+        /** Starts the adapter on the saved form, each device and the helper holding its value; the apply it publishes, all states in with it. */
+        async function startSaved(harness: IntegrationTestHarness): Promise<Record<string, unknown>> {
+          expect(saved, 'the form the Refresh suite saved').to.have.property('pickerArmed');
+          await setNative(harness, { brokerHost: '127.0.0.1', brokerPort: port(), ...saved });
+          await setObjects(harness, { ...TRV_OBJECTS, ...DOMAIN_OBJECTS, ...HELPER_SOLL });
+          for (const [id, val] of Object.entries(VALUES)) await harness.states.setStateAsync(id, { val, ack: true });
+          const seen = applies.length;
+          await harness.startAdapterAndWait(true);
+          const apply = JSON.parse(await waitFor(harness, () => applies[seen], 'the apply')) as Record<string, unknown>;
+          // Each entity's state goes out right after the apply (panel-manager.ts handleAnnouncement): all of them are in now.
+          await settled();
+          return apply;
+        }
+
+        // Nothing here asks iobroker.history: these round trips run, and never skip, however its install goes (Ruling 145, I2).
         suite('saved: a round trip each', (getHarness) => {
           withCleanFixtures(getHarness);
-          const now = Date.now();
-          /** A reading two days old, then one every 30 minutes through the last day, the newest a quarter of an hour old. */
-          const READINGS = [row(now - 48 * HOUR, 18.5), ...Array.from({ length: 48 }, (_, i) => row(now - 24 * HOUR + HOUR / 4 + (i * HOUR) / 2, 20 + i / 10))];
-          /** Planted as the suite starts. */
-          let counter: HistoryRow[] = [];
-          withHistoryAdapter(getHarness, () => {
-            counter = meterRows(Date.now());
-            return { [TEMPERATURE]: READINGS, [METER]: counter };
-          });
-          /** What each state of the devices and the helper holds as the adapter starts. */
-          const VALUES: Record<string, unknown> = {
-            [`${TRV_ROOT}.ACTUAL_TEMPERATURE`]: 20.5,
-            [`${TRV_ROOT}.SET_POINT_TEMPERATURE`]: 21,
-            [TRV_MODE]: 0,
-            [`${BLIND}.SET`]: 60,
-            [`${BLIND}.ACTUAL`]: 60,
-            [`${PLAYER}.state`]: 1,
-            [`${PLAYER}.Volume`]: 25,
-            [`${PLAYER}.Title`]: 'Hotel California',
-            [`${STATION}.icon`]: 'rain',
-            [`${STATION}.outside.temperature`]: 7.5,
-            [`${LEVEL}.Stufe`]: 1,
-            [`${PROGRAM}.SET`]: 1,
-            [`${CLOCK}.Zeit`]: '2026-09-24 08:15:00',
-            [SOLL]: 20,
+          /** The manual sensor's and the meter's states, logged by no history instance here. */
+          const UNLOGGED: Record<string, object> = {
+            [TEMPERATURE]: readOnly('Fenster', 'value.temperature', 'number', { unit: '°C' }),
+            [METER]: readOnly('Zaehler', 'value.energy.consumed', 'number', { unit: 'kWh' }),
           };
+          /** Every state of the fixtures, buttons included: a command may write to none a test does not expect (m3). */
+          const FIXTURE_STATES = new Set(Object.keys({ ...TRV_OBJECTS, ...DOMAIN_OBJECTS, ...HELPER_SOLL, ...UNLOGGED }));
           /** Every command written to one of those states (ack false), in order: what the panel's commands did. */
           const writes: Array<[string, unknown]> = [];
-          /** Every payload the panel received, by topic, in order. */
-          const inbox = new Map<string, string[]>();
-          const got = (topic: string): string[] => inbox.get(topic) ?? [];
-          /** The newest payload the panel holds for an entity on this leaf, parsed. */
-          const shown = (entityId: string, leaf = 'state'): Record<string, unknown> | undefined => {
-            const last = got(`ha/e2e/${entityId.replace('.', '/')}/${leaf}`).at(-1);
-            return last === undefined ? undefined : (JSON.parse(last) as Record<string, unknown>);
-          };
           /** A command as the panel sends it on cmnd/<leaf> (mqtt_topics.cpp). */
           const send = (leaf: string, body: object): Promise<unknown> => panel().publishAsync(`hometiles-e2e/cmnd/${leaf}`, JSON.stringify(body));
           let serial = 0;
@@ -2655,27 +2853,15 @@ if (process.env.HOMETILES_INTEGRATION === '1') {
             await waitFor(harness, () => (ips.includes(ip) ? true : undefined), 'the adapter reading the panel');
           }
           let apply: Record<string, unknown> = {};
-          /** The meter's live reading, just past the newest one stored. */
-          let live = 0;
 
           before(async function () {
             this.timeout(120000);
             const harness = getHarness();
-            expect(saved, 'the form the Refresh suite saved').to.have.property('pickerArmed');
             harness.on('stateChange', (id: string, state: Change) => {
-              if (state && !state.ack && id in VALUES) writes.push([id, state.val]);
+              if (state && !state.ack && FIXTURE_STATES.has(id)) writes.push([id, state.val]);
             });
-            panel().on('message', (topic, payload) => void inbox.set(topic, [...got(topic), payload.toString()]));
-            await panel().subscribeAsync(['ha/e2e/#', 'hometiles-e2e/stat/value', `tab5_lvgl/config/${PANEL}/+/response`]);
-            await setNative(harness, { brokerHost: '127.0.0.1', brokerPort: port(), ...saved });
-            await setObjects(harness, { ...TRV_OBJECTS, ...DOMAIN_OBJECTS, ...HELPER_SOLL });
-            for (const [id, val] of Object.entries(VALUES)) await harness.states.setStateAsync(id, { val, ack: true });
-            live = (counter.at(-1)!.val as number) + 0.1;
-            await harness.states.setStateAsync(METER, { val: live, ack: true });
-            await harness.startAdapterAndWait(true);
-            apply = JSON.parse(await waitFor(harness, () => applies[0], 'the apply')) as Record<string, unknown>;
-            // Each entity's state goes out right after the apply (panel-manager.ts handleAnnouncement): all of them are in now.
-            await settled();
+            await setObjects(harness, UNLOGGED);
+            apply = await startSaved(harness);
           });
 
           it('lists each picked device, the helper and the sensor under the ids their names give, and the meter, in bridge/apply', () => {
@@ -2697,27 +2883,30 @@ if (process.env.HOMETILES_INTEGRATION === '1') {
           });
 
           it('climate: shows the thermostat, and the setpoint the panel sets lands on SET_POINT_TEMPERATURE and comes back', async function () {
-            this.timeout(60000);
+            this.timeout(120000);
             const harness = getHarness();
             expect(shown('climate.heizung_bad'), 'the thermostat on the panel').to.include({ current_temperature: 20.5, temperature: 21, hvac_mode: 'auto' });
             const from = writes.length;
             await send('climate', { entity_id: 'climate.heizung_bad', command: 'set_temperature', temperature: 22.5 });
-            expect(await written(harness, from)).to.deep.equal([[`${TRV_ROOT}.SET_POINT_TEMPERATURE`, 22.5]]);
+            const expected = [[`${TRV_ROOT}.SET_POINT_TEMPERATURE`, 22.5]];
+            expect(await written(harness, from)).to.deep.equal(expected);
             expect((await changed(harness, 'climate.heizung_bad', 'temperature', 21)).temperature).to.equal(22.5);
+            expect(writes.slice(from), 'every write the command made').to.deep.equal(expected);
           });
 
           it("climate modes: heat on the panel writes the thermostat's own MANU-MODE, 1, as the Climate modes table maps it (Ruling 141)", async function () {
-            this.timeout(60000);
+            this.timeout(120000);
             const harness = getHarness();
             expect(shown('climate.heizung_bad')).to.deep.include({ hvac_mode: 'auto', hvac_modes: ['heat', 'auto'] });
             const from = writes.length;
             await send('climate', { entity_id: 'climate.heizung_bad', command: 'set_hvac_mode', hvac_mode: 'heat' });
             expect(await written(harness, from)).to.deep.equal([[TRV_MODE, 1]]);
             expect((await changed(harness, 'climate.heizung_bad', 'hvac_mode', 'auto')).hvac_mode).to.equal('heat');
+            expect(writes.slice(from), 'every write the command made').to.deep.equal([[TRV_MODE, 1]]);
           });
 
-          it('cover: shows the blind, and the position the panel sets lands on SET; once the blind reports it, the panel shows it', async function () {
-            this.timeout(60000);
+          it('cover: shows the blind, and the position the panel sets lands on SET, and on nothing else; once the blind reports it, the panel shows it', async function () {
+            this.timeout(120000);
             const harness = getHarness();
             expect(shown('cover.rollladen_wohnzimmer'), 'the blind on the panel').to.include({ state: 'open', current_position: 60 });
             const from = writes.length;
@@ -2726,21 +2915,23 @@ if (process.env.HOMETILES_INTEGRATION === '1') {
             // The blind moves and says so, as its adapter would.
             await harness.states.setStateAsync(`${BLIND}.ACTUAL`, { val: 40, ack: true });
             expect((await changed(harness, 'cover.rollladen_wohnzimmer', 'current_position', 60)).current_position).to.equal(40);
-            expect(writes.slice(from), 'nothing written more').to.have.lengthOf(1);
+            // No STOP pressed before or after: a blind stopped and moved is another command.
+            expect(writes.slice(from), 'every write the command made').to.deep.equal([[`${BLIND}.SET`, 40]]);
           });
 
-          it('media_player: shows the player, and the volume the panel sets lands on Volume, in percent, and comes back', async function () {
-            this.timeout(60000);
+          it('media_player: shows the player, and the volume the panel sets lands on Volume, in percent, and on nothing else, and comes back', async function () {
+            this.timeout(120000);
             const harness = getHarness();
             expect(shown('media_player.kuechenradio'), 'the player on the panel').to.include({ state: 'playing', volume_level: 0.25, media_title: 'Hotel California' });
             const from = writes.length;
             await send('media', { entity_id: 'media_player.kuechenradio', command: 'volume_set', volume_level: 0.3 });
             expect(await written(harness, from)).to.deep.equal([[`${PLAYER}.Volume`, 30]]);
             expect((await changed(harness, 'media_player.kuechenradio', 'volume_level', 0.25)).volume_level).to.equal(0.3);
+            expect(writes.slice(from), 'every write the command made').to.deep.equal([[`${PLAYER}.Volume`, 30]]);
           });
 
           it("weather: shows the station on its weather leaf, and answers the popup's request with it again, writing nothing", async function () {
-            this.timeout(60000);
+            this.timeout(120000);
             const harness = getHarness();
             const topic = 'ha/e2e/weather/wetterstation/weather';
             expect(got(topic), 'the station on its weather leaf').to.not.deep.equal([]);
@@ -2756,17 +2947,19 @@ if (process.env.HOMETILES_INTEGRATION === '1') {
           });
 
           it('number: shows the level on its control leaf, and the value the panel sets lands on it, answered ok, and comes back', async function () {
-            this.timeout(60000);
+            this.timeout(120000);
             const harness = getHarness();
             expect(shown('number.lueftung', 'control'), "the level's /control").to.include({ kind: 'number', state: '1', min: 0, max: 4, step: 1, writable: true });
             const from = writes.length;
+            // Answered once every write is done (panel-session.ts executeValueCommand): the writes are all in.
             expect(await setValue(harness, 'number.lueftung', 3)).to.include({ status: 'ok' });
             expect(await written(harness, from)).to.deep.equal([[`${LEVEL}.Stufe`, 3]]);
             expect((await changed(harness, 'number.lueftung', 'state', '1', 'control')).state).to.equal('3');
+            expect(writes.slice(from), 'every write the command made').to.deep.equal([[`${LEVEL}.Stufe`, 3]]);
           });
 
           it("select: shows the programme's options, and the option the panel picks lands as the raw value behind it, answered ok", async function () {
-            this.timeout(60000);
+            this.timeout(120000);
             const harness = getHarness();
             expect(shown('select.heizprogramm', 'control'), "the programme's /control").to.deep.include({
               kind: 'select',
@@ -2779,30 +2972,57 @@ if (process.env.HOMETILES_INTEGRATION === '1') {
             expect(await setValue(harness, 'select.heizprogramm', 'Komfort')).to.include({ status: 'ok' });
             expect(await written(harness, from)).to.deep.equal([[`${PROGRAM}.SET`, 2]]);
             expect((await changed(harness, 'select.heizprogramm', 'state', 'Eco', 'control')).state).to.equal('Komfort');
+            expect(writes.slice(from), 'every write the command made').to.deep.equal([[`${PROGRAM}.SET`, 2]]);
           });
 
           it('datetime: shows the alarm as its text holds it, and the time the panel sets lands in that same shape, answered ok', async function () {
-            this.timeout(60000);
+            this.timeout(120000);
             const harness = getHarness();
             expect(shown('datetime.wecker', 'control'), "the alarm's /control").to.include({ kind: 'datetime', state: '2026-09-24 08:15:00', writable: true });
             const from = writes.length;
             expect(await setValue(harness, 'datetime.wecker', '2026-09-25 06:30:00')).to.include({ status: 'ok' });
             expect(await written(harness, from)).to.deep.equal([[`${CLOCK}.Zeit`, '2026-09-25 06:30:00']]);
             expect((await changed(harness, 'datetime.wecker', 'state', '2026-09-24 08:15:00', 'control')).state).to.equal('2026-09-25 06:30:00');
+            expect(writes.slice(from), 'every write the command made').to.deep.equal([[`${CLOCK}.Zeit`, '2026-09-25 06:30:00']]);
           });
 
           it('a manual entity (Task 13b): the 0_userdata helper, published once the form is saved, takes the value the panel sets', async function () {
-            this.timeout(60000);
+            this.timeout(120000);
             const harness = getHarness();
             expect(shown('number.soll', 'control'), "the helper's /control").to.include({ kind: 'number', state: '20', min: 15, max: 28, writable: true });
             const from = writes.length;
             expect(await setValue(harness, 'number.soll', 21)).to.include({ status: 'ok' });
             expect(await written(harness, from)).to.deep.equal([[SOLL, 21]]);
             expect((await changed(harness, 'number.soll', 'state', '20', 'control')).state).to.equal('21');
+            expect(writes.slice(from), 'every write the command made').to.deep.equal([[SOLL, 21]]);
+          });
+        });
+
+        // Apart from the round trips (Ruling 145, I2): skipped only when iobroker.history cannot be installed for want of a network.
+        suite('saved: the energy and graph requests, answered from iobroker.history', (getHarness) => {
+          withCleanFixtures(getHarness);
+          const now = Date.now();
+          /** A reading two days old, then one every 30 minutes through the last day, the newest a quarter of an hour old. */
+          const READINGS = [row(now - 48 * HOUR, 18.5), ...Array.from({ length: 48 }, (_, i) => row(now - 24 * HOUR + HOUR / 4 + (i * HOUR) / 2, 20 + i / 10))];
+          /** Planted as the suite starts. */
+          let counter: HistoryRow[] = [];
+          withHistoryAdapter(getHarness, () => {
+            counter = meterRows(Date.now());
+            return { [TEMPERATURE]: READINGS, [METER]: counter };
+          });
+          /** The meter's live reading, just past the newest one stored. */
+          let live = 0;
+
+          before(async function () {
+            this.timeout(120000);
+            const harness = getHarness();
+            live = (counter.at(-1)!.val as number) + 0.1;
+            await harness.states.setStateAsync(METER, { val: live, ack: true });
+            await startSaved(harness);
           });
 
           it("an energy meter (Tasks 20, 20b): the panel's energy request is answered with the meter's day, read from the history instance", async function () {
-            this.timeout(60000);
+            this.timeout(120000);
             const harness = getHarness();
             await panel().publishAsync(`tab5_lvgl/config/${PANEL}/energy/request`, '{"period":"day"}');
             const energy = JSON.parse(await waitFor(harness, () => got(`tab5_lvgl/config/${PANEL}/energy/response`)[0], 'the energy answer')) as {
@@ -2816,7 +3036,7 @@ if (process.env.HOMETILES_INTEGRATION === '1') {
           });
 
           it("a graph (the brief): the manual sensor's last 24 hours in quarter hours, 96 values read from the history instance", async function () {
-            this.timeout(60000);
+            this.timeout(120000);
             const harness = getHarness();
             await panel().publishAsync(`tab5_lvgl/config/${PANEL}/history/request`, '{"entity_id":"sensor.fenster","hours":24,"period_minutes":15}');
             const history = JSON.parse(await waitFor(harness, () => got(`tab5_lvgl/config/${PANEL}/history/response`)[0], 'the graph')) as Record<string, unknown>;
@@ -2966,20 +3186,20 @@ if (process.env.HOMETILES_INTEGRATION === '1') {
         };
 
         it('reads the window and, asked for on its own, the reading in effect at its start, however old', async function () {
-          this.timeout(60000);
+          this.timeout(120000);
           const result = await ask(provide(), ID.window);
           expect(result.available).to.equal(true);
           expect(result.rows.map((r) => [r.ts, r.val])).to.deep.equal(WINDOW.map((r) => [r.ts, r.val]));
         });
 
         it('reads a reading in effect a month old, asked for again with no start when the week before holds none', async function () {
-          this.timeout(60000);
+          this.timeout(120000);
           const result = await ask(provide(), ID.old);
           expect(result.rows.map((r) => [r.ts, r.val])).to.deep.equal(OLD.map((r) => [r.ts, r.val]));
         });
 
         it("reads the system's default history instance, which the adapter set for itself, when none is configured", async function () {
-          this.timeout(60000);
+          this.timeout(120000);
           const config = await getHarness().objects.getObjectAsync('system.config');
           expect(config?.common).to.include({ defaultHistory: 'history.0' });
           const result = await ask(provide(''), ID.window);
@@ -2987,13 +3207,13 @@ if (process.env.HOMETILES_INTEGRATION === '1') {
         });
 
         it('finds the reading in effect behind the 400 later rows of its own day file', async function () {
-          this.timeout(60000);
+          this.timeout(120000);
           const result = await ask(provide(), ID.sameDay, 'numeric', morning);
           expect(result.rows.map((r) => r.val)).to.deep.equal(SAME_DAY.slice(1).map((r) => r.val));
         });
 
         it(`keeps the newest ${MAX_HISTORY_ROWS} rows of a busier window, with no reading carried over the rest`, async function () {
-          this.timeout(60000);
+          this.timeout(120000);
           const lines: string[] = [];
           const result = await ask(provide('history.0', lines), ID.busy, 'numeric', busyStart);
           expect(result.rows.map((r) => r.ts)).to.deep.equal(BUSY.slice(-MAX_HISTORY_ROWS).map((r) => r.ts));
@@ -3001,7 +3221,7 @@ if (process.env.HOMETILES_INTEGRATION === '1') {
         });
 
         it('keeps only good numeric readings for a graph, and every row with its quality for a timeline', async function () {
-          this.timeout(60000);
+          this.timeout(120000);
           const numeric = await ask(provide(), ID.marked, 'numeric');
           expect(numeric.rows.map((r) => r.val)).to.deep.equal([18.5, 21, 23]);
           const discrete = await ask(provide(), ID.marked, 'discrete');
@@ -3009,12 +3229,12 @@ if (process.env.HOMETILES_INTEGRATION === '1') {
         });
 
         it('asks nothing for a state the instance does not log', async function () {
-          this.timeout(60000);
+          this.timeout(120000);
           expect(await ask(provide(), ID.unlogged)).to.deep.include({ rows: [], available: false, reason: 'not_logged' });
         });
 
         it("answers a day's energy request from a logged meter: each hour its increase, summing to the total, and nothing for one not logged (Task 20b)", async function () {
-          this.timeout(60000);
+          this.timeout(120000);
           const harness = getHarness();
           const live = (METER.at(-1)!.val as number) + 0.1;
           await harness.states.setStateAsync(ID.meter, { val: live, ack: true });
