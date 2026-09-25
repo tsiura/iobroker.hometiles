@@ -341,7 +341,7 @@ function historyInstance(value: unknown, warnings: string[]): string {
 }
 
 /** What js-controller's tools.encrypt puts first in a value it encrypted with AES (js-controller-common-db tools.js:1747-1755). */
-const AES_PREFIX = '$/aes-192-cbc:';
+export const AES_PREFIX = '$/aes-192-cbc:';
 /** Nothing typed into a form's password field holds a control character: a decryption that yields one yielded garbage. */
 const hasControlCharacter = (text: string): boolean => [...text].some((char) => char.charCodeAt(0) < 0x20 || char.charCodeAt(0) === 0x7f);
 
@@ -377,6 +377,17 @@ export function storedPassword(
 /** Whether a stored value reads as 0.1's plain text: no AES prefix, under a secret that makes one (storedPassword). */
 export function storedInPlainText(raw: unknown, encrypt: (value: string) => string): boolean {
   return typeof raw === 'string' && raw !== '' && !raw.startsWith(AES_PREFIX) && encrypt(raw).startsWith(AES_PREFIX);
+}
+
+/**
+ * Whether the instance object lists the broker password in encryptedNative (final review I-5). js-controller
+ * decrypts only what it lists, copied from io-package.json by `iobroker add` and `iobroker upload`; an upgrade
+ * that ran no upload leaves 0.1's instance, which listed nothing. A password migrated there would reach the
+ * next start as stored, encrypted, and be refused, so nothing is migrated.
+ */
+export function declaresEncryptedPassword(instance: unknown): boolean {
+  const listed = (instance as { encryptedNative?: unknown } | null | undefined)?.encryptedNative;
+  return Array.isArray(listed) && listed.includes('brokerPassword');
 }
 
 /** Where admin encrypts with AES and its prefix: 6.2.3 on (Task 23 round-3 re-review, R3-m1). */

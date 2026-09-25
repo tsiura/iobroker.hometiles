@@ -1,6 +1,16 @@
 import { expect } from 'chai';
 import { createCipheriv, createDecipheriv, randomBytes } from 'node:crypto';
-import { DEFAULTS, normaliseTopic, outdatedAdmins, PICKER_VERSION, storedInPlainText, storedPassword, validateOptions, type AdapterOptions } from '../../src/config/options';
+import {
+  declaresEncryptedPassword,
+  DEFAULTS,
+  normaliseTopic,
+  outdatedAdmins,
+  PICKER_VERSION,
+  storedInPlainText,
+  storedPassword,
+  validateOptions,
+  type AdapterOptions,
+} from '../../src/config/options';
 
 describe('config/options', () => {
   it('strips leading and trailing slashes and collapses doubles', () => {
@@ -431,6 +441,14 @@ describe('config/options', () => {
         // Not migrated, a value whose decryption is garbage is refused as before.
         expect(storedPassword(PASSWORD, xor(LEGACY, PASSWORD), enc, false)).to.equal(undefined);
       });
+    });
+
+    it('allows the migration only where the instance lists the password in encryptedNative: js-controller decrypts nothing else (final review I-5)', () => {
+      expect(declaresEncryptedPassword({ encryptedNative: ['brokerPassword'], native: {} })).to.equal(true);
+      // What a manual npm install leaves without `iobroker upload`: 0.1's instance had no such list.
+      expect(declaresEncryptedPassword({ encryptedNative: [], native: {} })).to.equal(false);
+      expect(declaresEncryptedPassword({ native: {} })).to.equal(false);
+      expect(declaresEncryptedPassword(null)).to.equal(false);
     });
   });
 });

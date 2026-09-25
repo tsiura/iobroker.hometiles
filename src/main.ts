@@ -1,7 +1,17 @@
 import * as utils from '@iobroker/adapter-core';
 import { readdirSync, readFileSync } from 'node:fs';
 import path from 'node:path';
-import { outdatedAdmins, PICKER_VERSION, storedInPlainText, storedPassword, validateOptions, type AdapterOptions, type DeviceOverride } from './config/options';
+import {
+  AES_PREFIX,
+  declaresEncryptedPassword,
+  outdatedAdmins,
+  PICKER_VERSION,
+  storedInPlainText,
+  storedPassword,
+  validateOptions,
+  type AdapterOptions,
+  type DeviceOverride,
+} from './config/options';
 import { AnnounceError } from './protocol/announce';
 import { listsAnyEntity, MAX_EDITABLES, splitEditables } from './protocol/apply';
 import { ENTITY_ID_RE } from './protocol/commands';
@@ -58,6 +68,10 @@ const TEST_BROKER_DEADLINE_MS = 12_000;
 const PASSWORD_UNREADABLE =
   'The broker password could not be decrypted, so the adapter connects to no broker and pairs no panel. ' +
   'Passwords are stored encrypted since 0.2.0: enter it again on the Connection tab and save';
+/** Final review I-5, once per start whose instance does not list the broker password in encryptedNative. */
+const UNDECLARED =
+  'The installation is incomplete: this instance does not declare the broker password as encrypted, so it is left ' +
+  'stored as it is. Run "iobroker upload hometiles", then restart the adapter';
 /** Ruling 149, once per start that finds a password to migrate beside an admin older than 6.2.3. */
 const OUTDATED_ADMIN = (admins: readonly string[]): string =>
   `An ioBroker admin older than 6.2.3 is installed (${admins.join(', ')}). It stores passwords in a form the adapter cannot ` +
@@ -161,11 +175,25 @@ class HomeTiles extends utils.Adapter {
     // be that admin's own encryption, so nothing is migrated (Ruling 149): js-controller's globalDependencies
     // check does not run on a URL install or upgrade.
     const instance = `system.adapter.${this.namespace}`;
-    const stored: unknown = (await this.getForeignObjectAsync(instance))?.native?.brokerPassword;
+    const object = await this.getForeignObjectAsync(instance);
+    const stored: unknown = object?.native?.brokerPassword;
     const encrypt = (value: string): string => this.encrypt(value);
+    // js-controller decrypts only what the instance lists in encryptedNative (final review I-5): otherwise a
+    // value stored encrypted arrives as stored, and the adapter decrypts it itself. Nothing is migrated then.
+    const declared = declaresEncryptedPassword(object);
+    if (!declared) {
+      this.log.error(`[Config] ${UNDECLARED}`);
+      if (typeof stored === 'string' && stored.startsWith(AES_PREFIX)) {
+        try {
+          options.brokerPassword = this.decrypt(stored);
+        } catch {
+          // Left as stored: storedPassword refuses it, as one js-controller could not decrypt.
+        }
+      }
+    }
     const outdated = storedInPlainText(stored, encrypt) ? outdatedAdmins(await this.objectsOfType('instance', 'system.adapter.admin.')) : [];
     if (outdated.length > 0) this.log.error(`[Config] ${OUTDATED_ADMIN(outdated)}`);
-    const password = storedPassword(stored, options.brokerPassword, encrypt, outdated.length === 0);
+    const password = storedPassword(stored, options.brokerPassword, encrypt, outdated.length === 0 && declared);
     this.passwordUnreadable = !password;
     options.brokerPassword = password?.password ?? '';
     if (!password) this.log.error(`[Config] ${PASSWORD_UNREADABLE}`);

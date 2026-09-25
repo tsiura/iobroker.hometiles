@@ -2383,9 +2383,10 @@ if (process.env.HOMETILES_INTEGRATION === '1') {
         /**
          * Starts the adapter on the password `stored` gives for this system's secret, as an upgrade installs it
          * (iobroker upload, as the Ruling 140 suite does); its logs, once onReady has finished. By then its
-         * first connection attempt, if it made one, has had its answer (mqtt-client.ts connect).
+         * first connection attempt, if it made one, has had its answer (mqtt-client.ts connect). `declared`
+         * false: the instance lists nothing in encryptedNative, as 0.1's did after an upgrade without an upload.
          */
-        async function start(harness: IntegrationTestHarness, stored: (secret: string) => string): Promise<LogRecord[]> {
+        async function start(harness: IntegrationTestHarness, stored: (secret: string) => string, declared = true): Promise<LogRecord[]> {
           const logs = await captureLogs(harness);
           await promisify(execFile)(process.execPath, ['iobroker.js', 'upload', 'hometiles'], { cwd: CONTROLLER_DIR, timeout: 120000 });
           const secret = ((await harness.objects.getObjectAsync('system.config')) as { native: { secret: string } }).native.secret;
@@ -2393,6 +2394,12 @@ if (process.env.HOMETILES_INTEGRATION === '1') {
           await harness.changeAdapterConfig('hometiles', {
             native: { brokerHost: '127.0.0.1', brokerPort, brokerUser: 'gespeichert', brokerPassword: stored(secret), ...ARMED },
           });
+          if (!declared) {
+            const id = 'system.adapter.hometiles.0';
+            const instance = (await harness.objects.getObjectAsync(id)) as { native: Record<string, unknown> } & Record<string, unknown>;
+            delete instance.encryptedNative;
+            await harness.objects.setObjectAsync(id, instance);
+          }
           await harness.startAdapterAndWait();
           await waitFor(harness, () => ready(logs), 'onReady to finish');
           await harness.enableSendTo();
@@ -2492,6 +2499,45 @@ if (process.env.HOMETILES_INTEGRATION === '1') {
             expect((await harness.states.getStateAsync('hometiles.0.info.connection'))?.val).to.equal(false);
             expect(await pair(harness)).to.deep.include({ ok: false, error: 'broker_not_connected', args: [`127.0.0.1:${panelPort}`, ''] });
             expect(posted.length, 'forms posted').to.equal(postedBefore);
+          });
+        });
+
+        // js-controller decrypts only what the instance lists in encryptedNative (final review I-5): a value it
+        // did not decrypt, stored encrypted, would reach the next start as stored and be refused.
+        const uploadErrors = (logs: LogRecord[]): string[] => logs.filter((log) => log.message.includes('iobroker upload')).map((log) => log.severity);
+
+        suite('stored in plain text by 0.1, in an instance that does not declare it encrypted (final review I-5)', (getHarness) => {
+          withCleanFixtures(getHarness);
+
+          it('connects with it, leaves it plain, and names the upload that completes the installation, once', async function () {
+            this.timeout(180000);
+            const harness = getHarness();
+            const connection = valuesOf(harness, 'hometiles.0.info.connection');
+            const offeredBefore = offered.length;
+            const logs = await start(harness, () => PASSWORD, false);
+            await waitFor(harness, () => (connection.includes(true) ? true : undefined), 'the broker connection');
+            expect(offered.slice(offeredBefore), 'the passwords offered').to.deep.equal([PASSWORD]);
+            const stored = ((await harness.objects.getObjectAsync('system.adapter.hometiles.0')) as { native: { brokerPassword: string } }).native.brokerPassword;
+            expect(stored, 'left as stored').to.equal(PASSWORD);
+            expect(uploadErrors(logs)).to.deep.equal(['error']);
+          });
+        });
+
+        suite('stored encrypted, in an instance that does not declare it encrypted (final review I-5)', (getHarness) => {
+          withCleanFixtures(getHarness);
+
+          it('decrypts it itself, connects with it, leaves it as stored, and names the upload, once', async function () {
+            this.timeout(180000);
+            const harness = getHarness();
+            const connection = valuesOf(harness, 'hometiles.0.info.connection');
+            const offeredBefore = offered.length;
+            let written = '';
+            const logs = await start(harness, (secret) => (written = encryptAsAdmin(secret, PASSWORD)), false);
+            await waitFor(harness, () => (connection.includes(true) ? true : undefined), 'the broker connection');
+            expect(offered.slice(offeredBefore), 'the passwords offered').to.deep.equal([PASSWORD]);
+            const stored = ((await harness.objects.getObjectAsync('system.adapter.hometiles.0')) as { native: { brokerPassword: string } }).native.brokerPassword;
+            expect(stored, 'left as stored').to.equal(written);
+            expect(uploadErrors(logs)).to.deep.equal(['error']);
           });
         });
       });
