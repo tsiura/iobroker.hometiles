@@ -342,7 +342,7 @@ export class HistoryProvider {
   private async readBefore(lease: Lease, id: string, times: readonly number[], deadline: number): Promise<Found> {
     const found = new Map<number, number | null>();
     try {
-      const checked = await this.logging(id);
+      const checked = await this.loggingBy(id, deadline);
       if ('reason' in checked) return { found, reason: checked.reason };
       const { instance } = checked;
       for (const time of times.filter(isMidnight)) {
@@ -423,7 +423,7 @@ export class HistoryProvider {
   private async read(lease: Lease, id: string, start: number, kind: HistoryKind, limit: number): Promise<HistoryResult> {
     const deadline = Date.now() + HISTORY_BUDGET_MS;
     try {
-      const checked = await this.logging(id);
+      const checked = await this.loggingBy(id, limit);
       if ('reason' in checked) return failure(checked.reason);
       const found = await this.window(lease, checked.instance, id, start, kind, deadline, limit);
       if (typeof found === 'string') return failure(found);
@@ -432,6 +432,16 @@ export class HistoryProvider {
       this.note(`failed ${id}`, 'warn', `Reading the history of ${id} failed: ${error instanceof Error ? error.message : String(error)}`);
       return failure('failed');
     }
+  }
+
+  /**
+   * logging(), given up at `deadline`, a caller's own (Ruling 138 m1): its reads are cheap, but a slow
+   * objects database must not make the answer miss the panel's window. `timeout` then, or `closed`.
+   */
+  private async loggingBy(id: string, deadline: number): Promise<{ instance: string } | { reason: HistoryFailure }> {
+    if (deadline === Infinity) return this.logging(id);
+    const checked = await this.within(this.logging(id), deadline - Date.now());
+    return typeof checked === 'string' ? { reason: checked } : checked;
   }
 
   /** The instance to ask about `id`, or why none may be asked. Each check is one cheap read. */

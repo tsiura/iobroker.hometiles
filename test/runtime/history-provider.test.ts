@@ -796,6 +796,24 @@ describe('runtime/history-provider', () => {
       expect(query.result).to.deep.equal({ rows: [], now: NOW + 2_000, available: false, reason: 'timeout' });
     });
 
+    it('bounds the instance checks by its deadline too: an alive state read too late gives timeout, by the deadline (Ruling 138 m1)', async () => {
+      const fake = historyFake([], STORED);
+      const read = fake.getForeignStateAsync.bind(fake);
+      // A slow objects database: history.0's alive state answers only after the deadline.
+      fake.getForeignStateAsync = (id) =>
+        id === 'system.adapter.history.0.alive' ? new Promise((resolve) => setTimeout(() => resolve(read(id)), 5_000)) : read(id);
+      const provider = provide(fake);
+      const query = timed(provider, NOW + 1_000);
+      let readings: Readings | undefined;
+      void provider.readingsBefore(ID, [START], 'panel-b', NOW + 1_000).then((found) => (readings = found));
+      await clock.tickAsync(1_000);
+      expect(query.result).to.deep.equal({ rows: [], now: NOW + 1_000, available: false, reason: 'timeout' });
+      expect(readings).to.deep.equal({ readings: [null], available: false, reason: 'timeout' });
+      await clock.tickAsync(5_000);
+      expect(fake.calls, 'questions asked once the checks answered').to.deep.equal([]);
+      expect(clock.countTimers()).to.equal(0);
+    });
+
     it('gives the question for the reading in effect only what is left before its deadline', async () => {
       const fake = sqlFake(STORED);
       // The window answers after 1 s, the question before it never.
