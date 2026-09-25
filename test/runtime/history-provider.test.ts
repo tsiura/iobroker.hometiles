@@ -285,6 +285,30 @@ describe('runtime/history-provider', () => {
       expect(log.lines).to.deep.equal([]);
     });
 
+    it('looks back past the week once for the reading in effect of a window of about MAX_HISTORY_ROWS rows, unless it already has (N2)', async () => {
+      // 4997 rows in the window, so the question before it asks for 5000; the
+      // week before holds only bad rows, the reading is ten days old.
+      const window = series(START + MINUTE, 10_000, MAX_HISTORY_ROWS - 3);
+      const bad = series(START - DAY, MINUTE, 3, () => 1).map((row) => ({ ...row, q: 0x42 }));
+      const good: Stored = { ts: START - 10 * DAY, val: 7, ack: true, q: 0 };
+      const fake = sqlFake([good, ...bad, ...window]);
+      const result = await ask(provide(fake));
+      expect(result.rows[0]).to.include({ ts: good.ts, val: 7 });
+      expect(fake.calls.map(({ options }) => [options.start, options.end, options.count])).to.deep.equal([
+        [START, undefined, MAX_HISTORY_ROWS + 1],
+        [START - PRIOR_LOOKBACK_MS, START, MAX_HISTORY_ROWS],
+        [undefined, START, MAX_HISTORY_ROWS],
+      ]);
+      // An empty week: the question with no start has looked back as far already.
+      const quiet = sqlFake([...bad.map((row) => ({ ...row, ts: row.ts - 9 * DAY })), ...window]);
+      expect((await ask(provide(quiet))).rows[0]).to.include({ ts: window[0]!.ts });
+      expect(quiet.calls.map(({ options }) => [options.start, options.count])).to.deep.equal([
+        [START, MAX_HISTORY_ROWS + 1],
+        [START - PRIOR_LOOKBACK_MS, MAX_HISTORY_ROWS],
+        [undefined, MAX_HISTORY_ROWS],
+      ]);
+    });
+
     it('logs one line per entity and hour when the bound is hit', async () => {
       const log = logger();
       const provider = provide(sqlFake(series(START + MINUTE, 10_000, MAX_HISTORY_ROWS + 1)), log);
@@ -658,6 +682,19 @@ describe('runtime/history-provider', () => {
       expect(fake.calls).to.deep.equal([]);
     });
 
+    it('settles a query as closed when close() comes while the question for the reading in effect runs (N1)', async () => {
+      const fake = sqlFake(STORED);
+      fake.replyNext(async () => ({ result: sqlAdapter(STORED, { ...fake.lastCall.options }) }));
+      fake.hangNext();
+      const provider = provide(fake);
+      const pending = ask(provider);
+      await settle();
+      expect(fake.calls).to.have.length(2);
+      provider.close();
+      expect(await pending).to.deep.include({ rows: [], available: false, reason: 'closed' });
+      expect(clock.countTimers()).to.equal(0);
+    });
+
     it('asks nothing for a query that was still reading its checks', async () => {
       const fake = sqlFake(STORED);
       const object = fake.getForeignObjectAsync.bind(fake);
@@ -718,6 +755,91 @@ describe('runtime/history-provider', () => {
       expect(result.available).to.equal(true);
       expect(stamps(result)).to.deep.equal(WINDOW.map((row) => row.ts));
       expect(fake.calls).to.have.length(1);
+    });
+  });
+
+  describe('a deadline per query, the wait for a slot included (Task 22)', () => {
+    /** A query with a deadline, and what it gave once it settled. */
+    const timed = (provider: HistoryProvider, deadline: number, id = ID, panel = 'panel-a', kind: HistoryKind = 'numeric', start = START) => {
+      const settled: { result?: HistoryResult } = {};
+      void provider.query(id, { start, kind, panel, deadline }).then((result) => (settled.result = result));
+      return settled;
+    };
+
+    it('waits for a slot no longer than its deadline, then leaves the queue: what queued behind it is not held up', async () => {
+      const fake = gated();
+      const provider = provide(fake);
+      const held = [1, 2].map((n) => ask(provider, 'numeric', START, 'panel-a', `${ID}${n}`));
+      const late = timed(provider, NOW + 3_000, ID, 'panel-a', 'discrete');
+      const behind = ask(provider, 'numeric', START, 'panel-a', `${ID}3`);
+      await clock.tickAsync(2_999);
+      expect(late.result).to.equal(undefined);
+      await clock.tickAsync(1);
+      expect(late.result).to.deep.equal({ rows: [], now: NOW + 3_000, available: false, reason: 'timeout' });
+      fake.release(`${ID}1`);
+      await settle();
+      // The next slot goes to the query behind it; nothing is asked for the one that left.
+      expect(fake.calls.map((call) => call.id)).to.deep.equal([`${ID}1`, `${ID}2`, `${ID}3`]);
+      fake.release(`${ID}2`);
+      fake.release(`${ID}3`);
+      for (const result of [...held, behind]) expect((await result).available).to.equal(true);
+      expect(clock.countTimers()).to.equal(0);
+    });
+
+    it('ends the question for the window at its deadline, not after QUERY_TIMEOUT_MS', async () => {
+      const fake = sqlFake(STORED);
+      fake.hangNext();
+      const query = timed(provide(fake), NOW + 2_000);
+      await clock.tickAsync(2_000);
+      expect(query.result).to.deep.equal({ rows: [], now: NOW + 2_000, available: false, reason: 'timeout' });
+    });
+
+    it('gives the question for the reading in effect only what is left before its deadline', async () => {
+      const fake = sqlFake(STORED);
+      // The window answers after 1 s, the question before it never.
+      fake.replyNext(() => new Promise((resolve) => setTimeout(() => resolve({ result: sqlAdapter(STORED, fake.calls[0]!.options) }), 1_000)));
+      fake.hangNext();
+      const query = timed(provide(fake), NOW + 3_000);
+      await clock.tickAsync(3_000);
+      expect(query.result).to.deep.include({ now: NOW + 3_000, available: true });
+      expect(stamps(query.result!)).to.deep.equal(WINDOW.map((row) => row.ts));
+    });
+
+    it('joins a query that runs for no longer than its own deadline; the query goes on', async () => {
+      const fake = gated();
+      const provider = provide(fake);
+      const first = ask(provider);
+      await settle();
+      const joined = timed(provider, NOW + 2_000, ID, 'panel-b', 'numeric', START + 30_000);
+      await clock.tickAsync(2_000);
+      expect(joined.result).to.deep.equal({ rows: [], now: NOW + 2_000, available: false, reason: 'timeout' });
+      fake.release(ID);
+      expect((await first).available).to.equal(true);
+      expect(fake.calls).to.have.length(1);
+      expect(clock.countTimers()).to.equal(0);
+    });
+
+    it('hands its slot on at once when it finds its twin running, and waits for that twin outside it, up to its deadline (N3)', async () => {
+      const fake = gated();
+      const provider = provide(fake);
+      const held = [1, 2].map((n) => ask(provider, 'numeric', START, 'panel-a', `${ID}${n}`));
+      const first = ask(provider);
+      // The same popup opened again: the same request, queued behind the first.
+      const again = timed(provider, NOW + 3_000);
+      const other = ask(provider, 'numeric', START, 'panel-a', `${ID}3`);
+      await settle();
+      fake.release(`${ID}1`);
+      await settle();
+      fake.release(`${ID}2`);
+      await settle();
+      // The duplicate took the second slot, found its twin running and handed the slot on.
+      expect(fake.calls.map((call) => call.id)).to.deep.equal([`${ID}1`, `${ID}2`, ID, `${ID}3`]);
+      await clock.tickAsync(3_000);
+      expect(again.result).to.deep.equal({ rows: [], now: NOW + 3_000, available: false, reason: 'timeout' });
+      fake.release(ID);
+      fake.release(`${ID}3`);
+      for (const result of [...held, first, other]) expect((await result).available).to.equal(true);
+      expect(clock.countTimers()).to.equal(0);
     });
   });
 
@@ -961,6 +1083,25 @@ describe('runtime/history-provider', () => {
         expect(await joined).to.deep.equal(reading);
         provider.close();
         await Promise.all(popups);
+      });
+
+      it('hands its slot on at once when it finds its twin running, as a query does (energy re-review N6)', async () => {
+        const fake = gated();
+        const provider = provide(fake);
+        const held = [1, 2].map((n) => ask(provider, 'numeric', START, 'panel-b', `${ID}${n}`));
+        const first = provider.readingsBefore(METER, [TODAY], 'panel-b', NOW + HISTORY_BUDGET_MS);
+        const again = provider.readingsBefore(METER, [TODAY], 'panel-b', NOW + HISTORY_BUDGET_MS);
+        const other = ask(provider, 'numeric', START, 'panel-b', `${ID}3`);
+        await settle();
+        fake.release(`${ID}1`);
+        await settle();
+        fake.release(`${ID}2`);
+        await settle();
+        expect(fake.calls.map((call) => call.id)).to.deep.equal([`${ID}1`, `${ID}2`, METER, `${ID}3`]);
+        fake.release(METER);
+        fake.release(`${ID}3`);
+        expect(await again).to.deep.equal(await first);
+        await Promise.all([...held, other]);
       });
 
       it('joins a twin that started while it waited for its slot, asking nothing twice (M-5)', async () => {

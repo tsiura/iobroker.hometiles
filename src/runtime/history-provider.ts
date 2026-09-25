@@ -200,27 +200,19 @@ export class HistoryProvider {
    * same state, kind and minute share one query while it runs, so `rows` may
    * begin up to a minute before `start`. The builders read those rows as before
    * their window.
+   *
+   * `deadline`, epoch ms: when a panel's request must be answered (Task 22).
+   * The wait for a slot and for a shared query end there with `timeout`, and
+   * no question runs past it; a query that runs goes on for whoever else
+   * waits for it.
    */
-  query(id: string, { start, kind, panel }: { start: number; kind: HistoryKind; panel: string }): Promise<HistoryResult> {
+  query(
+    id: string,
+    { start, kind, panel, deadline = Infinity }: { start: number; kind: HistoryKind; panel: string; deadline?: number },
+  ): Promise<HistoryResult> {
     if (this.closed) return Promise.resolve(failure('closed'));
     const from = Math.floor(start / 60_000) * 60_000;
-    const key = `${kind} ${from} ${id}`;
-    // Only a query that runs is joined: one still waiting in another panel's
-    // queue would hold this panel behind that backlog (M-5). A twin that
-    // started while this request waited is joined once it has a slot.
-    const running = this.inFlight.get(key);
-    if (running) return running;
-    return this.slot(
-      panel,
-      (lease) => {
-        const twin = this.inFlight.get(key);
-        if (twin) return twin;
-        const result = this.read(lease, id, from, kind).finally(() => this.inFlight.delete(key));
-        this.inFlight.set(key, result);
-        return result;
-      },
-      failure,
-    );
+    return this.shared(this.inFlight, `${kind} ${from} ${id}`, panel, deadline, (lease) => this.read(lease, id, from, kind, deadline), failure);
   }
 
   /**
@@ -249,51 +241,68 @@ export class HistoryProvider {
     if (this.closed) return closed();
     const key = (time: number): string => `${id} ${time}`;
     const missing = times.filter((time) => !this.before.has(key(time)));
+    // What a read finds is kept when it ends, whether or not anyone still
+    // waits for it (review trap 10).
     const read: Found =
       missing.length === 0
         ? { found: new Map() }
         : deadline - Date.now() < MIN_QUESTION_MS
           ? { found: new Map(), reason: 'timeout' }
-          : await this.shared(id, missing, panel, deadline);
+          : await this.shared(
+              this.reading,
+              `${id} ${missing.join(' ')}`,
+              panel,
+              deadline,
+              (lease) =>
+                this.readBefore(lease, id, missing, deadline).then((found) => {
+                  this.keep(id, found.found);
+                  return found;
+                }),
+              (reason) => ({ found: new Map(), reason }),
+            );
     if (this.closed) return closed();
     const readings = times.map((time) => (read.found.has(time) ? read.found.get(time)! : (this.before.get(key(time)) ?? null)));
     return read.reason ? { readings, available: false, reason: read.reason } : { readings, available: true };
   }
 
   /**
-   * The read of `missing` in one of the panel's slots, waited for there until
-   * `deadline` at most (Ruling 133). A read that runs is shared by every
-   * request for the same state and boundaries, each waiting for it until its
-   * own deadline at most: a panel asking again, or another panel, joins it
-   * rather than asking twice, and joins only one that runs (M-5). What a read
-   * finds is kept when it ends, whether or not anyone still waits for it
-   * (review trap 10).
+   * `start`'s read in one of the panel's slots, waited for there until
+   * `deadline` at most (Ruling 133), and shared under `key` in `running` while
+   * it runs: a panel asking again, or another panel, joins it rather than
+   * asking twice, each waiting for it until its own deadline at most. Only a
+   * read that runs is joined: one still waiting in another panel's queue would
+   * hold this panel behind that backlog (M-5). A twin that started while this
+   * request waited is joined once it holds a slot, which goes on at once to
+   * the next in the queue (N3).
    */
-  private shared(id: string, missing: readonly number[], panel: string, deadline: number): Promise<Found> {
-    const share = `${id} ${missing.join(' ')}`;
-    const join = async (read: Promise<Found>): Promise<Found> => {
-      const found = deadline === Infinity ? await read : await this.within(read, deadline - Date.now());
-      return typeof found === 'string' ? { found: new Map(), reason: found } : found;
+  private async shared<T>(
+    running: Map<string, Promise<T>>,
+    key: string,
+    panel: string,
+    deadline: number,
+    start: (lease: Lease) => Promise<T>,
+    refuse: (reason: 'busy' | 'closed' | 'timeout') => T,
+  ): Promise<T> {
+    const join = async (read: Promise<T>): Promise<T> => {
+      if (deadline === Infinity) return read;
+      const result = await this.within(read.then((value) => ({ value })), deadline - Date.now());
+      return typeof result === 'string' ? refuse(result) : result.value;
     };
-    const running = this.reading.get(share);
-    if (running) return join(running);
-    return this.slot(
+    const twin = running.get(key);
+    if (twin) return join(twin);
+    const got = await this.slot<{ twin: Promise<T> } | { result: T }>(
       panel,
-      (lease) => {
-        const twin = this.reading.get(share);
-        if (twin) return join(twin);
-        const read = this.readBefore(lease, id, missing, deadline)
-          .then((found) => {
-            this.keep(id, found.found);
-            return found;
-          })
-          .finally(() => this.reading.delete(share));
-        this.reading.set(share, read);
-        return read;
+      async (lease) => {
+        const twin = running.get(key);
+        if (twin) return { twin };
+        const read = start(lease).finally(() => running.delete(key));
+        running.set(key, read);
+        return { result: await read };
       },
-      (reason) => ({ found: new Map(), reason }),
+      (reason) => ({ result: refuse(reason) }),
       deadline,
     );
+    return 'twin' in got ? join(got.twin) : got.result;
   }
 
   /** Keeps the readings found before boundaries a minute old, which never change (Task 20b). */
@@ -410,12 +419,13 @@ export class HistoryProvider {
     else if (--state.running === 0 && this.panels.get(panel) === state) this.panels.delete(panel);
   }
 
-  private async read(lease: Lease, id: string, start: number, kind: HistoryKind): Promise<HistoryResult> {
+  /** A query's read: the window and the reading in effect at its start in one budget (C3), no question past `limit`. */
+  private async read(lease: Lease, id: string, start: number, kind: HistoryKind, limit: number): Promise<HistoryResult> {
     const deadline = Date.now() + HISTORY_BUDGET_MS;
     try {
       const checked = await this.logging(id);
       if ('reason' in checked) return failure(checked.reason);
-      const found = await this.window(lease, checked.instance, id, start, kind, deadline);
+      const found = await this.window(lease, checked.instance, id, start, kind, deadline, limit);
       if (typeof found === 'string') return failure(found);
       return { rows: found.rows, now: Date.now(), available: true };
     } catch (error) {
@@ -492,6 +502,8 @@ export class HistoryProvider {
     // window returned. The +3 covers the row wanted and two rows written
     // between the two questions.
     const prior = await this.prior(lease, instance, id, start, sent.length + 3, kind, Math.min(budget, limit));
+    // What runs when close() comes settles as closed, this question too (N1).
+    if (prior === 'closed') return prior;
     if (typeof prior === 'string') return { rows, priorFailed: true };
     return { rows: prior ? [prior, ...rows] : rows, priorFailed: false };
   }
@@ -503,9 +515,11 @@ export class HistoryProvider {
    * only when the week holds no row, from the newest `count` however old. An
    * empty answer then is final: the rows a day file spills past `end` are
    * dropped before it is sent. When rows came and none suits -- of bad
-   * quality, or no number -- it looks back once more, as far as the bound
-   * (Task 20b). The questions share what is left before `deadline` (C3); with
-   * less than MIN_QUESTION_MS left none is asked, as if it had timed out.
+   * quality, or no number -- it looks back once more, however old, at least
+   * as far as the bound (Task 20b), unless the question with no start has
+   * reached that far already: after the week's, always (N2). The questions
+   * share what is left before `deadline` (C3); with less than
+   * MIN_QUESTION_MS left none is asked, as if it had timed out.
    */
   private async prior(
     lease: Lease,
@@ -516,12 +530,13 @@ export class HistoryProvider {
     kind: HistoryKind,
     deadline = Infinity,
   ): Promise<SourceValue | undefined | HistoryFailure> {
-    let rows = await this.question(lease, instance, id, { start: end - PRIOR_LOOKBACK_MS, end, count }, deadline);
-    if (Array.isArray(rows) && rows.length === 0) rows = await this.question(lease, instance, id, { end, count }, deadline);
+    const week = await this.question(lease, instance, id, { start: end - PRIOR_LOOKBACK_MS, end, count }, deadline);
+    const rows = Array.isArray(week) && week.length === 0 ? await this.question(lease, instance, id, { end, count }, deadline) : week;
     if (typeof rows === 'string') return rows;
     const found = suited(rows, kind, end);
     if (found || rows.length === 0) return found;
-    const back = count < MAX_HISTORY_ROWS ? await this.question(lease, instance, id, { end, count: MAX_HISTORY_ROWS }, deadline) : rows;
+    const reached = rows !== week && count >= MAX_HISTORY_ROWS;
+    const back = reached ? rows : await this.question(lease, instance, id, { end, count: Math.max(count, MAX_HISTORY_ROWS) }, deadline);
     if (typeof back === 'string') return back;
     if (back.length > 0 && usable(back, kind).length === 0) this.unusable(instance, id, back.length, kind);
     return suited(back, kind, end);
