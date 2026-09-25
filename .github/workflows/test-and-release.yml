@@ -12,6 +12,7 @@ on:
 jobs:
   check:
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     strategy:
       matrix:
         node: [20.x, 22.x]
@@ -31,9 +32,10 @@ jobs:
   # during the run, on the runner's own TMPDIR. It needs the network, no secrets.
   integration:
     runs-on: ubuntu-latest
+    timeout-minutes: 60
     strategy:
       matrix:
-        node: [20.x, 22.x]
+        node: [22.x, 24.x]
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
