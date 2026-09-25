@@ -382,6 +382,9 @@ describe('runtime/energy-source', () => {
         meter({ id: 'energy.akku_laden', category: 'battery', sign: -1 }),
         meter({ id: 'energy.waschen', category: 'device' }),
         meter({ id: 'energy.gas', category: 'gas', unit: 'm³' }),
+        // Water is no electricity, and a water device is no electric device (review N4 b).
+        meter({ id: 'energy.wasser', category: 'water', unit: 'm³' }),
+        meter({ id: 'energy.garten', category: 'device_water', unit: 'm³' }),
       ];
       const data = series([
         ['energy.bezug', { values: [1, 0, 2], total: 3 }],
@@ -390,13 +393,15 @@ describe('runtime/energy-source', () => {
         ['energy.akku_laden', { values: [1, 0, 0], total: 1 }],
         ['energy.waschen', { values: [0.2, 0.3, null], total: 0.5 }],
         ['energy.gas', { values: [1, 1, 1], total: 3 }],
+        ['energy.wasser', { values: [5, 5, 5], total: 15 }],
+        ['energy.garten', { values: [2, 2, 2], total: 6 }],
       ]);
       const entries = energyEntries(meters, 'EUR', { ...NAMES, consumption: 'Gesamtverbrauch', untracked: 'Nicht erfasster Verbrauch' }, data);
       expect(entries.slice(0, 2)).to.deep.equal([
         { id: 'consumption_total', category: 'consumption', sign: 1, name: 'Gesamtverbrauch', unit: 'kWh', values: [3.5, 4, 6], total: 13.5, is_total: true },
         { id: 'consumption_untracked', category: 'consumption', sign: 1, name: 'Nicht erfasster Verbrauch', unit: 'kWh', values: [3.3, 3.7, 6], total: 13, is_total: true },
       ]);
-      // No cost entry, category total or gas meter counts; the rest follow as before. First, the size
+      // No cost entry, category total, gas or water meter counts; the rest follow as before. First, the size
       // guard strips them last (energy.ts buildEnergyResponse, review trap 8).
       expect(entries.slice(2).map((e) => e.id)).to.deep.equal([
         'energy.bezug',
@@ -406,6 +411,8 @@ describe('runtime/energy-source', () => {
         'energy.akku_laden',
         'energy.waschen',
         'energy.gas',
+        'energy.wasser',
+        'energy.garten',
         'grid_total',
       ]);
       // The panel leaves them as they are: their sign is 1.

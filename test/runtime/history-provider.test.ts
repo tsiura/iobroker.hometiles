@@ -1010,6 +1010,8 @@ describe('runtime/history-provider', () => {
         available: false,
         reason: 'timeout',
       });
+      // A meter whose every boundary is kept is never late: nothing is missing (review N4 a).
+      expect(await provider.readingsBefore(METER, [TODAY], 'panel-a', NOW - 1)).to.deep.equal({ readings: [expected(COUNTER, TODAY)], available: true });
     });
 
     describe('one budget per energy answer (Ruling 133)', () => {
