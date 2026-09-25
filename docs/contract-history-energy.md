@@ -514,7 +514,8 @@ and unit from (`:1153-1161`), after sensor_meta has reset them (`:1189-1192`),
 and each id gets its category's icon (`:1163-1165`): this catalog, not the
 response, is what names an energy tile and draws its icon. The adapter
 therefore lists every id a response carries -- meters, their `_cost`
-entries, category totals -- as the Bridge's catalog does
+entries, category totals, and the house's `consumption_total` and
+`consumption_untracked` (Ruling 132) -- as the Bridge's catalog does
 (`__init__.py:3981-4234`), after the entity lists and before `scene_map`,
 whose unsanitised aliases could spell `"energy"`. If you are implementing the responder for
 `energy/request`/`energy/response`, use §6.1/§6.2, not this section — this

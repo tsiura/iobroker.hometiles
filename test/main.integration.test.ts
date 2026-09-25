@@ -7,7 +7,7 @@ import { closeSync, lstatSync, mkdirSync, openSync, readFileSync, rmSync, symlin
 import { createServer, type Server } from 'node:net';
 import os from 'node:os';
 import path from 'node:path';
-import { EnergySource, type TotalNames } from '../src/runtime/energy-source';
+import { EnergySource, type EnergyNames } from '../src/runtime/energy-source';
 import { HistoryProvider, MAX_HISTORY_ROWS, type HistoryResult, type HistorySource } from '../src/runtime/history-provider';
 
 /** A log line as js-controller forwards it (js-controller-common-db logger.js). */
@@ -946,6 +946,8 @@ if (process.env.HOMETILES_INTEGRATION === '1') {
           const apply = await waitFor(harness, () => applies.find((payload) => payload.includes('energy.')), 'the apply with the catalog');
           expect(JSON.parse(apply).sensors).to.deep.equal(['sensor.balkon']);
           expect(JSON.parse(apply).energy).to.deep.equal([
+            // The house's consumption, in the system language too (Ruling 132).
+            { id: 'consumption_total', name: 'Gesamtverbrauch', unit: 'kWh', category: 'consumption' },
             { id: 'energy.hausanschluss_bezug', name: 'Hausanschluss (Bezug)', unit: 'kWh', category: 'grid' },
             { id: 'energy.hausanschluss_bezug_cost', name: 'Hausanschluss (Bezug) (EUR)', unit: 'EUR', category: 'grid' },
             { id: 'energy.einspeisung', name: 'Einspeisung', unit: 'kWh', category: 'grid' },
@@ -1591,7 +1593,8 @@ if (process.env.HOMETILES_INTEGRATION === '1') {
           const harness = getHarness();
           const live = (METER.at(-1)!.val as number) + 0.1;
           await harness.states.setStateAsync(ID.meter, { val: live, ack: true });
-          const totals = { grid: 'Grid total', solar: 'Solar total', battery: 'Battery total', gas: 'Gas total', water: 'Water total', device: 'Devices total', device_water: 'Water devices total' } as TotalNames;
+          const totals = { grid: 'Grid total', solar: 'Solar total', battery: 'Battery total', gas: 'Gas total', water: 'Water total', device: 'Devices total', device_water: 'Water devices total' };
+          const names: EnergyNames = { totals, consumption: 'Total consumption', untracked: 'Untracked consumption' };
           const lines: string[] = [];
           const source = new EnergySource(provide('history.0', lines), harnessHistory(harness), { info() {}, warn: (m) => void lines.push(m), error: (m) => void lines.push(m), debug() {} });
           source.configure({
@@ -1601,7 +1604,7 @@ if (process.env.HOMETILES_INTEGRATION === '1') {
               { id: 'energy.unlogged', stateId: ID.unlogged, category: 'device', sign: 1, name: 'Unlogged' },
             ],
             currency: 'EUR',
-            totals,
+            names,
           });
           const answer = await source.answer('e2e', '{"period":"day"}');
           expect(answer!.topic).to.equal('tab5_lvgl/config/e2e/energy/response');
@@ -1609,7 +1612,7 @@ if (process.env.HOMETILES_INTEGRATION === '1') {
           const midnight = new Date(Date.now()).setHours(0, 0, 0, 0);
           expect(parsed.period).to.equal('day');
           expect(new Date(parsed.start).getTime()).to.equal(midnight);
-          const [meter, unlogged] = parsed.entries;
+          const [meter, unlogged] = ['energy.meter', 'energy.unlogged'].map((id) => parsed.entries.find((entry) => entry.id === id));
           const hours = Math.floor((Date.now() - midnight) / 3_600_000);
           expect(meter!.values, lines.join('\n')).to.have.lengthOf(hours + 1);
           // A reading before midnight and one before each hour, the running hour to the live one.

@@ -14,6 +14,7 @@ import {
   type Consumption,
   type EnergyConfig,
   type EnergyMeter,
+  type EnergyNames,
   type TotalNames,
 } from '../../src/runtime/energy-source';
 import { HistoryProvider, type Readings } from '../../src/runtime/history-provider';
@@ -38,6 +39,12 @@ const TOTALS: TotalNames = {
   device: 'Devices total',
   device_water: 'Water devices total',
 };
+const NAMES: EnergyNames = { totals: TOTALS, consumption: 'Total consumption', untracked: 'Untracked consumption' };
+
+/** A meter's, its cost's and its category's entries: the house's consumption apart (Ruling 132). */
+const ownEntries = (...args: Parameters<typeof energyEntries>): EnergyEntry[] => energyEntries(...args).filter((entry) => entry.category !== 'consumption');
+/** The entry of `id` in an energy/response. */
+const entryOf = (payload: string, id = 'energy.netzbezug'): EnergyEntry => (JSON.parse(payload).entries as EnergyEntry[]).find((entry) => entry.id === id)!;
 
 function meter(over: Partial<EnergyMeter> = {}): EnergyMeter {
   return { id: 'energy.netzbezug', stateId: 'shelly.0.em.total', category: 'grid', sign: 1, name: 'Netzbezug', unit: 'kWh', ...over };
@@ -122,8 +129,8 @@ describe('runtime/energy-source', () => {
     it('draws a kWh meter named "... cost" with its category icon, never the currency (review m3)', () => {
       const objects = { 'x.0.grid': counter({ name: 'Grid cost' }) };
       const { meters } = energyMeters([{ stateId: 'x.0.grid', category: 'grid', sign: 1 }], objects, {}, 'hometiles.0', '');
-      const apply = buildApplyPayload({ entities: [], sceneMap: {}, energy: energyCatalog(meters, 'EUR', TOTALS) });
-      expect(Object.fromEntries(panelEnergyCatalog(apply)!.icons)).to.deep.equal({ 'energy.grid_cost_meter': 'transmission-tower' });
+      const apply = buildApplyPayload({ entities: [], sceneMap: {}, energy: energyCatalog(meters, 'EUR', NAMES) });
+      expect(Object.fromEntries(panelEnergyCatalog(apply)!.icons)).to.deep.equal({ consumption_total: 'lightning-bolt', 'energy.grid_cost_meter': 'transmission-tower' });
     });
 
     it('names each meter the history instance does not log, and none when there is no instance', () => {
@@ -236,7 +243,7 @@ describe('runtime/energy-source', () => {
 
   describe('energyEntries: the Bridge\'s entries (__init__.py:2770-2880)', () => {
     it('gives a meter its values to 3 decimals and its total rounded from the unrounded sum', () => {
-      const [entry] = energyEntries([meter()], 'EUR', TOTALS, series([['energy.netzbezug', { values: [0.0004, 0.0004, 0.0004, null], total: 0.0012 }]]));
+      const [entry] = ownEntries([meter()], 'EUR', NAMES, series([['energy.netzbezug', { values: [0.0004, 0.0004, 0.0004, null], total: 0.0012 }]]));
       expect(entry).to.deep.equal({
         id: 'energy.netzbezug',
         category: 'grid',
@@ -250,7 +257,7 @@ describe('runtime/energy-source', () => {
 
     it('sends an export meter its values as measured and its total signed; the panel signs each once', () => {
       const exported = meter({ id: 'energy.einspeisung', sign: -1 });
-      const entries = energyEntries([exported], 'EUR', TOTALS, series([['energy.einspeisung', { values: [1.2, 0.3], total: 1.5 }]]));
+      const entries = ownEntries([exported], 'EUR', NAMES, series([['energy.einspeisung', { values: [1.2, 0.3], total: 1.5 }]]));
       expect(entries[0]).to.include({ total: -1.5, sign: -1 });
       expect(entries[0]!.values).to.deep.equal([1.2, 0.3]);
       const [panel] = panelEnergy(JSON.stringify({ period: 'day', entries }))!.entries;
@@ -261,7 +268,7 @@ describe('runtime/energy-source', () => {
 
     it('adds a cost entry for a meter with a price: the rounded values priced, to 4 decimals, the total to 2', () => {
       const priced = meter({ price: 0.3 });
-      const entries = energyEntries([priced], 'EUR', TOTALS, series([['energy.netzbezug', { values: [1.2345, null, 0.5], total: 1.7345 }]]));
+      const entries = ownEntries([priced], 'EUR', NAMES, series([['energy.netzbezug', { values: [1.2345, null, 0.5], total: 1.7345 }]]));
       expect(entries).to.have.lengthOf(2);
       expect(entries[1]).to.deep.equal({
         id: 'energy.netzbezug_cost',
@@ -280,27 +287,27 @@ describe('runtime/energy-source', () => {
     });
 
     it('spans the gaps in a cost total too, at the same price, and prices the rounded values as the Bridge where there is none (review I1)', () => {
-      const [, spanned] = energyEntries([meter({ price: 0.3 })], 'EUR', TOTALS, series([['energy.netzbezug', { values: [1, null, null, 1], total: 5 }]]));
+      const [, spanned] = ownEntries([meter({ price: 0.3 })], 'EUR', NAMES, series([['energy.netzbezug', { values: [1, null, null, 1], total: 5 }]]));
       expect(spanned).to.deep.include({ values: [0.3, null, null, 0.3], total: 1.5 });
-      const [, unknown] = energyEntries([meter({ price: 0.3 })], 'EUR', TOTALS, series([['energy.netzbezug', { values: [null, null], total: 5 }]]));
+      const [, unknown] = ownEntries([meter({ price: 0.3 })], 'EUR', NAMES, series([['energy.netzbezug', { values: [null, null], total: 5 }]]));
       expect(unknown).to.deep.include({ values: [null, null], total: 1.5 });
     });
 
     it('prices an export meter as the Bridge does: its values as they are, its total signed', () => {
       const feedIn = meter({ id: 'energy.einspeisung', sign: -1, price: 0.08 });
-      const [, cost] = energyEntries([feedIn], 'EUR', TOTALS, series([['energy.einspeisung', { values: [2, 3], total: 5 }]]));
+      const [, cost] = ownEntries([feedIn], 'EUR', NAMES, series([['energy.einspeisung', { values: [2, 3], total: 5 }]]));
       expect(cost).to.deep.include({ values: [0.16, 0.24], total: -0.4, sign: -1 });
     });
 
     it('adds a cost entry at a price of 0, and none without a price', () => {
       const data = series([['energy.a', { values: [1], total: 1 }], ['energy.b', { values: [1], total: 1 }]]);
-      const entries = energyEntries([meter({ id: 'energy.a', price: 0 }), meter({ id: 'energy.b' })], 'CHF', TOTALS, data);
+      const entries = ownEntries([meter({ id: 'energy.a', price: 0 }), meter({ id: 'energy.b' })], 'CHF', NAMES, data);
       expect(entries.map((e) => e.id)).to.deep.equal(['energy.a', 'energy.a_cost', 'energy.b', 'grid_total']);
       expect(entries[1]).to.deep.include({ values: [0], total: 0, unit: 'CHF' });
     });
 
     it('sends no total for a meter with no value, nor for its cost', () => {
-      const entries = energyEntries([meter({ price: 0.3 })], 'EUR', TOTALS, series([['energy.netzbezug', { values: [null, null], total: null }]]));
+      const entries = ownEntries([meter({ price: 0.3 })], 'EUR', NAMES, series([['energy.netzbezug', { values: [null, null], total: null }]]));
       for (const entry of entries) {
         expect(entry, entry.id).to.not.have.property('total');
         expect(entry.values, entry.id).to.deep.equal([null, null]);
@@ -318,8 +325,8 @@ describe('runtime/energy-source', () => {
         ['energy.einspeisung', { values: [0.5, null, null], total: 0.5 }],
         ['energy.pv', { values: [4, 4, 4], total: 12 }],
       ]);
-      const names: TotalNames = { ...TOTALS, grid: 'Netz gesamt' };
-      const entries = energyEntries(meters, 'EUR', names, data);
+      const names: EnergyNames = { ...NAMES, totals: { ...TOTALS, grid: 'Netz gesamt' } };
+      const entries = ownEntries(meters, 'EUR', names, data);
       expect(entries.map((e) => e.id)).to.deep.equal([
         'energy.bezug',
         'energy.bezug_cost',
@@ -360,23 +367,107 @@ describe('runtime/energy-source', () => {
         ['energy.a', { values: [null], total: null }],
         ['energy.b', { values: [null], total: null }],
       ]);
-      const [, , total] = energyEntries([meter({ id: 'energy.a' }), meter({ id: 'energy.b' })], 'EUR', TOTALS, data);
+      const [, , total] = ownEntries([meter({ id: 'energy.a' }), meter({ id: 'energy.b' })], 'EUR', NAMES, data);
       expect(total).to.deep.include({ id: 'grid_total', values: [null] });
       expect(total).to.not.have.property('total');
+    });
+  });
+
+  describe("energyEntries: the house's consumption, as the Bridge's (__init__.py:2882-2944, Ruling 132)", () => {
+    it('sums every grid, solar and battery meter, each signed -- export and charging count negative -- slot by slot; untracked less the devices; named; first', () => {
+      const meters = [
+        meter({ id: 'energy.bezug', price: 0.3 }),
+        meter({ id: 'energy.einspeisung', sign: -1 }),
+        meter({ id: 'energy.pv', category: 'solar' }),
+        meter({ id: 'energy.akku_laden', category: 'battery', sign: -1 }),
+        meter({ id: 'energy.waschen', category: 'device' }),
+        meter({ id: 'energy.gas', category: 'gas', unit: 'm³' }),
+      ];
+      const data = series([
+        ['energy.bezug', { values: [1, null, 2], total: 3 }],
+        ['energy.einspeisung', { values: [0.5, null, null], total: 0.5 }],
+        ['energy.pv', { values: [4, 4, 4], total: 12 }],
+        ['energy.akku_laden', { values: [1, null, null], total: 1 }],
+        ['energy.waschen', { values: [0.2, 0.3, null], total: 0.5 }],
+        ['energy.gas', { values: [1, 1, 1], total: 3 }],
+      ]);
+      const entries = energyEntries(meters, 'EUR', { ...NAMES, consumption: 'Gesamtverbrauch', untracked: 'Nicht erfasster Verbrauch' }, data);
+      expect(entries.slice(0, 2)).to.deep.equal([
+        { id: 'consumption_total', category: 'consumption', sign: 1, name: 'Gesamtverbrauch', unit: 'kWh', values: [3.5, 4, 6], total: 13.5, is_total: true },
+        { id: 'consumption_untracked', category: 'consumption', sign: 1, name: 'Nicht erfasster Verbrauch', unit: 'kWh', values: [3.3, 3.7, 6], total: 13, is_total: true },
+      ]);
+      // No cost entry, category total or gas meter counts; the rest follow as before. First, the size
+      // guard strips them last (energy.ts buildEnergyResponse, review trap 8).
+      expect(entries.slice(2).map((e) => e.id)).to.deep.equal([
+        'energy.bezug',
+        'energy.bezug_cost',
+        'energy.einspeisung',
+        'energy.pv',
+        'energy.akku_laden',
+        'energy.waschen',
+        'energy.gas',
+        'grid_total',
+      ]);
+      // The panel leaves them as they are: their sign is 1.
+      const panel = panelEnergy(JSON.stringify({ period: 'day', entries }))!.entries;
+      expect(panel.slice(0, 2).map((e) => [e.values, e.total])).to.deep.equal([
+        [[3.5, 4, 6], 13.5],
+        [[3.3, 3.7, 6], 13],
+      ]);
+    });
+
+    it("subtracts a device meter's values as measured and its total as signed, as the Bridge (:2918, :2928); no untracked without a device", () => {
+      const data = series([
+        ['energy.bezug', { values: [2, 2], total: 4 }],
+        ['energy.balkon', { values: [0.5, null], total: 0.5 }],
+      ]);
+      const entries = energyEntries([meter({ id: 'energy.bezug' }), meter({ id: 'energy.balkon', category: 'device', sign: -1 })], 'EUR', NAMES, data);
+      expect(entries[1]).to.deep.include({ id: 'consumption_untracked', values: [1.5, 2], total: 4.5 });
+      expect(energyEntries([meter({ id: 'energy.bezug' })], 'EUR', NAMES, data).map((e) => e.id)).to.deep.equal(['consumption_total', 'energy.bezug']);
+    });
+
+    it('skips a total not known, and has none while no meter has one (review trap 6)', () => {
+      const meters = [meter({ id: 'energy.bezug' }), meter({ id: 'energy.pv', category: 'solar' }), meter({ id: 'energy.waschen', category: 'device' })];
+      const partly = series([
+        ['energy.bezug', { values: [null, 1], total: null }],
+        ['energy.pv', { values: [2, 2], total: 4 }],
+        ['energy.waschen', { values: [null, 0.5], total: null }],
+      ]);
+      const [house, untracked] = energyEntries(meters, 'EUR', NAMES, partly);
+      expect(house).to.deep.include({ values: [2, 3], total: 4 });
+      expect(untracked).to.deep.include({ values: [2, 2.5], total: 4 });
+      const unknown = series(['energy.bezug', 'energy.pv', 'energy.waschen'].map((id): [string, Consumption] => [id, { values: [null], total: null }]));
+      for (const entry of energyEntries(meters, 'EUR', NAMES, unknown).slice(0, 2)) {
+        expect(entry.values, entry.id).to.deep.equal([null]);
+        expect(entry, entry.id).to.not.have.property('total');
+      }
+    });
+
+    it("takes the first meter's unit where the Bridge writes kWh (review trap 7), none when it has none", () => {
+      const [wh] = energyEntries([meter({ unit: 'Wh' }), meter({ id: 'energy.pv', category: 'solar' })], 'EUR', NAMES, series([]));
+      expect(wh).to.include({ id: 'consumption_total', unit: 'Wh' });
+      const [bare] = energyEntries([meter({ unit: undefined })], 'EUR', NAMES, series([]));
+      expect(bare).to.include({ id: 'consumption_total' }).and.not.have.property('unit');
+    });
+
+    it('makes none without a grid, solar or battery meter: gas and devices alone', () => {
+      const entries = energyEntries([meter({ id: 'energy.gas', category: 'gas' }), meter({ id: 'energy.waschen', category: 'device' })], 'EUR', NAMES, series([]));
+      expect(entries.map((e) => e.id)).to.deep.equal(['energy.gas', 'energy.waschen']);
     });
   });
 
   describe('energyCatalog: the bridge/apply catalog (contract §6.4)', () => {
     it('lists every id an answer carries, with its name, unit and category', () => {
       const meters = [meter({ price: 0.3 }), meter({ id: 'energy.einspeisung', sign: -1, name: 'Einspeisung', unit: undefined })];
-      const catalog = energyCatalog(meters, 'EUR', TOTALS);
+      const catalog = energyCatalog(meters, 'EUR', NAMES);
       expect(catalog).to.deep.equal([
+        { id: 'consumption_total', name: 'Total consumption', unit: 'kWh', category: 'consumption' },
         { id: 'energy.netzbezug', name: 'Netzbezug', unit: 'kWh', category: 'grid' },
         { id: 'energy.netzbezug_cost', name: 'Netzbezug (EUR)', unit: 'EUR', category: 'grid' },
         { id: 'energy.einspeisung', name: 'Einspeisung', category: 'grid' },
         { id: 'grid_total', name: 'Grid total', unit: 'kWh', category: 'grid' },
       ]);
-      const answered = energyEntries(meters, 'EUR', TOTALS, series([]));
+      const answered = energyEntries(meters, 'EUR', NAMES, series([]));
       expect(catalog.map((entry) => entry.id)).to.deep.equal(answered.map((entry) => entry.id));
     });
   });
@@ -403,7 +494,7 @@ describe('runtime/energy-source', () => {
       };
     }
     const states = (live: Record<string, unknown>) => ({ getForeignStateAsync: async (id: string): Promise<unknown> => live[id] ?? null });
-    const configured = (over: Partial<EnergyConfig> = {}): EnergyConfig => ({ armed: true, meters: [meter()], currency: 'EUR', totals: TOTALS, ...over });
+    const configured = (over: Partial<EnergyConfig> = {}): EnergyConfig => ({ armed: true, meters: [meter()], currency: 'EUR', names: NAMES, ...over });
 
     it('answers a day request on energy/response with the consumption of each hour since midnight', async () => {
       const history = fakeHistory();
@@ -413,15 +504,15 @@ describe('runtime/energy-source', () => {
       expect(answer!.topic).to.equal('tab5_lvgl/config/a1b2c3/energy/response');
       const parsed = JSON.parse(answer!.payload);
       expect(parsed).to.include({ period: 'day', start: '2026-09-25T00:00:00+02:00' });
-      expect(parsed.entries).to.have.lengthOf(1);
-      const [entry] = parsed.entries as EnergyEntry[];
+      expect((parsed.entries as EnergyEntry[]).map((e) => e.id)).to.deep.equal(['consumption_total', 'energy.netzbezug']);
+      const entry = entryOf(answer!.payload);
       expect(entry!.values).to.deep.equal([...Array(14).fill(0.5), 0.3]);
       expect(entry!.total).to.equal(7.3);
       expect(history.asked).to.deep.equal([{ id: 'shelly.0.em.total', times: energyPeriod('day', NOW()).boundaries, panel: 'a1b2c3' }]);
       // What the panel's energy tile shows (energy_data.cpp:173-199).
       const panel = panelEnergy(answer!.payload)!;
       expect(panel.queue).to.equal('day');
-      expect(panelTotalText(panel.entries[0]!.total, false)).to.equal('7.300');
+      expect(panelTotalText(panel.entries.find((e) => e.id === 'energy.netzbezug')!.total, false)).to.equal('7.300');
     });
 
     it('answers week and month with a value per day', async () => {
@@ -429,10 +520,10 @@ describe('runtime/energy-source', () => {
       source.configure(configured());
       const week = JSON.parse((await source.answer('a1', '{"period":"week"}'))!.payload);
       expect(week).to.include({ period: 'week', start: '2026-09-19T00:00:00+02:00' });
-      expect(week.entries[0].values).to.have.lengthOf(7);
+      expect(week.entries[1].values).to.have.lengthOf(7);
       const month = JSON.parse((await source.answer('a1', '{"period":"month"}'))!.payload);
       expect(month).to.include({ period: 'month', start: '2026-09-01T00:00:00+02:00' });
-      expect(month.entries[0].values).to.have.lengthOf(25);
+      expect(month.entries[1].values).to.have.lengthOf(25);
     });
 
     it('answers nothing while the adapter is not armed (Rulings 116, 118), and asks no history', async () => {
@@ -452,7 +543,7 @@ describe('runtime/energy-source', () => {
       source.configure(configured({ meters: [] }));
       expect([source.content(), source.catalog()]).to.deep.equal([false, []]);
       source.configure(configured());
-      expect([source.content(), source.catalog()]).to.deep.equal([true, energyCatalog([meter()], 'EUR', TOTALS)]);
+      expect([source.content(), source.catalog()]).to.deep.equal([true, energyCatalog([meter()], 'EUR', NAMES)]);
     });
 
     it('answers nothing to a payload that is no request', async () => {
@@ -478,7 +569,7 @@ describe('runtime/energy-source', () => {
       for (const live of [{ val: 1007.3, q: 0x42 }, { val: 'n/a', q: 0 }, null]) {
         const source = new EnergySource(fakeHistory(), states({ 'shelly.0.em.total': live }), logger());
         source.configure(configured());
-        const [entry] = JSON.parse((await source.answer('a1', '{"period":"day"}'))!.payload).entries as EnergyEntry[];
+        const entry = entryOf((await source.answer('a1', '{"period":"day"}'))!.payload);
         expect(entry!.values.at(-1), JSON.stringify(live)).to.equal(null);
         expect(entry!.total, JSON.stringify(live)).to.equal(7);
       }
@@ -490,8 +581,8 @@ describe('runtime/energy-source', () => {
       const source = new EnergySource(history, states({ 'shelly.0.em.total': { val: 1007.3, q: 0 }, 'x.0.unlogged': { val: 55, q: 0 } }), logger());
       source.configure(configured({ meters }));
       const entries = JSON.parse((await source.answer('a1', '{"period":"day"}'))!.payload).entries as EnergyEntry[];
-      expect(entries.map((e) => e.id)).to.deep.equal(['energy.netzbezug', 'energy.pumpe', 'energy.pumpe_cost']);
-      for (const entry of entries.slice(1)) {
+      expect(entries.map((e) => e.id)).to.deep.equal(['consumption_total', 'consumption_untracked', 'energy.netzbezug', 'energy.pumpe', 'energy.pumpe_cost']);
+      for (const entry of entries.slice(3)) {
         expect(entry.values, entry.id).to.deep.equal(Array(15).fill(null));
         expect(entry, entry.id).to.not.have.property('total');
       }
@@ -504,8 +595,12 @@ describe('runtime/energy-source', () => {
       source.configure(configured({ meters }));
       const answer = await source.answer('a1', '{"period":"day"}');
       expect(Buffer.byteLength(answer!.payload)).to.be.at.most(MAX_ENERGY_BYTES);
-      // 120 meters, their 120 cost entries, and the grid's two totals: every total goes out.
-      expect(panelEnergy(answer!.payload)!.entries).to.have.lengthOf(242);
+      // The house's consumption, 120 meters, their 120 cost entries, and the grid's two totals: every total goes out.
+      const entries = panelEnergy(answer!.payload)!.entries;
+      expect(entries).to.have.lengthOf(243);
+      // The house's consumption goes first: the last entries lose their values first (review trap 8).
+      expect(entries[0]).to.deep.include({ id: 'consumption_total', total: 840 });
+      expect(entries[0]!.values).to.have.lengthOf(15);
       await source.answer('a1', '{"period":"day"}');
       expect(log.lines).to.have.lengthOf(1);
       expect(log.lines[0]).to.match(/^warn: \[Energy\] /).and.include(String(MAX_ENERGY_BYTES)).and.include('Energy tab');
@@ -522,7 +617,7 @@ describe('runtime/energy-source', () => {
         logger(),
       );
       source.configure(configured());
-      const [entry] = JSON.parse((await source.answer('a1', '{"period":"day"}'))!.payload).entries as EnergyEntry[];
+      const entry = entryOf((await source.answer('a1', '{"period":"day"}'))!.payload);
       expect(entry!.values.at(-1)).to.equal(null);
     });
 
@@ -542,7 +637,7 @@ describe('runtime/energy-source', () => {
         clock.tick(20 * MINUTE);
         const second = await source.answer('a1', '{"period":"day"}');
         expect(fake.calls).to.have.lengthOf(asked);
-        expect(JSON.parse(second!.payload).entries[0].values.slice(0, -1)).to.deep.equal(JSON.parse(first!.payload).entries[0].values.slice(0, -1));
+        expect(entryOf(second!.payload).values.slice(0, -1)).to.deep.equal(entryOf(first!.payload).values.slice(0, -1));
         clock.tick(10 * MINUTE); // 15:05: the 15:00 boundary is new
         await source.answer('a1', '{"period":"day"}');
         const next = fake.calls.slice(asked).map((call) => call.options.end ?? call.options.start);
@@ -557,7 +652,7 @@ describe('runtime/energy-source', () => {
         fake.states['shelly.0.em.total'] = { val: (busy.at(-1)!.val as number) + 0.001, q: 0 };
         const source = new EnergySource(new HistoryProvider(fake, logger(), 'sql.0'), fake, logger());
         source.configure(configured());
-        const [entry] = JSON.parse((await source.answer('a1', '{"period":"week"}'))!.payload).entries as EnergyEntry[];
+        const entry = entryOf((await source.answer('a1', '{"period":"week"}'))!.payload);
         // 2880 readings a day, 0.001 kWh each.
         expect(entry!.values.slice(0, 6)).to.deep.equal(Array(6).fill(2.88));
         expect(fake.calls.every((call) => call.options.count === 3)).to.equal(true);
@@ -577,7 +672,7 @@ describe('runtime/energy-source', () => {
           fake.states['shelly.0.em.total'] = { val: live, q: 0 };
           const source = new EnergySource(new HistoryProvider(fake, logger(), fake.instance), fake, logger());
           source.configure(configured());
-          const day = async (): Promise<EnergyEntry> => (JSON.parse((await source.answer('a1', '{"period":"day"}'))!.payload).entries as EnergyEntry[])[0]!;
+          const day = async (): Promise<EnergyEntry> => entryOf((await source.answer('a1', '{"period":"day"}'))!.payload);
           const entry = await day();
           expect(entry.values, fake.instance).to.deep.equal([null, null, ...Array(13).fill(0.36), 0.004]);
           expect(entry.total, fake.instance).to.equal(5.404);
@@ -594,7 +689,7 @@ describe('runtime/energy-source', () => {
           fake.states['shelly.0.em.total'] = { val: 911.2, q: 0 };
           const source = new EnergySource(new HistoryProvider(fake, logger(), fake.instance), fake, logger());
           source.configure(configured());
-          const [entry] = JSON.parse((await source.answer('a1', '{"period":"day"}'))!.payload).entries as EnergyEntry[];
+          const entry = entryOf((await source.answer('a1', '{"period":"day"}'))!.payload);
           const values = entry!.values as number[];
           expect(values, fake.instance).to.have.lengthOf(15);
           // 23:50 read 902.3 before midnight, 14:30 read 911.1, live 911.2.

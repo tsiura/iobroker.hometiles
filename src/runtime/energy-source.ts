@@ -40,6 +40,15 @@ export interface EnergyMeter {
 /** Each category's total, named in the system's language: the Bridge's are German only (__init__.py:2828-2836). */
 export type TotalNames = Readonly<Record<EnergyCategory, string>>;
 
+/** The names of the totals an answer adds, in the system's language (Rulings 124, 132). */
+export interface EnergyNames {
+  totals: TotalNames;
+  /** consumption_total, the Bridge's "Gesamtverbrauch" (__init__.py:2906). */
+  consumption: string;
+  /** consumption_untracked, its "Nicht erfasster Verbrauch" (__init__.py:2939). */
+  untracked: string;
+}
+
 /** A meter's buckets: each counter increase, null where no reading is known, and their sum. */
 export interface Consumption {
   values: Array<number | null>;
@@ -153,10 +162,29 @@ export function consumption(readings: ReadonlyArray<number | null>, live: number
 const sum = (values: readonly number[]): number => values.reduce((total, value) => total + value, 0);
 const known = (values: ReadonlyArray<number | null>): number[] => values.filter((value): value is number => value !== null);
 
+/** Each slot's sum of the members' values, each signed, rounded; null where no member has one (__init__.py:2848-2860, :2888-2899). */
+function signedSlots(members: readonly EnergyEntry[], digits: number): Array<number | null> {
+  const length = Math.max(...members.map((member) => member.values.length));
+  return Array.from({ length }, (_, i) => {
+    const slot = members.flatMap((member) => {
+      const value = member.values[i];
+      return value === null || value === undefined ? [] : [applyEnergySign(value, member.sign)];
+    });
+    return slot.length > 0 ? bridgeRound(sum(slot), digits) : null;
+  });
+}
+
+/** The sum of the members' signed totals, rounded, a total not known skipped; none while no member has one (review trap 6). */
+function knownTotal(members: readonly EnergyEntry[], digits: number): number | undefined {
+  const totals = known(members.map((member) => member.total ?? null));
+  return totals.length > 0 ? bridgeRound(sum(totals), digits) : undefined;
+}
+
 /**
- * The entries of an answer, shaped as the Bridge's (__init__.py:2770-2880):
+ * The entries of an answer, shaped as the Bridge's (__init__.py:2770-2944):
  * per meter its own, and a cost entry when it has a price; then each
- * category of two or more a total, one of energy and one of cost. Values and
+ * category of two or more a total, one of energy and one of cost; and the
+ * house's consumption (consumptionEntries), which goes first. Values and
  * totals are rounded as the Bridge rounds them: a meter's values to 3
  * decimals and its total from their unrounded sum, spanning any gap
  * (consumption); costs priced from the rounded values, to 4 decimals, their
@@ -164,13 +192,13 @@ const known = (values: ReadonlyArray<number | null>): number[] => values.filter(
  * (or 4) and its total, the sum of its members', to 3 (or 2). A meter's
  * values go out as measured and its total signed, so the panel, which turns
  * a positive value negative for sign -1, signs each once (applyEnergySign);
- * a category total is signed already and goes out with sign 1. Without
- * `series`, each entry has no values: the catalog.
+ * a total is signed already and goes out with sign 1. Without `series`, each
+ * entry has no values: the catalog.
  */
 export function energyEntries(
   meters: readonly EnergyMeter[],
   currency: string,
-  totals: TotalNames,
+  names: EnergyNames,
   series?: ReadonlyMap<string, Consumption>,
 ): EnergyEntry[] {
   const entries: EnergyEntry[] = [];
@@ -208,18 +236,11 @@ export function energyEntries(
     }
     for (const [category, members] of groups) {
       if (members.length < 2) continue;
-      const length = Math.max(...members.map((member) => member.values.length));
-      const values = Array.from({ length }, (_, i) => {
-        const slot = members.flatMap((member) => {
-          const value = member.values[i];
-          return value === null || value === undefined ? [] : [applyEnergySign(value, member.sign)];
-        });
-        return slot.length > 0 ? bridgeRound(sum(slot), isCost ? 4 : 3) : null;
-      });
-      const label = totals[category as EnergyCategory];
+      const label = names.totals[category as EnergyCategory];
+      const values = signedSlots(members, isCost ? 4 : 3);
       const total: EnergyEntry = { id: `${category}_total${isCost ? '_cost' : ''}`, category, sign: 1, name: isCost ? `${label} (${currency})` : label, values, is_total: true };
-      const known = members.flatMap((member) => (member.total === undefined ? [] : [member.total]));
-      if (known.length > 0) total.total = bridgeRound(sum(known), isCost ? 2 : 3);
+      const sumTotal = knownTotal(members, isCost ? 2 : 3);
+      if (sumTotal !== undefined) total.total = sumTotal;
       if (isCost) {
         total.unit = currency;
         total.is_cost = true;
@@ -227,18 +248,58 @@ export function energyEntries(
       entries.push(total);
     }
   }
-  return entries;
+  return [...consumptionEntries(entries, names), ...entries];
+}
+
+/**
+ * The Bridge's "Gesamtverbrauch" and "Nicht erfasster Verbrauch"
+ * (__init__.py:2882-2944), under its ids -- a panel moved from Home Assistant
+ * keeps its tiles -- and translated names (Ruling 132). consumption_total,
+ * once a grid, solar or battery meter is set: each slot their values, each
+ * signed, to 3 decimals; its total their signed totals. consumption_untracked,
+ * once a device meter is set too: each slot of the consumption less the device
+ * meters' values as measured, its total less their signed totals, as the
+ * Bridge subtracts them (:2918, :2928; its dev_max is unused, the slots are the
+ * consumption's). A total not known is skipped, as in a category total; the
+ * unit is the first meter's where the Bridge writes kWh (review traps 6, 7).
+ * They go first in an answer: its size guard strips the last entries first,
+ * and the house's consumption is the tile most likely bound (review trap 8).
+ */
+function consumptionEntries(entries: readonly EnergyEntry[], names: EnergyNames): EnergyEntry[] {
+  const own = (categories: readonly string[]): EnergyEntry[] =>
+    entries.filter((entry) => !entry.is_total && !entry.is_cost && categories.includes(entry.category));
+  const electric = own(['solar', 'grid', 'battery']);
+  if (electric.length === 0) return [];
+  const unit = electric[0]!.unit;
+  const house: EnergyEntry = { id: 'consumption_total', category: 'consumption', sign: 1, name: names.consumption, values: signedSlots(electric, 3), is_total: true };
+  const houseTotal = knownTotal(electric, 3);
+  if (houseTotal !== undefined) house.total = houseTotal;
+  if (unit) house.unit = unit;
+  const devices = own(['device']);
+  if (devices.length === 0) return [house];
+  const untracked: EnergyEntry = {
+    id: 'consumption_untracked',
+    category: 'consumption',
+    sign: 1,
+    name: names.untracked,
+    values: house.values.map((value, i) => (value === null ? null : bridgeRound(value - sum(known(devices.map((device) => device.values[i] ?? null))), 3))),
+    is_total: true,
+  };
+  if (house.total !== undefined) untracked.total = bridgeRound(house.total - sum(known(devices.map((device) => device.total ?? null))), 3);
+  if (unit) untracked.unit = unit;
+  return [house, untracked];
 }
 
 /**
  * bridge/apply's `energy` catalog (contract §6.4): every id an answer
- * carries -- meters, cost entries, category totals, as the Bridge's catalog
- * lists them (__init__.py:3981-4234) -- with its name, unit and category. It
- * is where a tile finds its title (energy/renderer.cpp:110-113) and its icon
- * (ha_bridge_config.cpp:1083-1099, :1165-1167); an answer's names are never shown.
+ * carries -- meters, cost entries, category totals and the house's
+ * consumption, as the Bridge's catalog lists them (__init__.py:3981-4234) --
+ * with its name, unit and category. It is where a tile finds its title
+ * (energy/renderer.cpp:110-113) and its icon (ha_bridge_config.cpp:1083-1099,
+ * :1165-1167); an answer's names are never shown.
  */
-export function energyCatalog(meters: readonly EnergyMeter[], currency: string, totals: TotalNames): EnergyCatalogEntry[] {
-  return energyEntries(meters, currency, totals).map(({ id, name, unit, category }) => (unit ? { id, name: name!, unit, category } : { id, name: name!, category }));
+export function energyCatalog(meters: readonly EnergyMeter[], currency: string, names: EnergyNames): EnergyCatalogEntry[] {
+  return energyEntries(meters, currency, names).map(({ id, name, unit, category }) => (unit ? { id, name: name!, unit, category } : { id, name: name!, category }));
 }
 
 /** What a rebuild tells the energy source. */
@@ -247,7 +308,7 @@ export interface EnergyConfig {
   armed: boolean;
   meters: readonly EnergyMeter[];
   currency: string;
-  totals: TotalNames;
+  names: EnergyNames;
 }
 
 const LOG_EVERY_MS = 3_600_000;
@@ -283,7 +344,7 @@ export class EnergySource {
 
   /** The catalog of bridge/apply: the meters' while content(), else none. */
   catalog(): EnergyCatalogEntry[] {
-    return this.content() ? energyCatalog(this.config!.meters, this.config!.currency, this.config!.totals) : [];
+    return this.content() ? energyCatalog(this.config!.meters, this.config!.currency, this.config!.names) : [];
   }
 
   /**
@@ -310,7 +371,7 @@ export class EnergySource {
         const { readings } = await this.history.readingsBefore(meter.stateId, boundaries, deviceId);
         series.set(meter.id, consumption(readings, await this.live(meter.stateId)));
       }
-      const built = buildEnergyResponse(request.period, localIso(start), energyEntries(config.meters, config.currency, config.totals, series));
+      const built = buildEnergyResponse(request.period, localIso(start), energyEntries(config.meters, config.currency, config.names, series));
       if (built.valuesDropped > 0 || built.entriesDropped > 0) {
         this.note(
           `size ${request.period}`,

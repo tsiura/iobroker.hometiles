@@ -73,6 +73,8 @@
   "energy_total_water": "Wasser gesamt",
   "energy_total_device": "Geräte gesamt",
   "energy_total_device_water": "Wassergeräte gesamt",
+  "energy_consumption_total": "Gesamtverbrauch",
+  "energy_consumption_untracked": "Nicht erfasster Verbrauch",
   "coalesce_ms": "Sammelfenster für Statusänderungen (ms)",
   "coalesce_ms_help": "Änderungen innerhalb dieses Fensters werden einmal gesendet. Der letzte Wert wird immer zugestellt.",
   "max_publish_queue": "Maximale Warteschlange",

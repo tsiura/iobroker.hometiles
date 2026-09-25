@@ -22,7 +22,7 @@ import { applyOverrides, detectedRows, mergeDetected } from './registry/override
 import { synthesise } from './registry/synth/index';
 import type { DeviceInput, SourceValue, VirtualEntity } from './registry/types';
 import { Dispatcher } from './runtime/dispatcher';
-import { energyMeters, EnergySource, type TotalNames } from './runtime/energy-source';
+import { energyMeters, EnergySource, type EnergyNames, type TotalNames } from './runtime/energy-source';
 import { HistoryProvider } from './runtime/history-provider';
 import { HomeTilesMqttClient, type Logger } from './runtime/mqtt-client';
 import { PanelManager } from './runtime/panel-manager';
@@ -558,7 +558,8 @@ class HomeTiles extends utils.Adapter {
   /**
    * The Energy tab's meters (Task 20b): what the energy source answers panels
    * with and lists in every apply, only while armed (Ruling 118), with each
-   * category's total named in the system's language. One warning per rebuild
+   * category's total and the house's consumption named in the system's
+   * language (Rulings 124, 132). One warning per rebuild
    * names the meters left out, and one those the history instance does not
    * log, whose tiles would show nothing. The meters' ids, to store.
    */
@@ -578,8 +579,12 @@ class HomeTiles extends utils.Adapter {
       );
     }
     const language = (await this.getForeignObjectAsync('system.config'))?.common?.language ?? 'en';
-    const totals = Object.fromEntries(ENERGY_CATEGORIES.map((category) => [category, adminText(`energy_total_${category}`, language)])) as TotalNames;
-    this.energy.configure({ armed, meters, currency: this.options.currency, totals });
+    const names: EnergyNames = {
+      totals: Object.fromEntries(ENERGY_CATEGORIES.map((category) => [category, adminText(`energy_total_${category}`, language)])) as TotalNames,
+      consumption: adminText('energy_consumption_total', language),
+      untracked: adminText('energy_consumption_untracked', language),
+    };
+    this.energy.configure({ armed, meters, currency: this.options.currency, names });
     return ids;
   }
 

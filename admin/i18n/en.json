@@ -73,6 +73,8 @@
   "energy_total_water": "Water total",
   "energy_total_device": "Devices total",
   "energy_total_device_water": "Water devices total",
+  "energy_consumption_total": "Total consumption",
+  "energy_consumption_untracked": "Untracked consumption",
   "coalesce_ms": "State coalescing window (ms)",
   "coalesce_ms_help": "Bursts inside this window publish once. The final value is always delivered.",
   "max_publish_queue": "Maximum queued publishes",

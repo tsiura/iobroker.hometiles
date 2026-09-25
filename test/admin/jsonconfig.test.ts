@@ -241,6 +241,16 @@ describe('admin/jsonConfig', () => {
     expect(translations.de!.energy_total_grid).to.equal('Netz gesamt');
   });
 
+  it("names the house's consumption totals in every language, the Bridge's German in German (Ruling 132)", () => {
+    for (const [language, strings] of Object.entries(translations)) {
+      expect(strings, language).to.have.property('energy_consumption_total');
+      expect(strings, language).to.have.property('energy_consumption_untracked');
+    }
+    // __init__.py:2906, :2939
+    expect(translations.de!.energy_consumption_total).to.equal('Gesamtverbrauch');
+    expect(translations.de!.energy_consumption_untracked).to.equal('Nicht erfasster Verbrauch');
+  });
+
   it('wires each action button to a command the adapter implements', () => {
     // Read from main.ts itself, so a command it stops answering fails here.
     expect([...handled]).to.include.members(['listDetected', 'refreshDetected', 'testBroker', 'previewEntity', 'pairPanel']);
