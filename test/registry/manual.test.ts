@@ -365,17 +365,24 @@ describe('registry/manual (Task 13b)', () => {
       ]);
     });
 
-    it('reports a state listed twice once, at any scale (m6)', () => {
-      // Beyond the review's measured scale: 50,000 missing states, each
-      // listed twice. Scanning the reports for each duplicate took seconds.
-      const ids = Array.from({ length: 50_000 }, (_, i) => `${U}.Fehlt.S${i}`);
-      const entries: ManualEntity[] = [...ids, ...ids].map((stateId) => ({ stateId, domain: 'sensor' }));
-      const started = Date.now();
-      const { rejected } = manualDevices(entries, ALL, NS);
-      const elapsed = Date.now() - started;
-      expect(rejected).to.have.length(50_000);
-      expect(rejected[49_999]).to.deep.equal({ stateId: ids[49_999], reason: 'no such object' });
-      expect(elapsed, `${elapsed} ms`).to.be.below(1000);
+    it('reports a state listed twice once, at any scale: its time grows linearly (m6)', () => {
+      // Missing states, each listed twice: scanning the reports for each
+      // duplicate took seconds at 50,000. Timed at two sizes, not against a
+      // wall clock: four times the entries take about four times as long
+      // when linear, sixteen times when quadratic.
+      const time = (count: number): number => {
+        const ids = Array.from({ length: count }, (_, i) => `${U}.Fehlt.S${i}`);
+        const entries: ManualEntity[] = [...ids, ...ids].map((stateId) => ({ stateId, domain: 'sensor' }));
+        const started = performance.now();
+        const { rejected } = manualDevices(entries, ALL, NS);
+        const elapsed = performance.now() - started;
+        expect(rejected).to.have.length(count);
+        expect(rejected[count - 1]).to.deep.equal({ stateId: ids[count - 1], reason: 'no such object' });
+        return elapsed;
+      };
+      const small = time(25_000);
+      const large = time(100_000);
+      expect(large, `${large.toFixed(0)} ms for 100,000, ${small.toFixed(0)} ms for 25,000`).to.be.below(8 * small + 50);
     });
 
     it('lists at most 20 in a log line, then how many more (m6)', () => {

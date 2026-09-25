@@ -160,7 +160,7 @@ describe('protocol/commands', () => {
     });
   });
 
-  it('clamps kelvin at both boundaries without rejecting them', () => {
+  it("passes kelvin through to the dispatcher unclamped, which skips a value outside the light's range", () => {
     expect((parseLightCommand('{"entity_id":"light.d","color_temp_kelvin":1000}') as { kelvin: number }).kelvin).to.equal(1000);
     expect((parseLightCommand('{"entity_id":"light.d","color_temp_kelvin":15000}') as { kelvin: number }).kelvin).to.equal(15000);
   });

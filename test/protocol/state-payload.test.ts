@@ -106,7 +106,7 @@ describe('protocol/state-payload', () => {
     // be fabricated (review round 1, C1) -- see climate.test.ts for the full
     // rule and its rationale.
     expect(parsed).to.include.keys('current_temperature', 'available');
-    expect(parsed).to.not.have.keys('temperature', 'min_temp', 'max_temp', 'state');
+    expect(parsed).to.not.have.any.keys('temperature', 'min_temp', 'max_temp', 'state');
   });
 
   it('routes cover through buildCoverPayload instead of the generic JSON body', () => {
@@ -129,7 +129,6 @@ describe('protocol/state-payload', () => {
     expect(p!.topic).to.equal('ha/statestream/cover/kitchen_blind/state');
     const parsed = JSON.parse(p!.payload) as Record<string, unknown>;
     expect(parsed.supported_features).to.be.a('number');
-    expect(parsed).to.not.have.property('state', undefined);
     expect(parsed.state).to.equal('open');
   });
 
