@@ -1773,6 +1773,135 @@ git add -A && git commit -m "docs: document the v0.2 domains and release 0.2.0"
 
 ---
 
+## Task 25b: Panel battery charge — HomeSnapshot (added during execution, Rulings 148 + 152)
+
+**Where it fits.** The last feature task before the whole-branch review. It
+closes the "HomeSnapshot" deferral that Task 25 documented in README.md
+("What 0.2.0 does not cover") and docs/protocol.md (Not implemented).
+
+### Firmware facts (verified by the controller; HomeTiles repo at 5d25167, read-only)
+
+1. `mqttPublishHomeSnapshot` (`src/network/mqtt/mqtt_handlers.cpp:1909-1928`)
+   runs ONCE per broker connection (`mqttServicePostConnect`, `:2699-2711`),
+   never periodically. It publishes, retained:
+   - `<base>/sensor/outside_c` and `<base>/sensor/inside_c`: `dtostrf` of
+     `g_outside_c` / `g_inside_c`, placeholders initialised to 21.7 / 22.4
+     (`:45-46`) and set ONLY by messages on those same topics
+     (`handleOutside`/`handleInside`, `:865-871`). No sensor feeds them; the
+     HA Bridge ignores them. **Not exposed (Ruling 152).**
+   - `<base>/sensor/soc_pct`: if `batteryStateSupportsMeasurement()`: the
+     integer charge `"%d"` (already clamped 0..100) when
+     `batteryStateHasDisplayPercent()`, else the literal `unavailable`; if
+     not supported: an EMPTY retained payload (clears the retained message).
+2. The announcement (`ha_bridge_config.cpp:332-334`) carries
+   `"capabilities":{"view_navigation":true,"battery_soc":<true|false>,"legacy_external_temperature":false}`.
+3. The panel SUBSCRIBES to its own `sensor/soc_pct` (`handleSoc` sets its
+   internal value from any payload). The adapter must NEVER publish to any
+   `<base>/sensor/*` topic.
+4. Reference implementation (HA Bridge, read-only):
+   `/home/user/webapp/zigbee/HomeTiles-Bridge/custom_components/tab5_lvgl/`
+   `sensor.py` `Tab5BatterySensor` (unit %, battery class, rounds, clamps
+   0..100, ignores empty and non-numeric) is created only when
+   `capabilities.py` `supports(data, "battery_soc")` holds: an explicit
+   boolean in `capabilities` wins; with no such key it is true only when the
+   model, trimmed and lower-cased, is one of `""`, `"tab5"`,
+   `"m5stack tab5"`, `"m5stack_tab5"` (older Tab5 firmware had real PMIC
+   telemetry and no capabilities block).
+
+### Requirements
+
+1. `src/protocol/announce.ts`: `Announcement` gains `batterySoc: boolean`.
+   If `payload.capabilities` is a plain object with an own `battery_soc`
+   key: true iff the value `=== true` (a non-boolean value counts as false;
+   it never throws, the rest of the announcement stays valid). Otherwise
+   (no capabilities object, or no such key): the legacy fallback on the
+   parsed `model` (`model.trim().toLowerCase()` in the four values above).
+2. `src/protocol/topics.ts`: `sensorTopic(baseTopic, leaf)` returns
+   `${baseTopic}/sensor/${leaf}`, next to `stateTopic`.
+3. `src/runtime/panel-session.ts`: `commandTopics()` adds
+   `sensorTopic(base, 'soc_pct')` UNCONDITIONALLY. Reason:
+   `updateAnnouncement`'s same-base path swaps the announcement without
+   re-subscribing, so a subscription gated on the capability would miss a
+   capability change. Add a `batterySoc` getter like the others.
+4. `src/runtime/panel-objects.ts`: when `session.batterySoc`, add
+   `panels.<id>.info.battery`: name `Battery`, `type: 'number'`,
+   `role: 'value.battery'`, `unit: '%'`, `min: 0`, `max: 100`,
+   `write: false` (read as `stateObject` already sets it). NO `def`: the
+   state stays null until the panel sends a value, never 0.
+5. A pure exported parser, `parseBatteryPayload(payload: string): number | null | undefined`:
+   - trim; `""` gives null;
+   - `unavailable` or `unknown` (any case) gives null;
+   - one optional trailing `%` is stripped, then trimmed; a strict decimal
+     `/^-?\d+(\.\d+)?$/` (NOT `Number()`, which takes `0x10`, `1e2` and
+     `" "`) gives `Math.round`, clamped to 0..100;
+   - anything else gives undefined: ignored, no write, at most one debug
+     line.
+6. Routing (`src/main.ts`, the panel-message handler, beside the `ioStateTopic`
+   loop): a message on `sensorTopic(session.baseTopic, 'soc_pct')` goes to a
+   new `PanelObjects.applyBattery(session, payload)`, like `applyIoStat`.
+   In it: if `!session.batterySoc`, return with no write (the object does
+   not exist, and a setState on a missing object warns on every connect of
+   every mains panel); otherwise parse; undefined means return; else
+   `setState('panels.<id>.info.battery', value, true)`.
+7. Out of scope, and documented as such:
+   - `inside_c` / `outside_c` (Ruling 152);
+   - removing `info.battery` after a firmware drops the capability (panel
+     objects are created with setObjectNotExists and never removed, the same
+     as v0.1's local IO channels);
+   - any periodic refresh: the panel sends the value once per connection.
+8. Docs:
+   - README "What 0.2.0 does not cover" (the HomeSnapshot / Discovery /
+     DynamicSlotsReload item, about lines 60-67): replace it with a short
+     statement.
+     - The battery charge is now `panels.<id>.info.battery` for panels that
+       announce `battery_soc` (the Tab5).
+     - The panel sends it once per broker connection, so it refreshes when
+       the panel reconnects, not continuously.
+     - The outside and inside temperatures are firmware placeholders and
+       are deliberately left out.
+     - Discovery and DynamicSlotsReload need nothing from ioBroker.
+     - Move whatever no longer belongs under "does not cover".
+   - Add `info.battery` wherever the README lists `panels.<id>` states.
+   - `docs/protocol.md` (about lines 922-940): update the HomeSnapshot
+     bullet so it says what is subscribed and what is not, and why. Keep
+     the `#not-implemented` anchor that the README links to working.
+   - README changelog and io-package.json `news`: if the 0.2.0 entry lists
+     features, add "panel battery charge" in en and de (de must not equal
+     en), in the existing format.
+
+### Tests (write them red first)
+
+- `test/protocol/announce.test.ts`:
+  - `battery_soc` true gives true and false gives false;
+  - with no capabilities: model `Tab5` or `""` gives true, and
+    `JC8012P4A1` gives false;
+  - a `battery_soc` of `"true"` (a string) gives false;
+  - `capabilities` as a string or an array uses the fallback.
+- `test/protocol/topics.test.ts`: `sensorTopic`.
+- `test/runtime/panel-session.test.ts`:
+  - `commandTopics()` includes `<base>/sensor/soc_pct` for BOTH capability
+    values;
+  - nothing is ever published to `<base>/sensor/*`.
+- `test/runtime/panel-objects.test.ts`:
+  - the `info.battery` definition is present iff `batterySoc`, with exactly
+    the common fields above and no `def`;
+  - a `parseBatteryPayload` table:
+    - `"87"` → 87, `" 87 "` → 87, `"87%"` → 87, `"87.6"` → 88;
+    - `"-3"` → 0, `"140"` → 100;
+    - `""`, `"unavailable"`, `"Unavailable"` and `"unknown"` → null;
+    - `"abc"`, `"0x10"`, `"1e2"`, `"%"`, `"NaN"` and `"Infinity"` →
+      undefined;
+  - `applyBattery`:
+    - capability false: no setState;
+    - true with `""`: null, ack true;
+    - true with `"55"`: 55;
+    - true with `"abc"`: no setState.
+- If the main.ts panel-message routing already has a test pattern (for
+  `applyIoStat` or the stat leaves), cover the new topic the same way.
+- If the integration suite already announces a panel, add one assertion: a
+  retained `soc_pct` shows up in `info.battery`. Otherwise stay at unit
+  level and say so.
+
 ## Self-review notes
 
 **Coverage against the gap document.** Every missing `bridge/apply` section
