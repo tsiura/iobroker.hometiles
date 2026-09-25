@@ -1565,6 +1565,19 @@ describe('discovery orchestration (Task 5d)', () => {
     expect(second.anchors[DEV]).to.equal(`${DEV}.C.s`);
   });
 
+  it('(Ruling 45) a catch-all root keeps reading its recorded state when a new one sorts ahead of it', () => {
+    // info's ACTUAL takes several states (multiple) and the mapping keeps the
+    // first in detector order: the root must not start reading Aaa under the
+    // same id.
+    const flur = objects(channel(FLUR, 'Flur'), state(`${FLUR}.Anzeige`, { role: 'state', type: 'string', write: false }));
+    const first = discoverDevices(flur, 'hometiles.0');
+    expect(first.devices.find(({ objectId }) => objectId === FLUR)?.channels.actual?.objectId).to.equal(`${FLUR}.Anzeige`);
+
+    const withAaa = { ...flur, ...objects(state(`${FLUR}.Aaa`, { role: 'state', type: 'number', write: false })) };
+    const second = discoverDevices(withAaa, 'hometiles.0', first.anchors);
+    expect(second.devices.find(({ objectId }) => objectId === FLUR)?.channels.actual?.objectId).to.equal(`${FLUR}.Anzeige`);
+  });
+
   it("strips the root's name from a state name only as a whole word", () => {
     expect(run(BATH_SET).map(({ device: detected }) => detected.name)).to.deep.equal(['Bad', 'Bad Badezimmer Luftdruck']);
   });

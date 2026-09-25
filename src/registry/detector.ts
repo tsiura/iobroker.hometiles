@@ -726,10 +726,18 @@ export function discoverDevices(
       for (const id of required) claimed.add(id);
       const anchor = own ?? required[0];
 
+      // info's ACTUAL takes several states (multiple: true) and the mapping
+      // keeps the first in detector order, so the catch-all holding the root
+      // id reads its recorded state first: a new state sorting ahead of it
+      // must not become the reading under the same id (Ruling 45).
+      const mapped =
+        control === holder && recorded !== undefined && control.type === 'info'
+          ? { ...control, states: [...control.states.filter((s) => s.id === recorded), ...control.states.filter((s) => s.id !== recorded)] }
+          : control;
       // Such a catch-all is no device before it can hold the root id: sorted
       // by how many states it matched (ChannelDetector.js:742-744), it may
       // come ahead of the control it belongs to.
-      const device = LEVEL_CATCH_ALLS.includes(control.type) && levelsDropped ? null : mapControlToDevice(rootId, control, meta);
+      const device = LEVEL_CATCH_ALLS.includes(control.type) && levelsDropped ? null : mapControlToDevice(rootId, mapped, meta);
       // A view is another root's source seen again: never this root's holder,
       // so the root's own control keeps its id (Task 11 round 1, M3).
       if (view) {
