@@ -3,7 +3,7 @@ import type { EnergyCatalogEntry } from '../../src/protocol/energy';
 import { Dispatcher } from '../../src/runtime/dispatcher';
 import type { PublishRequest } from '../../src/runtime/mqtt-client';
 import { PanelManager } from '../../src/runtime/panel-manager';
-import type { PanelTransport } from '../../src/runtime/panel-session';
+import type { PanelRequests, PanelTransport } from '../../src/runtime/panel-session';
 import type { VirtualEntity } from '../../src/registry/types';
 
 function announcement(deviceId: string, baseTopic: string): string {
@@ -34,6 +34,7 @@ function harness(
   entities: () => VirtualEntity[] | null = () => [ENTITY],
   unpublished?: () => readonly string[],
   energy?: () => readonly EnergyCatalogEntry[],
+  requests?: PanelRequests,
 ) {
   const published: PublishRequest[] = [];
   const subscribed: string[] = [];
@@ -66,6 +67,7 @@ function harness(
     entities,
     ...(unpublished ? { unpublished } : {}),
     ...(energy ? { energy } : {}),
+    ...(requests ? { requests } : {}),
     onSessionsChanged: () => {
       sessionsChanged++;
     },
@@ -196,6 +198,42 @@ describe('runtime/panel-manager', () => {
     expect(warnings.some((w) => w.includes('already used by panel'))).to.equal(true);
 
     await manager.handleMessage('shared/cmnd/switch', '{"entity_id":"switch.k","state":"on"}', false);
+    expect(writes).to.deep.equal([['shelly.0.on', true]]);
+  });
+
+  it('answers a history and an energy request of panels sharing a base topic once, each for the panel that asked, and one tap is still one write (Task 22)', async () => {
+    const sensor: VirtualEntity = { ...ENTITY, entityId: 'sensor.t', domain: 'sensor', source: { actual: 'hm.0.t' }, state: '21.5' };
+    const asked: Array<[string, string]> = [];
+    const requests: PanelRequests = {
+      history: {
+        query: async (id, { panel }) => {
+          asked.push([panel, id]);
+          return { rows: [], now: Date.now(), available: true };
+        },
+      },
+      stateOf: () => undefined,
+      energy: { answer: async (deviceId) => ({ topic: `tab5_lvgl/config/${deviceId}/energy/response`, payload: '{"period":"day","entries":[]}' }) },
+    };
+    const { manager, published, subscribed, writes } = harness(() => [ENTITY, sensor], undefined, undefined, requests);
+    await manager.handleAnnouncement('a1', announcement('a1', 'shared'));
+    await manager.handleAnnouncement('a2', announcement('a2', 'shared'));
+    // Each panel's requests under its own device id, none under the base topic they share.
+    expect(subscribed.filter((topic) => /history|energy/.test(topic)).sort()).to.deep.equal([
+      'tab5_lvgl/config/a1/energy/request',
+      'tab5_lvgl/config/a1/history/request',
+      'tab5_lvgl/config/a2/energy/request',
+      'tab5_lvgl/config/a2/history/request',
+    ]);
+    published.length = 0;
+
+    await manager.handleMessage('tab5_lvgl/config/a2/history/request', '{"entity_id":"sensor.t","hours":24,"period_minutes":5}', false);
+    await manager.handleMessage('tab5_lvgl/config/a1/energy/request', '{"period":"day"}', false);
+    await manager.handleMessage('shared/cmnd/switch', '{"entity_id":"switch.k","state":"on"}', false);
+    expect(asked).to.deep.equal([['a2', 'hm.0.t']]);
+    expect(published.map(({ topic, retain }) => [topic, retain])).to.deep.equal([
+      ['tab5_lvgl/config/a2/history/response', false],
+      ['tab5_lvgl/config/a1/energy/response', false],
+    ]);
     expect(writes).to.deep.equal([['shelly.0.on', true]]);
   });
 

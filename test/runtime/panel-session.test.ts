@@ -1,14 +1,20 @@
 import { expect } from 'chai';
+import sinon from 'sinon';
 import { parseAnnouncement } from '../../src/protocol/announce';
 import { buildApplyPayload } from '../../src/protocol/apply';
 import { CONTROL_SESSION, controlRevision } from '../../src/protocol/editable';
+import { buildDiscreteHistoryResponse, buildNumericHistoryResponse, parseHistoryRequest, type HistoryRequest, type StateSample } from '../../src/protocol/history';
 import { buildWeatherPayload } from '../../src/protocol/weather';
 import type { PublishRequest } from '../../src/runtime/mqtt-client';
 import { Dispatcher } from '../../src/runtime/dispatcher';
-import { PanelSession, type PanelTransport } from '../../src/runtime/panel-session';
+import { EnergySource } from '../../src/runtime/energy-source';
+import { HISTORY_BUDGET_MS, HistoryProvider, QUERY_TIMEOUT_MS, type HistoryFailure, type HistoryResult } from '../../src/runtime/history-provider';
+import { PanelSession, type PanelRequests, type PanelTransport } from '../../src/runtime/panel-session';
+import { synthesise } from '../../src/registry/synth/index';
 import { synthMediaPlayer } from '../../src/registry/synth/media_player';
-import type { DeviceInput, VirtualEntity } from '../../src/registry/types';
+import type { DeviceInput, SourceValue, VirtualEntity } from '../../src/registry/types';
 import { panelIcons, panelList, panelNames } from '../protocol/panel-scan';
+import { sqlFake } from './history-ports';
 
 const ANNOUNCE = JSON.stringify({
   device_id: 'a1',
@@ -37,7 +43,7 @@ function entity(over: Partial<VirtualEntity>): VirtualEntity {
   };
 }
 
-function harness(now: () => number = Date.now) {
+function harness(now: () => number = Date.now, requests?: PanelRequests) {
   const published: PublishRequest[] = [];
   const subscribed: string[] = [];
   const transport: PanelTransport = {
@@ -62,14 +68,15 @@ function harness(now: () => number = Date.now) {
   const infos: string[] = [];
   const warnings: string[] = [];
   const errors: string[] = [];
+  const debugs: string[] = [];
   const capturingLog = {
-    ...silentLog,
     info: (message: string): void => void infos.push(message),
     warn: (message: string): void => void warnings.push(message),
     error: (message: string): void => void errors.push(message),
+    debug: (message: string): void => void debugs.push(message),
   };
-  const session = new PanelSession(parseAnnouncement('a1', ANNOUNCE), transport, dispatcher, capturingLog, now);
-  return { session, published, subscribed, writes, registryEntities, infos, warnings, errors };
+  const session = new PanelSession(parseAnnouncement('a1', ANNOUNCE), transport, dispatcher, capturingLog, now, undefined, requests);
+  return { session, published, subscribed, writes, registryEntities, infos, warnings, errors, debugs };
 }
 
 describe('runtime/panel-session', () => {
@@ -860,6 +867,328 @@ describe('runtime/panel-session', () => {
       const { session, published } = await started();
       expect(await session.handleMessage('tab5_lvgl/config/b2/weather/request', '{"entity_id":"weather.home"}', false)).to.equal(false);
       expect(published).to.deep.equal([]);
+    });
+  });
+
+  describe('history and energy requests (Task 22)', () => {
+    const NOW = 1_790_000_000_000;
+    const HOUR = 3_600_000;
+    /** When the history adapter answered: after the request came, so never the session's own now. */
+    const ANSWERED = NOW + 1_500;
+    const HISTORY = 'tab5_lvgl/config/a1/history/request';
+    const ENERGY = 'tab5_lvgl/config/a1/energy/request';
+    const RESPONSE = 'tab5_lvgl/config/a1/history/response';
+
+    /** A temperature, a door contact, a text state, a setpoint beside its reading, a socket: as detection gives them. */
+    const DEVICES: Record<string, DeviceInput> = {
+      'sensor.t': {
+        objectId: 'hm.0.t',
+        name: 'T',
+        detectorType: 'temperature',
+        domain: 'sensor',
+        channels: { actual: { objectId: 'hm.0.t.ACTUAL', role: 'value.temperature', type: 'number', unit: '°C' } },
+      },
+      'binary_sensor.door': {
+        objectId: 'zigbee.0.door',
+        name: 'Door',
+        detectorType: 'door',
+        domain: 'binary_sensor',
+        channels: { actual: { objectId: 'zigbee.0.door.opened', type: 'boolean' } },
+      },
+      'sensor.mode': { objectId: 'hm.0.mode', name: 'Mode', detectorType: 'info', domain: 'sensor', channels: { actual: { objectId: 'hm.0.mode.STATE', type: 'string' } } },
+      'number.soll': {
+        objectId: 'hm.0.soll',
+        name: 'Soll',
+        detectorType: 'levelSlider',
+        domain: 'number',
+        channels: {
+          actual: { objectId: 'hm.0.soll.ACTUAL', type: 'number' },
+          set: { objectId: 'hm.0.soll.SET', type: 'number', min: 15, max: 28, write: true },
+        },
+      },
+      'switch.k': { objectId: 'shelly.0.k', name: 'K', detectorType: 'socket', domain: 'switch', channels: { set: { objectId: 'shelly.0.k.on', type: 'boolean', write: true } } },
+    };
+    const row = (ts: number, val: unknown, q = 0): SourceValue => ({ ts, val, ack: true, q });
+    /** The entity its synth makes of `val` on every channel, changed an hour ago. */
+    const live = (entityId: string, val: unknown): VirtualEntity => {
+      const device = DEVICES[entityId]!;
+      return synthesise(device, entityId, Object.fromEntries(Object.values(device.channels).map((channel) => [channel.objectId, row(NOW - HOUR, val)])))!;
+    };
+    /** The registry's stateOf, over the same devices and the real synths. */
+    const stateOf = (entityId: string, objectId: string, value: SourceValue): string | undefined => {
+      const device = DEVICES[entityId];
+      return device && synthesise(device, entityId, { [objectId]: value })?.state;
+    };
+
+    type Asked = { id: string } & Parameters<HistoryProvider['query']>[1];
+    /** The session, its history answered by `results` and its energy by what answerEnergy sets. */
+    function wired(results: (id: string) => HistoryResult | Promise<HistoryResult> = () => ({ rows: [], now: ANSWERED, available: true })) {
+      const queries: Asked[] = [];
+      const energy: Array<[string, string]> = [];
+      let energyAnswer: { topic: string; payload: string } | null = null;
+      const requests: PanelRequests = {
+        history: {
+          query: async (id, options) => {
+            queries.push({ id, ...options });
+            return results(id);
+          },
+        },
+        stateOf,
+        energy: {
+          answer: async (deviceId, payload) => {
+            energy.push([deviceId, payload]);
+            return energyAnswer;
+          },
+        },
+      };
+      const run = harness(() => NOW, requests);
+      for (const entityId of ['sensor.t', 'binary_sensor.door', 'switch.k']) run.session.pushEntityState(live(entityId, entityId === 'sensor.t' ? 21.5 : false));
+      run.session.pushEntityState(live('sensor.mode', 'Komfort'));
+      run.session.pushEntityState(live('number.soll', 22));
+      run.published.length = 0;
+      const answerEnergy = (answer: { topic: string; payload: string } | null): void => void (energyAnswer = answer);
+      return { ...run, requests, queries, energy, answerEnergy };
+    }
+
+    const NUMERIC = '{"entity_id":"sensor.t","hours":24,"period_minutes":5,"points":288,"stat":"mean"}';
+    const BINARY = '{"version":1,"kind":"binary","entity_id":"binary_sensor.door","hours":24,"max_transitions":96}';
+    const STATE = '{"version":1,"kind":"state","entity_id":"sensor.mode","hours":168,"max_transitions":96}';
+    const EDITABLE = '{"entity_id":"number.soll","kind":"editable","version":1,"hours":24,"max_transitions":96,"request_id":"1a2b3c4d-0002b1c8-00000001"}';
+    const parsed = <K extends HistoryRequest['kind']>(payload: string, kind: K): Extract<HistoryRequest, { kind: K }> => {
+      const request = parseHistoryRequest(payload);
+      expect(request?.kind).to.equal(kind);
+      return request as Extract<HistoryRequest, { kind: K }>;
+    };
+
+    it('subscribes to its own history and energy requests under the config root, never under the base topic', async () => {
+      const { session, subscribed } = harness();
+      await session.start();
+      expect(session.commandTopics()).to.include.members([HISTORY, ENERGY]);
+      // The base topic is hometiles: nothing of history or energy there.
+      expect(subscribed.filter((topic) => /history|energy/.test(topic))).to.deep.equal([HISTORY, ENERGY]);
+    });
+
+    it("answers each kind on history/response, not retained, from the state the entity's synth reads, by a deadline 7 s on", async () => {
+      const rows: Record<string, SourceValue[]> = {
+        'hm.0.t.ACTUAL': [row(NOW - 30 * HOUR, 18.5), row(NOW - 2 * HOUR, 21), row(NOW - HOUR, 22)],
+        'zigbee.0.door.opened': [row(NOW - 30 * HOUR, false), row(NOW - 3 * HOUR, true), row(NOW - 2 * HOUR, null, 0x40), row(NOW - HOUR, false)],
+        'hm.0.mode.STATE': [row(NOW - 200 * HOUR, 'Eco'), row(NOW - 2 * HOUR, 'Komfort')],
+        // A null with good quality is unknown for a number, bad quality unavailable (Ruling 88).
+        'hm.0.soll.SET': [row(NOW - 30 * HOUR, 20), row(NOW - 3 * HOUR, null), row(NOW - 2 * HOUR, 21, 0x42), row(NOW - HOUR, 22)],
+      };
+      const run = wired((id) => ({ rows: rows[id]!, now: ANSWERED, available: true }));
+      for (const payload of [NUMERIC, BINARY, STATE, EDITABLE]) expect(await run.session.handleMessage(HISTORY, payload, false)).to.equal(true);
+
+      const asked = (id: string, hours: number, kind: 'numeric' | 'discrete'): Asked => ({ id, start: NOW - hours * HOUR, kind, panel: 'a1', deadline: NOW + HISTORY_BUDGET_MS });
+      // A number's value channel, SET, not the reading beside it (valueChannel).
+      expect(run.queries).to.deep.equal([
+        asked('hm.0.t.ACTUAL', 24, 'numeric'),
+        asked('zigbee.0.door.opened', 24, 'discrete'),
+        asked('hm.0.mode.STATE', 168, 'discrete'),
+        asked('hm.0.soll.SET', 24, 'discrete'),
+      ]);
+      const samples = (id: string, states: string[]): StateSample[] => rows[id]!.map(({ ts }, i) => ({ ts, state: states[i]! }));
+      expect(run.published).to.deep.equal(
+        [
+          buildNumericHistoryResponse(parsed(NUMERIC, 'numeric'), rows['hm.0.t.ACTUAL']!, ANSWERED),
+          buildDiscreteHistoryResponse(parsed(BINARY, 'binary'), samples('zigbee.0.door.opened', ['off', 'on', 'unavailable', 'off']), ANSWERED, live('binary_sensor.door', false), true),
+          buildDiscreteHistoryResponse(parsed(STATE, 'state'), samples('hm.0.mode.STATE', ['Eco', 'Komfort']), ANSWERED, live('sensor.mode', 'Komfort'), true),
+          buildDiscreteHistoryResponse(parsed(EDITABLE, 'editable'), samples('hm.0.soll.SET', ['20', 'unknown', 'unavailable', '22']), ANSWERED, live('number.soll', 22), true),
+        ].map((payload) => ({ topic: RESPONSE, payload, retain: false })),
+      );
+      // Each row as the synth reads it, and the editable popup's own id echoed after kind, entity_id and hours.
+      const [, binary, , editable] = run.published.map(({ payload }) => JSON.parse(payload) as Record<string, unknown>);
+      expect((binary!.activity as Array<{ state: string }>).map(({ state }) => state)).to.deep.equal(['on', 'unavailable', 'off']);
+      expect(Object.keys(editable!).slice(0, 4)).to.deep.equal(['kind', 'entity_id', 'hours', 'request_id']);
+      expect(editable).to.include({ kind: 'number', request_id: '1a2b3c4d-0002b1c8-00000001' });
+      expect((editable!.activity as Array<{ state: string }>).map(({ state }) => state)).to.deep.equal(['unknown', 'unavailable', '22']);
+    });
+
+    it('ignores a retained request, which would replay at every reconnect: no query, no answer', async () => {
+      const run = wired();
+      run.answerEnergy({ topic: 'tab5_lvgl/config/a1/energy/response', payload: '{"period":"day"}' });
+      for (const [topic, payload] of [
+        [HISTORY, NUMERIC],
+        [HISTORY, EDITABLE],
+        [ENERGY, '{"period":"day"}'],
+      ] as const) {
+        expect(await run.session.handleMessage(topic, payload, true)).to.equal(true);
+      }
+      expect(run.queries).to.deep.equal([]);
+      expect(run.energy).to.deep.equal([]);
+      expect(run.published).to.deep.equal([]);
+      // The same, live, are answered.
+      await run.session.handleMessage(HISTORY, NUMERIC, false);
+      await run.session.handleMessage(ENERGY, '{"period":"day"}', false);
+      expect(run.published.map(({ topic }) => topic)).to.deep.equal([RESPONSE, 'tab5_lvgl/config/a1/energy/response']);
+    });
+
+    it('answers only for an entity this panel was given, and asks for: no other, removed, switch, sensor as an editable, or malformed request', async () => {
+      const run = wired();
+      run.session.clearEntityState('number.soll');
+      run.published.length = 0;
+      const ignored = [
+        '{"entity_id":"sensor.elsewhere","hours":24,"period_minutes":5}',
+        EDITABLE,
+        '{"entity_id":"switch.k","hours":24,"period_minutes":5}',
+        EDITABLE.replace('number.soll', 'sensor.t'),
+        'not json',
+        '{"entity_id":"sensor.t"}',
+        '{"entity_id":"sensor.t","kind":"trend","hours":24}',
+      ];
+      for (const payload of ignored) expect(await run.session.handleMessage(HISTORY, payload, false), payload).to.equal(true);
+      expect(run.queries).to.deep.equal([]);
+      expect(run.published).to.deep.equal([]);
+      // Panels ask again every minute: one line an hour for each, and debug only.
+      const lines = run.debugs.length;
+      expect(lines).to.equal(ignored.length - 2);
+      for (const payload of ignored) await run.session.handleMessage(HISTORY, payload, false);
+      expect(run.debugs).to.have.length(lines);
+      expect(run.debugs[0]).to.equal('[Panel a1] History request for sensor.elsewhere ignored: no entity of this panel whose history it can ask for');
+      // Another panel's request is not this session's.
+      expect(await run.session.handleMessage('tab5_lvgl/config/b2/history/request', NUMERIC, false)).to.equal(false);
+      expect(await run.session.handleMessage('tab5_lvgl/config/b2/energy/request', '{"period":"day"}', false)).to.equal(false);
+      expect(run.energy).to.deep.equal([]);
+    });
+
+    it('stays silent while unarmed: no entity given, and the energy source answers nothing (Rulings 116, 118)', async () => {
+      let read = 0;
+      const source = new EnergySource(
+        { readingsBefore: async () => ((read += 1), { readings: [], available: true }) },
+        { getForeignStateAsync: async () => ({ val: 5, q: 0 }) },
+        silentLog,
+      );
+      const totals = { grid: 'Netz', solar: 'Solar', battery: 'Batterie', gas: 'Gas', water: 'Wasser', device: 'Geräte', device_water: 'Wasser Geräte' };
+      source.configure({
+        armed: false,
+        meters: [{ id: 'energy.netz', stateId: 'shelly.0.em.total', category: 'grid', sign: 1, name: 'Netz' }],
+        currency: 'EUR',
+        names: { totals, consumption: 'Verbrauch', untracked: 'Rest' },
+      });
+      const queried: string[] = [];
+      const requests: PanelRequests = { history: { query: async (id) => (queried.push(id), { rows: [], now: NOW, available: true }) }, stateOf, energy: source };
+      // Unarmed, main.ts gives a panel no entity (panelEntities is null).
+      const { session, published } = harness(() => NOW, requests);
+      await session.handleMessage(HISTORY, NUMERIC, false);
+      await session.handleMessage(ENERGY, '{"period":"day"}', false);
+      expect(published).to.deep.equal([]);
+      expect(queried).to.deep.equal([]);
+      expect(read).to.equal(0);
+    });
+
+    it('answers by its deadline, the wait for a slot included: a popup queued behind two hung reads hears "unavailable" 7 s on', async () => {
+      const clock = sinon.useFakeTimers({ now: NOW, toFake: ['setTimeout', 'clearTimeout', 'Date'] });
+      // An instance that never answers.
+      const fake = sqlFake([]);
+      fake.getHistoryAsync = (id, options) => {
+        fake.calls.push({ id, options: { ...options } });
+        return new Promise(() => undefined);
+      };
+      const provider = new HistoryProvider(fake, silentLog, 'sql.0');
+      try {
+        const { session, published } = harness(Date.now, { history: provider, stateOf, energy: { answer: async () => null } });
+        for (const entity of [live('sensor.t', 21.5), live('sensor.mode', 'Komfort'), live('binary_sensor.door', false)]) session.pushEntityState(entity);
+        published.length = 0;
+        // The panel's two slots, then the popup's request behind them.
+        void session.handleMessage(HISTORY, NUMERIC, false);
+        void session.handleMessage(HISTORY, STATE, false);
+        void session.handleMessage(HISTORY, BINARY, false);
+        await clock.tickAsync(QUERY_TIMEOUT_MS - 1);
+        expect(published).to.deep.equal([]);
+        await clock.tickAsync(1);
+        // The two reads time out: the state popup hears it, the graph keeps what it shows.
+        expect(published.map(({ payload }) => JSON.parse(payload).entity_id)).to.deep.equal(['sensor.mode']);
+        await clock.tickAsync(HISTORY_BUDGET_MS - QUERY_TIMEOUT_MS - 1);
+        expect(published).to.have.length(1);
+        await clock.tickAsync(1);
+        expect(published[1]).to.deep.equal({
+          topic: RESPONSE,
+          payload: '{"kind":"binary","entity_id":"binary_sensor.door","hours":24,"history_available":false,"error":"history_unavailable"}',
+          retain: false,
+        });
+        // Its slots held by the hung calls (M-4), the door asked nothing.
+        expect(fake.calls.map(({ id }) => id)).to.deep.equal(['hm.0.t.ACTUAL', 'hm.0.mode.STATE']);
+      } finally {
+        provider.close();
+        clock.restore();
+      }
+    });
+
+    it('sends the live value at now when the entity has no history: no rows, none kept, no instance, not running', async () => {
+      const values = [...Array<null>(287).fill(null), 21.5];
+      for (const result of [
+        { rows: [], now: ANSWERED, available: true },
+        { rows: [], now: ANSWERED, available: false, reason: 'not_logged' as const },
+        { rows: [], now: ANSWERED, available: false, reason: 'no_instance' as const },
+        { rows: [], now: ANSWERED, available: false, reason: 'not_running' as const },
+      ]) {
+        const run = wired(() => result);
+        await run.session.handleMessage(HISTORY, NUMERIC, false);
+        expect(run.published, String(result.reason)).to.deep.equal([
+          { topic: RESPONSE, payload: JSON.stringify({ entity_id: 'sensor.t', hours: 24, period_minutes: 5, values }), retain: false },
+        ]);
+      }
+    });
+
+    it('sends nothing for a graph whose read failed for now, so a tile graph keeps what it shows; a popup hears "unavailable"', async () => {
+      for (const reason of ['timeout', 'busy', 'failed', 'malformed', 'closed'] as HistoryFailure[]) {
+        const run = wired(() => ({ rows: [], now: ANSWERED, available: false, reason }));
+        await run.session.handleMessage(HISTORY, NUMERIC, false);
+        expect(run.published, reason).to.deep.equal([]);
+        // An editable popup has no timeout of its own (value_control.cpp:179-189): it always hears.
+        await run.session.handleMessage(HISTORY, EDITABLE, false);
+        expect(run.published.map(({ payload }) => payload), reason).to.deep.equal([
+          '{"kind":"number","entity_id":"number.soll","hours":24,"request_id":"1a2b3c4d-0002b1c8-00000001","history_available":false,"error":"history_unavailable"}',
+        ]);
+      }
+    });
+
+    it('answers with the entity as the panel has it once the history came, and not at all once it was taken away', async () => {
+      let answer!: (result: HistoryResult) => void;
+      const run = wired(() => new Promise((resolve) => (answer = resolve)));
+      const pending = run.session.handleMessage(HISTORY, BINARY, false);
+      await Promise.resolve();
+      const opened = { ...live('binary_sensor.door', true), lastChanged: NOW - 60_000 };
+      run.session.pushEntityState(opened);
+      run.published.length = 0;
+      answer({ rows: [], now: ANSWERED, available: true });
+      await pending;
+      expect(run.published).to.deep.equal([
+        { topic: RESPONSE, payload: buildDiscreteHistoryResponse(parsed(BINARY, 'binary'), [], ANSWERED, opened, true), retain: false },
+      ]);
+      const again = run.session.handleMessage(HISTORY, BINARY, false);
+      await Promise.resolve();
+      run.session.clearEntityState('binary_sensor.door');
+      run.published.length = 0;
+      answer({ rows: [], now: ANSWERED, available: true });
+      await again;
+      expect(run.published).to.deep.equal([]);
+    });
+
+    it('answers an energy request with what the energy source gives, on its topic, never retained, and nothing when it gives nothing', async () => {
+      const run = wired();
+      const answer = { topic: 'tab5_lvgl/config/a1/energy/response', payload: '{"period":"week","start":"2026-09-19T00:00:00+02:00","entries":[]}' };
+      run.answerEnergy(answer);
+      expect(await run.session.handleMessage(ENERGY, '{"period":"week"}', false)).to.equal(true);
+      expect(run.energy).to.deep.equal([['a1', '{"period":"week"}']]);
+      expect(run.published).to.deep.equal([{ ...answer, retain: false }]);
+      run.answerEnergy(null);
+      await run.session.handleMessage(ENERGY, '{"period":"month"}', false);
+      expect(run.published).to.have.length(1);
+    });
+
+    it('lets nothing thrown reach the MQTT handler, and says so once an hour', async () => {
+      const run = wired(() => Promise.reject(new Error('history gone')));
+      run.requests.energy.answer = () => Promise.reject(new Error('energy gone'));
+      for (let i = 0; i < 2; i++) {
+        expect(await run.session.handleMessage(HISTORY, NUMERIC, false)).to.equal(true);
+        expect(await run.session.handleMessage(ENERGY, '{"period":"day"}', false)).to.equal(true);
+      }
+      expect(run.published).to.deep.equal([]);
+      expect(run.warnings).to.deep.equal([
+        `[Panel a1] Answering a request on ${HISTORY} failed: history gone`,
+        `[Panel a1] Answering a request on ${ENERGY} failed: energy gone`,
+      ]);
     });
   });
 });

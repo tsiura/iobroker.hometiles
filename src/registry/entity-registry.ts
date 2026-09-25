@@ -168,6 +168,16 @@ export class EntityRegistry {
     return this.slots.get(entityId)?.entity;
   }
 
+  /**
+   * The state the entity's synth gives `row` of its state `objectId` alone: a
+   * history row read as the live state reads it (Task 22), or undefined for
+   * an entity it does not hold.
+   */
+  stateOf(entityId: string, objectId: string, row: SourceValue): string | undefined {
+    const slot = this.slots.get(entityId);
+    return slot && synthesise(slot.device, entityId, { [objectId]: row })?.state;
+  }
+
   setSceneAliases(aliases: Record<string, string>): void {
     this.sceneAliases = new Map(Object.entries(aliases).map(([alias, target]) => [alias.toLowerCase(), target]));
   }

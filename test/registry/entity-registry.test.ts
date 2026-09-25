@@ -210,6 +210,25 @@ describe('registry/entity-registry', () => {
     expect(membership()).to.equal(after);
   });
 
+  it("reads a history row of one state as the entity's synth reads it live, for an entity it holds (Task 22)", () => {
+    const { registry } = harness();
+    const DOOR: DeviceInput = {
+      objectId: 'zigbee.0.door',
+      name: 'Tür',
+      detectorType: 'door',
+      domain: 'binary_sensor',
+      channels: { actual: { objectId: 'zigbee.0.door.opened', type: 'boolean' } },
+    };
+    const { entityIds } = registry.rebuild([TEMP, DOOR], {});
+    const doorId = entityIds['zigbee.0.door']!;
+    const door = (row: SourceValue): string | undefined => registry.stateOf(doorId, 'zigbee.0.door.opened', row);
+    expect([door(value(true)), door(value(false)), door({ ...value(true), q: 0x42 }), door(value(null))]).to.deep.equal(['on', 'off', 'unavailable', 'unavailable']);
+    expect(registry.stateOf('sensor.wohnzimmer', 'zigbee.0.temp.value', value(21.5))).to.equal('21.5');
+    // The live entity does not move.
+    expect(registry.byId(doorId)!.state).to.equal('unavailable');
+    expect(registry.stateOf('sensor.elsewhere', 'zigbee.0.temp.value', value(21.5))).to.equal(undefined);
+  });
+
   it('resolves a scene by its configured alias, case-insensitively', () => {
     const { registry } = harness();
     const scene: DeviceInput = {

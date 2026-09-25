@@ -87,12 +87,9 @@ class HomeTiles extends utils.Adapter {
   private panels!: PanelManager;
   private panelObjects!: PanelObjects;
   private dispatcher!: Dispatcher;
-  /** Panel history and energy read through it (Task 19): Task 22 answers history requests with it too. */
+  /** Panel history and energy read through it (Task 19): what a panel's history request is answered from (Task 22). */
   private history!: HistoryProvider;
-  /**
-   * The energy meters (Task 20b): their catalog goes into every apply, and
-   * Task 22 answers a panel's energy/request with energy.answer(deviceId, payload).
-   */
+  /** The energy meters (Task 20b): their catalog goes into every apply, and a panel's energy request is answered from them (Task 22). */
   private energy!: EnergySource;
   private persistedIds: Record<string, string> = {};
   private rootAnchors: RootAnchors = {};
@@ -189,6 +186,11 @@ class HomeTiles extends utils.Adapter {
       entities: () => this.panelEntities(),
       unpublished: () => this.unpublished,
       energy: () => this.energy.catalog(),
+      requests: {
+        history: this.history,
+        stateOf: (entityId, objectId, row) => this.registry.stateOf(entityId, objectId, row),
+        energy: this.energy,
+      },
       onSessionsChanged: async () => {
         await this.syncPanelObjects();
       },
@@ -336,6 +338,10 @@ class HomeTiles extends utils.Adapter {
   // ---- MQTT ----
 
   private async onMqttMessage(topic: string, payload: string, retain: boolean): Promise<void> {
+    // Stopping, nothing a panel sends is acted on: the history provider is
+    // closed, or was made after unload began (Task 19 re-review observation 3),
+    // the registry is emptied, and no answer would go out (Ruling 62 B).
+    if (this.unloading) return;
     const announceDeviceId = deviceIdFromAnnounceTopic(topic);
     if (announceDeviceId) {
       try {

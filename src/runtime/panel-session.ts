@@ -3,21 +3,43 @@ import { buildApplyPayload, buildIconsPayload, configSignature, MAX_APPLY_BYTES,
 import { CommandError, parseCommand, parseValueCommand, requireEntityId, type ServiceCall } from '../protocol/commands';
 import { buildValueAck, CONTROL_SESSION, MAX_CONTROL_BYTES, type ValueStatus } from '../protocol/editable';
 import type { EnergyCatalogEntry } from '../protocol/energy';
+import { buildDiscreteHistoryResponse, buildNumericHistoryResponse, parseHistoryRequest } from '../protocol/history';
 import { buildStateClear, buildStatePublish } from '../protocol/state-payload';
 import {
   applyTopic,
   bridgeRequestTopic,
   commandTopic,
+  energyRequestTopic,
+  historyRequestTopic,
+  historyResponseTopic,
   iconsTopic,
   ioStateTopic,
   PANEL_SETTING_LEAVES,
   stateTopic,
   weatherRequestTopic,
 } from '../protocol/topics';
-import type { VirtualEntity } from '../registry/types';
+import { valueChannel } from '../registry/synth/editable';
+import type { Domain, SourceValue, VirtualEntity } from '../registry/types';
 import type { Dispatcher } from './dispatcher';
+import type { EnergySource } from './energy-source';
+import { HISTORY_BUDGET_MS, type HistoryFailure, type HistoryProvider } from './history-provider';
 import { isPlausibleHost } from './pairing';
 import type { Logger, PublishRequest } from './mqtt-client';
+
+/** What a panel's history and energy requests are answered from (Task 22); main.ts wires the adapter's own. */
+export interface PanelRequests {
+  /** The history provider (Task 19). */
+  history: Pick<HistoryProvider, 'query'>;
+  /**
+   * The state the entity's own synth gives one history row of its state
+   * `objectId`, as it reads a live one (Task 18): bad quality is unavailable,
+   * a null what the domain makes of one. Undefined for an entity the
+   * registry no longer holds.
+   */
+  stateOf(entityId: string, objectId: string, row: SourceValue): string | undefined;
+  /** The energy source (Task 20b): the answer's topic and payload, or null for none, as while unarmed. */
+  energy: Pick<EnergySource, 'answer'>;
+}
 
 export interface PanelTransport {
   publish(request: PublishRequest): void;
@@ -71,6 +93,32 @@ const FAILURE_LOG_INTERVAL_MS = 60_000;
 const VALUE_REFUSALS: ReadonlySet<string> = new Set(['changed', 'unavailable', 'invalid_value', 'invalid_step', 'invalid_option']);
 /** Text from the wire for a log line: JSON-escaped, so no line break gets through, and cut short (review m6). */
 const quoted = (text: string): string => JSON.stringify(text).slice(0, 100);
+/** A line about a panel's requests, at most once in this long for what it names: panels ask again every minute. */
+const REQUEST_LOG_INTERVAL_MS = 3_600_000;
+/** The states a sensor's and a binary sensor's synth read their reading from, the first configured one (synth/sensor.ts, synth/binary_sensor.ts). */
+const READINGS: Partial<Record<Domain, readonly string[]>> = {
+  sensor: ['actual', 'pressure', 'set'],
+  binary_sensor: ['actual', 'level', 'set'],
+};
+
+/**
+ * The state an entity's history is read from: the one its synth reads (Task
+ * 18 hand-off), for an editable its value channel, SET over ACTUAL
+ * (valueChannel). None for a domain whose history no panel asks for.
+ */
+function historyState(entity: VirtualEntity): string | undefined {
+  const name = EDITABLE_DOMAINS.has(entity.domain)
+    ? valueChannel(entity.source)
+    : READINGS[entity.domain]?.find((channel) => entity.source[channel] !== undefined);
+  return name === undefined ? undefined : entity.source[name];
+}
+
+/**
+ * A read that found the entity has no history to show, not one that failed
+ * for now: a graph is then given the live value, as the Bridge answers an
+ * entity without recorded history (__init__.py:2388-2392, :2439-2440).
+ */
+const NO_HISTORY: ReadonlySet<HistoryFailure | undefined> = new Set<HistoryFailure>(['no_instance', 'not_running', 'not_logged']);
 /** An apply payload's three largest sections with their sizes, for a log line: "sensor_meta 20113 bytes, ...". */
 function largestSections(payload: string): string {
   return Object.entries(JSON.parse(payload) as Record<string, unknown>)
@@ -94,8 +142,13 @@ export class PanelSession {
   /** The configuration whose icon map was last refused as too large, so each is named in one error only (Ruling 114). */
   private refusedIconsFor: string | null = null;
   private started = false;
-  /** The weather entities pushed to this panel, as last pushed: what its weather request is answered with. */
-  private readonly weathers = new Map<string, VirtualEntity>();
+  /**
+   * The entities pushed to this panel, as last pushed: what its requests are
+   * answered for and with -- weather (Task 12), history (Task 22) -- and the
+   * only editables whose value command it takes (__init__.py:1557); the
+   * /control published after an answer is this one.
+   */
+  private readonly pushed = new Map<string, VirtualEntity>();
   /** entity id -> when its weather request was last answered */
   private readonly weatherAnswered = new Map<string, number>();
   /**
@@ -104,12 +157,8 @@ export class PanelSession {
    * payload that fits or the entity's removal.
    */
   private readonly oversized = new Set<string>();
-  /**
-   * The numbers, selects and datetimes pushed to this panel, as last pushed:
-   * a value command for any other entity is dropped (__init__.py:1557), and
-   * the /control published after an answer is this one.
-   */
-  private readonly editables = new Map<string, VirtualEntity>();
+  /** When each line about the panel's requests last went out, by what it names (note). */
+  private readonly noted = new Map<string, number>();
   /** Value command id -> its deadline, epoch seconds: a replay while it runs is dropped (Ruling 99). */
   private readonly commandIds = new Map<string, number>();
   private failureLoggedAt = -Infinity;
@@ -127,6 +176,8 @@ export class PanelSession {
     private readonly now: () => number = Date.now,
     /** The energy meters' catalog, as the last rebuild resolved them (Task 20b). */
     private readonly energy: () => readonly EnergyCatalogEntry[] = () => [],
+    /** What its history and energy requests are answered from (Task 22); none are without. */
+    private readonly requests?: PanelRequests,
   ) {}
 
   get deviceId(): string {
@@ -167,6 +218,8 @@ export class PanelSession {
     topics.push(stateTopic(this.baseTopic, 'ip'));
     topics.push(bridgeRequestTopic(this.deviceId));
     topics.push(weatherRequestTopic(this.deviceId));
+    topics.push(historyRequestTopic(this.deviceId));
+    topics.push(energyRequestTopic(this.deviceId));
     for (const leaf of PANEL_SETTING_LEAVES) topics.push(stateTopic(this.baseTopic, leaf));
     for (const channel of this.announcement.localIo) topics.push(ioStateTopic(this.baseTopic, channel.id));
     return topics;
@@ -282,14 +335,12 @@ export class PanelSession {
           `payload is over the panel's ${MAX_CONTROL_BYTES}-byte limit`,
       );
     }
-    if (entity.domain === 'weather') this.weathers.set(entity.entityId, entity);
-    if (EDITABLE_DOMAINS.has(entity.domain)) this.editables.set(entity.entityId, entity);
+    this.pushed.set(entity.entityId, entity);
     this.transport.publish(request);
   }
 
   clearEntityState(entityId: string): void {
-    this.weathers.delete(entityId);
-    this.editables.delete(entityId);
+    this.pushed.delete(entityId);
     this.oversized.delete(entityId);
     this.transport.publish(buildStateClear(this.haPrefix, entityId));
   }
@@ -326,6 +377,11 @@ export class PanelSession {
 
     if (topic === weatherRequestTopic(this.deviceId)) {
       this.answerWeatherRequest(payload);
+      return true;
+    }
+
+    if (topic === historyRequestTopic(this.deviceId) || topic === energyRequestTopic(this.deviceId)) {
+      await this.answerRequest(topic, payload, retain);
       return true;
     }
 
@@ -388,8 +444,8 @@ export class PanelSession {
     } catch {
       return;
     }
-    const entity = this.weathers.get(entityId);
-    if (!entity) {
+    const entity = this.pushed.get(entityId);
+    if (entity?.domain !== 'weather') {
       this.log.debug(`[Panel ${this.deviceId}] Weather request for ${entityId} ignored: no weather entity of this panel`);
       return;
     }
@@ -397,6 +453,96 @@ export class PanelSession {
     if (now - (this.weatherAnswered.get(entityId) ?? -Infinity) < WEATHER_REQUEST_REPEAT_MS) return;
     this.weatherAnswered.set(entityId, now);
     this.pushEntityState(entity);
+  }
+
+  /**
+   * A history or energy request (Task 22), answered on its response topic,
+   * never retained. A retained one is ignored: it would be answered again at
+   * every (re)subscription, and the panel retains none (mqtt_handlers.cpp:
+   * 2424, :2488, :2555; value_control.cpp:187). Nothing thrown reaches the
+   * MQTT handler.
+   */
+  private async answerRequest(topic: string, payload: string, retain: boolean): Promise<void> {
+    if (retain || !this.requests) {
+      this.note(`ignored ${topic}`, retain ? 'debug' : 'warn', `Request on ${topic} ignored: ${retain ? 'retained' : 'nothing answers it here, a wiring error'}`);
+      return;
+    }
+    try {
+      if (topic === historyRequestTopic(this.deviceId)) {
+        await this.answerHistory(this.requests, payload);
+        return;
+      }
+      // Rulings 116, 118: none while unarmed.
+      const answer = await this.requests.energy.answer(this.deviceId, payload);
+      if (answer) this.publishRaw(answer.topic, answer.payload);
+    } catch (error) {
+      this.note(`failed ${topic}`, 'warn', `Answering a request on ${topic} failed: ${error instanceof Error ? error.message : String(error)}`);
+    }
+  }
+
+  /**
+   * A history request (Task 16), answered for an entity this panel was given
+   * -- none while unarmed (Rulings 116, 118) -- whose history it can ask for:
+   * an editable request only for a number, select or datetime, as the
+   * Bridge's (__init__.py:1590). The rows of the state its synth reads (Task
+   * 19) come by a deadline that leaves the popup's 8 s timer time
+   * (mqtt_handlers.cpp:66), the wait for a slot included, and are built by
+   * the request's own builder, which a malformed range refuses (Ruling 70):
+   *
+   * - numeric (Task 17): the good numeric rows. With no history -- no rows,
+   *   or none kept for the state -- the live value at now, as the Bridge
+   *   answers; a read that failed for now answers nothing, so a tile graph
+   *   keeps what it shows, as a Bridge whose recorder raised sends nothing.
+   * - binary, state, editable (Task 18): each row as the entity's synth reads
+   *   it, the entity as the panel has it once the rows came, and a failed read
+   *   as "History unavailable" (Ruling 126).
+   */
+  private async answerHistory(requests: PanelRequests, payload: string): Promise<void> {
+    const request = parseHistoryRequest(payload);
+    const given = request ? this.pushed.get(request.entityId) : undefined;
+    const stateId = request && given && (request.kind !== 'editable' || EDITABLE_DOMAINS.has(given.domain)) ? historyState(given) : undefined;
+    if (!request || !stateId) {
+      this.note(
+        `ignored ${request?.entityId ?? ''}`,
+        'debug',
+        request
+          ? `History request for ${request.entityId} ignored: no entity of this panel whose history it can ask for`
+          : `History request ignored: ${quoted(payload)} is none the panel sends`,
+      );
+      return;
+    }
+    const now = this.now();
+    const result = await requests.history.query(stateId, {
+      start: now - request.hours * 3_600_000,
+      kind: request.kind === 'numeric' ? 'numeric' : 'discrete',
+      panel: this.deviceId,
+      deadline: now + HISTORY_BUDGET_MS,
+    });
+    // Taken away meanwhile, it is no longer this panel's to ask for.
+    const entity = this.pushed.get(request.entityId);
+    if (!entity) return;
+    let answer: string | null;
+    if (request.kind === 'numeric') {
+      if (!result.available && !NO_HISTORY.has(result.reason)) return;
+      answer = buildNumericHistoryResponse(request, result.rows.length > 0 ? result.rows : [{ ts: result.now, val: entity.state }], result.now);
+    } else {
+      const samples = result.rows.flatMap((row) => {
+        const state = requests.stateOf(entity.entityId, stateId, row);
+        return state === undefined ? [] : [{ ts: row.ts, state }];
+      });
+      answer = buildDiscreteHistoryResponse(request, samples, result.now, entity, result.available);
+    }
+    if (answer !== null) this.publishRaw(historyResponseTopic(this.deviceId), answer);
+  }
+
+  /** One English line per key and hour: panels repeat their requests. */
+  private note(key: string, level: 'debug' | 'warn', text: string): void {
+    const now = this.now();
+    if (now - (this.noted.get(key) ?? -Infinity) < REQUEST_LOG_INTERVAL_MS) return;
+    // ponytail: cleared when full; keys are the entities a panel asks about, so 100 is rarely reached.
+    if (this.noted.size >= 100) this.noted.clear();
+    this.noted.set(key, now);
+    this.log[level](`[Panel ${this.deviceId}] ${text}`);
   }
 
   /**
@@ -421,7 +567,7 @@ export class PanelSession {
       this.log.debug(`[Panel ${this.deviceId}] Value command dropped: ${code}`);
       return;
     }
-    if (!this.editables.has(call.entityId)) {
+    if (!EDITABLE_DOMAINS.has(this.pushed.get(call.entityId)?.domain ?? '')) {
       this.log.debug(`[Panel ${this.deviceId}] Value command dropped: ${quoted(call.entityId)} is no editable value of this panel`);
       return;
     }
@@ -449,7 +595,7 @@ export class PanelSession {
     if (status !== 'ok') this.log.debug(`[Panel ${this.deviceId}] Value command for ${call.entityId} refused: ${status}${why}`);
     this.transport.publish(buildValueAck(this.baseTopic, call.entityId, call.id, status));
     // As the Bridge does after every answer (__init__.py:1586): the panel re-reads it.
-    const entity = this.editables.get(call.entityId);
+    const entity = this.pushed.get(call.entityId);
     if (entity) this.pushEntityState(entity);
   }
 

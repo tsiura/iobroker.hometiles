@@ -3,7 +3,7 @@ import type { EnergyCatalogEntry } from '../protocol/energy';
 import type { VirtualEntity } from '../registry/types';
 import type { Dispatcher } from './dispatcher';
 import type { Logger } from './mqtt-client';
-import { PanelSession, type PanelTransport } from './panel-session';
+import { PanelSession, type PanelRequests, type PanelTransport } from './panel-session';
 
 export interface PanelManagerDeps {
   transport: PanelTransport;
@@ -24,6 +24,8 @@ export interface PanelManagerDeps {
   unpublished?(): readonly string[];
   /** The energy meters' catalog for every apply (Task 20b); none without. */
   energy?(): readonly EnergyCatalogEntry[];
+  /** What each panel's history and energy requests are answered from (Task 22); none are without. */
+  requests?: PanelRequests;
   /** Called after a session is created, updated or removed. */
   onSessionsChanged(): void | Promise<void>;
   /**
@@ -84,7 +86,15 @@ export class PanelManager {
       );
     }
 
-    const session = new PanelSession(announcement, this.deps.transport, this.deps.dispatcher, this.deps.log, Date.now, () => this.deps.energy?.() ?? []);
+    const session = new PanelSession(
+      announcement,
+      this.deps.transport,
+      this.deps.dispatcher,
+      this.deps.log,
+      Date.now,
+      () => this.deps.energy?.() ?? [],
+      this.deps.requests,
+    );
     session.onRefreshRequested = (): void => {
       session.pushConfig(this.deps.entities(), true);
       for (const entity of this.deps.entities() ?? []) session.pushEntityState(entity);
