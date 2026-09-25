@@ -2365,6 +2365,8 @@ if (process.env.HOMETILES_INTEGRATION === '1') {
         /** A manual sensor's readings and an energy counter, in iobroker.history's store. */
         const TEMPERATURE = '0_userdata.0.t24.temperature';
         const METER = '0_userdata.0.t24.meter';
+        /** A heating helper of 0_userdata, for the Manual entities tab. */
+        const HELPER_SOLL = { '0_userdata.0.Heizung': HELPER_OBJECTS['0_userdata.0.Heizung']!, [SOLL]: HELPER_OBJECTS[SOLL]! };
         /** The form as the admin saves it after the Refresh (JsonConfig.onSave), for the next suite's start. */
         let saved: Record<string, unknown> = {};
 
@@ -2375,14 +2377,19 @@ if (process.env.HOMETILES_INTEGRATION === '1') {
             this.timeout(120000);
             const harness = getHarness();
             const logs = await captureLogs(harness);
-            await setNative(harness, { brokerHost: '127.0.0.1', brokerPort: port() });
-            await setObjects(harness, { ...TRV_OBJECTS, ...DOMAIN_OBJECTS });
+            // The helper, added on the Manual entities tab before the Devices tab was used, waits for it as well
+            // (Ruling 118): what goes out here is held back, not missing.
+            await setNative(harness, { brokerHost: '127.0.0.1', brokerPort: port(), manualEntities: [{ stateId: SOLL, domain: 'number' }] });
+            await setObjects(harness, { ...TRV_OBJECTS, ...DOMAIN_OBJECTS, ...HELPER_SOLL });
+            await harness.states.setStateAsync(SOLL, { val: 20, ack: true });
             const panels = valuesOf(harness, 'hometiles.0.info.panels');
             await harness.startAdapterAndWait(true);
             await waitFor(harness, () => ready(logs), 'onReady to finish');
             await waitFor(harness, () => (panels.includes(1) ? true : undefined), 'the panel session');
             await settled();
             expect(applies, 'no apply before the Devices tab is used').to.deep.equal([]);
+            const hint = logs.map((log) => log.message).find((message) => message.includes('No devices selected yet'));
+            expect(hint, 'the hint to use the Devices tab').to.include('Held back until then: 1 manual entities');
 
             await harness.enableSendTo();
             type Row = { objectId: string; include: boolean; detectedDomain: string };
@@ -2522,7 +2529,7 @@ if (process.env.HOMETILES_INTEGRATION === '1') {
             panel().on('message', (topic, payload) => void inbox.set(topic, [...got(topic), payload.toString()]));
             await panel().subscribeAsync(['ha/e2e/#', 'hometiles-e2e/stat/value', `tab5_lvgl/config/${PANEL}/+/response`]);
             await setNative(harness, { brokerHost: '127.0.0.1', brokerPort: port(), ...saved });
-            await setObjects(harness, { ...TRV_OBJECTS, ...DOMAIN_OBJECTS, '0_userdata.0.Heizung': HELPER_OBJECTS['0_userdata.0.Heizung']!, [SOLL]: HELPER_OBJECTS[SOLL]! });
+            await setObjects(harness, { ...TRV_OBJECTS, ...DOMAIN_OBJECTS, ...HELPER_SOLL });
             for (const [id, val] of Object.entries(VALUES)) await harness.states.setStateAsync(id, { val, ack: true });
             live = (counter.at(-1)!.val as number) + 0.1;
             await harness.states.setStateAsync(METER, { val: live, ack: true });
