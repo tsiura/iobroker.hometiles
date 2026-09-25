@@ -3332,6 +3332,28 @@ if (process.env.HOMETILES_INTEGRATION === '1') {
           expect(unlogged).to.not.have.property('total');
         });
       });
+
+      suite('a panel that announces its battery charge (Task 25b)', (getHarness) => {
+        const { panel, port } = withBrokerAndPanel();
+
+        it('creates info.battery from the announced capability and fills it from a retained soc_pct charge', async function () {
+          this.timeout(120000);
+          const harness = getHarness();
+          const battery = valuesOf(harness, `hometiles.0.panels.${PANEL}.info.battery`);
+          // Same base topic and ha_prefix as ANNOUNCEMENT (a retained publish
+          // replaces it on the broker): the capability lives on the same
+          // subscribe-once path updateAnnouncement's same-base branch takes,
+          // which is exactly why PanelSession subscribes to sensor/soc_pct
+          // unconditionally rather than gating it on the capability.
+          const withBattery = JSON.stringify({ ...(JSON.parse(ANNOUNCEMENT) as Record<string, unknown>), capabilities: { battery_soc: true } });
+          await panel().publishAsync(ANNOUNCE_TOPIC, withBattery, { retain: true });
+          await panel().publishAsync('hometiles-e2e/sensor/soc_pct', '77', { retain: true });
+          await harness.changeAdapterConfig('hometiles', { native: { brokerHost: '127.0.0.1', brokerPort: port() } });
+          await harness.startAdapterAndWait(true);
+          await waitFor(harness, () => (battery.includes(77) ? true : undefined), 'the retained battery charge');
+          expect(battery).to.deep.equal([77]);
+        });
+      });
     },
   });
 }

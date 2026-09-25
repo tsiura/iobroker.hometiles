@@ -136,4 +136,30 @@ describe('protocol/announce', () => {
     // dropped, and a differently-cased valid one is normalised and kept.
     expect(normaliseLocalIo(raw)[0]!.legacyEntityIds).to.deep.equal(['switch.old_one', 'switch.old_two']);
   });
+
+  describe('the battery_soc capability (Task 25b)', () => {
+    it('reads an explicit boolean capability as itself', () => {
+      const withCap = (value: unknown): boolean =>
+        parseAnnouncement('a1', JSON.stringify({ model: 'JC8012P4A1', capabilities: { battery_soc: value } })).batterySoc;
+      expect(withCap(true)).to.equal(true);
+      expect(withCap(false)).to.equal(false);
+    });
+
+    it('falls back to the model when there is no capabilities object or key', () => {
+      expect(parseAnnouncement('a1', JSON.stringify({ model: 'Tab5' })).batterySoc).to.equal(true);
+      expect(parseAnnouncement('a1', JSON.stringify({}))).to.include({ batterySoc: true });
+      expect(parseAnnouncement('a1', JSON.stringify({ model: 'JC8012P4A1' })).batterySoc).to.equal(false);
+    });
+
+    it('treats a non-boolean value as false rather than falling back to the model', () => {
+      // A truthy string is still not === true: an older Tab5 without this
+      // field would otherwise be indistinguishable from a panel that sent one.
+      expect(parseAnnouncement('a1', JSON.stringify({ model: 'Tab5', capabilities: { battery_soc: 'true' } })).batterySoc).to.equal(false);
+    });
+
+    it('falls back to the model when capabilities is not a plain object', () => {
+      expect(parseAnnouncement('a1', JSON.stringify({ model: 'Tab5', capabilities: 'nope' })).batterySoc).to.equal(true);
+      expect(parseAnnouncement('a1', JSON.stringify({ model: 'JC8012P4A1', capabilities: ['battery_soc'] })).batterySoc).to.equal(false);
+    });
+  });
 });

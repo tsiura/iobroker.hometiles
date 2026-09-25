@@ -19,6 +19,8 @@ export interface Announcement {
   binarySensors: string[];
   sceneMap: Record<string, string>;
   localIo: LocalIoChannel[];
+  /** Whether the panel reports its battery charge on sensor/soc_pct (Task 25b). */
+  batterySoc: boolean;
 }
 
 export class AnnounceError extends Error {
@@ -117,6 +119,32 @@ export function normaliseLocalIo(raw: unknown): LocalIoChannel[] {
   return result;
 }
 
+/**
+ * Older Tab5 firmware had real PMIC telemetry and no capabilities block at
+ * all, so a panel that never sends one is still assumed to have a battery
+ * when its model says Tab5 (ha_bridge_config.cpp / the HA Bridge's
+ * capabilities.py `supports`). An empty model is included: HomeTiles's own
+ * default before `model` was populated everywhere.
+ */
+const LEGACY_BATTERY_MODELS = new Set(['', 'tab5', 'm5stack tab5', 'm5stack_tab5']);
+
+/**
+ * An explicit `capabilities.battery_soc` wins; anything but `=== true` counts
+ * as false rather than throwing or falling back, so one malformed field never
+ * invalidates the rest of the announcement. With no capabilities object, or
+ * none of that key, the legacy model fallback decides.
+ */
+function parseBatterySoc(payload: Record<string, unknown>, model: string): boolean {
+  const capabilities = payload.capabilities;
+  if (capabilities && typeof capabilities === 'object' && !Array.isArray(capabilities)) {
+    const record = capabilities as Record<string, unknown>;
+    if (Object.prototype.hasOwnProperty.call(record, 'battery_soc')) {
+      return record.battery_soc === true;
+    }
+  }
+  return LEGACY_BATTERY_MODELS.has(model.trim().toLowerCase());
+}
+
 export function parseAnnouncement(deviceId: string, raw: string): Announcement {
   let parsed: unknown;
   try {
@@ -134,6 +162,8 @@ export function parseAnnouncement(deviceId: string, raw: string): Announcement {
     return typeof value === 'string' && value.trim() ? value.trim() : fallback;
   };
 
+  const model = text('model', '');
+
   return {
     // The topic is authoritative: it is what the panel actually owns.
     deviceId,
@@ -141,10 +171,11 @@ export function parseAnnouncement(deviceId: string, raw: string): Announcement {
     haPrefix: text('ha_prefix', 'ha/statestream'),
     deviceName: text('device_name', ''),
     manufacturer: text('manufacturer', 'HomeTiles'),
-    model: text('model', ''),
+    model,
     sensors: asStringArray(payload.sensors, MAX_ENTITY_LIST, 'too_many_sensors'),
     binarySensors: asStringArray(payload.binary_sensors, MAX_ENTITY_LIST, 'too_many_binary_sensors'),
     sceneMap: asStringRecord(payload.scene_map, MAX_SCENE_ALIASES, 'too_many_scene_aliases'),
     localIo: normaliseLocalIo(payload.local_io),
+    batterySoc: parseBatterySoc(payload, model),
   };
 }

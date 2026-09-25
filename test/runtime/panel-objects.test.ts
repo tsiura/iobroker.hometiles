@@ -2,7 +2,7 @@ import { expect } from 'chai';
 import { parseAnnouncement } from '../../src/protocol/announce';
 import { Dispatcher } from '../../src/runtime/dispatcher';
 import type { PublishRequest } from '../../src/runtime/mqtt-client';
-import { PanelObjects, panelObjectDefs, type ObjectStore } from '../../src/runtime/panel-objects';
+import { PanelObjects, panelObjectDefs, parseBatteryPayload, type ObjectStore } from '../../src/runtime/panel-objects';
 import { PanelSession, type PanelTransport } from '../../src/runtime/panel-session';
 
 const silentLog = { info: () => undefined, warn: () => undefined, error: () => undefined, debug: () => undefined };
@@ -20,7 +20,10 @@ const ANNOUNCE = JSON.stringify({
   ],
 });
 
-function harness() {
+/** Same panel, but announcing the battery_soc capability (Task 25b). */
+const WITH_BATTERY = JSON.stringify({ ...(JSON.parse(ANNOUNCE) as Record<string, unknown>), capabilities: { battery_soc: true } });
+
+function harness(announce = ANNOUNCE) {
   const published: PublishRequest[] = [];
   const transport: PanelTransport = {
     publish: (request) => published.push(request),
@@ -28,7 +31,7 @@ function harness() {
     unsubscribe: async () => undefined,
   };
   const dispatcher = new Dispatcher({ byId: () => undefined, bySceneAlias: () => undefined }, async () => undefined, silentLog);
-  const session = new PanelSession(parseAnnouncement('a1', ANNOUNCE), transport, dispatcher, silentLog);
+  const session = new PanelSession(parseAnnouncement('a1', announce), transport, dispatcher, silentLog);
 
   const objects: Array<[string, unknown]> = [];
   const states: Array<[string, unknown, boolean]> = [];
@@ -263,5 +266,75 @@ describe('runtime/panel-objects', () => {
     const { panelObjects, deleted } = harness();
     await panelObjects.remove('a1');
     expect(deleted).to.deep.equal(['panels.a1']);
+  });
+
+  describe('the battery charge (Task 25b)', () => {
+    it('adds info.battery only for a panel that announces the battery_soc capability', () => {
+      expect(panelObjectDefs(harness().session).some((d) => d.id === 'panels.a1.info.battery')).to.equal(false);
+
+      const withBattery = panelObjectDefs(harness(WITH_BATTERY).session).find((d) => d.id === 'panels.a1.info.battery');
+      expect(withBattery).to.not.equal(undefined);
+      const common = (withBattery!.obj as { common: Record<string, unknown> }).common;
+      // Exactly these fields, and no `def`: the state stays null until the panel sends a value, never 0.
+      expect(common).to.deep.equal({ name: 'Battery', read: true, write: false, type: 'number', role: 'value.battery', unit: '%', min: 0, max: 100 });
+    });
+
+    it('adds info.battery once the running session updates into the capability, without needing a new session', async () => {
+      // PanelManager re-runs panelObjectDefs (via syncPanelObjects) after every
+      // updateAnnouncement; this is how a capability flip false -> true creates
+      // the object on the SAME session the manager already holds.
+      const { session } = harness();
+      expect(panelObjectDefs(session).some((d) => d.id === 'panels.a1.info.battery')).to.equal(false);
+      await session.updateAnnouncement(parseAnnouncement('a1', WITH_BATTERY));
+      expect(panelObjectDefs(session).some((d) => d.id === 'panels.a1.info.battery')).to.equal(true);
+    });
+
+    it('parses the panel-sent charge exactly as the firmware can send it', () => {
+      const cases: Array<[string, number | null | undefined]> = [
+        ['87', 87],
+        [' 87 ', 87],
+        ['87%', 87],
+        ['87.6', 88],
+        ['-3', 0],
+        ['140', 100],
+        ['', null],
+        ['unavailable', null],
+        ['Unavailable', null],
+        ['unknown', null],
+        ['abc', undefined],
+        ['0x10', undefined],
+        ['1e2', undefined],
+        ['%', undefined],
+        ['NaN', undefined],
+        ['Infinity', undefined],
+      ];
+      for (const [input, expected] of cases) {
+        expect(parseBatteryPayload(input), JSON.stringify(input)).to.equal(expected);
+      }
+    });
+
+    it('writes nothing for a panel that never announced the capability', async () => {
+      const { session, panelObjects, states } = harness();
+      await panelObjects.applyBattery(session, '55');
+      expect(states).to.have.length(0);
+    });
+
+    it('writes null, not zero, for a blank or unavailable charge', async () => {
+      const { session, panelObjects, states } = harness(WITH_BATTERY);
+      await panelObjects.applyBattery(session, '');
+      expect(states).to.deep.equal([['panels.a1.info.battery', null, true]]);
+    });
+
+    it('writes the parsed charge with ack true', async () => {
+      const { session, panelObjects, states } = harness(WITH_BATTERY);
+      await panelObjects.applyBattery(session, '55');
+      expect(states).to.deep.equal([['panels.a1.info.battery', 55, true]]);
+    });
+
+    it('ignores a charge the firmware would never send', async () => {
+      const { session, panelObjects, states } = harness(WITH_BATTERY);
+      await panelObjects.applyBattery(session, 'abc');
+      expect(states).to.have.length(0);
+    });
   });
 });

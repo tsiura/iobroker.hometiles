@@ -65,6 +65,11 @@ export function stateTopic(baseTopic: string, leaf: string): string {
   return `${baseTopic}/stat/${leaf}`;
 }
 
+/** The panel's own telemetry (`mqttPublishHomeSnapshot`), e.g. `sensor/soc_pct`: read-only, never published by the adapter. */
+export function sensorTopic(baseTopic: string, leaf: string): string {
+  return `${baseTopic}/sensor/${leaf}`;
+}
+
 export function ioCommandTopic(baseTopic: string, channelId: string): string {
   return `${baseTopic}/cmnd/io/${channelId}`;
 }

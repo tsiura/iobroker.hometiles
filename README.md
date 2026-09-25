@@ -59,13 +59,17 @@ adapter shows the provider's own values, as its own widgets do.
 
 - **Camera.** Deliberately absent. The adapter serves no camera, and each
   configuration it pushes clears the panel's camera list.
-- **The panel's own telemetry, HomeSnapshot** (`mqttPublishHomeSnapshot`):
-  its outside and inside temperature and battery charge on
-  `<base>/sensor/{outside_c,inside_c,soc_pct}` are not read into ioBroker.
-  Needs nothing from the adapter: Discovery (`mqttPublishDiscovery`; the
-  panel only removes its own legacy Home Assistant discovery entries with
-  empty retained payloads) and DynamicSlotsReload
-  (`mqttRequestDynamicSlotsReload`; internal to the panel).
+- **The panel's own outside and inside temperature** (`mqttPublishHomeSnapshot`,
+  `<base>/sensor/{outside_c,inside_c}`): firmware placeholders, never fed by a
+  real sensor, deliberately left out. The battery charge on the same
+  HomeSnapshot message (`soc_pct`) is read instead, as
+  `panels.<deviceId>.info.battery`, for a panel that announces the
+  `battery_soc` capability (the Tab5); the panel sends it once per broker
+  connection, so it refreshes when the panel reconnects, not continuously.
+  Discovery (`mqttPublishDiscovery`) and DynamicSlotsReload
+  (`mqttRequestDynamicSlotsReload`) need nothing from ioBroker: the panel only
+  removes its own legacy Home Assistant discovery entries, and reloads its own
+  dynamic subscriptions internally.
   [docs/protocol.md](docs/protocol.md#not-implemented) has what is known.
 - **Climate presets, humidity targets, power and boost.** No ioBroker climate
   pattern has a preset or a writable humidity target, and the panel sends no
@@ -381,6 +385,7 @@ hometiles.0.panels.<deviceId>.info.connected
 hometiles.0.panels.<deviceId>.info.ip
 hometiles.0.panels.<deviceId>.info.baseTopic
 hometiles.0.panels.<deviceId>.info.model
+hometiles.0.panels.<deviceId>.info.battery     charge %, panels that announce it
 hometiles.0.panels.<deviceId>.control.display_brightness
 hometiles.0.panels.<deviceId>.control.screensaver_brightness
 hometiles.0.panels.<deviceId>.control.display_rotate
@@ -509,6 +514,8 @@ run.
   energy tiles from cumulative energy meters on the Energy tab.
 - Opt-in device selection on the Devices tab, manual entities, a Climate
   modes table and a per-row MQTT payload preview.
+- Panel battery charge, for a panel that announces it (the Tab5), as
+  `panels.<deviceId>.info.battery`.
 - The broker password is stored encrypted; one that 0.1.0 stored in plain
   text is migrated at the first start (see
   [Upgrading from 0.1.0](#upgrading-from-010)).

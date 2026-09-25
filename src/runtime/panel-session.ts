@@ -15,6 +15,7 @@ import {
   iconsTopic,
   ioStateTopic,
   PANEL_SETTING_LEAVES,
+  sensorTopic,
   stateTopic,
   weatherRequestTopic,
 } from '../protocol/topics';
@@ -210,6 +211,10 @@ export class PanelSession {
     return this.announcement.model;
   }
 
+  get batterySoc(): boolean {
+    return this.announcement.batterySoc;
+  }
+
   publishRaw(topic: string, payload: string): void {
     this.transport.publish({ topic, payload, retain: false });
   }
@@ -224,6 +229,11 @@ export class PanelSession {
     topics.push(energyRequestTopic(this.deviceId));
     for (const leaf of PANEL_SETTING_LEAVES) topics.push(stateTopic(this.baseTopic, leaf));
     for (const channel of this.announcement.localIo) topics.push(ioStateTopic(this.baseTopic, channel.id));
+    // Unconditional: updateAnnouncement's same-base path swaps the
+    // announcement without re-subscribing, so a subscription gated on
+    // batterySoc would miss a capability that only appears on a later
+    // announcement (Task 25b).
+    topics.push(sensorTopic(this.baseTopic, 'soc_pct'));
     return topics;
   }
 

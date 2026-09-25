@@ -12,6 +12,7 @@ import {
   deviceIdFromAnnounceTopic,
   ioStateTopic,
   PANEL_SETTING_LEAVES,
+  sensorTopic,
   stateTopic,
 } from './protocol/topics';
 import { discoverDevices, type Discovery, type RootAnchors } from './registry/detector';
@@ -439,6 +440,10 @@ class HomeTiles extends utils.Adapter {
         await this.panelObjects.applyIoStat(session, channel.id, payload);
         return;
       }
+    }
+    if (topic === sensorTopic(session.baseTopic, 'soc_pct')) {
+      await this.panelObjects.applyBattery(session, payload);
+      return;
     }
   }
 

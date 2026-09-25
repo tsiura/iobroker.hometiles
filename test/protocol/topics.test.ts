@@ -13,6 +13,7 @@ import {
   iconsTopic,
   ioCommandTopic,
   ioStateTopic,
+  sensorTopic,
   stateTopic,
 } from '../../src/protocol/topics';
 
@@ -46,6 +47,10 @@ describe('protocol/topics', () => {
     expect(stateTopic('hometiles', 'connected')).to.equal('hometiles/stat/connected');
     expect(ioCommandTopic('hometiles', 'relay_1')).to.equal('hometiles/cmnd/io/relay_1');
     expect(ioStateTopic('hometiles', 'relay_1')).to.equal('hometiles/stat/io/relay_1');
+  });
+
+  it('builds the panel telemetry topic the firmware publishes HomeSnapshot to (Task 25b)', () => {
+    expect(sensorTopic('hometiles', 'soc_pct')).to.equal('hometiles/sensor/soc_pct');
   });
 
   it('maps an entity id onto the statestream topic by replacing the domain dot', () => {

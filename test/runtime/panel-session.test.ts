@@ -704,6 +704,29 @@ describe('runtime/panel-session', () => {
     expect(session.localIo.map((channel) => channel.id)).to.deep.equal(['relay_1']);
   });
 
+  describe('the battery charge topic (Task 25b)', () => {
+    it('subscribes to sensor/soc_pct for both capability values, since a same-base update never re-subscribes', async () => {
+      const { session } = harness();
+      expect(session.batterySoc).to.equal(false);
+      expect(session.commandTopics()).to.include('hometiles/sensor/soc_pct');
+
+      await session.updateAnnouncement(parseAnnouncement('a1', JSON.stringify({ ...JSON.parse(ANNOUNCE), model: 'tab5' })));
+      expect(session.batterySoc).to.equal(true);
+      expect(session.commandTopics()).to.include('hometiles/sensor/soc_pct');
+    });
+
+    it('never publishes to the panel-owned sensor topics', async () => {
+      const { session, published, registryEntities } = harness();
+      registryEntities.set('switch.k', entity({ entityId: 'switch.k', domain: 'switch', source: { set: 'x.0.on' } }));
+      await session.start();
+      session.pushConfig([entity({ entityId: 'switch.k', domain: 'switch', source: { set: 'x.0.on' } })], true);
+      session.pushEntityState(entity({ entityId: 'switch.k', domain: 'switch', source: { set: 'x.0.on' } }));
+      session.publishPanelCommand('display_brightness', '50');
+      await session.handleMessage('hometiles/cmnd/switch', '{"entity_id":"switch.k","state":"on"}', false);
+      expect(published.some((request) => request.topic.includes('/sensor/'))).to.equal(false);
+    });
+  });
+
   describe('retained messages (Ruling 101)', () => {
     // The broker replays a retained message at every (re)subscription, marked
     // retained; a live one never is. A retained command would run again at

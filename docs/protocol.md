@@ -924,11 +924,23 @@ not armed.
   no `camera_meta`.
 - **The panel's own telemetry, HomeSnapshot.** `mqttPublishHomeSnapshot`
   (`src/network/mqtt/mqtt_handlers.cpp:1909-1928`) publishes the panel's own
-  readings, retained, to `<baseTopic>/sensor/outside_c`,
-  `<baseTopic>/sensor/inside_c` and `<baseTopic>/sensor/soc_pct` (the
-  battery charge, `unavailable`, or an empty payload that removes it). The
-  adapter subscribes to none of them: its outside and inside temperature and
-  battery charge are not read into ioBroker.
+  readings, retained, once per broker connection, to
+  `<baseTopic>/sensor/outside_c`, `<baseTopic>/sensor/inside_c` and
+  `<baseTopic>/sensor/soc_pct`. The adapter subscribes to none of the first
+  two: they are firmware placeholders (initialised to 21.7 / 22.4 and never
+  fed by a real sensor), so its outside and inside temperature are not read
+  into ioBroker. It does subscribe to `soc_pct` (the battery charge,
+  `unavailable`, or an empty payload that clears the retained message) for a
+  panel whose announcement carries `capabilities.battery_soc: true` (the
+  Tab5): the parsed value (or `null` for empty/`unavailable`/`unknown`) is
+  written to `panels.<deviceId>.info.battery`, and a value the firmware would
+  never send is ignored. The subscription itself is unconditional — a panel
+  without the capability just has nothing to write it to — because an
+  announcement update on the same base topic swaps the panel's configuration
+  without re-subscribing, so a subscription gated on the capability could miss
+  one that only appears later. `info.battery` is created once and never
+  removed if a later announcement drops the capability, the same limitation
+  the local hardware I/O channels above already have.
 
 Needs nothing from the adapter. No contract was extracted for these two
 firmware entry points; this is a first reading of the same file at the same

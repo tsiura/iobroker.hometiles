@@ -75,6 +75,26 @@ function parseFiniteNumber(raw: string): number | undefined {
   return Number.isFinite(numeric) ? numeric : undefined;
 }
 
+const BATTERY_UNAVAILABLE = new Set(['unavailable', 'unknown']);
+/** A strict decimal, unlike Number(), which also accepts "0x10", "1e2" and " " (Task 25b). */
+const DECIMAL_RE = /^-?\d+(\.\d+)?$/;
+
+/**
+ * The panel's own `sensor/soc_pct` payload (`mqttPublishHomeSnapshot`):
+ * already an integer 0..100 or `unavailable` on the wire, but parsed
+ * defensively rather than trusted. `null` means unknown (never write a
+ * confident 0); `undefined` means the payload matches nothing the firmware
+ * would ever send, so the caller writes nothing at all.
+ */
+export function parseBatteryPayload(payload: string): number | null | undefined {
+  const text = payload.trim();
+  if (text === '') return null;
+  if (BATTERY_UNAVAILABLE.has(text.toLowerCase())) return null;
+  const stripped = (text.endsWith('%') ? text.slice(0, -1) : text).trim();
+  if (!DECIMAL_RE.test(stripped)) return undefined;
+  return Math.min(100, Math.max(0, Math.round(Number(stripped))));
+}
+
 /** The firmware's older protocol encoded 1..100 percent as 121..255. */
 function decodeBrightness(raw: number): number {
   if (raw <= 100) return Math.round(raw);
@@ -104,6 +124,12 @@ export function panelObjectDefs(session: PanelSession): Array<{ id: string; obj:
     { id: `${root}.info.model`, obj: stateObject('Model', { type: 'string', role: 'text', write: false }) },
     { id: `${root}.control`, obj: { type: 'channel', common: { name: 'Control' }, native: {} } },
   ];
+
+  if (session.batterySoc) {
+    // No `def`: the state stays null until the panel actually sends a value
+    // (once per broker connection), never a confident 0 (Task 25b).
+    defs.push({ id: `${root}.info.battery`, obj: stateObject('Battery', { type: 'number', role: 'value.battery', unit: '%', min: 0, max: 100, write: false }) });
+  }
 
   for (const def of PANEL_SETTING_DEFS) {
     const stateType = def.kind === 'percent' ? 'number' : def.kind === 'bool' ? 'boolean' : 'string';
@@ -194,6 +220,19 @@ export class PanelObjects {
     // a blank or non-numeric payload must never be coerced into one.
     const numeric = parseFiniteNumber(text);
     await this.store.setState(id, numeric ?? null, true);
+  }
+
+  /**
+   * The panel's own battery charge (Task 25b), sent once per broker
+   * connection, retained. A panel that never announced battery_soc has no
+   * info.battery object; setState on a missing object would warn on every
+   * connect of every mains panel, so it is skipped rather than guessed at.
+   */
+  async applyBattery(session: PanelSession, payload: string): Promise<void> {
+    if (!session.batterySoc) return;
+    const value = parseBatteryPayload(payload);
+    if (value === undefined) return;
+    await this.store.setState(`panels.${session.deviceId}.info.battery`, value, true);
   }
 
   handleControlWrite(session: PanelSession, path: string, value: unknown): void {
