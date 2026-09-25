@@ -99,6 +99,14 @@ const TEXT_ATTRIBUTES = [
 ] as const;
 
 /**
+ * The player's state (STATE): without it nothing on a device is a media
+ * player's -- only a domain override brings one here without, a socket's
+ * power switch, say. synthMediaPlayer's null test, and lacks' (synth/index.ts,
+ * Ruling 139).
+ */
+export const playerState = (device: DeviceInput): ChannelInput | undefined => device.channels.state;
+
+/**
  * mediaPlayer (@iobroker/type-detector 6.0.1) requires only STATE. The panel
  * has no acceptance check for a media payload (tile_renderer.cpp:4244-4263
  * drops only an empty or repeated one) and no supported_features, but two
@@ -113,9 +121,7 @@ const TEXT_ATTRIBUTES = [
  * payload key shapes them.
  */
 export function synthMediaPlayer(device: DeviceInput, entityId: string, values: Values): VirtualEntity | null {
-  // Only a domain override brings a device here without STATE, and nothing
-  // on it is a media player's (a socket's power switch, say).
-  const stateChannel = device.channels.state;
+  const stateChannel = playerState(device);
   if (!stateChannel) return null;
 
   const { source, channelMeta, lastChanged, friendly } = baseEntity(device, entityId, values);

@@ -120,6 +120,14 @@ function enumModes(role: string, channel: ChannelInput | undefined, names: reado
   return names.filter((name) => encodeChannelValue(codec, name) !== undefined);
 }
 
+/**
+ * Whether the device has a channel the firmware accepts a climate payload
+ * for: synthClimate's null test, and lacks' (synth/index.ts, Ruling 139).
+ */
+export function hasClimateChannel(device: DeviceInput): boolean {
+  return VALIDITY_CHANNELS.some((name) => device.channels[name] !== undefined);
+}
+
 export function synthClimate(device: DeviceInput, entityId: string, values: Values): VirtualEntity | null {
   // The trap: type-detector 6.0.1 requires a setpoint for both climate types,
   // but a later ^6 minor or a domain override need not, so a device may have
@@ -129,7 +137,7 @@ export function synthClimate(device: DeviceInput, entityId: string, values: Valu
   // only SPEED/SPEED_LEVEL/SWING/SWING_TOGGLE/POWER/BOOST would previously
   // have synthesised anyway, then published a payload the firmware always
   // rejects as invalid.
-  if (!VALIDITY_CHANNELS.some((name) => device.channels[name])) return null;
+  if (!hasClimateChannel(device)) return null;
 
   // channelMeta is passed through unchanged from baseEntity, not computed
   // here -- this is plumbing, not a decode-logic change. Without it, a real

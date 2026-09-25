@@ -20,6 +20,12 @@ interface Captured {
   body: string;
 }
 
+/**
+ * Servers a test started: each is closed after it, passed or failed. A failed
+ * assertion used to leave its server listening, and mocha never exited.
+ */
+const started: Server[] = [];
+
 function startPanel(handler: (path: string) => number): {
   server: Server;
   port: number;
@@ -42,10 +48,15 @@ function startPanel(handler: (path: string) => number): {
   });
   const port = 18900 + Math.floor(Math.random() * 500);
   const ready = new Promise<void>((resolve) => server.listen(port, '127.0.0.1', resolve));
+  started.push(server);
   return { server, port, captured, ready };
 }
 
 describe('runtime/pairing', () => {
+  afterEach(async () => {
+    await Promise.all(started.splice(0).map((server) => new Promise<void>((resolve) => server.close(() => resolve()))));
+  });
+
   it('posts the credentials form and then the restart', async () => {
     const panel = startPanel(() => 200);
     await panel.ready;
@@ -63,31 +74,28 @@ describe('runtime/pairing', () => {
     expect(form.get('mqtt_base')).to.equal('hometiles');
     expect(form.get('ha_prefix')).to.equal('ha/statestream');
 
-    await new Promise<void>((resolve) => panel.server.close(() => resolve()));
   });
 
   it('accepts a 303 redirect status without following it', async () => {
     const panel = startPanel(() => 303);
     await panel.ready;
     expect(await pushCredentials(`127.0.0.1:${panel.port}`, CREDS, silentLog)).to.deep.equal({ ok: true });
-    await new Promise<void>((resolve) => panel.server.close(() => resolve()));
   });
 
   it('fails without attempting the restart when the credentials post is rejected', async () => {
     const panel = startPanel(() => 401);
     await panel.ready;
     const result = await pushCredentials(`127.0.0.1:${panel.port}`, CREDS, silentLog);
-    expect(result).to.deep.equal({ ok: false, reason: 'credentials_rejected_401' });
+    // The status apart from the reason, so the admin can name it in a text of its own (Ruling 140).
+    expect(result).to.deep.equal({ ok: false, reason: 'credentials_rejected', status: 401 });
     expect(panel.captured.map((c) => c.path)).to.deep.equal(['/mqtt']);
-    await new Promise<void>((resolve) => panel.server.close(() => resolve()));
   });
 
   it('reports a failed restart distinctly, because the credentials did land', async () => {
     const panel = startPanel((path) => (path === '/restart' ? 500 : 200));
     await panel.ready;
     const result = await pushCredentials(`127.0.0.1:${panel.port}`, CREDS, silentLog);
-    expect(result).to.deep.equal({ ok: false, reason: 'restart_failed_500' });
-    await new Promise<void>((resolve) => panel.server.close(() => resolve()));
+    expect(result).to.deep.equal({ ok: false, reason: 'restart_failed', status: 500 });
   });
 
   it('reports an unreachable panel rather than throwing', async () => {
@@ -100,7 +108,6 @@ describe('runtime/pairing', () => {
     const panel = startPanel(() => 200);
     await panel.ready;
     expect(await pushCredentials(`http://127.0.0.1:${panel.port}/`, CREDS, silentLog)).to.deep.equal({ ok: true });
-    await new Promise<void>((resolve) => panel.server.close(() => resolve()));
   });
 
   it('rejects an empty host without making a request', async () => {

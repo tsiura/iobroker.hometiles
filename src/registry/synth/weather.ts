@@ -65,6 +65,19 @@ function forecastDays(device: DeviceInput, values: Values): Array<Record<string,
 }
 
 /**
+ * What weather is read from: a temperature (ACTUAL, else the forecast's TEMP)
+ * or a forecast (TEMP_MIN/TEMP_MAX). Undefined when there is neither --
+ * nothing on the device is weather: an hour's symbol read as ACTUAL, or a
+ * domain override. synthWeather's null test, and lacks' (synth/index.ts,
+ * Ruling 139).
+ */
+export function weatherReadings(device: DeviceInput): { temperature: string | undefined; hasForecast: boolean } | undefined {
+  const temperature = ['actual', 'temp'].find((name) => isTemperature(device.channels[name]));
+  const hasForecast = !!(device.channels.temp_min ?? device.channels.temp_max);
+  return temperature || hasForecast ? { temperature, hasForecast } : undefined;
+}
+
+/**
  * weatherCurrent (ACTUAL, WEATHER and its ICON as `current_icon`) and
  * weatherForecast (TEMP and the day channels), as detector.ts keeps them --
  * one source's two detections already combined into one device there.
@@ -83,10 +96,9 @@ function forecastDays(device: DeviceInput, values: Values): Array<Record<string,
  * its text and icon -- no Home Assistant condition, so the state is unknown.
  */
 export function synthWeather(device: DeviceInput, entityId: string, values: Values): VirtualEntity | null {
-  const temperature = ['actual', 'temp'].find((name) => isTemperature(device.channels[name]));
-  const hasForecast = !!(device.channels.temp_min ?? device.channels.temp_max);
-  // Nothing on it is weather: an hour's symbol read as ACTUAL, or a domain override.
-  if (!temperature && !hasForecast) return null;
+  const readings = weatherReadings(device);
+  if (!readings) return null;
+  const { temperature, hasForecast } = readings;
 
   const { source, channelMeta, lastChanged, friendly } = baseEntity(device, entityId, values);
   const attributes: Record<string, unknown> = { ...friendly };

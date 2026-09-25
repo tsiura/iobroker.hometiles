@@ -10,7 +10,12 @@ export interface PairingCredentials {
   haPrefix: string;
 }
 
-export type PairingResult = { ok: true } | { ok: false; reason: string };
+/** Why a pairing failed: each has a text of its own in the admin (Ruling 140). */
+export const PAIRING_FAILURES = ['invalid_host', 'unreachable', 'credentials_rejected', 'restart_unreachable', 'restart_failed'] as const;
+export type PairingFailure = (typeof PAIRING_FAILURES)[number];
+
+/** A failure the panel answered with an HTTP status carries it apart, for that text to name. */
+export type PairingResult = { ok: true } | { ok: false; reason: PairingFailure; status?: number };
 
 const REQUEST_TIMEOUT_MS = 5000;
 const ACCEPTED_STATUS = new Set([200, 303]);
@@ -108,7 +113,7 @@ export async function pushCredentials(
 
   if (!ACCEPTED_STATUS.has(status)) {
     log.warn(`[Pairing] Panel at ${target} rejected the credentials with status ${status}`);
-    return { ok: false, reason: `credentials_rejected_${status}` };
+    return { ok: false, reason: 'credentials_rejected', status };
   }
 
   let restartStatus: number;
@@ -121,7 +126,7 @@ export async function pushCredentials(
 
   if (!ACCEPTED_STATUS.has(restartStatus)) {
     log.warn(`[Pairing] Panel at ${target} refused the restart with status ${restartStatus}`);
-    return { ok: false, reason: `restart_failed_${restartStatus}` };
+    return { ok: false, reason: 'restart_failed', status: restartStatus };
   }
 
   log.info(`[Pairing] Credentials pushed to panel at ${target}, restart requested`);

@@ -18,8 +18,8 @@ import { discoverDevices, type Discovery, type RootAnchors } from './registry/de
 import { idsToStore, parseStringMap, resolveEntityIds } from './registry/entity-id';
 import { EntityRegistry } from './registry/entity-registry';
 import { listed, manualDevices } from './registry/manual';
-import { applyOverrides, detectedRows, mergeDetected } from './registry/overrides';
-import { synthesise } from './registry/synth/index';
+import { applyOverrides, detectedRows, mergeDetected, unbuiltForces } from './registry/overrides';
+import { lacks, synthesise } from './registry/synth/index';
 import type { DeviceInput, SourceValue, VirtualEntity } from './registry/types';
 import { Dispatcher } from './runtime/dispatcher';
 import { energyMeters, EnergySource, unloggedWarning, type EnergyNames, type TotalNames } from './runtime/energy-source';
@@ -48,6 +48,8 @@ const DISCOVERY_RETRY_FIRST_MS = 5_000;
 const DISCOVERY_RETRY_MAX_MS = 300_000;
 
 const I18N_DIR = path.join(__dirname, '..', 'admin', 'i18n');
+/** What the Connection tab's Test broker sends as typed (Ruling 140): the fields a broker connection is made of. */
+const BROKER_FIELDS = ['brokerHost', 'brokerPort', 'brokerTls', 'brokerUser', 'brokerPassword', 'clientId'] as const;
 
 /** One text of one admin translation file, or undefined. Only a language code names a file, never a path. */
 function i18nText(language: string, key: string): string | undefined {
@@ -473,7 +475,15 @@ class HomeTiles extends utils.Adapter {
     // would give each panel a list of only those (Ruling 118).
     const armed = this.options.pickerArmed;
     this.detected = detected;
-    this.devices = armed ? [...applyOverrides(detected, this.options.deviceOverrides), ...manual.devices] : [];
+    const picked = armed ? applyOverrides(detected, this.options.deviceOverrides) : [];
+    this.devices = armed ? [...picked, ...manual.devices] : [];
+    // A forced type the device cannot serve stays no entity, as Task 13 pinned; the log names each such
+    // override and what the device lacks, by the synths' own test, as the admin's preview does (Ruling 139).
+    const unbuilt = unbuiltForces(detected, picked);
+    if (unbuilt.length > 0) {
+      const named = unbuilt.map(({ objectId, domain, lack }) => `${domain} on ${objectId} (${adminText(`lack_${lack}`, 'en')})`);
+      this.log.warn(`[Registry] Forced types that produced no tile: ${listed(named)}. Choose Auto or another type for them on the Devices tab`);
+    }
     this.rootAnchors = anchors;
     await this.saveJsonMap(ROOT_ANCHOR_STATE, 'Root anchors: the state each root id stays with', anchors);
     // Before the registry, whose membership change pushes the apply with their catalog.
@@ -758,6 +768,10 @@ class HomeTiles extends utils.Adapter {
         if (!detected) return reply({ error: 'device_not_detected' });
         const row = { objectId, include: true, detectedDomain: detected.domain, forcedDomain: text(request.forcedDomain), name: text(request.name) };
         const device = applyOverrides([detected], [row])[0]!;
+        const language = (await this.getForeignObjectAsync('system.config'))?.common?.language ?? 'en';
+        // What the device lacks for the type chosen, by the synths' own test: the rebuild's warning names the same (Ruling 139).
+        const lack = lacks(device);
+        if (lack) return reply({ error: 'no_usable_channel', args: [adminText(`lack_${lack}`, language)] });
 
         // The id picking it gives: a stored one only in the domain chosen (resolveEntityIds).
         const entityId = resolveEntityIds([device], this.persistedIds)[objectId]!;
@@ -768,12 +782,12 @@ class HomeTiles extends utils.Adapter {
             ? { val: state.val, ack: state.ack, q: state.q ?? 0, ts: state.ts }
             : null;
         }
+        // None where lacks names nothing: the synths return null by that same test (Ruling 139).
         const entity = synthesise(device, entityId, values);
-        if (!entity) return reply({ error: 'no_usable_channel' });
+        if (!entity) return reply({ error: 'no_usable_channel', args: [''] });
         const built = buildStatePublish(this.options.haPrefix, entity);
         // What goes on the wire, never the internal degraded flag (Task 14 re-review N1): a note says what it means.
         const publish = built && { topic: built.topic, payload: built.payload, retain: built.retain };
-        const language = (await this.getForeignObjectAsync('system.config'))?.common?.language ?? 'en';
         const note = !built ? adminText('preview_no_state', language) : built.degraded ? adminText('preview_degraded', language) : undefined;
         const shown = {
           entity_id: entity.entityId,
@@ -791,17 +805,47 @@ class HomeTiles extends utils.Adapter {
       }
 
       case 'testBroker': {
-        const probe = new HomeTilesMqttClient(this.options, this.log4);
+        // The Connection tab as typed, unsaved fields included (jsonConfig _testBroker, Ruling 140); a
+        // field a script leaves out is the saved one. Validated as a start validates them: of these
+        // fields, validateOptions refuses only a port.
+        const typed = typeof message.message === 'object' && message.message !== null ? (message.message as Record<string, unknown>) : {};
+        const raw = Object.fromEntries(BROKER_FIELDS.map((key) => [key, key in typed ? typed[key] : this.options[key]]));
+        const { options, errors } = validateOptions(raw as Partial<AdapterOptions>);
+        if (errors.length > 0) return reply({ connected: false, error: 'invalid_port' });
+        const broker = `${options.brokerHost}:${options.brokerPort}`;
+        // What goes wrong is this test's answer, not the adapter's trouble: to the reply, and to debug.
+        const quiet: Logger = {
+          info: (text) => this.log.debug(text),
+          warn: (text) => this.log.debug(text),
+          error: (text) => this.log.debug(text),
+          debug: (text) => this.log.debug(text),
+        };
+        const probe = new HomeTilesMqttClient(options, quiet);
         await probe.connect();
-        const connected = probe.connected;
+        const { connected, lastError } = probe;
         await probe.disconnect();
-        return reply({ connected });
+        // Never a password: the broker, and what it or the network said.
+        this.log.info(`[Admin] Broker test of ${broker}: ${connected ? 'connected' : `no connection, ${lastError ?? 'no answer'}`}`);
+        // Each answer as admin shows it (json-config ConfigSendto): a result text, the native branch
+        // taken so that no raw code follows it, or an error text; never "Ok" alone.
+        if (connected) return reply({ connected, result: 'connected', args: [broker], native: {} });
+        // mqtt.js gives up after the connect timeout, 10 s (mqtt-client.ts), with this error.
+        if (lastError === 'connack timeout') return reply({ connected, error: 'timeout', args: [broker] });
+        return reply({ connected, error: 'failed', args: [broker, lastError ?? ''] });
       }
 
       case 'pairPanel': {
-        const host = String((message.message as { host?: string })?.host ?? '');
+        // The Panels tab's address field (jsonConfig _pairHost, Ruling 140); the credentials the
+        // Connection tab saved, which the adapter itself uses.
+        const request = typeof message.message === 'object' && message.message !== null ? (message.message as { host?: unknown }) : {};
+        const host = typeof request.host === 'string' ? request.host.trim() : '';
         const result = await pushCredentials(host, credentialsFromOptions(this.options), this.log4);
-        return reply(result);
+        // As admin shows it: a result text, or the failure's own text with the address and any HTTP status.
+        return reply(
+          result.ok
+            ? { ...result, result: 'paired', args: [host], native: {} }
+            : { ...result, error: result.reason, args: [host, String(result.status ?? '')] },
+        );
       }
 
       default:

@@ -26,6 +26,8 @@ export class HomeTilesMqttClient {
   private dropped = 0;
   private lastDropWarnMs = 0;
   private stopping = false;
+  /** The broker's or the connection's last error, as mqtt.js words it: the admin's Test broker shows it (Ruling 140). */
+  lastError: string | undefined;
 
   constructor(
     private readonly options: AdapterOptions,
@@ -104,7 +106,10 @@ export class HomeTilesMqttClient {
       this.notifyConnection(false);
     });
 
-    client.on('error', (error) => this.log.error(`[MQTT] ${error.message}`));
+    client.on('error', (error) => {
+      this.lastError = error.message;
+      this.log.error(`[MQTT] ${error.message}`);
+    });
 
     await new Promise<void>((resolve) => {
       if (client.connected) return resolve();

@@ -1,5 +1,6 @@
 import type { DeviceOverride } from '../config/options';
 import { lastSegment, type IoBrokerObject } from './detector';
+import { lacks, type Lack } from './synth/index';
 import type { DeviceInput, Domain } from './types';
 import { DOMAINS } from './types';
 
@@ -45,6 +46,23 @@ export function applyOverrides(devices: DeviceInput[], overrides: DeviceOverride
   }
 
   return result;
+}
+
+/**
+ * The picked devices whose forced type makes no entity (Ruling 139): each
+ * with that type and what the device lacks for it, by the synths' own test
+ * (lacks). They stay no entity, as Task 13 pinned; main.ts names them. A
+ * type the detector found is no force.
+ */
+export function unbuiltForces(
+  detected: readonly DeviceInput[],
+  picked: readonly DeviceInput[],
+): Array<{ objectId: string; domain: Domain; lack: Lack }> {
+  const found = new Map(detected.map((device) => [device.objectId, device.domain]));
+  return picked.flatMap((device) => {
+    const lack = device.domain === found.get(device.objectId) ? undefined : lacks(device);
+    return lack ? [{ objectId: device.objectId, domain: device.domain, lack }] : [];
+  });
 }
 
 /** What detection found of one device: the picker shows it read-only beside the user's choices. */

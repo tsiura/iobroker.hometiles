@@ -7,11 +7,11 @@ import { parseLightCommand, parseMediaCommand, type ServiceCall } from '../../sr
 import { buildStatePublish } from '../../src/protocol/state-payload';
 import { createIoBrokerDetector, discoverDevices, type RootAnchors } from '../../src/registry/detector';
 import { EntityRegistry } from '../../src/registry/entity-registry';
-import { applyOverrides, detectedRows, mergeDetected } from '../../src/registry/overrides';
+import { applyOverrides, detectedRows, mergeDetected, unbuiltForces } from '../../src/registry/overrides';
 import { encodeChannelValue } from '../../src/registry/synth/common';
 import { synthDatetime, valueChannel } from '../../src/registry/synth/editable';
-import { synthesise } from '../../src/registry/synth/index';
-import type { DeviceInput, Domain, SourceValue, VirtualEntity } from '../../src/registry/types';
+import { lacks, synthesise } from '../../src/registry/synth/index';
+import { DOMAINS, type DeviceInput, type Domain, type SourceValue, type VirtualEntity } from '../../src/registry/types';
 import { Dispatcher } from '../../src/runtime/dispatcher';
 import type { PublishRequest } from '../../src/runtime/mqtt-client';
 import { PanelSession } from '../../src/runtime/panel-session';
@@ -2513,5 +2513,79 @@ describe('each type the Devices tab can force, end to end (Task 23)', () => {
     expect(entityIds).to.deep.equal({ [RELAY]: 'media_player.kaffeemaschine' });
     expect(entities).to.deep.equal([]);
     for (const list of ['switches', 'media_players']) expect(panelList(apply, list), list).to.deep.equal([]);
+  });
+});
+
+describe('a forced type that makes no tile, and what the device lacks for it (Ruling 139)', () => {
+  // Every state of the installation holds a value of its own type: whether a
+  // synth makes an entity depends on the channels alone, never on a value.
+  const FILLED: Record<string, SourceValue> = Object.fromEntries(
+    Object.entries(INSTALLATION)
+      .filter(([, obj]) => obj.type === 'state')
+      .map(([id, obj]) => [id, value(obj.common.type === 'boolean' ? true : obj.common.type === 'string' ? 'play' : 21)]),
+  );
+  const force = (detected: DeviceInput, forcedDomain: string): DeviceInput =>
+    applyOverrides([detected], [{ objectId: detected.objectId, include: true, detectedDomain: detected.domain, forcedDomain }])[0]!;
+
+  it('lacks names what is missing exactly where synthesise makes nothing, for every detection forced into every type', () => {
+    const detected = detectDevices(INSTALLATION);
+    expect(detected.length).to.be.greaterThan(25);
+    const disagree: string[] = [];
+    let unbuilt = 0;
+    for (const device of detected) {
+      for (const domain of DOMAINS) {
+        const forced = force(device, domain);
+        for (const values of [{}, FILLED]) {
+          const none = synthesise(forced, `${domain}.x`, values) === null;
+          if (none !== (lacks(forced) !== undefined)) disagree.push(`${domain} on ${device.objectId}`);
+          if (none) unbuilt++;
+        }
+      }
+    }
+    expect(disagree).to.deep.equal([]);
+    // The premise: the installation has devices each of these types cannot be made of.
+    expect(unbuilt).to.be.greaterThan(20);
+  });
+
+  it('names each lack by what the type needs', () => {
+    const relay = detectDevices(SHELLY_SET).find((device) => device.objectId === `${SHELLY}.Relay0`)!;
+    const garden = detectDevices(GARDEN_SET)[0]!;
+    const sonos = detectDevices(SONOS_SET)[0]!;
+    expect([
+      lacks(force(relay, 'media_player')),
+      lacks(force(relay, 'weather')),
+      lacks(force(sonos, 'climate')),
+      lacks(force(sonos, 'number')),
+      lacks(force(garden, 'weather')),
+      lacks(force(relay, 'cover')),
+    ]).to.deep.equal(['player_state', 'weather_reading', 'climate_channels', 'value_channel', undefined, undefined]);
+  });
+
+  it('names each picked device whose forced type makes no tile, and no device whose forced type fits', () => {
+    const all: IoObjects = { ...SHELLY_SET, ...GARDEN_SET, ...FLOW_SET, ...SQUEEZE_SET };
+    const detected = detectDevices(all);
+    const row = (objectId: string, forcedDomain: string): { objectId: string; include: true; detectedDomain: string; forcedDomain: string } => ({
+      objectId,
+      include: true,
+      detectedDomain: 'sensor',
+      forcedDomain,
+    });
+    const picked = applyOverrides(detected, [
+      // Unfit: a relay has no temperature, a thermometer no playback state.
+      row(`${SHELLY}.Relay0`, 'weather'),
+      row(GARDEN, 'media_player'),
+      // Fit: a setpoint as a thermostat, a player as what it is, the plug's own temperature as the weather.
+      row(FLOW, 'climate'),
+      row(SQUEEZE, 'media_player'),
+      row(`${SHELLY}.temperatureF`, 'weather'),
+      // Auto.
+      row(`${SHELLY}.Sys`, ''),
+    ]);
+    expect(picked).to.have.lengthOf(6);
+    expect(unbuiltForces(detected, picked)).to.have.deep.members([
+      { objectId: `${SHELLY}.Relay0`, domain: 'weather', lack: 'weather_reading' },
+      { objectId: GARDEN, domain: 'media_player', lack: 'player_state' },
+    ]);
+    expect(unbuiltForces(detected, picked)).to.have.lengthOf(2);
   });
 });

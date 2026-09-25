@@ -4,7 +4,8 @@ import { tests, type IntegrationTestHarness } from '@iobroker/testing';
 import mqtt, { type MqttClient } from 'mqtt';
 import { execFileSync, spawn, type ChildProcess } from 'node:child_process';
 import { closeSync, lstatSync, mkdirSync, openSync, readFileSync, rmSync, symlinkSync, unlinkSync, writeFileSync } from 'node:fs';
-import { createServer, type Server } from 'node:net';
+import { createServer as createHttpServer, type Server as HttpServer } from 'node:http';
+import { createServer, type AddressInfo, type Server } from 'node:net';
 import os from 'node:os';
 import path from 'node:path';
 import { EnergySource, type EnergyNames } from '../src/runtime/energy-source';
@@ -710,6 +711,8 @@ if (process.env.HOMETILES_INTEGRATION === '1') {
           expect(named(`${BAD_ALIAS}.ACTUAL`), warnings.join('\n')).to.equal(true);
           // Task 13: the device forced into number is an entity, not left out.
           expect(named(FORCED), warnings.join('\n')).to.equal(false);
+          // A number fits a temperature: no forced type here is one that made no tile (Ruling 139).
+          expect(warnings.filter((message) => message.includes('Forced types that produced no tile'))).to.deep.equal([]);
         });
       });
 
@@ -1352,7 +1355,8 @@ if (process.env.HOMETILES_INTEGRATION === '1') {
               [SENSOR, ''],
               [KAFFEE, ''],
             ]);
-            expect(await ask(harness, 'testBroker', {})).to.deep.equal({ connected: true });
+            // Nothing typed sent, as a script might ask: the saved broker, which this suite runs (Ruling 140).
+            expect(await ask(harness, 'testBroker', {})).to.deep.include({ connected: true, result: 'connected', args: [`127.0.0.1:${port}`] });
             // A script's request, the object id alone: the device as detected, under the id picking it would give (Task 23).
             const preview = (await ask(harness, 'previewEntity', { objectId: SENSOR })) as { entity: object; publish: object };
             expect(preview.entity).to.include({ entityId: 'sensor.balkon', state: '21.5' });
@@ -1548,6 +1552,210 @@ if (process.env.HOMETILES_INTEGRATION === '1') {
         });
       });
 
+      suite('a forced type the device cannot serve (Ruling 139)', (getHarness) => {
+        withCleanFixtures(getHarness);
+
+        it('is no tile, as Task 13 pinned, and one warning per start names each such override and what the device lacks; a fit one is not named', async function () {
+          this.timeout(120000);
+          const harness = getHarness();
+          const en = JSON.parse(readFileSync(path.join(__dirname, '../admin/i18n/en.json'), 'utf8')) as Record<string, string>;
+          const logs = await captureLogs(harness);
+          const forced = (objectId: string, detectedDomain: string, forcedDomain: string): object => ({ objectId, include: true, detectedDomain, forcedDomain });
+          await harness.changeAdapterConfig('hometiles', {
+            native: {
+              ...ARMED,
+              deviceOverrides: [
+                // A switch has no temperature, a temperature no playback state.
+                forced(KAFFEE, 'switch', 'weather'),
+                forced(SENSOR, 'sensor', 'media_player'),
+                // A reading with states makes a select.
+                forced(SENDER, 'sensor', 'select'),
+              ],
+            },
+          });
+          await setObjects(harness, { ...SENSOR_OBJECTS, ...KAFFEE_OBJECTS, ...SENDER_OBJECTS });
+          await harness.startAdapterAndWait();
+          await waitFor(harness, () => ready(logs), 'onReady to finish');
+
+          const lines = logs.filter((log) => log.message.includes('Forced types that produced no tile'));
+          expect(lines.map((log) => log.severity)).to.deep.equal(['warn']);
+          const line = lines[0]!.message.slice(lines[0]!.message.indexOf('[Registry]'));
+          // In English whatever the system language, each reason the synth's own (lacks).
+          expect(line)
+            .to.include(`weather on ${KAFFEE} (${en.lack_weather_reading})`)
+            .and.include(`media_player on ${SENSOR} (${en.lack_player_state})`)
+            .and.not.include(SENDER);
+          // Neither is an entity: the select alone reaches the panels.
+          expect(await harness.states.getStateAsync('hometiles.0.info.entities')).to.include({ val: 1 });
+          expect(JSON.parse(String((await harness.states.getStateAsync('hometiles.0.info.publishedIds'))?.val))).to.deep.equal({ [SENDER]: 'select.sender' });
+        });
+      });
+
+      suite("the Connection tab's Test broker and the Panels tab's Pair buttons, with what is typed (Ruling 140)", (getHarness) => {
+        withCleanFixtures(getHarness);
+        /** Typed on the Connection tab and never saved; no log line may hold it. */
+        const TYPED_PASSWORD = 'ge"heim\\ `1` ${data.x}';
+        const SAVED_PASSWORD = 'gespeichert-9f2c41';
+        /** What the broker was asked to let in, in order. */
+        const seen: Array<{ user: string | undefined; password: string | undefined }> = [];
+        /** Each credentials form the panel's setup page received, and the status it answers /mqtt with. */
+        const posted: string[] = [];
+        let panelStatus = 303;
+        let broker: Aedes;
+        let brokerServer: Server;
+        let panelServer: HttpServer;
+        let brokerPort = 0;
+        let panelPort = 0;
+        let closedPort = 0;
+        /** A port that takes the connection and never answers it, as a broker that hangs would. */
+        let silent: Server;
+        let silentPort = 0;
+        let logs: LogRecord[] = [];
+        /** A port the system picks (Ruling 137). */
+        const listen = (server: Server | HttpServer): Promise<number> =>
+          new Promise((resolve) => server.listen(0, '127.0.0.1', () => resolve((server.address() as AddressInfo).port)));
+
+        before(async function () {
+          this.timeout(120000);
+          // A broker that lets one user in.
+          broker = new Aedes({
+            authenticate: (_client, username, password, done) => {
+              seen.push({ user: username, password: password?.toString() });
+              if (username === 'panel' && password?.toString() === TYPED_PASSWORD) return done(null, true);
+              done(Object.assign(new Error('Bad username or password'), { returnCode: 4 as const }), false);
+            },
+          });
+          brokerServer = createServer(broker.handle);
+          brokerPort = await listen(brokerServer);
+          // A port nothing listens on: taken, then let go.
+          const spare = createServer();
+          closedPort = await listen(spare);
+          await new Promise((resolve) => spare.close(resolve));
+          silent = createServer(() => undefined);
+          silentPort = await listen(silent);
+          // A panel's setup page, as pairing.ts posts to it: the form to /mqtt, then /restart.
+          panelServer = createHttpServer((request, response) => {
+            let body = '';
+            request.on('data', (chunk: Buffer) => (body += chunk.toString()));
+            request.on('end', () => {
+              if (request.url === '/mqtt') posted.push(body);
+              response.writeHead(request.url === '/mqtt' ? panelStatus : 200);
+              response.end();
+            });
+          });
+          panelPort = await listen(panelServer);
+
+          const harness = getHarness();
+          logs = await captureLogs(harness);
+          // Saved: a broker that is not there, under other credentials.
+          await harness.changeAdapterConfig('hometiles', {
+            native: { brokerHost: '127.0.0.1', brokerPort: closedPort, brokerUser: 'gespeichert', brokerPassword: SAVED_PASSWORD, ...ARMED },
+          });
+          await harness.startAdapterAndWait();
+          await waitFor(harness, () => ready(logs), 'onReady to finish');
+          await harness.enableSendTo();
+        });
+        after((done) => {
+          panelServer.close();
+          silent.close();
+          broker.close();
+          brokerServer.close(() => done());
+        });
+
+        type Answer = Record<string, unknown> & { args?: string[] };
+        /** A request as the button sends it, and the answer; one at a time. */
+        async function ask(command: string, message: unknown): Promise<Answer> {
+          const harness = getHarness();
+          let answer: Answer | undefined;
+          harness.sendTo('hometiles.0', command, message, (reply: unknown) => {
+            answer = reply as Answer;
+          });
+          return waitFor(harness, () => answer, `the answer to ${command}`);
+        }
+        const typed = (): Record<string, unknown> => ({
+          brokerHost: ' 127.0.0.1 ',
+          brokerPort,
+          brokerTls: false,
+          brokerUser: 'panel',
+          brokerPassword: TYPED_PASSWORD,
+          clientId: 'getippt',
+        });
+
+        it('tests the broker and credentials as typed, not the saved ones, and says it connected', async function () {
+          this.timeout(60000);
+          const answer = await ask('testBroker', typed());
+          // json-config shows a mapped result (schema.result) and, the native branch taken, nothing more.
+          expect(answer).to.deep.equal({ connected: true, result: 'connected', args: [`127.0.0.1:${brokerPort}`], native: {} });
+          expect(seen.at(-1)).to.deep.equal({ user: 'panel', password: TYPED_PASSWORD });
+        });
+
+        it('shows why it could not connect: the refusal, a port nobody listens on, a port that is none', async function () {
+          this.timeout(60000);
+          const refused = await ask('testBroker', { ...typed(), brokerPassword: 'falsch' });
+          expect(refused).to.include({ connected: false, error: 'failed' });
+          expect(refused.args![0]).to.equal(`127.0.0.1:${brokerPort}`);
+          expect(refused.args![1]).to.match(/^Connection refused/);
+          const nobody = await ask('testBroker', { ...typed(), brokerPort: closedPort });
+          expect(nobody).to.include({ connected: false, error: 'failed' });
+          expect(nobody.args).to.have.lengthOf(2);
+          expect(nobody.args![1]).to.include('ECONNREFUSED');
+          // A cleared number field ('') and one out of range: validateOptions refuses both.
+          expect(await ask('testBroker', { ...typed(), brokerPort: '' })).to.deep.equal({ connected: false, error: 'invalid_port' });
+          expect(await ask('testBroker', { ...typed(), brokerPort: 70000 })).to.deep.equal({ connected: false, error: 'invalid_port' });
+        });
+
+        it('says so when the broker takes the connection and never answers it, after the 10 s the client waits', async function () {
+          this.timeout(60000);
+          const started = Date.now();
+          expect(await ask('testBroker', { ...typed(), brokerPort: silentPort })).to.deep.equal({
+            connected: false,
+            error: 'timeout',
+            args: [`127.0.0.1:${silentPort}`],
+          });
+          expect(Date.now() - started).to.be.within(9000, 30000);
+        });
+
+        it('saves nothing it tested, and logs no password, typed or saved', async function () {
+          this.timeout(60000);
+          const instance = (await getHarness().objects.getObjectAsync('system.adapter.hometiles.0')) as { native: Record<string, unknown> };
+          expect(instance.native).to.include({ brokerPort: closedPort, brokerUser: 'gespeichert', brokerPassword: SAVED_PASSWORD });
+          const tested = logs.filter((log) => log.message.includes('[Admin] Broker test'));
+          expect(tested.map((log) => log.severity)).to.deep.equal(['info', 'info', 'info', 'info']);
+          const leaked = logs.filter((log) => [TYPED_PASSWORD, 'falsch', SAVED_PASSWORD].some((secret) => log.message.includes(secret)));
+          expect(leaked.map((log) => log.message)).to.deep.equal([]);
+        });
+
+        it('pairs the panel at the typed address with the saved credentials, and says so', async function () {
+          this.timeout(60000);
+          const host = `127.0.0.1:${panelPort}`;
+          expect(await ask('pairPanel', { host: ` ${host} ` })).to.deep.equal({ ok: true, result: 'paired', args: [host], native: {} });
+          expect(Object.fromEntries(new URLSearchParams(posted.at(-1)))).to.include({
+            mqtt_host: '127.0.0.1',
+            mqtt_port: String(closedPort),
+            mqtt_user: 'gespeichert',
+            mqtt_pass: SAVED_PASSWORD,
+          });
+        });
+
+        it('names why pairing failed: no address, a panel that does not answer, credentials it refused', async function () {
+          this.timeout(60000);
+          expect(await ask('pairPanel', { host: '' })).to.deep.include({ ok: false, error: 'invalid_host' });
+          // The old button's message: none at all.
+          expect(await ask('pairPanel', null)).to.deep.include({ ok: false, error: 'invalid_host' });
+          expect(await ask('pairPanel', { host: `127.0.0.1:${closedPort}` })).to.deep.include({
+            ok: false,
+            error: 'unreachable',
+            args: [`127.0.0.1:${closedPort}`, ''],
+          });
+          panelStatus = 401;
+          expect(await ask('pairPanel', { host: `127.0.0.1:${panelPort}` })).to.deep.include({
+            ok: false,
+            error: 'credentials_rejected',
+            args: [`127.0.0.1:${panelPort}`, '401'],
+          });
+        });
+      });
+
       suite("the preview of a Detected devices row, as its button asks for it (Task 23)", (getHarness) => {
         withCleanFixtures(getHarness);
         /** The adapter's own English texts: what its answers carry, in the system language. */
@@ -1634,7 +1842,8 @@ if (process.env.HOMETILES_INTEGRATION === '1') {
         it('answers with an error, which the button shows in words, for a type the device cannot serve and for a device it did not detect', async function () {
           this.timeout(60000);
           // A temperature reading has no player state (synthMediaPlayer).
-          expect(await preview(row(SENSOR, 'media_player'))).to.deep.equal({ error: 'no_usable_channel' });
+          // What the device lacks, as the synth tests it, the rebuild's warning too (Ruling 139).
+          expect(await preview(row(SENSOR, 'media_player'))).to.deep.equal({ error: 'no_usable_channel', args: [en.lack_player_state] });
           expect(await preview(row('zigbee.0.nirgends'))).to.deep.equal({ error: 'device_not_detected' });
           // The message the old button sent: none at all (Task 21b C5).
           expect(await preview(null)).to.deep.equal({ error: 'device_not_detected' });

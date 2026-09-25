@@ -18,6 +18,10 @@
           "type": "sendTo",
           "label": "test_broker",
           "command": "testBroker",
+          "jsonData": "{\"brokerHost\": ${JSON.stringify(data.brokerHost ?? '')}, \"brokerPort\": ${JSON.stringify(data.brokerPort ?? null)}, \"brokerTls\": ${JSON.stringify(data.brokerTls ?? false)}, \"brokerUser\": ${JSON.stringify(data.brokerUser ?? '')}, \"brokerPassword\": ${JSON.stringify(data.brokerPassword ?? '')}, \"clientId\": ${JSON.stringify(data.clientId ?? '')}}",
+          "result": { "connected": "broker_connected" },
+          "error": { "invalid_port": "broker_invalid_port", "failed": "broker_failed", "timeout": "broker_timeout" },
+          "showProcess": true,
           "newLine": true,
           "variant": "contained",
           "useNative": true,
@@ -193,11 +197,21 @@
       "label": "tab_panels",
       "items": {
         "_pairInfo": { "type": "staticText", "text": "pair_info", "sm": 12, "md": 12, "lg": 12 },
+        "_pairHost": { "type": "text", "label": "pair_host", "help": "pair_host_help", "newLine": true, "sm": 12, "md": 4, "lg": 3 },
         "_pairPanel": {
           "type": "sendTo",
           "label": "pair_panel",
           "command": "pairPanel",
-          "newLine": true,
+          "jsonData": "{\"host\": ${JSON.stringify(data._pairHost ?? '')}}",
+          "result": { "paired": "pair_done" },
+          "error": {
+            "invalid_host": "pair_invalid_host",
+            "unreachable": "pair_unreachable",
+            "credentials_rejected": "pair_credentials_rejected",
+            "restart_unreachable": "pair_restart_unreachable",
+            "restart_failed": "pair_restart_failed"
+          },
+          "showProcess": true,
           "variant": "contained",
           "useNative": true,
           "sm": 12,

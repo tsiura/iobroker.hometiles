@@ -5,7 +5,9 @@ import { PICKER_VERSION, validateOptions, type EnergyMeterRow, type ManualEntity
 import { ENERGY_CATEGORIES } from '../../src/protocol/energy';
 import { MANUAL_DOMAINS } from '../../src/registry/manual';
 import { mergeDetected } from '../../src/registry/overrides';
+import { LACKS } from '../../src/registry/synth/index';
 import { DOMAINS } from '../../src/registry/types';
+import { PAIRING_FAILURES } from '../../src/runtime/pairing';
 
 const config = JSON.parse(readFileSync(path.join(__dirname, '../../admin/jsonConfig.json'), 'utf8'));
 const ioPackage = JSON.parse(readFileSync(path.join(__dirname, '../../io-package.json'), 'utf8'));
@@ -184,11 +186,9 @@ describe('admin/jsonConfig', () => {
       name: '',
     });
     // Each error the adapter answers the preview with has a text of its own (ConfigSendto: schema.error[response.error]).
-    const start = MAIN.indexOf("case 'previewEntity'");
-    const previewCase = MAIN.slice(start, MAIN.indexOf("case '", start + 1));
-    const answered = [...previewCase.matchAll(/error: '([a-z_]+)'/g)].map((match) => match[1]);
-    expect(answered.length, 'the preview answers errors').to.be.greaterThan(1);
-    expect(Object.keys(preview.error!)).to.have.members(answered);
+    const { errors } = answered('previewEntity');
+    expect(errors.length, 'the preview answers errors').to.be.greaterThan(1);
+    expect(Object.keys(preview.error!)).to.have.members(errors);
     // No button anywhere asks for a preview without naming the object: the one below the tables did (Task 21b C5).
     const previews: Array<Record<string, unknown>> = [];
     const walk = (node: unknown): void => {
@@ -412,8 +412,71 @@ describe('admin/jsonConfig', () => {
     // main.ts writes these into the admin form or its replies (adminText, adminTexts), in the system language.
     const read = new Set([...MAIN.matchAll(/adminTexts?\('([a-z_]+)'/g)].map((match) => match[1]!));
     expect([...read]).to.include.members(['not_detected', 'energy_consumption_total', 'preview_degraded', 'preview_no_state']);
+    // And what a device lacks for a type (synth lacks, Ruling 139): the preview's reason, and the log's in English.
+    expect(MAIN).to.include('adminText(`lack_${');
+    for (const lack of LACKS) read.add(`lack_${lack}`);
     for (const key of read) {
       for (const [language, strings] of Object.entries(translations)) expect(strings, `${language}.json is missing "${key}"`).to.have.property(key);
     }
+  });
+
+  /** The codes one case of main.ts's onMessage answers with: `result: '…'` and `error: '…'`. */
+  function answered(command: string): { results: string[]; errors: string[] } {
+    const start = MAIN.indexOf(`case '${command}'`);
+    const body = MAIN.slice(start, MAIN.indexOf("case '", start + 1));
+    const codes = (key: string): string[] => [...new Set([...body.matchAll(new RegExp(`${key}: '([a-z_]+)'`, 'g'))].map((match) => match[1]!))];
+    return { results: codes('result'), errors: codes('error') };
+  }
+
+  it('tests the broker with the Connection tab as typed, unsaved fields included, and shows what came of it (Ruling 140)', () => {
+    const button = config.items.connection.items._testBroker;
+    expect(button).to.include({ type: 'sendTo', command: 'testBroker', useNative: true, showProcess: true });
+    expect(button).to.not.have.property('data');
+    // Evaluated over the form's data (json-config ConfigSendto._onClick), what is typed and not saved yet included.
+    // A password that would break a pattern or a JSON literal, were it spliced in raw:
+    const typed = {
+      brokerHost: ' mqtt.lan ',
+      brokerPort: 8883,
+      brokerTls: true,
+      brokerUser: 'päneel',
+      brokerPassword: 'ge"heim\\ `1` ${data.x} }\n',
+      clientId: 'tab5',
+    };
+    const form = { ...typed, baseTopic: 'hometiles', deviceOverrides: [], _origin: 'http://x', _originIp: 'http://y' };
+    expect(JSON.parse(evaluatePattern(button.jsonData, form))).to.deep.equal(typed);
+    // A port the number field was cleared of ('', json-config ConfigNumber) goes as it is: the adapter says it is none.
+    expect(JSON.parse(evaluatePattern(button.jsonData, { ...form, brokerPort: '' })).brokerPort).to.equal('');
+    // Fields the form does not hold yet are sent empty, never as broken JSON.
+    expect(JSON.parse(evaluatePattern(button.jsonData, {}))).to.deep.equal({
+      brokerHost: '',
+      brokerPort: null,
+      brokerTls: false,
+      brokerUser: '',
+      brokerPassword: '',
+      clientId: '',
+    });
+    // Each answer has a text of its own (ConfigSendto: schema.result[result], schema.error[error]); "Ok" alone is never one.
+    const { results, errors } = answered('testBroker');
+    expect(Object.keys(button.result)).to.have.members(results);
+    expect(Object.keys(button.error)).to.have.members(errors);
+    expect(results).to.deep.equal(['connected']);
+    expect(errors).to.have.members(['invalid_port', 'failed', 'timeout']);
+  });
+
+  it('pairs the panel at the address typed on the Panels tab, a field never saved, and shows what came of it (Ruling 140)', () => {
+    const panels = config.items.panels.items;
+    // An underscore keeps it out of the saved config (json-config JsonConfig.onSave), not out of the form's data.
+    expect(panels._pairHost).to.include({ type: 'text', label: 'pair_host' });
+    expect(Object.keys(panels).indexOf('_pairHost')).to.be.below(Object.keys(panels).indexOf('_pairPanel'));
+    const button = panels._pairPanel;
+    expect(button).to.include({ type: 'sendTo', command: 'pairPanel', useNative: true, showProcess: true });
+    expect(button).to.not.have.property('data');
+    expect(JSON.parse(evaluatePattern(button.jsonData, { brokerHost: 'x', _pairHost: ' 192.168.1.50 ' }))).to.deep.equal({ host: ' 192.168.1.50 ' });
+    expect(JSON.parse(evaluatePattern(button.jsonData, {}))).to.deep.equal({ host: '' });
+    // Each answer has a text: success, and every failure pushCredentials names (pairing.ts).
+    const { results } = answered('pairPanel');
+    expect(results).to.deep.equal(['paired']);
+    expect(Object.keys(button.result)).to.deep.equal(results);
+    expect(Object.keys(button.error)).to.have.members([...PAIRING_FAILURES]);
   });
 });
