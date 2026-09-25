@@ -421,6 +421,7 @@ describe('runtime/energy-source', () => {
         ['energy.bezug', { values: [2, 2], total: 4 }],
         ['energy.balkon', { values: [0.5, null], total: 0.5 }],
       ]);
+      // The Bridge's arithmetic; the Energy tab refuses a device of sign -1 since review N1 (validateOptions).
       const entries = energyEntries([meter({ id: 'energy.bezug' }), meter({ id: 'energy.balkon', category: 'device', sign: -1 })], 'EUR', NAMES, data);
       expect(entries[1]).to.deep.include({ id: 'consumption_untracked', values: [1.5, 2], total: 4.5 });
       expect(energyEntries([meter({ id: 'energy.bezug' })], 'EUR', NAMES, data).map((e) => e.id)).to.deep.equal(['consumption_total', 'energy.bezug']);

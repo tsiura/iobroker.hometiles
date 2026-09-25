@@ -242,6 +242,11 @@ function energyMeters(value: unknown, warnings: string[]): EnergyMeterRow[] {
       warnings.push(`${where} has a sign that is neither 1 (import) nor -1 (export); ignoring it`);
       return;
     }
+    // The Bridge's devices and water devices are always 1 (__init__.py:2628-2641), as consumption_untracked takes them (review N1).
+    if (sign === -1 && (row.category === 'device' || row.category === 'device_water')) {
+      warnings.push(`${where} is a device, which only consumes: its sign must be 1 (import); ignoring it`);
+      return;
+    }
     if (seen.has(stateId)) {
       warnings.push(`${where} is listed more than once; the first entry is used`);
       return;

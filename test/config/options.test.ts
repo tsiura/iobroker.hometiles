@@ -196,7 +196,7 @@ describe('config/options', () => {
           { stateId: ' shelly.0.em.returned ', category: 'grid', sign: -1, price: 0.08 },
           // The admin stores a cleared number as '', a cleared name as ''; a hand edit may write the sign as text.
           { stateId: 'modbus.0.pv.total', category: 'solar', sign: '1', name: '', price: '' },
-          { stateId: 'x.0.free', category: 'device', sign: '-1', price: 0 },
+          { stateId: 'x.0.free', category: 'battery', sign: '-1', price: 0 },
           null,
           'shelly.0.em.total',
           { category: 'grid', sign: 1 },
@@ -217,7 +217,7 @@ describe('config/options', () => {
         { stateId: 'shelly.0.em.total', category: 'grid', sign: 1, name: 'Netzbezug', price: 0.32 },
         { stateId: 'shelly.0.em.returned', category: 'grid', sign: -1, price: 0.08 },
         { stateId: 'modbus.0.pv.total', category: 'solar', sign: 1 },
-        { stateId: 'x.0.free', category: 'device', sign: -1, price: 0 },
+        { stateId: 'x.0.free', category: 'battery', sign: -1, price: 0 },
         { stateId: 'x.0.water', category: 'water', sign: 1 },
         { stateId: 'x.0.gas', category: 'gas', sign: -1 },
         { stateId: 'x.0.pump', category: 'device_water', sign: 1 },
@@ -237,6 +237,29 @@ describe('config/options', () => {
         'energyMeters entry 14 (x.0.water) has a price that is no number of 0 or more; ignoring the price',
         'energyMeters entry 15 (x.0.gas) has a price that is no number of 0 or more; ignoring the price',
         'energyMeters entry 17 (x.0.nan) has a price that is no number of 0 or more; ignoring the price',
+      ]);
+    });
+
+    it("takes a device only as consumption, as the Bridge's devices are: a sign of -1 on device or device_water is refused, saying why (review N1)", () => {
+      const raw = {
+        energyMeters: [
+          { stateId: 'x.0.wash', category: 'device', sign: -1 },
+          { stateId: 'x.0.pump', category: 'device_water', sign: '-1' },
+          { stateId: 'x.0.fridge', category: 'device', sign: 1 },
+          { stateId: 'x.0.garden', category: 'device_water', sign: '1' },
+          // Refused, a row takes no state: a later row of it is used.
+          { stateId: 'x.0.wash', category: 'device', sign: 1 },
+        ],
+      } as unknown as Partial<AdapterOptions>;
+      const { options, warnings } = validateOptions(raw);
+      expect(options.energyMeters).to.deep.equal([
+        { stateId: 'x.0.fridge', category: 'device', sign: 1 },
+        { stateId: 'x.0.garden', category: 'device_water', sign: 1 },
+        { stateId: 'x.0.wash', category: 'device', sign: 1 },
+      ]);
+      expect(warnings).to.deep.equal([
+        'energyMeters entry 1 (x.0.wash) is a device, which only consumes: its sign must be 1 (import); ignoring it',
+        'energyMeters entry 2 (x.0.pump) is a device, which only consumes: its sign must be 1 (import); ignoring it',
       ]);
     });
 
