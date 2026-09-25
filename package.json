@@ -1,6 +1,6 @@
 {
   "name": "iobroker.hometiles",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "Connects HomeTiles ESP32-P4/S3 touch panels to ioBroker over MQTT",
   "author": "Evgenij Cjura",
   "license": "MIT",

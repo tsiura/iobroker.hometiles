@@ -1,8 +1,8 @@
 {
   "common": {
     "name": "hometiles",
-    "version": "0.1.0",
-    "news": { "0.1.0": { "en": "Initial release: sensor, binary sensor, switch, light and scene tiles, panel control, local Hardware I/O and pairing." } },
+    "version": "0.2.0",
+    "news": { "0.2.0": { "en": "First release that can serve a panel: 0.1.0 failed at startup and restarted in a loop on any installation with ordinary detected devices. New tile types: climate, cover, media player, weather, number, select and date/time. History for sensor, binary sensor, number, select and date/time popups and graph tiles, from a history, SQL or InfluxDB instance. Energy tiles from cumulative energy meters (Energy tab). Opt-in device selection: nothing is published until Refresh detected devices and Save on the Devices tab. Manual entities, a Climate modes table and a per-row MQTT payload preview. The broker password is stored encrypted: after upgrading, start the adapter once before opening its settings, so it can migrate the stored password. Camera tiles are not supported. Not yet run on a physical panel." }, "0.1.0": { "en": "Initial release: sensor, binary sensor, switch, light and scene tiles, panel control, local Hardware I/O and pairing." } },
     "title": "HomeTiles",
     "titleLang": { "en": "HomeTiles", "de": "HomeTiles" },
     "desc": { "en": "Connects HomeTiles ESP32 touch panels to ioBroker over MQTT", "de": "Verbindet HomeTiles ESP32 Touch-Panels ueber MQTT mit ioBroker" },
@@ -19,6 +19,7 @@
     "dataSource": "push",
     "adminUI": { "config": "json" },
     "dependencies": [{ "js-controller": ">=5.0.19" }],
+    "globalDependencies": [{ "admin": ">=6.2.3" }],
     "messagebox": true
   },
   "native": {
