@@ -214,8 +214,9 @@ function manualEntities(value: unknown, warnings: string[]): ManualEntity[] {
  * Energy meters as the Energy tab or a hand edit leaves them, the shape only
  * (Task 20b): a row without a state, a category the panel draws or a sign is
  * dropped, the first row of a state is used, and a name or price that is no
- * name or price costs itself, not the row. The admin stores a cleared number
- * as '' (json-config ConfigNumber) and a sign as the number its select holds.
+ * name or price costs itself, not the row. A device's sign of -1 becomes 1
+ * (Task 23). The admin stores a cleared number as '' (json-config
+ * ConfigNumber) and a sign as the number its select holds.
  */
 function energyMeters(value: unknown, warnings: string[]): EnergyMeterRow[] {
   if (value === undefined || value === null) return [];
@@ -237,15 +238,16 @@ function energyMeters(value: unknown, warnings: string[]): EnergyMeterRow[] {
       warnings.push(`${where} has no category of ${ENERGY_CATEGORIES.join(', ')}; ignoring it`);
       return;
     }
-    const sign = row.sign === 1 || row.sign === '1' ? 1 : row.sign === -1 || row.sign === '-1' ? -1 : undefined;
+    let sign: 1 | -1 | undefined = row.sign === 1 || row.sign === '1' ? 1 : row.sign === -1 || row.sign === '-1' ? -1 : undefined;
     if (!sign) {
       warnings.push(`${where} has a sign that is neither 1 (import) nor -1 (export); ignoring it`);
       return;
     }
-    // The Bridge's devices and water devices are always 1 (__init__.py:2628-2641), as consumption_untracked takes them (review N1).
+    // The Bridge's devices and water devices are always 1 (__init__.py:2628-2641), as consumption_untracked takes them
+    // (review N1). A device measured the other way round is still that device's meter, so it is kept (Task 23).
     if (sign === -1 && (row.category === 'device' || row.category === 'device_water')) {
-      warnings.push(`${where} is a device, which only consumes: its sign must be 1 (import); ignoring it`);
-      return;
+      warnings.push(`${where} is a device, which only consumes: its sign must be 1 (import); using 1`);
+      sign = 1;
     }
     if (seen.has(stateId)) {
       warnings.push(`${where} is listed more than once; the first entry is used`);

@@ -1,7 +1,7 @@
 import { expect } from 'chai';
 import sinon from 'sinon';
 import { buildApplyPayload } from '../../src/protocol/apply';
-import { MAX_ENERGY_BYTES, MAX_ENERGY_VALUES, type EnergyCategory, type EnergyEntry, type EnergyPeriod } from '../../src/protocol/energy';
+import { ENERGY_CATEGORIES, MAX_ENERGY_BYTES, MAX_ENERGY_VALUES, type EnergyCategory, type EnergyEntry, type EnergyPeriod } from '../../src/protocol/energy';
 import type { IoBrokerObject } from '../../src/registry/detector';
 import {
   consumption,
@@ -11,6 +11,7 @@ import {
   energyPeriod,
   EnergySource,
   localIso,
+  unloggedWarning,
   type Consumption,
   type EnergyConfig,
   type EnergyMeter,
@@ -145,6 +146,35 @@ describe('runtime/energy-source', () => {
       const rows = Object.keys(objects).map((stateId) => ({ stateId, category: 'device' as EnergyCategory, sign: 1 as const }));
       expect(energyMeters(rows, objects, {}, 'hometiles.0', 'history.0').unlogged).to.deep.equal(['a.0.other', 'a.0.disabled', 'a.0.off']);
       expect(energyMeters(rows, objects, {}, 'hometiles.0', '').unlogged).to.deep.equal([]);
+    });
+
+    it("names apart the unlogged meters the house's consumption is made of: while one is unknown, so are its totals (Task 23, energy round 2 C2)", () => {
+      // One meter per category, each logged or not.
+      const objects: Record<string, IoBrokerObject> = {};
+      const rows = ENERGY_CATEGORIES.flatMap((category) =>
+        [true, false].map((isLogged) => {
+          const stateId = `x.0.${category}_${isLogged ? 'logged' : 'unlogged'}`;
+          objects[stateId] = counter(isLogged ? logged : {});
+          return { stateId, category, sign: 1 as const };
+        }),
+      );
+      const { unlogged, unloggedElectric } = energyMeters(rows, objects, {}, 'hometiles.0', 'history.0');
+      expect(unlogged).to.deep.equal(ENERGY_CATEGORIES.map((category) => `x.0.${category}_unlogged`));
+      // consumptionEntries: grid, solar and battery (the Bridge's __init__.py:2882-2944).
+      expect(unloggedElectric).to.deep.equal(['x.0.grid_unlogged', 'x.0.solar_unlogged', 'x.0.battery_unlogged']);
+      expect(energyMeters(rows, objects, {}, 'hometiles.0', '').unloggedElectric).to.deep.equal([]);
+    });
+
+    it("warns that an unlogged meter's tiles show nothing, and while it is electric the house's totals too (Task 23, energy round 2 C2)", () => {
+      const enable = 'Enable history.0 in the settings of each of these states';
+      expect(unloggedWarning('history.0', ['x.0.gas', 'x.0.pump'], [])).to.equal(
+        `Not logged by history.0, so their energy tiles show no consumption: x.0.gas, x.0.pump. ${enable}`,
+      );
+      expect(unloggedWarning('history.0', ['x.0.gas', 'x.0.pv', 'x.0.grid'], ['x.0.pv', 'x.0.grid'])).to.equal(
+        'Not logged by history.0, so their energy tiles show no consumption: x.0.gas, x.0.pv, x.0.grid. ' +
+          "The house's total and untracked consumption stay blank as well while any grid, solar or battery meter is unknown: x.0.pv, x.0.grid. " +
+          enable,
+      );
     });
   });
 

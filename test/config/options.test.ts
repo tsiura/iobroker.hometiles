@@ -240,26 +240,31 @@ describe('config/options', () => {
       ]);
     });
 
-    it("takes a device only as consumption, as the Bridge's devices are: a sign of -1 on device or device_water is refused, saying why (review N1)", () => {
+    it("takes a device only as consumption, as the Bridge's devices are: a sign of -1 on device or device_water becomes 1, with one warning naming the row (review N1, Task 23)", () => {
       const raw = {
         energyMeters: [
-          { stateId: 'x.0.wash', category: 'device', sign: -1 },
+          { stateId: 'x.0.wash', category: 'device', sign: -1, name: 'Waschmaschine', price: 0.3 },
           { stateId: 'x.0.pump', category: 'device_water', sign: '-1' },
           { stateId: 'x.0.fridge', category: 'device', sign: 1 },
           { stateId: 'x.0.garden', category: 'device_water', sign: '1' },
-          // Refused, a row takes no state: a later row of it is used.
+          // Kept, the first row of a state is the meter: a later row of it is not.
           { stateId: 'x.0.wash', category: 'device', sign: 1 },
+          // Export stays what it says on every other category.
+          { stateId: 'x.0.feed', category: 'grid', sign: -1 },
         ],
       } as unknown as Partial<AdapterOptions>;
       const { options, warnings } = validateOptions(raw);
       expect(options.energyMeters).to.deep.equal([
+        { stateId: 'x.0.wash', category: 'device', sign: 1, name: 'Waschmaschine', price: 0.3 },
+        { stateId: 'x.0.pump', category: 'device_water', sign: 1 },
         { stateId: 'x.0.fridge', category: 'device', sign: 1 },
         { stateId: 'x.0.garden', category: 'device_water', sign: 1 },
-        { stateId: 'x.0.wash', category: 'device', sign: 1 },
+        { stateId: 'x.0.feed', category: 'grid', sign: -1 },
       ]);
       expect(warnings).to.deep.equal([
-        'energyMeters entry 1 (x.0.wash) is a device, which only consumes: its sign must be 1 (import); ignoring it',
-        'energyMeters entry 2 (x.0.pump) is a device, which only consumes: its sign must be 1 (import); ignoring it',
+        'energyMeters entry 1 (x.0.wash) is a device, which only consumes: its sign must be 1 (import); using 1',
+        'energyMeters entry 2 (x.0.pump) is a device, which only consumes: its sign must be 1 (import); using 1',
+        'energyMeters entry 5 (x.0.wash) is listed more than once; the first entry is used',
       ]);
     });
 

@@ -71,12 +71,20 @@ function counter(stateId: string, objects: Readonly<Record<string, IoBrokerObjec
 }
 
 /**
+ * The categories the house's consumption is made of (consumptionEntries, the
+ * Bridge's __init__.py:2882-2944): while one of their meters is unknown, so
+ * are its totals.
+ */
+export const ELECTRIC_CATEGORIES: readonly EnergyCategory[] = ['solar', 'grid', 'battery'];
+
+/**
  * The Energy tab's rows as meters, at each rebuild. A row whose state is
  * missing, no state, the adapter's own, or holds no number is left out with
  * its reason. A meter's id is kept under `energy:<state id>` like a manual
  * entity's under `manual:` (`ids` goes into the stored map); its name is the
  * row's, else the object's as detection reads it; its unit the object's.
- * `unlogged`: meters `instance` does not log, whose tiles would show nothing.
+ * `unlogged`: meters `instance` does not log, whose tiles would show nothing;
+ * `unloggedElectric`: those of them the house's consumption waits for too.
  */
 export function energyMeters(
   rows: readonly EnergyMeterRow[],
@@ -84,7 +92,13 @@ export function energyMeters(
   persisted: Readonly<Record<string, string>>,
   ownNamespace: string,
   instance: string,
-): { meters: EnergyMeter[]; ids: Record<string, string>; rejected: Array<{ stateId: string; reason: string }>; unlogged: string[] } {
+): {
+  meters: EnergyMeter[];
+  ids: Record<string, string>;
+  rejected: Array<{ stateId: string; reason: string }>;
+  unlogged: string[];
+  unloggedElectric: string[];
+} {
   const rejected: Array<{ stateId: string; reason: string }> = [];
   const kept: Array<{ row: EnergyMeterRow; name: string; unit?: string }> = [];
   for (const row of rows) {
@@ -102,8 +116,27 @@ export function energyMeters(
     if (row.price !== undefined) meter.price = row.price;
     return meter;
   });
-  const unlogged = instance ? meters.filter((m) => !isLogged(objects[m.stateId], instance)).map((m) => m.stateId) : [];
-  return { meters, ids, rejected, unlogged };
+  const unlogged = instance ? meters.filter((m) => !isLogged(objects[m.stateId], instance)) : [];
+  return {
+    meters,
+    ids,
+    rejected,
+    unlogged: unlogged.map((m) => m.stateId),
+    unloggedElectric: unlogged.filter((m) => ELECTRIC_CATEGORIES.includes(m.category)).map((m) => m.stateId),
+  };
+}
+
+/**
+ * The warning naming the meters the history instance does not log: their
+ * tiles show no consumption, nor, while an electric one is among them, do
+ * the house's totals, which are known only where every electric meter is
+ * (energy round 2, C2).
+ */
+export function unloggedWarning(instance: string, unlogged: readonly string[], unloggedElectric: readonly string[]): string {
+  const house = unloggedElectric.length
+    ? `The house's total and untracked consumption stay blank as well while any grid, solar or battery meter is unknown: ${listed(unloggedElectric)}. `
+    : '';
+  return `Not logged by ${instance}, so their energy tiles show no consumption: ${listed(unlogged)}. ${house}Enable ${instance} in the settings of each of these states`;
 }
 
 const HOUR = 3_600_000;
@@ -272,7 +305,7 @@ export function energyEntries(
 function consumptionEntries(entries: readonly EnergyEntry[], names: EnergyNames): EnergyEntry[] {
   const own = (categories: readonly string[]): EnergyEntry[] =>
     entries.filter((entry) => !entry.is_total && !entry.is_cost && categories.includes(entry.category));
-  const electric = own(['solar', 'grid', 'battery']);
+  const electric = own(ELECTRIC_CATEGORIES);
   if (electric.length === 0) return [];
   const unit = electric[0]!.unit;
   const complete = (i: number): boolean => electric.every((entry) => (entry.values[i] ?? null) !== null);
