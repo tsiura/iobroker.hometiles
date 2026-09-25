@@ -21,11 +21,12 @@ const DROP_WARN_INTERVAL_MS = 10_000;
 const LOGIN_REFUSALS: ReadonlySet<unknown> = new Set([4, 5, 134, 135]);
 /** How often the hint on a refused login may repeat while the broker goes on refusing it (Ruling 149). */
 export const LOGIN_HINT_INTERVAL_MS = 3_600_000;
+/** How often one error message may repeat at error level; its repeats in between go to debug (Ruling 153). */
+export const ERROR_REPEAT_INTERVAL_MS = 3_600_000;
 /**
  * Ruling 149: a password a settings page saved before 0.2.0 had migrated it is AES-encrypted garbage, which
  * the adapter can refuse only when its decryption holds a control character; otherwise it is used, and all
- * the log would show is the broker's refusal. mqtt.js 5.16 and later then try no more (handlers/connack.js),
- * earlier versions try again every 2 s.
+ * the log would show is the broker's refusal. The client tries again every 2 s (reconnectOnConnackError).
  */
 export const LOGIN_REFUSED_HINT =
   '[MQTT] The broker refused the user name or password. If this began after an upgrade to 0.2.0, a settings ' +
@@ -42,6 +43,10 @@ export class HomeTilesMqttClient {
   private lastDropWarnMs = 0;
   private stopping = false;
   private loginHintAt = -Infinity;
+  /** When each error line was last logged at error level, since the last connection (logError). */
+  private readonly errorLoggedAt = new Map<string, number>();
+  /** The error lines logged at debug since the last connection: repeats of one logged at error level. */
+  private repeatedErrors = 0;
   /** The broker's or the connection's last error, as mqtt.js words it: the admin's Test broker shows it (Ruling 140). */
   lastError: string | undefined;
 
@@ -90,6 +95,10 @@ export class HomeTilesMqttClient {
       reconnectPeriod: 2000,
       connectTimeout: 10_000,
       resubscribe: true,
+      // mqtt.js 5.16 and later retry a refused login only when asked to (handlers/connack.js): without this,
+      // one transient refusal, such as the broker's auth backend restarting, left the adapter offline until
+      // restarted (Ruling 153).
+      reconnectOnConnackError: true,
     });
     this.client = client;
 
@@ -108,7 +117,9 @@ export class HomeTilesMqttClient {
 
     client.on('connect', () => {
       this.isConnected = true;
-      this.log.info('[MQTT] Connected to broker');
+      this.log.info(this.repeatedErrors ? `[MQTT] Connected to broker after ${this.repeatedErrors} repeated errors` : '[MQTT] Connected to broker');
+      this.errorLoggedAt.clear();
+      this.repeatedErrors = 0;
       this.notifyConnection(true);
       this.flush();
     });
@@ -124,7 +135,7 @@ export class HomeTilesMqttClient {
 
     client.on('error', (error) => {
       this.lastError = error.message;
-      this.log.error(`[MQTT] ${error.message}`);
+      this.logError(`[MQTT] ${error.message}`);
       if (LOGIN_REFUSALS.has((error as { code?: unknown }).code)) this.loginRefused();
     });
 
@@ -150,6 +161,22 @@ export class HomeTilesMqttClient {
       this.isConnected = false;
       this.notifyConnection(false);
     }
+  }
+
+  /**
+   * An error at error level, then its repeats at debug for an hour: a broker that is down or goes on
+   * refusing the login fails every retry, every 2 s, some 1,800 lines an hour (Ruling 153). A connection
+   * resets it, so the next outage is logged again.
+   */
+  private logError(line: string): void {
+    const now = Date.now();
+    if (now - (this.errorLoggedAt.get(line) ?? -Infinity) < ERROR_REPEAT_INTERVAL_MS) {
+      this.repeatedErrors++;
+      this.log.debug(line);
+      return;
+    }
+    this.errorLoggedAt.set(line, now);
+    this.log.error(line);
   }
 
   /**

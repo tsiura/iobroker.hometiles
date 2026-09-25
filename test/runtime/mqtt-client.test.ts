@@ -4,7 +4,14 @@ import mqtt from 'mqtt';
 import { createServer, type AddressInfo, type Server } from 'node:net';
 import sinon from 'sinon';
 import { DEFAULTS } from '../../src/config/options';
-import { HomeTilesMqttClient, LOGIN_HINT_INTERVAL_MS, LOGIN_REFUSED_HINT, probeBroker, type Logger } from '../../src/runtime/mqtt-client';
+import {
+  ERROR_REPEAT_INTERVAL_MS,
+  HomeTilesMqttClient,
+  LOGIN_HINT_INTERVAL_MS,
+  LOGIN_REFUSED_HINT,
+  probeBroker,
+  type Logger,
+} from '../../src/runtime/mqtt-client';
 
 function silentLogger(): Logger & { warnings: string[] } {
   const warnings: string[] = [];
@@ -191,17 +198,76 @@ describe('runtime/mqtt-client: a broker that refuses the login (Ruling 149)', ()
     await new Promise<void>((resolve) => broker.close(() => resolve()));
   });
 
-  /** A logger that keeps every error line. */
-  function recording(): Logger & { errors: string[] } {
+  /** A logger that keeps every error, info and debug line. */
+  function recording(): Logger & { errors: string[]; infos: string[]; debugs: string[] } {
     const errors: string[] = [];
-    return { errors, info: () => undefined, debug: () => undefined, warn: () => undefined, error: (message: string) => errors.push(message) };
+    const infos: string[] = [];
+    const debugs: string[] = [];
+    return {
+      errors,
+      infos,
+      debugs,
+      info: (message: string) => infos.push(message),
+      debug: (message: string) => debugs.push(message),
+      warn: () => undefined,
+      error: (message: string) => errors.push(message),
+    };
   }
   const hints = (errors: string[]): number => errors.filter((line) => line === LOGIN_REFUSED_HINT).length;
+  const REFUSED = '[MQTT] Connection refused: Bad username or password';
+
+  it('logs in again after a refused login, which mqtt.js 5.16 and later retry only when asked to (Ruling 153)', async () => {
+    // Refused once, as while the broker's auth backend restarts, then let in.
+    let attempts = 0;
+    broker.authenticate = (_client, _user, _password, done) => {
+      attempts++;
+      if (attempts === 1) done(Object.assign(new Error('Bad username or password'), { returnCode: 4 as const }), false);
+      else done(null, true);
+    };
+    // mqtt.js schedules its retry, every 2 s, with setInterval (client.js _setupReconnect): the fake clock runs it.
+    const clock = sinon.useFakeTimers({ toFake: ['setInterval', 'clearInterval'] });
+    const client = new HomeTilesMqttClient({ ...DEFAULTS, brokerPort: port, brokerUser: 'panel', brokerPassword: 'secret' }, recording());
+    try {
+      await client.connect();
+      expect(client.connected, 'refused at first').to.equal(false);
+      clock.tick(2000);
+      await waitUntil(() => client.connected);
+      expect(attempts).to.equal(2);
+    } finally {
+      await client.disconnect();
+      clock.restore();
+    }
+  });
+
+  it('logs a repeated error at error level once an hour and its repeats at debug, and says so once connected (Ruling 153)', async () => {
+    const log = recording();
+    const clock = sinon.useFakeTimers({ toFake: ['Date'] });
+    const client = new HomeTilesMqttClient({ ...DEFAULTS, brokerPort: port, brokerUser: 'panel', brokerPassword: 'garbage' }, log);
+    const attempt = async (): Promise<void> => {
+      await client.connect();
+      await client.disconnect();
+    };
+    try {
+      for (let i = 0; i < 3; i++) await attempt();
+      expect(log.errors.filter((line) => line === REFUSED), 'three refusals within the hour').to.have.lengthOf(1);
+      expect(log.debugs.filter((line) => line === REFUSED)).to.have.lengthOf(2);
+      clock.setSystemTime(Date.now() + ERROR_REPEAT_INTERVAL_MS);
+      await attempt();
+      expect(log.errors.filter((line) => line === REFUSED), 'an hour on').to.have.lengthOf(2);
+
+      broker.authenticate = (_client, _user, _password, done) => done(null, true);
+      await attempt();
+      expect(log.infos).to.deep.equal(['[MQTT] Connected to broker after 2 repeated errors']);
+    } finally {
+      clock.restore();
+      await client.disconnect();
+    }
+  });
 
   it('names the likely cause at the first refused login, and again at most once an hour', async () => {
     const log = recording();
-    // The fake Date is what the hint's hour is measured by. mqtt.js 5.16 and later try a refused login no
-    // more (handlers/connack.js), earlier versions every 2 s: each attempt here is a connection of its own.
+    // The fake Date is what the hint's hour is measured by. Each attempt here is a connection of its own,
+    // closed before the client's own retry, 2 s later, would come.
     const clock = sinon.useFakeTimers({ toFake: ['Date'] });
     const client = new HomeTilesMqttClient({ ...DEFAULTS, brokerPort: port, brokerUser: 'panel', brokerPassword: 'garbage' }, log);
     const attempt = async (): Promise<void> => {
