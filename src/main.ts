@@ -177,6 +177,9 @@ class HomeTiles extends utils.Adapter {
         this.log.warn(`[Config] The broker password, stored unencrypted by an earlier version, could not be stored encrypted: ${error instanceof Error ? error.message : String(error)}`);
       }
     }
+    // Stopped meanwhile: unload has run, and anything made from here on would outlive it (with
+    // common.compact, the process does too), a client reconnecting for a stopped instance.
+    if (this.unloading) return;
     this.options = options;
 
     await this.setState('info.connection', false, true);
@@ -253,6 +256,7 @@ class HomeTiles extends utils.Adapter {
     this.mqtt.onMessage((topic, payload, retain) => void this.onMqttMessage(topic, payload, retain));
 
     await this.discover();
+    if (this.unloading) return;
     // Bounded like the sources' calls (Ruling 150): the start goes on without it.
     if ((await within(this.subscribeStatesAsync('panels.*'), SOURCE_CALL_MS)) === UNANSWERED) {
       this.log.warn(
@@ -263,6 +267,7 @@ class HomeTiles extends utils.Adapter {
 
     // A broker that is down must not stop the adapter: the client reconnects. With a password that could
     // not be decrypted it connects to none: the broker would only refuse it, every 2 s (Ruling 144).
+    if (this.unloading) return;
     if (!this.passwordUnreadable) await this.mqtt.connect();
     this.log.info(
       this.discovered ? `[HomeTiles] Ready. ${this.tally}` : '[HomeTiles] Ready. Devices are published once a discovery succeeds',
@@ -325,6 +330,8 @@ class HomeTiles extends utils.Adapter {
     try {
       await this.rebuildRegistry();
     } catch (error) {
+      // Stopping: what failed is the stop's doing, and a retry would outlive it.
+      if (this.unloading) return;
       const delay = Math.min(DISCOVERY_RETRY_FIRST_MS * 2 ** attempt, DISCOVERY_RETRY_MAX_MS);
       this.log.error(
         `[Registry] Discovering devices failed: ${error instanceof Error ? error.message : String(error)}. ` +

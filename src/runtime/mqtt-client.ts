@@ -213,6 +213,13 @@ export class HomeTilesMqttClient {
   async unsubscribe(topic: string): Promise<void> {
     const client = this.client;
     if (!client) return;
+    // Offline, mqtt.js answers only at its next failed reconnect, 2-12 s on, and a stop unsubscribes some 23
+    // topics per panel. Asked all the same, it drops the topic from what it subscribes again on reconnecting;
+    // with clean: true the broker dropped the session's subscriptions with the connection: nothing to wait for.
+    if (!this.isConnected) {
+      client.unsubscribe(topic);
+      return;
+    }
     await new Promise<void>((resolve) => client.unsubscribe(topic, () => resolve()));
   }
 

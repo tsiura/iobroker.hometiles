@@ -170,6 +170,23 @@ describe('runtime/mqtt-client', () => {
     await client.disconnect();
   });
 
+  it('lets go of a topic at once while the broker is unreachable, not at the next reconnect (final review I-4)', async () => {
+    const client = new HomeTilesMqttClient({ ...DEFAULTS, brokerPort: port }, silentLogger());
+    try {
+      await client.connect();
+      await client.subscribe('gone/topic');
+      // No new connection is taken, and the broker closes the one there is.
+      server.close();
+      await new Promise<void>((resolve) => broker.close(() => resolve()));
+      await waitUntil(() => !client.connected);
+      const started = Date.now();
+      await client.unsubscribe('gone/topic');
+      expect(Date.now() - started).to.be.below(200);
+    } finally {
+      await client.disconnect();
+    }
+  });
+
   it('is idempotent on repeated disconnect', async () => {
     const client = new HomeTilesMqttClient({ ...DEFAULTS, brokerPort: port }, silentLogger());
     await client.connect();

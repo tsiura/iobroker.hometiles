@@ -693,8 +693,11 @@ function withBrokerAndPanel(): {
   settled: () => Promise<void>;
   /** What the broker retains on these topics, from its own store: what a panel subscribing now is sent. */
   retained: (...topics: string[]) => Promise<Record<string, string>>;
+  /** Every CONNECT the broker has seen, as it arrived: the client id it names and when. */
+  connects: Array<{ clientId: string; at: number }>;
 } {
   const applies: string[] = [];
+  const connects: Array<{ clientId: string; at: number }> = [];
   let broker: Aedes;
   let server: Server;
   let panel: MqttClient;
@@ -704,7 +707,12 @@ function withBrokerAndPanel(): {
   // Created in the hook: a broker's timers would keep a --grep run that
   // skips this suite from ever exiting.
   before(async () => {
-    broker = new Aedes();
+    broker = new Aedes({
+      preConnect: (_client, packet, done) => {
+        connects.push({ clientId: packet.clientId, at: Date.now() });
+        done(null, true);
+      },
+    });
     server = createServer(broker.handle);
     await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', resolve));
     bound = (server.address() as AddressInfo).port;
@@ -723,6 +731,7 @@ function withBrokerAndPanel(): {
   });
   return {
     applies,
+    connects,
     panel: () => panel,
     port: () => bound,
     settled: () =>
@@ -1478,6 +1487,49 @@ if (process.env.HOMETILES_INTEGRATION === '1') {
           // Nor does the log claim one was pushed.
           const pushed = logs.map((log) => log.message).filter((message) => message.includes('Configuration pushed'));
           expect(pushed.filter((message) => !message.includes('Configuration pushed, 1 entities, ')), pushed.join('\n')).to.deep.equal([]);
+        });
+      });
+
+      suite('stopping the adapter before it is ready (final review I-4)', (getHarness) => {
+        withCleanFixtures(getHarness);
+        const { port, settled, connects } = withBrokerAndPanel();
+        // A discovery made slow, so that the stop lands in it, before the adapter connects.
+        const MANY = Object.fromEntries(
+          Array.from({ length: 2000 }, (_, i) => `0_userdata.0.Viele.s${String(i).padStart(4, '0')}`).map((id) => [
+            id,
+            { type: 'state', common: { name: id, role: 'value', type: 'number', read: true, write: false } },
+          ]),
+        );
+        const many = { '0_userdata.0.Viele': { type: 'channel', common: { name: 'Viele' } }, ...MANY };
+        const removeMany = async (): Promise<void> => {
+          for (const id of Object.keys(many)) await getHarness().objects.delObjectAsync(id).catch(() => undefined);
+        };
+        before(async function () {
+          this.timeout(120000);
+          await removeMany();
+        });
+        after(async function () {
+          this.timeout(120000);
+          await removeMany();
+        });
+
+        it('connects to no broker once stopped in its first discovery, and info.connection stays false', async function () {
+          this.timeout(120000);
+          const harness = getHarness();
+          await harness.changeAdapterConfig('hometiles', {
+            native: { brokerHost: '127.0.0.1', brokerPort: port(), ...ARMED, deviceOverrides: picked(SENSOR) },
+          });
+          await setObjects(harness, { ...SENSOR_OBJECTS, ...many });
+          const connection = valuesOf(harness, 'hometiles.0.info.connection');
+          await harness.startAdapterAndWait();
+          const stopping = Date.now();
+          await harness.stopAdapter();
+          // The process has exited: whatever it sent, the broker has seen once the panel's own mark is back.
+          await settled();
+          const late = connects.filter(({ clientId, at }) => clientId.startsWith('iobroker-hometiles') && at >= stopping);
+          expect(late, 'CONNECTs from the adapter after the stop began').to.deep.equal([]);
+          expect(connection, 'the values info.connection took').to.not.include(true);
+          expect((await harness.states.getStateAsync('hometiles.0.info.connection'))?.val).to.equal(false);
         });
       });
 
