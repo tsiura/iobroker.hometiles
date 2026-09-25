@@ -155,13 +155,15 @@ describe('runtime/panel-manager', () => {
     expect(warnings.some((w) => w.includes('Rejected announcement'))).to.equal(true);
   });
 
-  it('treats an empty retained announcement as the panel withdrawing itself', async () => {
-    const { manager, unsubscribed } = harness();
+  it('treats an empty retained announcement as the panel withdrawing itself, and lets go of every topic its session took', async () => {
+    const { manager, subscribed, unsubscribed } = harness();
     await manager.handleAnnouncement('a1', announcement('a1', 'panel-a'));
     unsubscribed.length = 0;
     await manager.handleAnnouncement('a1', '');
     expect(manager.get('a1')).to.equal(undefined);
-    expect(unsubscribed.length).to.be.greaterThan(0);
+    // The config-plane requests too, which live under the device id, not the base topic (review m2, Ruling 138).
+    expect(unsubscribed).to.include.members(['tab5_lvgl/config/a1/history/request', 'tab5_lvgl/config/a1/energy/request']);
+    expect([...unsubscribed].sort()).to.deep.equal([...subscribed].sort());
   });
 
   it('calls onPanelRemoved with the device id after a panel withdraws', async () => {
@@ -253,13 +255,14 @@ describe('runtime/panel-manager', () => {
     expect(warnings).to.deep.equal([]);
   });
 
-  it('releases subscriptions for every panel on stopAll', async () => {
-    const { manager, unsubscribed } = harness();
+  it('releases every subscription of every panel on stopAll, the request topics among them (review m2)', async () => {
+    const { manager, subscribed, unsubscribed } = harness();
     await manager.handleAnnouncement('a1', announcement('a1', 'panel-a'));
     await manager.handleAnnouncement('a2', announcement('a2', 'panel-b'));
     unsubscribed.length = 0;
     await manager.stopAll();
     expect(manager.sessions()).to.have.length(0);
-    expect(unsubscribed.length).to.be.greaterThan(0);
+    expect(unsubscribed).to.include.members(['tab5_lvgl/config/a2/history/request', 'tab5_lvgl/config/a2/energy/request']);
+    expect([...unsubscribed].sort()).to.deep.equal([...subscribed].sort());
   });
 });

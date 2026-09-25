@@ -1,4 +1,5 @@
 import { expect } from 'chai';
+import sinon from 'sinon';
 import { parseMediaCommand } from '../../src/protocol/commands';
 import { mapControlToDevice, type DetectedControl } from '../../src/registry/detector';
 import { EntityRegistry } from '../../src/registry/entity-registry';
@@ -316,18 +317,26 @@ describe('registry/entity-registry', () => {
       // The default window is 200 ms (config/options.ts), up to 5000 ms. A
       // command arriving inside it used to read the entity from BEFORE the
       // value, and wrote 3 with ok:true.
-      const { registry, changed } = harness(200);
-      const entityId = registry.rebuild([AC], {}).entityIds['ac.0']!;
-      registry.applyStateChange('ac.0.mode', value(3));
-      registry.flush();
-      changed.length = 0;
+      // The window's timer on a clock the test holds: no sleep past it to see nothing land (Task 24).
+      const clock = sinon.useFakeTimers({ now: NOW, toFake: ['setTimeout', 'clearTimeout'] });
+      try {
+        const { registry, changed } = harness(200);
+        const entityId = registry.rebuild([AC], {}).entityIds['ac.0']!;
+        registry.applyStateChange('ac.0.mode', value(3));
+        registry.flush();
+        changed.length = 0;
 
-      registry.applyStateChange('ac.0.mode', value(5, NOW + 1000));
-      expect(await reselectFive(registry, entityId)).to.deep.equal([['ac.0.mode', 5]]);
+        registry.applyStateChange('ac.0.mode', value(5, NOW + 1000));
+        expect(clock.countTimers(), 'the window is open').to.equal(1);
+        expect(await reselectFive(registry, entityId)).to.deep.equal([['ac.0.mode', 5]]);
 
-      // The window's own timer was consumed: nothing lands late or twice.
-      await new Promise((resolve) => setTimeout(resolve, 300));
-      expect(changed).to.have.length(0);
+        // The window's own timer was consumed: nothing lands late or twice.
+        expect(clock.countTimers(), 'the window still open').to.equal(0);
+        clock.runAll();
+        expect(changed).to.have.length(0);
+      } finally {
+        clock.restore();
+      }
     });
   });
 

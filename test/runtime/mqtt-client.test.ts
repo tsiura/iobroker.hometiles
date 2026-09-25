@@ -2,6 +2,7 @@ import Aedes from 'aedes';
 import { expect } from 'chai';
 import mqtt from 'mqtt';
 import { createServer, type AddressInfo, type Server } from 'node:net';
+import sinon from 'sinon';
 import { DEFAULTS } from '../../src/config/options';
 import { HomeTilesMqttClient, probeBroker, type Logger } from '../../src/runtime/mqtt-client';
 
@@ -16,10 +17,6 @@ function silentLogger(): Logger & { warnings: string[] } {
       warnings.push(message);
     },
   };
-}
-
-async function listen(server: Server, port: number): Promise<void> {
-  await new Promise<void>((resolve) => server.listen(port, '127.0.0.1', resolve));
 }
 
 /**
@@ -38,14 +35,16 @@ async function waitUntil(predicate: () => boolean, timeoutMs = 3000): Promise<vo
 }
 
 describe('runtime/mqtt-client', () => {
-  const PORT = 18831;
+  /** One the system hands out (Ruling 137): two runs at once never meet on it. */
+  let port = 0;
   let broker: Aedes;
   let server: Server;
 
   beforeEach(async () => {
     broker = new Aedes();
     server = createServer(broker.handle);
-    await listen(server, PORT);
+    await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', resolve));
+    port = (server.address() as AddressInfo).port;
   });
 
   afterEach(async () => {
@@ -54,7 +53,7 @@ describe('runtime/mqtt-client', () => {
   });
 
   it('connects, subscribes and delivers a message to the handler', async () => {
-    const client = new HomeTilesMqttClient({ ...DEFAULTS, brokerPort: PORT }, silentLogger());
+    const client = new HomeTilesMqttClient({ ...DEFAULTS, brokerPort: port }, silentLogger());
     const received: Array<[string, string]> = [];
     client.onMessage((topic, payload) => received.push([topic, payload]));
 
@@ -73,8 +72,8 @@ describe('runtime/mqtt-client', () => {
     // A retained cmnd/value would run again at every subscription; the value
     // command ignores it, as the Bridge does (__init__.py:1550). MQTT 3.1.1
     // marks retained only what a new subscription replays (§3.3.1.3).
-    const other = await mqtt.connectAsync(`mqtt://127.0.0.1:${PORT}`);
-    const client = new HomeTilesMqttClient({ ...DEFAULTS, brokerPort: PORT }, silentLogger());
+    const other = await mqtt.connectAsync(`mqtt://127.0.0.1:${port}`);
+    const client = new HomeTilesMqttClient({ ...DEFAULTS, brokerPort: port }, silentLogger());
     // Closed however the test ends: an open connection keeps the broker from closing.
     try {
       await other.publishAsync('kept/topic', 'stale', { retain: true });
@@ -98,7 +97,7 @@ describe('runtime/mqtt-client', () => {
   });
 
   it('reports connection changes', async () => {
-    const client = new HomeTilesMqttClient({ ...DEFAULTS, brokerPort: PORT }, silentLogger());
+    const client = new HomeTilesMqttClient({ ...DEFAULTS, brokerPort: port }, silentLogger());
     const changes: boolean[] = [];
     client.onConnectionChange((connected) => changes.push(connected));
 
@@ -110,7 +109,7 @@ describe('runtime/mqtt-client', () => {
   });
 
   it('queues publishes made before the connection is up and flushes them afterwards', async () => {
-    const client = new HomeTilesMqttClient({ ...DEFAULTS, brokerPort: PORT }, silentLogger());
+    const client = new HomeTilesMqttClient({ ...DEFAULTS, brokerPort: port }, silentLogger());
     const received: string[] = [];
     client.onMessage((_topic, payload) => received.push(payload));
 
@@ -127,7 +126,7 @@ describe('runtime/mqtt-client', () => {
 
   it('drops the oldest entry when the queue overflows and counts the drop', async () => {
     const logger = silentLogger();
-    const client = new HomeTilesMqttClient({ ...DEFAULTS, brokerPort: PORT, maxPublishQueue: 100 }, logger);
+    const client = new HomeTilesMqttClient({ ...DEFAULTS, brokerPort: port, maxPublishQueue: 100 }, logger);
     // Never connected, so nothing drains: every publish stays queued.
     for (let i = 0; i < 150; i++) {
       client.publish({ topic: 't', payload: String(i), retain: false });
@@ -143,7 +142,7 @@ describe('runtime/mqtt-client', () => {
     // library and kills the adapter. The protocol parsers these handlers feed
     // throw by design on malformed input arriving from the network.
     const logger = silentLogger();
-    const client = new HomeTilesMqttClient({ ...DEFAULTS, brokerPort: PORT }, logger);
+    const client = new HomeTilesMqttClient({ ...DEFAULTS, brokerPort: port }, logger);
     const seen: string[] = [];
     client.onMessage((_topic, payload) => {
       seen.push(payload);
@@ -165,7 +164,7 @@ describe('runtime/mqtt-client', () => {
   });
 
   it('is idempotent on repeated disconnect', async () => {
-    const client = new HomeTilesMqttClient({ ...DEFAULTS, brokerPort: PORT }, silentLogger());
+    const client = new HomeTilesMqttClient({ ...DEFAULTS, brokerPort: port }, silentLogger());
     await client.connect();
     await client.disconnect();
     await client.disconnect();
@@ -217,14 +216,19 @@ describe("runtime/mqtt-client probeBroker: the admin's Test broker (Rulings 140,
         socket.on('data', () => socket.end());
       }),
     );
-    const started = Date.now();
-    expect(await probeBroker({ ...DEFAULTS, brokerPort: port }, silentLogger(), 300)).to.deep.equal({ connected: false, error: undefined, timedOut: true });
-    expect(Date.now() - started).to.be.below(2000);
-    const tried = accepted;
-    expect(tried).to.be.greaterThan(0);
-    // mqtt.js tries again every 2 s (reconnectPeriod); a closed client does not.
-    await new Promise((resolve) => setTimeout(resolve, 2500));
-    expect(accepted).to.equal(tried);
+    // mqtt.js schedules its retry, every 2 s, with setInterval (client.js _setupReconnect) and a closed
+    // client clears it: the fake clock holds each one, so what is left once the probe answers is a retry
+    // that would still run. No sleep through a retry period to see none come (Task 24).
+    const clock = sinon.useFakeTimers({ toFake: ['setInterval', 'clearInterval'] });
+    try {
+      const started = Date.now();
+      expect(await probeBroker({ ...DEFAULTS, brokerPort: port }, silentLogger(), 300)).to.deep.equal({ connected: false, error: undefined, timedOut: true });
+      expect(Date.now() - started).to.be.below(2000);
+      expect(accepted).to.be.greaterThan(0);
+      expect(clock.countTimers(), 'a retry still scheduled').to.equal(0);
+    } finally {
+      clock.restore();
+    }
   });
 
   it('gives up at its deadline on a broker that takes the connection and never answers, and closes that connection', async () => {

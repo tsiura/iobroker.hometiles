@@ -1,7 +1,7 @@
 import Aedes from 'aedes';
 import { expect } from 'chai';
 import mqtt, { type MqttClient } from 'mqtt';
-import { createServer, type Server } from 'node:net';
+import { createServer, type AddressInfo, type Server } from 'node:net';
 import { DEFAULTS } from '../../src/config/options';
 import { CONTROL_SESSION, controlRevision } from '../../src/protocol/editable';
 import type { IoBrokerObject } from '../../src/registry/detector';
@@ -13,7 +13,6 @@ import { HomeTilesMqttClient } from '../../src/runtime/mqtt-client';
 import { PanelManager } from '../../src/runtime/panel-manager';
 import { ANNOUNCE_TOPIC_PATTERN, deviceIdFromAnnounceTopic } from '../../src/protocol/topics';
 
-const PORT = 18841;
 const silentLog = { info: () => undefined, warn: () => undefined, error: () => undefined, debug: () => undefined };
 
 const PLUG: DeviceInput = {
@@ -95,6 +94,8 @@ describe('integration round trip', function () {
   // ReturnType<typeof Aedes> does not compile (TS2344). The class IS the type.
   let broker: Aedes;
   let server: Server;
+  /** One the system hands out (Ruling 137): two runs at once never meet on it. */
+  let port = 0;
   let adapterMqtt: HomeTilesMqttClient;
   let panelMqtt: MqttClient;
   // Tracked out here so afterEach can close it even when a test throws. Closing
@@ -112,11 +113,12 @@ describe('integration round trip', function () {
   beforeEach(async () => {
     broker = new Aedes();
     server = createServer(broker.handle);
-    await new Promise<void>((resolve) => server.listen(PORT, '127.0.0.1', resolve));
+    await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', resolve));
+    port = (server.address() as AddressInfo).port;
 
     writes = [];
     received = [];
-    adapterMqtt = new HomeTilesMqttClient({ ...DEFAULTS, brokerPort: PORT, coalesceMs: 0 }, silentLog);
+    adapterMqtt = new HomeTilesMqttClient({ ...DEFAULTS, brokerPort: port, coalesceMs: 0 }, silentLog);
 
     registry = new EntityRegistry(
       {
@@ -171,7 +173,7 @@ describe('integration round trip', function () {
     registry.applyStateChange('hue.0.decke.level', { val: 60, ack: true, q: 0, ts: Date.now() });
 
     panelInbox.clear();
-    panelMqtt = mqtt.connect(`mqtt://127.0.0.1:${PORT}`, { clientId: 'fake-panel' });
+    panelMqtt = mqtt.connect(`mqtt://127.0.0.1:${port}`, { clientId: 'fake-panel' });
     await new Promise<void>((resolve) => panelMqtt.once('connect', () => resolve()));
     panelMqtt.on('message', (topic, payload) => panelInbox.set(topic, payload.toString('utf8')));
     await new Promise<void>((resolve) => {
@@ -238,7 +240,7 @@ describe('integration round trip', function () {
     panelMqtt.publish('tab5_lvgl/config/e2e1/bridge', ANNOUNCE, { retain: true });
     await waitFor(() => panelInbox.get('ha/e2e/switch/kaffee/state'));
 
-    const late = mqtt.connect(`mqtt://127.0.0.1:${PORT}`, { clientId: 'late-panel' });
+    const late = mqtt.connect(`mqtt://127.0.0.1:${port}`, { clientId: 'late-panel' });
     lateMqtt = late;
     await new Promise<void>((resolve) => late.once('connect', () => resolve()));
     const lateInbox = new Map<string, string>();
@@ -408,7 +410,7 @@ describe('integration round trip', function () {
       },
       log,
     );
-    adapterMqtt = new HomeTilesMqttClient({ ...DEFAULTS, brokerPort: PORT, coalesceMs: 0 }, log);
+    adapterMqtt = new HomeTilesMqttClient({ ...DEFAULTS, brokerPort: port, coalesceMs: 0 }, log);
     manager = new PanelManager({
       transport: {
         publish: (request) => adapterMqtt.publish(request),

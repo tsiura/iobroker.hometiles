@@ -1,5 +1,6 @@
 import { expect } from 'chai';
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from 'node:http';
+import type { AddressInfo } from 'node:net';
 import { credentialsFromOptions, pushCredentials } from '../../src/runtime/pairing';
 import { DEFAULTS } from '../../src/config/options';
 
@@ -26,12 +27,8 @@ interface Captured {
  */
 const started: Server[] = [];
 
-function startPanel(handler: (path: string) => number): {
-  server: Server;
-  port: number;
-  captured: Captured[];
-  ready: Promise<void>;
-} {
+/** A panel's setup page on a port the system hands out (Ruling 137), listening once this resolves. */
+async function startPanel(handler: (path: string) => number): Promise<{ server: Server; port: number; captured: Captured[] }> {
   const captured: Captured[] = [];
   const server = createServer((request: IncomingMessage, response: ServerResponse) => {
     const chunks: Buffer[] = [];
@@ -46,10 +43,9 @@ function startPanel(handler: (path: string) => number): {
       response.end();
     });
   });
-  const port = 18900 + Math.floor(Math.random() * 500);
-  const ready = new Promise<void>((resolve) => server.listen(port, '127.0.0.1', resolve));
   started.push(server);
-  return { server, port, captured, ready };
+  await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', resolve));
+  return { server, port: (server.address() as AddressInfo).port, captured };
 }
 
 describe('runtime/pairing', () => {
@@ -58,8 +54,7 @@ describe('runtime/pairing', () => {
   });
 
   it('posts the credentials form and then the restart', async () => {
-    const panel = startPanel(() => 200);
-    await panel.ready;
+    const panel = await startPanel(() => 200);
 
     const result = await pushCredentials(`127.0.0.1:${panel.port}`, CREDS, silentLog);
     expect(result).to.deep.equal({ ok: true });
@@ -77,14 +72,12 @@ describe('runtime/pairing', () => {
   });
 
   it('accepts a 303 redirect status without following it', async () => {
-    const panel = startPanel(() => 303);
-    await panel.ready;
+    const panel = await startPanel(() => 303);
     expect(await pushCredentials(`127.0.0.1:${panel.port}`, CREDS, silentLog)).to.deep.equal({ ok: true });
   });
 
   it('fails without attempting the restart when the credentials post is rejected', async () => {
-    const panel = startPanel(() => 401);
-    await panel.ready;
+    const panel = await startPanel(() => 401);
     const result = await pushCredentials(`127.0.0.1:${panel.port}`, CREDS, silentLog);
     // The status apart from the reason, so the admin can name it in a text of its own (Ruling 140).
     expect(result).to.deep.equal({ ok: false, reason: 'credentials_rejected', status: 401 });
@@ -92,21 +85,22 @@ describe('runtime/pairing', () => {
   });
 
   it('reports a failed restart distinctly, because the credentials did land', async () => {
-    const panel = startPanel((path) => (path === '/restart' ? 500 : 200));
-    await panel.ready;
+    const panel = await startPanel((path) => (path === '/restart' ? 500 : 200));
     const result = await pushCredentials(`127.0.0.1:${panel.port}`, CREDS, silentLog);
     expect(result).to.deep.equal({ ok: false, reason: 'restart_failed', status: 500 });
   });
 
   it('reports an unreachable panel rather than throwing', async () => {
-    const result = await pushCredentials('127.0.0.1:9', CREDS, silentLog);
+    // A port taken, then let go: nothing listens there.
+    const { server, port } = await startPanel(() => 200);
+    await new Promise<void>((resolve) => server.close(() => resolve()));
+    const result = await pushCredentials(`127.0.0.1:${port}`, CREDS, silentLog);
     expect(result.ok).to.equal(false);
     expect((result as { reason: string }).reason).to.equal('unreachable');
   });
 
   it('strips a scheme and a trailing slash from the supplied host', async () => {
-    const panel = startPanel(() => 200);
-    await panel.ready;
+    const panel = await startPanel(() => 200);
     expect(await pushCredentials(`http://127.0.0.1:${panel.port}/`, CREDS, silentLog)).to.deep.equal({ ok: true });
   });
 
