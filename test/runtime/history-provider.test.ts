@@ -864,6 +864,12 @@ describe('runtime/history-provider', () => {
     it('asks nothing once the deadline it is given has passed, and keeps nothing (Ruling 133)', async () => {
       const fake = sqlFake(COUNTER);
       const provider = provide(fake);
+      // No read starts: not even the adapter's own reads.
+      let reads = 0;
+      const state = fake.getForeignStateAsync.bind(fake);
+      const object = fake.getForeignObjectAsync.bind(fake);
+      fake.getForeignStateAsync = (id) => (reads++, state(id));
+      fake.getForeignObjectAsync = (id) => (reads++, object(id));
       expect(await provider.readingsBefore(METER, [TODAY, HOURS[0]!], 'panel-a', NOW - 1)).to.deep.equal({
         readings: [null, null],
         available: false,
@@ -872,7 +878,110 @@ describe('runtime/history-provider', () => {
       // The hours alone: their window is not asked either.
       expect((await provider.readingsBefore(METER, HOURS, 'panel-a', NOW + 100)).reason).to.equal('timeout');
       expect(fake.calls).to.deep.equal([]);
+      expect(reads).to.equal(0);
       expect((await before(provider, [TODAY])).readings).to.deep.equal([expected(COUNTER, TODAY)]);
+      // What it keeps it gives, however late (review trap 11).
+      expect(await provider.readingsBefore(METER, [TODAY, HOURS[0]!], 'panel-a', NOW - 1)).to.deep.equal({
+        readings: [expected(COUNTER, TODAY), null],
+        available: false,
+        reason: 'timeout',
+      });
+    });
+
+    describe('one budget per energy answer (Ruling 133)', () => {
+      it('waits for a slot no longer than its deadline, then leaves the queue: what queued behind it is not held up', async () => {
+        const fake = gated();
+        const provider = provide(fake);
+        const held = [1, 2].map((n) => ask(provider, 'numeric', START, 'panel-a', `${ID}${n}`));
+        let late: Readings | undefined;
+        void provider.readingsBefore(METER, [TODAY], 'panel-a', NOW + 3_000).then((result) => (late = result));
+        const behind = ask(provider, 'numeric', START, 'panel-a', `${ID}3`);
+        await clock.tickAsync(3_000);
+        expect(late).to.deep.equal({ readings: [null], available: false, reason: 'timeout' });
+        fake.release(`${ID}1`);
+        await settle();
+        // The next slot goes to the query behind it, and nothing is asked for the meter.
+        expect(fake.calls.map((call) => call.id)).to.deep.equal([`${ID}1`, `${ID}2`, `${ID}3`]);
+        fake.release(`${ID}2`);
+        fake.release(`${ID}3`);
+        for (const result of [...held, behind]) expect((await result).available).to.equal(true);
+        await settle();
+        expect(fake.calls.filter((call) => call.id === METER)).to.deep.equal([]);
+        expect(clock.countTimers()).to.equal(0);
+      });
+
+      it('settles a read waiting for a slot with a deadline as closed on close(), leaving no timer', async () => {
+        const fake = gated();
+        const provider = provide(fake);
+        const held = [1, 2].map((n) => ask(provider, 'numeric', START, 'panel-a', `${ID}${n}`));
+        const waiting = provider.readingsBefore(METER, [TODAY], 'panel-a', NOW + HISTORY_BUDGET_MS);
+        await settle();
+        provider.close();
+        expect(await waiting).to.deep.equal({ readings: [null], available: false, reason: 'closed' });
+        await Promise.all(held);
+        expect(clock.countTimers()).to.equal(0);
+      });
+
+      it('shares a read in flight per state and boundaries: another panel asking meanwhile joins it, up to its own deadline (review trap 10)', async () => {
+        const fake = sqlFake(COUNTER);
+        const provider = provide(fake);
+        // The midnight's question answers after 3 s.
+        fake.replyNext(() => new Promise((resolve) => setTimeout(() => resolve({ result: sqlAdapter(COUNTER, fake.calls[0]!.options) }), 3_000)));
+        const first = provider.readingsBefore(METER, [TODAY], 'panel-a', NOW + HISTORY_BUDGET_MS);
+        await settle();
+        const joined = provider.readingsBefore(METER, [TODAY], 'panel-b', NOW + HISTORY_BUDGET_MS);
+        const leaving = provider.readingsBefore(METER, [TODAY], 'panel-c', NOW + 2_000);
+        await clock.tickAsync(2_000);
+        expect(await leaving).to.deep.equal({ readings: [null], available: false, reason: 'timeout' });
+        await clock.tickAsync(1_000);
+        const reading = { readings: [expected(COUNTER, TODAY)], available: true };
+        expect(await first).to.deep.equal(reading);
+        expect(await joined).to.deep.equal(reading);
+        expect(fake.calls).to.have.length(1);
+        // Kept once read, for the panel that left too.
+        expect(await provider.readingsBefore(METER, [TODAY], 'panel-c')).to.deep.equal(reading);
+        expect(fake.calls).to.have.length(1);
+        expect(clock.countTimers()).to.equal(0);
+      });
+
+      it("joins a read that runs at once, though its own panel's slots are taken (M-5)", async () => {
+        const fake = sqlFake(COUNTER);
+        const provider = provide(fake);
+        const answer = fake.getHistoryAsync.bind(fake);
+        // panel-b's two slots: popup histories of a hung instance.
+        fake.getHistoryAsync = (id, options) => (id.startsWith(ID) ? new Promise<{ result?: unknown }>(() => undefined) : answer(id, options));
+        const popups = [1, 2].map((n) => ask(provider, 'numeric', START, 'panel-b', `${ID}${n}`));
+        fake.replyNext(() => new Promise((resolve) => setTimeout(() => resolve({ result: sqlAdapter(COUNTER, fake.lastCall.options) }), 3_000)));
+        const first = provider.readingsBefore(METER, [TODAY], 'panel-a', NOW + HISTORY_BUDGET_MS);
+        await settle();
+        const joined = provider.readingsBefore(METER, [TODAY], 'panel-b', NOW + HISTORY_BUDGET_MS);
+        await clock.tickAsync(3_000);
+        const reading = { readings: [expected(COUNTER, TODAY)], available: true };
+        expect(await first).to.deep.equal(reading);
+        expect(await joined).to.deep.equal(reading);
+        provider.close();
+        await Promise.all(popups);
+      });
+
+      it('joins a twin that started while it waited for its slot, asking nothing twice (M-5)', async () => {
+        const fake = gated();
+        const provider = provide(fake);
+        const held = [1, 2].map((n) => ask(provider, 'numeric', START, 'panel-b', `${ID}${n}`));
+        const queued = provider.readingsBefore(METER, [TODAY], 'panel-b', NOW + HISTORY_BUDGET_MS);
+        await settle();
+        const first = provider.readingsBefore(METER, [TODAY], 'panel-a', NOW + HISTORY_BUDGET_MS);
+        await settle();
+        expect(fake.calls.map((call) => call.id)).to.deep.equal([`${ID}1`, `${ID}2`, METER]);
+        // panel-b's slot frees while panel-a's read runs: its read joins that one.
+        fake.release(`${ID}1`);
+        await settle();
+        expect(fake.calls.map((call) => call.id)).to.deep.equal([`${ID}1`, `${ID}2`, METER]);
+        fake.release(METER);
+        expect(await queued).to.deep.equal(await first);
+        expect((await first).available).to.equal(true);
+        fake.release(`${ID}2`);
+        await Promise.all(held);
+      });
     });
 
     describe('the cache: a boundary a minute old never changes', () => {

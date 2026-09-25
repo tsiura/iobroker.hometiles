@@ -17,7 +17,7 @@ import {
   type EnergyNames,
   type TotalNames,
 } from '../../src/runtime/energy-source';
-import { HistoryProvider, type Readings } from '../../src/runtime/history-provider';
+import { HISTORY_BUDGET_MS, HistoryProvider, PANEL_QUERIES, type Readings } from '../../src/runtime/history-provider';
 import { panelEnergy, panelTotalText } from '../protocol/panel-energy';
 import { panelEnergyCatalog } from '../protocol/panel-scan';
 import { historyFake, logger, sqlFake, type Stored } from './history-ports';
@@ -606,6 +606,63 @@ describe('runtime/energy-source', () => {
       expect(log.lines[0]).to.match(/^warn: \[Energy\] /).and.include(String(MAX_ENERGY_BYTES)).and.include('Energy tab');
     });
 
+    it(`reads the meters ${PANEL_QUERIES} at a time, the panel's slots, each within the one budget of the answer (Ruling 133)`, async () => {
+      let running = 0;
+      let most = 0;
+      const deadlines: Array<number | undefined> = [];
+      const history = {
+        readingsBefore: async (id: string, times: readonly number[], panel: string, deadline?: number): Promise<Readings> => {
+          deadlines.push(deadline);
+          most = Math.max(most, ++running);
+          await new Promise((resolve) => setTimeout(resolve, 2_000));
+          running--;
+          return { readings: times.map((time) => reading(time)), available: true };
+        },
+      };
+      const meters = [1, 2, 3].map((n) => meter({ id: `energy.m${n}`, stateId: `x.0.m${n}` }));
+      const source = new EnergySource(history, states({}), logger());
+      source.configure(configured({ meters }));
+      let answered = false;
+      const pending = source.answer('a1', '{"period":"day"}').then((answer) => {
+        answered = true;
+        return answer;
+      });
+      await clock.tickAsync(2_000);
+      expect(answered).to.equal(false);
+      // Two at once, then the third: 4 s, where one after another took 6.
+      await clock.tickAsync(2_000);
+      expect(answered).to.equal(true);
+      expect(most).to.equal(PANEL_QUERIES);
+      expect(deadlines).to.deep.equal(meters.map(() => NOW() + HISTORY_BUDGET_MS));
+      const { payload } = (await pending)!;
+      expect(meters.map((m) => entryOf(payload, m.id).total)).to.deep.equal([7, 7, 7]);
+    });
+
+    it('answers a meter that missed the budget with the readings kept, and names it once per rebuild (Ruling 133)', async () => {
+      const slow = meter({ id: 'energy.slow', stateId: 'x.0.slow' });
+      // The midnight kept from an earlier answer, the hours not read in time.
+      const history = {
+        readingsBefore: async (id: string, times: readonly number[]): Promise<Readings> =>
+          id === 'x.0.slow'
+            ? { readings: times.map((time, i) => (i === 0 ? reading(time) : null)), available: false, reason: 'timeout' }
+            : { readings: times.map((time) => reading(time)), available: true },
+      };
+      const log = logger();
+      const source = new EnergySource(history, states({ 'shelly.0.em.total': { val: 1007.3, q: 0 }, 'x.0.slow': { val: 1007.3, q: 0 } }), log);
+      source.configure(configured({ meters: [meter(), slow] }));
+      const day = (await source.answer('a1', '{"period":"day"}'))!.payload;
+      // Its bars null, its day total whole: its tile keeps its value (review trap 11).
+      expect(entryOf(day, 'energy.slow')).to.deep.include({ values: Array(15).fill(null), total: 7.3 });
+      expect(entryOf(day)).to.deep.include({ total: 7.3 });
+      await source.answer('a1', '{"period":"week"}');
+      expect(log.lines).to.have.lengthOf(1);
+      expect(log.lines[0]).to.match(/^warn: \[Energy\] /).and.include('x.0.slow').and.not.include('shelly.0.em.total');
+      // Named again after the next rebuild.
+      source.configure(configured({ meters: [meter(), slow] }));
+      await source.answer('a1', '{"period":"day"}');
+      expect(log.lines).to.have.lengthOf(2);
+    });
+
     it('never throws into the MQTT handler: a failing read is none', async () => {
       const source = new EnergySource(
         fakeHistory(),
@@ -681,6 +738,33 @@ describe('runtime/energy-source', () => {
           clock.tick(MINUTE);
           expect((await day()).total, fake.instance).to.equal(5.404);
         }
+      });
+
+      it("answers within its budget, the time waiting for the panel's slots included: what it could not read is null (Ruling 133)", async () => {
+        const fake = sqlFake(rows());
+        fake.states['shelly.0.em.total'] = { val: 911.2, q: 0 };
+        const answer = fake.getHistoryAsync.bind(fake);
+        // A hung instance for two popups' histories: they hold the panel's two slots.
+        fake.getHistoryAsync = (id, options) => {
+          if (!id.startsWith('x.0.popup')) return answer(id, options);
+          fake.calls.push({ id, options });
+          return new Promise<{ result?: unknown }>(() => undefined);
+        };
+        const provider = new HistoryProvider(fake, logger(), 'sql.0');
+        const popups = [1, 2].map((n) => provider.query(`x.0.popup${n}`, { start: NOW() - HOUR, kind: 'numeric', panel: 'a1' }));
+        const log = logger();
+        const source = new EnergySource(provider, fake, log);
+        source.configure(configured());
+        let answered: { topic: string; payload: string } | null | undefined;
+        void source.answer('a1', '{"period":"day"}').then((result) => (answered = result));
+        await clock.tickAsync(HISTORY_BUDGET_MS);
+        expect(answered, 'an answer within the budget').to.not.equal(undefined);
+        expect(entryOf(answered!.payload).values).to.deep.equal(Array(15).fill(null));
+        expect(fake.calls.filter((call) => call.id === 'shelly.0.em.total')).to.deep.equal([]);
+        expect(log.lines).to.have.lengthOf(1);
+        expect(log.lines[0]).to.include('shelly.0.em.total');
+        provider.close();
+        await Promise.all(popups);
       });
 
       it('sums a day to its total from real rows, whichever history adapter answers', async () => {

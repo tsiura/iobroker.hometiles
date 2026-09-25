@@ -181,6 +181,8 @@ export class HistoryProvider {
   private readonly logged = new Map<string, number>();
   /** `${id} ${time}` -> the reading before that past boundary, or null for none: it never changes (Task 20b). */
   private readonly before = new Map<string, number | null>();
+  /** readingsBefore's reads that run, by state and boundaries: an identical request joins one (review trap 10). */
+  private readonly reading = new Map<string, Promise<Found>>();
   /** Every timer that runs, with what ends its wait early: close() clears them all (I-2). */
   private readonly timers = new Map<ReturnType<typeof setTimeout>, () => void>();
   private closed = false;
@@ -237,8 +239,10 @@ export class HistoryProvider {
    * one window from the earliest, as query() reads one. A window keeps its
    * newest MAX_HISTORY_ROWS rows, and an hour before them reads null.
    *
-   * `deadline`, epoch ms: no question runs past it, and none is asked with
-   * less than half a second left (for the energy answer's budget, Ruling 133).
+   * `deadline`, epoch ms: the energy answer's budget (Ruling 133), the wait
+   * for a slot included. No question runs past it, none is asked with less
+   * than half a second left, and then no read starts: what is kept is given,
+   * however late.
    */
   async readingsBefore(id: string, times: readonly number[], panel: string, deadline = Infinity): Promise<Readings> {
     const closed = (): Readings => ({ readings: times.map(() => null), available: false, reason: 'closed' });
@@ -246,19 +250,61 @@ export class HistoryProvider {
     const key = (time: number): string => `${id} ${time}`;
     const missing = times.filter((time) => !this.before.has(key(time)));
     const read: Found =
-      missing.length > 0
-        ? await this.slot(panel, (lease) => this.readBefore(lease, id, missing, deadline), (reason) => ({ found: new Map(), reason }))
-        : { found: new Map() };
+      missing.length === 0
+        ? { found: new Map() }
+        : deadline - Date.now() < MIN_QUESTION_MS
+          ? { found: new Map(), reason: 'timeout' }
+          : await this.shared(id, missing, panel, deadline);
     if (this.closed) return closed();
     const readings = times.map((time) => (read.found.has(time) ? read.found.get(time)! : (this.before.get(key(time)) ?? null)));
+    return read.reason ? { readings, available: false, reason: read.reason } : { readings, available: true };
+  }
+
+  /**
+   * The read of `missing` in one of the panel's slots, waited for there until
+   * `deadline` at most (Ruling 133). A read that runs is shared by every
+   * request for the same state and boundaries, each waiting for it until its
+   * own deadline at most: a panel asking again, or another panel, joins it
+   * rather than asking twice, and joins only one that runs (M-5). What a read
+   * finds is kept when it ends, whether or not anyone still waits for it
+   * (review trap 10).
+   */
+  private shared(id: string, missing: readonly number[], panel: string, deadline: number): Promise<Found> {
+    const share = `${id} ${missing.join(' ')}`;
+    const join = async (read: Promise<Found>): Promise<Found> => {
+      const found = deadline === Infinity ? await read : await this.within(read, deadline - Date.now());
+      return typeof found === 'string' ? { found: new Map(), reason: found } : found;
+    };
+    const running = this.reading.get(share);
+    if (running) return join(running);
+    return this.slot(
+      panel,
+      (lease) => {
+        const twin = this.reading.get(share);
+        if (twin) return join(twin);
+        const read = this.readBefore(lease, id, missing, deadline)
+          .then((found) => {
+            this.keep(id, found.found);
+            return found;
+          })
+          .finally(() => this.reading.delete(share));
+        this.reading.set(share, read);
+        return read;
+      },
+      (reason) => ({ found: new Map(), reason }),
+      deadline,
+    );
+  }
+
+  /** Keeps the readings found before boundaries a minute old, which never change (Task 20b). */
+  private keep(id: string, found: ReadonlyMap<number, number | null>): void {
     const settled = Date.now() - SETTLE_MS;
-    for (const [time, reading] of read.found) {
+    for (const [time, reading] of found) {
       if (time > settled) continue;
       // ponytail: first in, first out; a boundary read long ago is the one least likely asked again.
       if (this.before.size >= MAX_CACHED_READINGS) this.before.delete(this.before.keys().next().value!);
-      this.before.set(key(time), reading);
+      this.before.set(`${id} ${time}`, reading);
     }
-    return read.reason ? { readings, available: false, reason: read.reason } : { readings, available: true };
   }
 
   /**
@@ -278,6 +324,7 @@ export class HistoryProvider {
     for (const state of this.panels.values()) for (const wake of state.waiting.splice(0)) wake(false);
     this.panels.clear();
     this.inFlight.clear();
+    this.reading.clear();
     this.before.clear();
     this.logged.clear();
   }
@@ -316,15 +363,29 @@ export class HistoryProvider {
 
   /**
    * Runs `run` in one of the panel's PANEL_QUERIES slots, waiting in its queue
-   * for one: `busy` when the queue is full, `closed` when close() came first.
+   * for one: `busy` when the queue is full, `closed` when close() came first,
+   * `timeout` once `deadline` passed, leaving the queue (Ruling 133).
    */
-  private async slot<T>(panel: string, run: (lease: Lease) => Promise<T>, refuse: (reason: 'busy' | 'closed') => T): Promise<T> {
+  private async slot<T>(
+    panel: string,
+    run: (lease: Lease) => Promise<T>,
+    refuse: (reason: 'busy' | 'closed' | 'timeout') => T,
+    deadline = Infinity,
+  ): Promise<T> {
     const state = this.panels.get(panel) ?? { running: 0, waiting: [] };
     this.panels.set(panel, state);
     if (state.running < PANEL_QUERIES) state.running += 1;
     else if (state.waiting.length < PANEL_QUEUE) {
-      // Woken holding the slot of a question that ended, or by close() holding none.
-      if (!(await new Promise<boolean>((resolve) => state.waiting.push(resolve)))) return refuse('closed');
+      // Woken holding the slot of a question that ended, or by close() holding
+      // none; at the deadline it leaves the queue, unless handed a slot just then.
+      let wake!: (granted: boolean) => void;
+      const waited = new Promise<boolean>((resolve) => state.waiting.push((wake = resolve)));
+      const woken = deadline === Infinity ? await waited : await this.within(waited, deadline - Date.now());
+      if (woken === 'timeout' && state.waiting.includes(wake)) {
+        state.waiting.splice(state.waiting.indexOf(wake), 1);
+        return refuse('timeout');
+      }
+      if (woken === false || woken === 'closed') return refuse('closed');
     } else {
       this.note(`busy ${panel}`, 'warn', `Panel ${panel} asks for more than ${PANEL_QUERIES + PANEL_QUEUE} histories at once; the rest get none`);
       return refuse('busy');

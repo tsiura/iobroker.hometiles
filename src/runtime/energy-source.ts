@@ -14,7 +14,8 @@ import {
 import { energyResponseTopic } from '../protocol/topics';
 import { lastSegment, objectMeta, type IoBrokerObject, type ObjectMeta } from '../registry/detector';
 import { ENERGY_KEY, resolveEnergyIds } from '../registry/entity-id';
-import { isLogged, type HistoryProvider } from './history-provider';
+import { listed } from '../registry/manual';
+import { HISTORY_BUDGET_MS, isLogged, PANEL_QUERIES, type HistoryProvider } from './history-provider';
 import type { Logger } from './mqtt-client';
 
 /**
@@ -323,6 +324,8 @@ export class EnergySource {
   private config: EnergyConfig | undefined;
   /** When each log line last went out: the panel asks for the day every minute. */
   private readonly logged = new Map<string, number>();
+  /** Meters named since the last rebuild for missing an answer's budget (Ruling 133). */
+  private readonly named = new Set<string>();
 
   constructor(
     private readonly history: Pick<HistoryProvider, 'readingsBefore'>,
@@ -332,6 +335,7 @@ export class EnergySource {
 
   configure(config: EnergyConfig): void {
     this.config = config;
+    this.named.clear();
   }
 
   /**
@@ -352,8 +356,13 @@ export class EnergySource {
    * payload of the answer, published not retained, or null for no answer --
    * while not armed or configured (Rulings 116, 118), for a payload that is no
    * request, and while no meter is set, as the Bridge (__init__.py:2644-2646).
-   * It never throws. The meters are read one after another, so an answer
-   * takes one of the panel's history slots at a time.
+   * It never throws. One budget of HISTORY_BUDGET_MS bounds the answer, the
+   * wait for the panel's history slots included, so it goes out before the
+   * panel asks again (energy_data.cpp:45-47). The meters are read
+   * PANEL_QUERIES at a time, as many as the panel has slots, so its queue
+   * stays free for its popups (Ruling 133, review trap 9). A meter not read
+   * in time is answered with the readings kept, null for the rest, and named
+   * once per rebuild.
    */
   async answer(deviceId: string, payload: string): Promise<{ topic: string; payload: string } | null> {
     const config = this.config;
@@ -365,11 +374,26 @@ export class EnergySource {
       return null;
     }
     try {
+      const deadline = Date.now() + HISTORY_BUDGET_MS;
       const { start, boundaries } = energyPeriod(request.period, Date.now());
       const series = new Map<string, Consumption>();
-      for (const meter of config.meters) {
-        const { readings } = await this.history.readingsBefore(meter.stateId, boundaries, deviceId);
-        series.set(meter.id, consumption(readings, await this.live(meter.stateId)));
+      const late = new Set<string>();
+      const next = config.meters.values();
+      const reader = async (): Promise<void> => {
+        for (const meter of next) {
+          const { readings, reason } = await this.history.readingsBefore(meter.stateId, boundaries, deviceId, deadline);
+          if (reason === 'timeout') late.add(meter.stateId);
+          series.set(meter.id, consumption(readings, await this.live(meter.stateId)));
+        }
+      };
+      await Promise.all(Array.from({ length: PANEL_QUERIES }, reader));
+      const unnamed = config.meters.map((meter) => meter.stateId).filter((stateId) => late.has(stateId) && !this.named.has(stateId));
+      if (unnamed.length > 0) {
+        for (const stateId of unnamed) this.named.add(stateId);
+        this.log.warn(
+          `[Energy] The history instance did not answer in time for ${listed(unnamed)}: panel ${deviceId}'s ${request.period} ` +
+            `answer went out within ${HISTORY_BUDGET_MS / 1000} s without some of their readings, which later answers read`,
+        );
       }
       const built = buildEnergyResponse(request.period, localIso(start), energyEntries(config.meters, config.currency, config.names, series));
       if (built.valuesDropped > 0 || built.entriesDropped > 0) {
