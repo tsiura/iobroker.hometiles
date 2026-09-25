@@ -82,13 +82,22 @@ adapter shows the provider's own values, as its own widgets do.
 - **Energy counters that reset daily**, price entities (only a fixed price per
   unit), and unit conversion (a category total adds its meters' values as
   they are).
+- **A meter's reading right after a start**: a meter whose history is not read
+  within 7 s of the adapter starting shows 0.000 until the panel's next
+  request, about a minute later.
 - **Colour on single-channel colour lights** (`rgbSingle`, `rgbwSingle`,
   `cie`): the colour is one combined value, and there is no encoder for it.
   Such a light still works for on/off, brightness and colour temperature; only
   the colour picker is absent.
+- **Colour temperature from a state whose declared min and max are inverted
+  or equal**: such a state gets no colour-temperature control.
+- **On/off for a level detected as a Number**: it carries none. Add its switch
+  state as a manual Switch entity.
 - **Media:** a stop button (the panel has none), a seek bar for a SEEK state
   whose unit is neither empty nor `%`, and cover art that is not an absolute
-  `http(s)://` URL.
+  `http(s)://` URL. A player whose only play state is text (a string
+  `media.state`) is detected as a sensor, and a Chromecast whose detection
+  binds its `…paused` state gets no media tile.
 - **Select and date/time are never detected on their own**: use a Forced type
   on the Devices tab, or a manual entity.
 
