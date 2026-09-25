@@ -465,6 +465,12 @@ panel:
     tile without one shows its type's icon.
 20. Upgrading a 0.1.0 installation with a saved broker password: it connects
     after one restart, and the password is stored encrypted.
+21. Reconnect snapshot: each time a panel announces itself (after every
+    connection), the adapter sends every picked entity's state again. After a
+    broker restart that lost its retained messages, every tile shows its
+    state again; watch the panel's log for "Inbound queue full".
+22. Battery charge: on a Tab5, `panels.<deviceId>.info.battery` shows the
+    charge after the panel connects; a mains-powered panel has no such state.
 
 Until those are done, treat 0.2.0 as ready to test, not ready to rely on.
 
