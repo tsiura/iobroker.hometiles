@@ -123,7 +123,10 @@ export function buildStatePublish(haPrefix: string, entity: VirtualEntity): Stat
 
   const body: Record<string, unknown> = {};
   for (const [key, value] of Object.entries(entity.attributes)) {
-    if (value === undefined) continue;
+    // No name (T5 C5): the panel reads none from a state payload, and its
+    // scanner takes a key's first quoted occurrence (json_scan.h:34-60), so a
+    // light named "state" read its name's neighbour as its state.
+    if (value === undefined || key === 'friendly_name') continue;
     body[key] = value;
   }
   // The entity's own state is authoritative and overwrites any attribute that

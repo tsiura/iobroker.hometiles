@@ -40,7 +40,7 @@ describe('protocol/state-payload', () => {
     expect(p!.payload).to.equal('unavailable');
   });
 
-  it('publishes a light as JSON carrying state plus its attributes', () => {
+  it('publishes a light as JSON carrying state plus its attributes, but for its name', () => {
     const p = buildStatePublish(
       'ha/statestream',
       entity({
@@ -53,10 +53,15 @@ describe('protocol/state-payload', () => {
     expect(p!.topic).to.equal('ha/statestream/light/decke/state');
     expect(JSON.parse(p!.payload)).to.deep.equal({
       state: 'on',
-      friendly_name: 'Decke',
       brightness_pct: 60,
       rgb_color: [255, 180, 90],
     });
+  });
+
+  it("sends no friendly_name for a light: the panel's scanner takes a key's first quoted occurrence, which a name equal to the key would be (T5 C5)", () => {
+    // A light named "state" read the wrong state (json_scan.h:34-60); the panel reads no name here.
+    const p = buildStatePublish('ha/statestream', entity({ entityId: 'light.state', domain: 'light', state: 'on', attributes: { friendly_name: 'state', brightness_pct: 60 } }));
+    expect(p!.payload.slice(p!.payload.indexOf('"state"'))).to.match(/^"state":"on"/);
   });
 
   it('lets state win over an attribute that happens to be called state', () => {

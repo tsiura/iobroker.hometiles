@@ -199,14 +199,20 @@ describe('protocol/climate', () => {
     expect(JSON.parse(buildClimatePayload(entity({ available: false }))).available).to.equal(false);
   });
 
-  it('forwards only the validated non-climate keys: friendly_name, icon, power, boost', () => {
+  it('forwards only the validated non-climate keys: icon, power, boost', () => {
     const p = JSON.parse(
       buildClimatePayload(entityWithOnly({ friendly_name: 'Living room', icon: 'mdi:thermostat', power: 'on', boost: 'off' })),
     );
-    expect(p.friendly_name).to.equal('Living room');
+    expect(p).to.not.have.property('friendly_name');
     expect(p.icon).to.equal('mdi:thermostat');
     expect(p.power).to.equal('on');
     expect(p.boost).to.equal('off');
+  });
+
+  it("sends no friendly_name: the panel's scanner takes a key's first quoted occurrence, which a name equal to the key would be (T5 C5)", () => {
+    // A thermostat named "temperature" lost its setpoint (json_scan.h:34-60); the panel reads no name here.
+    const payload = buildClimatePayload(entityWithOnly({ friendly_name: 'temperature', target_temperature: 21 }));
+    expect(payload.slice(payload.indexOf('"temperature"'))).to.match(/^"temperature":21\b/);
   });
 
   it('does not forward an attribute outside the validated allow-list, even one the firmware would read as a fallback key', () => {

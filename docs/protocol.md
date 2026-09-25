@@ -294,11 +294,13 @@ detail in the port:**
 | `select` | **`control`** | JSON object in the `/control` schema | [Number, select and date/time](#number-select-and-datetime) |
 | `datetime` | **`control`** | JSON object in the `/control` schema | [Number, select and date/time](#number-select-and-datetime) |
 
-A light's payload carries `state` and whichever of these are known:
-`friendly_name`, `icon`, `supported_color_modes`, `color_mode`, `brightness`
-(0-255), `brightness_pct` (0-100), `rgb_color`, `color_temp_kelvin`,
-`min_color_temp_kelvin` and `max_color_temp_kelvin`. An unknown value is
-omitted, never sent as `null` or `0`. A colour mode is advertised only for a
+A light's payload carries `state` and whichever of these are known: `icon`,
+`supported_color_modes`, `color_mode`, `brightness` (0-255), `brightness_pct`
+(0-100), `rgb_color`, `color_temp_kelvin`, `min_color_temp_kelvin` and
+`max_color_temp_kelvin`. It carries no `friendly_name`: the panel reads none
+from a state payload, and its scanner takes a key's first quoted occurrence,
+so a light named `state` read the wrong state. An unknown value is omitted,
+never sent as `null` or `0`. A colour mode is advertised only for a
 channel that can be commanded: a read-only dimmer gives no brightness, and a
 single combined colour channel (`rgbSingle`, `rgbwSingle`, `cie`) gives no
 colour, since no encoder writes one. A dimmer's level is scaled from its
@@ -395,7 +397,8 @@ every known key on every publish and omits every unknown one:
 | `swing_horizontal_mode` | known | the boolean SWING toggle, `on` or `off` |
 | `hvac_modes`, `fan_modes`, `swing_modes`, `swing_horizontal_modes` | at least one name survives | see below |
 | `supported_features` | always | see below |
-| `friendly_name`, `icon`, `power`, `boost` | set | passed through; the panel's climate parser reads none of them |
+| `icon`, `power`, `boost` | set | passed through; the panel's climate parser reads none of them |
+| `friendly_name` | never | the parser reads no name, and it takes a key's first quoted occurrence: a thermostat named `temperature` lost its setpoint |
 
 - **The `*_modes` lists are the panel's buttons.** Each list is turned into a
   bitmask against the firmware's fixed name tables (hvac: `off`, `heat`,

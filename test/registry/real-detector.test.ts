@@ -792,7 +792,6 @@ describe('real type-detector end to end (Task 5c)', () => {
       );
       expectRealChannels(HUE_SET, result.device, { set: `${HUE}.on`, dimmer: `${HUE}.level`, temperature: `${HUE}.ct` });
       expect(json(result)).to.deep.equal({
-        friendly_name: 'Wohnzimmer Decke',
         supported_color_modes: ['color_temp'],
         brightness: 153,
         brightness_pct: 60,
@@ -886,7 +885,6 @@ describe('real type-detector end to end (Task 5c)', () => {
       const result = runFor(runs, `${RT}.4`);
       expect(result.entity!.writable).to.deep.equal({ setpoint: true, boost: true });
       expect(json(result)).to.deep.equal({
-        friendly_name: 'Heizung Bad:4',
         boost: 'off',
         available: true,
         temperature: 21,
@@ -907,7 +905,6 @@ describe('real type-detector end to end (Task 5c)', () => {
       expectRealChannels(FLOOR_SET, result.device, { set_heating: `${FLOOR}.SET_HEATING`, actual: `${FLOOR}.ACTUAL` });
       expect(result.entity!.writable).to.deep.equal({ setpoint: true });
       expect(json(result)).to.deep.equal({
-        friendly_name: 'Fußbodenheizung Bad',
         available: true,
         temperature: 22,
         current_temperature: 20.5,

@@ -28,8 +28,10 @@ import type { VirtualEntity } from '../registry/types';
  * Non-climate attributes this module knows are safe to forward verbatim:
  * plain metadata the firmware's climate scanner never looks for under these
  * names, and always a defined, non-blank string in practice (see
- * synth/common.ts's baseEntity for friendly_name/icon, synth/climate.ts's
- * readBoolAttr for power/boost). This is an explicit allow-list, not an
+ * synth/common.ts's baseEntity for icon, synth/climate.ts's readBoolAttr for
+ * power/boost). Never friendly_name (T5 C5): the scanner takes a key's first
+ * quoted occurrence (json_scan.h:34-60) and reads no name, so a thermostat
+ * named "temperature" lost its setpoint. This is an explicit allow-list, not an
  * exclude-list (review round 1, M5): the firmware's scanner also recognises
  * "state" (hvac_mode fallback), "unit_of_measurement" (temperature_unit
  * fallback), "humidity" (target_humidity fallback), "precision"
@@ -41,7 +43,7 @@ import type { VirtualEntity } from '../registry/types';
  * supported_features and four of the lists now have dedicated, validated
  * paths below (Task 5b); none of them is ever forwarded from here.
  */
-const PASSTHROUGH_KEYS = ['friendly_name', 'icon', 'power', 'boost'] as const;
+const PASSTHROUGH_KEYS = ['icon', 'power', 'boost'] as const;
 
 /**
  * The control lists synthClimate builds (Task 5b). The firmware draws a mode,
