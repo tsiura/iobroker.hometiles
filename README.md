@@ -365,12 +365,14 @@ panel, change **Panel base topic** on the Connection tab and save.
   answered to the panel. Every other refusal is only in the adapter's log;
   the panel then shows the unchanged state.
 - **An alias whose target cannot be read is left out.** An alias with no
-  target, an invalid one, or one that is missing or not a state is neither
-  subscribed nor read: its device shows unavailable until the alias is
-  repaired and the adapter restarted, and the log names each such alias. A
-  js-controller call at start that is not answered within 5 s is given up the
-  same way: the log names it, and its device may show unavailable until the
-  adapter restarts.
+  target or an invalid one is neither subscribed nor read: its device shows
+  unavailable until the alias is repaired and the adapter restarted, and the
+  log names each such alias. An alias whose target is missing or not a state
+  is subscribed and read all the same, and the log names it too: its device
+  shows unavailable until the target exists, and js-controller follows it
+  then, with no restart. A js-controller call at start that is not answered
+  within 5 s is given up: the log names it, and its device may show
+  unavailable until the adapter restarts.
 
 ## Objects
 

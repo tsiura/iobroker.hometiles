@@ -19,10 +19,12 @@ export const UNANSWERED = Symbol('unanswered');
 
 /**
  * The call's answer, or UNANSWERED once `ms` pass without one: js-controller
- * 5.0.19 to 7.2.3 never answers a subscribe to an alias it cannot resolve
- * (adapter.js _subscribeForeignStates), and 5.x's promisify drops a rejection
- * inside the call. A refusal in time still rejects. A late answer or refusal
- * goes nowhere, and the timer goes as soon as either comes first.
+ * 6.0.11, the declared minimum, to 7.2.3 never answers a subscribe to an
+ * alias whose target id it refuses (adapter.js _addAliasSubscribe: none, or
+ * one validateId refuses), which aliasProblem leaves out, and a database
+ * fault can leave any call unanswered. A refusal in time still rejects. A
+ * late answer or refusal goes nowhere, and the timer goes as soon as either
+ * comes first.
  */
 export async function within<T>(call: Promise<T>, ms: number): Promise<T | typeof UNANSWERED> {
   let timer: NodeJS.Timeout | undefined;
@@ -37,22 +39,38 @@ export async function within<T>(call: Promise<T>, ms: number): Promise<T | typeo
 }
 
 /**
- * Why an alias's target cannot be read, or undefined: none, as js-controller
- * reads it (adapter.js _addAliasSubscribe: common.alias.id, or its `read` of
- * a {read, write} pair, which validateId refuses empty, not a string, or
- * ending in "."), or no state among the objects discovery read. An object
- * outside them, or no alias state, is left to js-controller.
+ * An alias state's read target as js-controller reads it (adapter.js
+ * _addAliasSubscribe: common.alias.id, or its `read` of a {read, write} pair,
+ * which validateId refuses empty, not a string, or ending in "."), or why it
+ * has none it could read. Undefined for an object outside those discovery
+ * read, or no alias state: js-controller answers for it.
  */
-export function aliasProblem(objectId: string, objects: Readonly<Record<string, IoBrokerObject>>): string | undefined {
+function aliasTarget(objectId: string, objects: Readonly<Record<string, IoBrokerObject>>): { read: string } | { problem: string } | undefined {
   const object = objects[objectId];
   if (!objectId.startsWith('alias.') || object?.type !== 'state') return undefined;
   const target = (object.common as { alias?: { id?: unknown } } | undefined)?.alias?.id;
-  if (!target) return 'no target';
+  if (!target) return { problem: 'no target' };
   const read = typeof target === 'object' ? (target as { read?: unknown }).read : target;
-  if (!read) return 'no read target';
-  if (typeof read !== 'string' || read.endsWith('.')) return `target ${JSON.stringify(read)} is invalid`;
-  if (objects[read]?.type !== 'state') return `target ${read} is missing or not a state`;
-  return undefined;
+  if (!read) return { problem: 'no read target' };
+  if (typeof read !== 'string' || read.endsWith('.')) return { problem: `target ${JSON.stringify(read)} is invalid` };
+  return { read };
+}
+
+/** Why an alias's target cannot be read, or undefined (aliasTarget): such an alias is neither subscribed nor read. */
+export function aliasProblem(objectId: string, objects: Readonly<Record<string, IoBrokerObject>>): string | undefined {
+  const alias = aliasTarget(objectId, objects);
+  return alias && 'problem' in alias ? alias.problem : undefined;
+}
+
+/**
+ * The target of an alias that no state among the objects discovery read has
+ * as its id, missing or no state, or undefined. Such an alias is subscribed
+ * and read all the same: js-controller answers for it, and follows the target
+ * once it exists (Ruling 151 n1).
+ */
+export function missingTarget(objectId: string, objects: Readonly<Record<string, IoBrokerObject>>): string | undefined {
+  const alias = aliasTarget(objectId, objects);
+  return alias && 'read' in alias && objects[alias.read]?.type !== 'state' ? alias.read : undefined;
 }
 
 /** The js-controller calls a rebuild makes for the states its entities read. */
@@ -92,15 +110,24 @@ export async function connectSources(
     return result;
   };
   const broken: string[] = [];
+  const missing: string[] = [];
   const subscribe = changes.subscribe.filter((objectId) => {
     const problem = aliasProblem(objectId, objects);
     if (problem) broken.push(`${objectId} (${problem})`);
+    const target = missingTarget(objectId, objects);
+    if (target) missing.push(`${objectId} (target ${target})`);
     return !problem;
   });
   if (broken.length > 0) {
     log.warn(
       `[Registry] Aliases left out, their target cannot be read: ${listed(broken)}. ` +
         'Their devices show unavailable until the alias is repaired and the adapter restarted',
+    );
+  }
+  if (missing.length > 0) {
+    log.warn(
+      `[Registry] Aliases whose target is no state: ${listed(missing)}. ` +
+        'Their devices show unavailable until the target exists; js-controller follows it then, with no restart',
     );
   }
 

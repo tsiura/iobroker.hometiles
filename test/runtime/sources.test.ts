@@ -3,7 +3,7 @@ import sinon from 'sinon';
 import type { IoBrokerObject } from '../../src/registry/detector';
 import { EntityRegistry } from '../../src/registry/entity-registry';
 import type { DeviceInput } from '../../src/registry/types';
-import { aliasProblem, connectSources, SOURCE_CALL_MS, type SourceAccess } from '../../src/runtime/sources';
+import { aliasProblem, connectSources, missingTarget, SOURCE_CALL_MS, type SourceAccess } from '../../src/runtime/sources';
 
 /** A value as js-controller hands it. */
 const state = (val: unknown): ioBroker.State => ({ val, ack: true, ts: 1_757_000_000_000, lc: 1_757_000_000_000, from: 'system.adapter.test.0', q: 0 }) as ioBroker.State;
@@ -42,7 +42,7 @@ function rebuild(...devices: DeviceInput[]): { registry: EntityRegistry; result:
   return { registry, result: registry.rebuild(devices, {}) };
 }
 
-/** js-controller as seen from the adapter: each call recorded; `hang` ids never answered, as 5.0.19-7.2.3 do an alias they cannot subscribe. */
+/** js-controller as seen from the adapter: each call recorded; `hang` ids never answered, as 6.0.11-7.2.3 do an alias whose target id they refuse. */
 function controller(hang: { subscribe?: string[]; read?: string[] } = {}): SourceAccess & { calls: string[] } {
   const calls: string[] = [];
   const never = new Promise<never>(() => undefined);
@@ -137,7 +137,7 @@ describe('runtime/sources: the calls a rebuild makes for its entities\' states (
   });
 
   describe('the alias check before subscribing (Ruling 150 b)', () => {
-    it('names why an alias target cannot be read: none, an invalid one, one missing or not a state', () => {
+    it('names why an alias target cannot be read, none or an invalid one; one missing or not a state is no reason', () => {
       expect(aliasProblem(TEMP, OBJECTS), 'no alias').to.equal(undefined);
       expect(aliasProblem('alias.0.ok', OBJECTS), 'a target id').to.equal(undefined);
       expect(aliasProblem('alias.0.split', OBJECTS), 'read and write targets: the read one is read').to.equal(undefined);
@@ -147,34 +147,58 @@ describe('runtime/sources: the calls a rebuild makes for its entities\' states (
       expect(aliasProblem('alias.0.number', OBJECTS)).to.equal('target 42 is invalid');
       // What js-controller's validateId refuses: an id ending in ".".
       expect(aliasProblem('alias.0.dot', OBJECTS)).to.equal('target "zigbee.0.nirgends." is invalid');
-      expect(aliasProblem('alias.0.gone', OBJECTS)).to.equal('target zigbee.0.gone is missing or not a state');
-      expect(aliasProblem('alias.0.chan', OBJECTS)).to.equal('target hm.0.chan is missing or not a state');
+      // js-controller 6.0.11 to 7.2.3 answers for these, and follows the target once it exists (Ruling 151 n1).
+      expect(aliasProblem('alias.0.gone', OBJECTS)).to.equal(undefined);
+      expect(aliasProblem('alias.0.chan', OBJECTS)).to.equal(undefined);
+      expect(missingTarget('alias.0.gone', OBJECTS)).to.equal('zigbee.0.gone');
+      expect(missingTarget('alias.0.chan', OBJECTS)).to.equal('hm.0.chan');
+      expect(missingTarget('alias.0.ok', OBJECTS)).to.equal(undefined);
+      expect(missingTarget('alias.0.dot', OBJECTS), 'left out instead').to.equal(undefined);
       // An object not read with the others is none of this check's business: js-controller answers for it.
       expect(aliasProblem('alias.0.unknown', OBJECTS)).to.equal(undefined);
+      expect(missingTarget('alias.0.unknown', OBJECTS)).to.equal(undefined);
     });
 
     it('neither subscribes nor reads an alias whose target cannot be read, names each with its target in one warning, and reads the rest', async () => {
       const { registry, result } = rebuild(
         sensor('zigbee.0.t', 'Temp', TEMP),
         sensor('alias.0.a', 'Dot', 'alias.0.dot'),
-        sensor('alias.0.b', 'Gone', 'alias.0.gone'),
         sensor('alias.0.c', 'Ok', 'alias.0.ok'),
       );
       // As js-controller 7.2.2 does: a subscribe it cannot make is never answered.
-      const js = controller({ subscribe: ['alias.0.dot', 'alias.0.gone'] });
+      const js = controller({ subscribe: ['alias.0.dot'] });
       const warnings: string[] = [];
       const done = connectSources(result, OBJECTS, js, (id, value) => registry.applyStateChange(id, value), { warn: (text) => void warnings.push(text) });
       await clock.tickAsync(0);
       await done;
-      expect(js.calls.filter((call) => call.includes('alias.0.dot') || call.includes('alias.0.gone'))).to.deep.equal([]);
+      expect(js.calls.filter((call) => call.includes('alias.0.dot'))).to.deep.equal([]);
       expect(registry.byId('sensor.temp')).to.include({ state: '21.5' });
       expect(registry.byId('sensor.ok')).to.include({ state: '21.5' });
       expect(registry.byId('sensor.dot')).to.include({ state: 'unavailable' });
-      expect(registry.byId('sensor.gone')).to.include({ state: 'unavailable' });
       expect(warnings).to.deep.equal([
-        '[Registry] Aliases left out, their target cannot be read: alias.0.dot (target "zigbee.0.nirgends." is invalid), ' +
-          'alias.0.gone (target zigbee.0.gone is missing or not a state). ' +
+        '[Registry] Aliases left out, their target cannot be read: alias.0.dot (target "zigbee.0.nirgends." is invalid). ' +
           'Their devices show unavailable until the alias is repaired and the adapter restarted',
+      ]);
+    });
+
+    it('subscribes and reads an alias whose target is missing or not a state, and names each with its target in one warning', async () => {
+      const { registry, result } = rebuild(
+        sensor('alias.0.b', 'Gone', 'alias.0.gone'),
+        sensor('alias.0.d', 'Chan', 'alias.0.chan'),
+        sensor('alias.0.c', 'Ok', 'alias.0.ok'),
+      );
+      // js-controller answers both, and has no value for either while no state has the target's id.
+      const js = controller();
+      js.read = (id) => (js.calls.push(`read ${id}`), Promise.resolve(id === 'alias.0.ok' ? state(21.5) : null));
+      const warnings: string[] = [];
+      await connectSources(result, OBJECTS, js, (id, value) => registry.applyStateChange(id, value), { warn: (text) => void warnings.push(text) });
+      expect(js.calls).to.include.members(['subscribe alias.0.gone', 'read alias.0.gone', 'subscribe alias.0.chan', 'read alias.0.chan']);
+      expect(registry.byId('sensor.ok')).to.include({ state: '21.5' });
+      expect(registry.byId('sensor.gone')).to.include({ state: 'unavailable' });
+      expect(registry.byId('sensor.chan')).to.include({ state: 'unavailable' });
+      expect(warnings).to.deep.equal([
+        '[Registry] Aliases whose target is no state: alias.0.chan (target hm.0.chan), alias.0.gone (target zigbee.0.gone). ' +
+          'Their devices show unavailable until the target exists; js-controller follows it then, with no restart',
       ]);
     });
   });
