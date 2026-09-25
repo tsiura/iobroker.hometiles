@@ -373,6 +373,106 @@ function harnessHistory(harness: IntegrationTestHarness): HistorySource {
 
 const pause = (ms: number): Promise<void> => new Promise((resolve) => setTimeout(resolve, ms));
 
+const row = (ts: number, val: unknown, q = 0, ack = true): HistoryRow => ({ ts, val, ack, q });
+
+/** A kWh counter every 10 minutes, 0.1 a row, from 20:00 yesterday to two minutes before `until` (Task 20b). */
+const meterRows = (until: number): HistoryRow[] => {
+  const eightPm = new Date(until).setHours(-4, 0, 0, 0);
+  return Array.from({ length: Math.floor((until - 120_000 - eightPm) / 600_000) + 1 }, (_, i) => row(eightPm + i * 600_000, 900 + i / 10));
+};
+
+/**
+ * A real iobroker.history for the suite it is called in (Task 19). Installed
+ * once, and again for another version; without the network the install
+ * fails and the suite is skipped, saying why (M-7). Linked where js-controller
+ * finds adapters while the suite runs. The `planted()` rows go into its store,
+ * each of those states and of `unlogged` gets its object, all but `unlogged`
+ * logged by history.0, and it runs until it answers for the first planted
+ * state. Afterwards it is stopped and all it added removed: the next run's
+ * database starts from what the last suite leaves.
+ */
+function withHistoryAdapter(
+  getHarness: () => IntegrationTestHarness,
+  planted: () => Record<string, HistoryRow[]>,
+  unlogged: readonly string[] = [],
+): void {
+  let adapter: ChildProcess | undefined;
+  let systemConfig: Record<string, unknown> | null | undefined;
+  let ids: string[] = [];
+
+  before(async function () {
+    this.timeout(300000);
+    const installed = (): unknown => {
+      try {
+        return JSON.parse(readFileSync(path.join(HISTORY_PACKAGE, 'package.json'), 'utf8')).version;
+      } catch {
+        return undefined;
+      }
+    };
+    if (installed() !== HISTORY_VERSION) {
+      mkdirSync(HISTORY_DIR, { recursive: true });
+      try {
+        execFileSync('npm', ['install', '--prefix', HISTORY_DIR, '--omit=dev', '--no-audit', '--no-fund', `iobroker.history@${HISTORY_VERSION}`], {
+          stdio: 'pipe',
+        });
+      } catch (error) {
+        const reason = String((error as { stderr?: unknown }).stderr ?? error).trim().split('\n').slice(-3).join(' ');
+        process.stderr.write(`Skipping the iobroker.history suite: installing iobroker.history@${HISTORY_VERSION} failed: ${reason}\n`);
+        this.skip();
+      }
+    }
+    if (!lstatSync(HISTORY_LINK, { throwIfNoEntry: false })) symlinkSync(HISTORY_PACKAGE, HISTORY_LINK, 'dir');
+    rmSync(HISTORY_STORE, { recursive: true, force: true });
+    const rows = planted();
+    for (const [id, list] of Object.entries(rows)) plantHistory(id, list);
+    ids = [...Object.keys(rows), ...unlogged];
+
+    const harness = getHarness();
+    systemConfig = await harness.objects.getObjectAsync('system.config');
+    const custom = { 'history.0': { enabled: true, changesOnly: true, debounce: 0, retention: 31536000, maxLength: 960 } };
+    for (const id of ids) {
+      const common = { name: id, type: 'mixed', role: 'value', read: true, write: false, ...(unlogged.includes(id) ? {} : { custom }) };
+      await harness.objects.setObjectAsync(id, { _id: id, type: 'state', common, native: {} });
+    }
+    const io = JSON.parse(readFileSync(path.join(HISTORY_PACKAGE, 'io-package.json'), 'utf8'));
+    await harness.objects.setObjectAsync('system.adapter.history.0', {
+      _id: 'system.adapter.history.0',
+      type: 'instance',
+      common: { ...io.common, enabled: true },
+      native: { ...io.native, storeDir: HISTORY_STORE, writeNulls: false },
+    });
+    const log = openSync(path.join(HISTORY_DIR, 'history.0.log'), 'w');
+    adapter = spawn(process.execPath, [HISTORY_MAIN, '--force', '--console'], { cwd: HISTORY_DIR, stdio: ['ignore', log, log] });
+    closeSync(log);
+
+    // Alive comes before its ready handler has set the store directory:
+    // asked earlier, it reads nothing, so wait for a first real answer.
+    const provider = new HistoryProvider(harnessHistory(harness), { info() {}, warn() {}, error() {}, debug() {} }, 'history.0');
+    const deadline = Date.now() + 60000;
+    for (;;) {
+      if (adapter.exitCode !== null) throw new Error(`iobroker.history exited with ${adapter.exitCode}; see ${HISTORY_DIR}/history.0.log`);
+      const result = await provider.query(ids[0]!, { start: Date.now() - 24 * 3_600_000, kind: 'numeric', panel: 'e2e' });
+      if (result.available && result.rows.length > 0) break;
+      if (Date.now() > deadline) throw new Error(`iobroker.history never answered (${result.reason ?? 'no rows'})`);
+      await pause(500);
+    }
+  });
+
+  after(async function () {
+    this.timeout(30000);
+    if (adapter && adapter.exitCode === null) {
+      const exited = new Promise((resolve) => adapter!.once('exit', resolve));
+      adapter.kill('SIGTERM');
+      await Promise.race([exited, pause(10000)]);
+      if (adapter.exitCode === null) adapter.kill('SIGKILL');
+    }
+    if (lstatSync(HISTORY_LINK, { throwIfNoEntry: false })?.isSymbolicLink()) unlinkSync(HISTORY_LINK);
+    const harness = getHarness();
+    for (const id of [...ids, 'system.adapter.history.0']) await harness.objects.delObjectAsync(id).catch(() => undefined);
+    if (systemConfig) await harness.objects.setObjectAsync('system.config', systemConfig);
+  });
+}
+
 // Opt-in: this downloads and runs a real js-controller, so it stays out of the
 // default suite. Run it with HOMETILES_INTEGRATION=1 npm test.
 if (process.env.HOMETILES_INTEGRATION === '1') {
@@ -969,7 +1069,7 @@ if (process.env.HOMETILES_INTEGRATION === '1') {
       ] as const) {
         suite(`energy meters, no entity in a list, ${armed ? 'armed' : 'before the Devices tab is used'} (Ruling 131)`, (getHarness) => {
           withCleanFixtures(getHarness);
-          const { applies } = withBrokerAndPanel(port);
+          const { applies, panel } = withBrokerAndPanel(port);
           const ZAEHLER = '0_userdata.0.Energie.Zaehler';
           const removeMeter = async (): Promise<void> => {
             await getHarness().objects.delObjectAsync(ZAEHLER).catch(() => undefined);
@@ -1012,6 +1112,17 @@ if (process.env.HOMETILES_INTEGRATION === '1') {
               expect(hints[0]).to.include('Held back until then: 1 device rows of an earlier version, 1 energy meters');
               expect(await harness.states.getStateAsync('hometiles.0.info.entities')).to.include({ val: 0 });
               expect(await published()).to.deep.equal({});
+              // Nor is a history or an energy request answered (Task 22). The
+              // presence sent after them, which is read, marks both handled.
+              const answers: string[] = [];
+              panel().on('message', (topic) => void (topic.endsWith('/response') && answers.push(topic)));
+              await panel().subscribeAsync([`tab5_lvgl/config/${PANEL}/history/response`, `tab5_lvgl/config/${PANEL}/energy/response`]);
+              const connected = valuesOf(harness, `hometiles.0.panels.${PANEL}.info.connected`);
+              await panel().publishAsync(`tab5_lvgl/config/${PANEL}/history/request`, '{"entity_id":"scene.kaffee","hours":24,"period_minutes":5}');
+              await panel().publishAsync(`tab5_lvgl/config/${PANEL}/energy/request`, '{"period":"day"}');
+              await panel().publishAsync('hometiles-e2e/stat/connected', 'online');
+              await waitFor(harness, () => (connected.includes(true) ? true : undefined), 'the presence');
+              expect(answers).to.deep.equal([]);
               return;
             }
             expect(applies, 'an apply').to.not.deep.equal([]);
@@ -1409,13 +1520,95 @@ if (process.env.HOMETILES_INTEGRATION === '1') {
         });
       });
 
+      suite("a panel's history and energy requests, answered through the adapter (Task 22)", (getHarness) => {
+        const port = 18862;
+        const { applies, panel } = withBrokerAndPanel(port);
+        const HOUR = 3_600_000;
+        const TEMPERATURE = '0_userdata.0.t22.temperature';
+        const METER = '0_userdata.0.t22.meter';
+        const now = Date.now();
+        /** A reading two days old, then one every 30 minutes through the last day, the newest a quarter of an hour old. */
+        const READINGS = [row(now - 48 * HOUR, 18.5), ...Array.from({ length: 48 }, (_, i) => row(now - 24 * HOUR + HOUR / 4 + (i * HOUR) / 2, 20 + i / 10))];
+        /** Planted as the suite starts. */
+        let counter: HistoryRow[] = [];
+        withHistoryAdapter(getHarness, () => {
+          counter = meterRows(Date.now());
+          return { [TEMPERATURE]: READINGS, [METER]: counter };
+        });
+
+        it('answers a numeric history request from the history instance and an energy request, each on its own response topic', async function () {
+          this.timeout(120000);
+          const harness = getHarness();
+          await harness.changeAdapterConfig('hometiles', { native: { brokerHost: '127.0.0.1', brokerPort: port, ...ARMED, historyInstance: 'history.0' } });
+          await setManualEntities(harness, [{ stateId: TEMPERATURE, domain: 'sensor', name: 'Fenster' }]);
+          await setEnergyMeters(harness, [{ stateId: METER, category: 'grid', sign: 1, name: 'Zaehler' }]);
+          // The running hour ends at the live reading.
+          const live = (counter.at(-1)!.val as number) + 0.1;
+          await harness.states.setStateAsync(METER, { val: live, ack: true });
+          const HISTORY_RESPONSE = `tab5_lvgl/config/${PANEL}/history/response`;
+          const ENERGY_RESPONSE = `tab5_lvgl/config/${PANEL}/energy/response`;
+          const answers: Record<string, string[]> = { [HISTORY_RESPONSE]: [], [ENERGY_RESPONSE]: [] };
+          panel().on('message', (topic, payload) => answers[topic]?.push(payload.toString()));
+          await panel().subscribeAsync([HISTORY_RESPONSE, ENERGY_RESPONSE]);
+          await harness.startAdapterAndWait(true);
+
+          const apply = JSON.parse(await waitFor(harness, () => applies.find((payload) => payload.includes('"energy.')), 'the apply')) as {
+            sensors: string[];
+            energy: Array<{ id: string; name: string }>;
+          };
+          const [sensor] = apply.sensors;
+          const meter = apply.energy.find((entry) => entry.name === 'Zaehler')!.id;
+          // As the firmware asks: a graph, the state popup, the energy tile
+          // (mqtt_handlers.cpp:2410-2419, :2476-2486, :2548-2550).
+          await panel().publishAsync(`tab5_lvgl/config/${PANEL}/history/request`, `{"entity_id":"${sensor}","hours":24,"period_minutes":5,"points":288,"stat":"mean"}`);
+          await panel().publishAsync(`tab5_lvgl/config/${PANEL}/history/request`, `{"version":1,"kind":"state","entity_id":"${sensor}","hours":24,"max_transitions":96}`);
+          await panel().publishAsync(`tab5_lvgl/config/${PANEL}/energy/request`, '{"period":"day"}');
+          // A graph's answer has no kind (Task 17).
+          const answered = (kind?: string): string | undefined => answers[HISTORY_RESPONSE]!.find((text) => (JSON.parse(text) as { kind?: string }).kind === kind);
+          const history = JSON.parse(await waitFor(harness, () => answered(), 'the graph')) as Record<string, unknown>;
+          const timeline = JSON.parse(await waitFor(harness, () => answered('state'), 'the state history')) as {
+            history_available: boolean;
+            current: string;
+            activity: Array<{ state: string }>;
+          };
+          const energy = JSON.parse(await waitFor(harness, () => answers[ENERGY_RESPONSE]![0], 'the energy answer')) as {
+            period: string;
+            entries: Array<{ id: string; total?: number }>;
+          };
+
+          expect(history).to.include({ entity_id: sensor, hours: 24, period_minutes: 5 });
+          // Every bucket a planted reading, in time order: those of the day
+          // shown, the reading in effect before them carried in, the newest last.
+          const values = history.values as number[];
+          const planted = READINGS.map((reading) => reading.val as number);
+          expect(values).to.have.lengthOf(288);
+          expect(values.every((value) => planted.includes(value)), JSON.stringify(values)).to.equal(true);
+          expect(values).to.deep.equal([...values].sort((a, b) => a - b));
+          expect([...new Set(values)]).to.include.members(planted.slice(2));
+          expect(values.at(-1)).to.equal(24.7);
+
+          // Each row as the sensor's synth reads it, the live state unknown to the history.
+          expect(timeline).to.include({ entity_id: sensor, hours: 24, history_available: true, current: 'unavailable' });
+          expect(timeline.activity.map(({ state }) => Number(state)).every((value) => planted.includes(value)), JSON.stringify(timeline.activity)).to.equal(true);
+          expect(timeline.activity.map(({ state }) => state)).to.include.members(planted.slice(2).map(String));
+          expect(timeline.activity.at(-1)!.state).to.equal('24.7');
+
+          expect(energy.period).to.equal('day');
+          const midnight = new Date().setHours(0, 0, 0, 0);
+          const total = energy.entries.find((entry) => entry.id === meter)?.total;
+          expect(total).to.equal(Math.round((live - (counter.filter((reading) => reading.ts < midnight).at(-1)!.val as number)) * 1000) / 1000);
+          expect(energy.entries.map((entry) => entry.id)).to.include('consumption_total');
+          expect(answers[HISTORY_RESPONSE]).to.have.lengthOf(2);
+          expect(answers[ENERGY_RESPONSE]).to.have.lengthOf(1);
+        });
+      });
+
       suite('the history provider against iobroker.history (Task 19)', (getHarness) => {
         const HOUR = 3_600_000;
         const now = Date.now();
         const start = now - 24 * HOUR;
         /** Local 06:00 of the day the window starts in. */
         const morning = new Date(start).setHours(6, 0, 0, 0);
-        const row = (ts: number, val: unknown, q = 0, ack = true): HistoryRow => ({ ts, val, ack, q });
         const every = (first: number, step: number, count: number): HistoryRow[] =>
           Array.from({ length: count }, (_, i) => row(first + i * step, 20 + i / 10));
         const ID = {
@@ -1434,11 +1627,6 @@ if (process.env.HOMETILES_INTEGRATION === '1') {
         /** Three days back: its 42.5 hours of rows cross a midnight whatever the hour, so two day files hold them. */
         const busyStart = start - 48 * HOUR;
         const BUSY = [row(busyStart - HOUR, 1), ...every(busyStart + HOUR, 30_000, MAX_HISTORY_ROWS + 100)];
-        /** A kWh counter every 10 minutes, 0.1 a row, from 20:00 yesterday to two minutes before `until` (Task 20b). */
-        const meterRows = (until: number): HistoryRow[] => {
-          const eightPm = new Date(until).setHours(-4, 0, 0, 0);
-          return Array.from({ length: Math.floor((until - 120_000 - eightPm) / 600_000) + 1 }, (_, i) => row(eightPm + i * 600_000, 900 + i / 10));
-        };
         /** Planted as the suite starts, so its newest row is minutes old when the energy test asks. */
         let METER: HistoryRow[] = [];
         const MARKED = [
@@ -1450,90 +1638,17 @@ if (process.env.HOMETILES_INTEGRATION === '1') {
           row(start + 4 * HOUR, 'n/a'),
           row(start + 5 * HOUR, 23),
         ];
-        let adapter: ChildProcess | undefined;
-        let systemConfig: Record<string, unknown> | null | undefined;
+        withHistoryAdapter(
+          getHarness,
+          () => {
+            METER = meterRows(Date.now());
+            return { [ID.window]: WINDOW, [ID.sameDay]: SAME_DAY, [ID.busy]: BUSY, [ID.marked]: MARKED, [ID.old]: OLD, [ID.meter]: METER };
+          },
+          [ID.unlogged],
+        );
 
         const ask = (provider: HistoryProvider, id: string, kind: 'numeric' | 'discrete' = 'numeric', from = start): Promise<HistoryResult> =>
           provider.query(id, { start: from, kind, panel: 'e2e' });
-
-        before(async function () {
-          this.timeout(300000);
-          // Installed once, and again for another version. Without the
-          // network the install fails: the suite is skipped, saying why (M-7).
-          const installed = (): unknown => {
-            try {
-              return JSON.parse(readFileSync(path.join(HISTORY_PACKAGE, 'package.json'), 'utf8')).version;
-            } catch {
-              return undefined;
-            }
-          };
-          if (installed() !== HISTORY_VERSION) {
-            mkdirSync(HISTORY_DIR, { recursive: true });
-            try {
-              execFileSync('npm', ['install', '--prefix', HISTORY_DIR, '--omit=dev', '--no-audit', '--no-fund', `iobroker.history@${HISTORY_VERSION}`], {
-                stdio: 'pipe',
-              });
-            } catch (error) {
-              const reason = String((error as { stderr?: unknown }).stderr ?? error).trim().split('\n').slice(-3).join(' ');
-              process.stderr.write(`Skipping the iobroker.history suite: installing iobroker.history@${HISTORY_VERSION} failed: ${reason}\n`);
-              this.skip();
-            }
-          }
-          if (!lstatSync(HISTORY_LINK, { throwIfNoEntry: false })) symlinkSync(HISTORY_PACKAGE, HISTORY_LINK, 'dir');
-          rmSync(HISTORY_STORE, { recursive: true, force: true });
-          plantHistory(ID.window, WINDOW);
-          plantHistory(ID.sameDay, SAME_DAY);
-          plantHistory(ID.busy, BUSY);
-          plantHistory(ID.marked, MARKED);
-          plantHistory(ID.old, OLD);
-          METER = meterRows(Date.now());
-          plantHistory(ID.meter, METER);
-
-          const harness = getHarness();
-          systemConfig = await harness.objects.getObjectAsync('system.config');
-          const custom = { 'history.0': { enabled: true, changesOnly: true, debounce: 0, retention: 31536000, maxLength: 960 } };
-          for (const id of Object.values(ID)) {
-            const common = { name: id, type: 'mixed', role: 'value', read: true, write: false, ...(id === ID.unlogged ? {} : { custom }) };
-            await harness.objects.setObjectAsync(id, { _id: id, type: 'state', common, native: {} });
-          }
-          const io = JSON.parse(readFileSync(path.join(HISTORY_PACKAGE, 'io-package.json'), 'utf8'));
-          await harness.objects.setObjectAsync('system.adapter.history.0', {
-            _id: 'system.adapter.history.0',
-            type: 'instance',
-            common: { ...io.common, enabled: true },
-            native: { ...io.native, storeDir: HISTORY_STORE, writeNulls: false },
-          });
-          const log = openSync(path.join(HISTORY_DIR, 'history.0.log'), 'w');
-          adapter = spawn(process.execPath, [HISTORY_MAIN, '--force', '--console'], { cwd: HISTORY_DIR, stdio: ['ignore', log, log] });
-          closeSync(log);
-
-          // Alive comes before its ready handler has set the store directory:
-          // asked earlier, it reads nothing, so wait for a first real answer.
-          const provider = new HistoryProvider(harnessHistory(harness), { info() {}, warn() {}, error() {}, debug() {} }, 'history.0');
-          const deadline = Date.now() + 60000;
-          for (;;) {
-            if (adapter.exitCode !== null) throw new Error(`iobroker.history exited with ${adapter.exitCode}; see ${HISTORY_DIR}/history.0.log`);
-            const result = await ask(provider, ID.window);
-            if (result.available && result.rows.length > 0) break;
-            if (Date.now() > deadline) throw new Error(`iobroker.history never answered (${result.reason ?? 'no rows'})`);
-            await pause(500);
-          }
-        });
-
-        after(async function () {
-          this.timeout(30000);
-          if (adapter && adapter.exitCode === null) {
-            const exited = new Promise((resolve) => adapter!.once('exit', resolve));
-            adapter.kill('SIGTERM');
-            await Promise.race([exited, pause(10000)]);
-            if (adapter.exitCode === null) adapter.kill('SIGKILL');
-          }
-          if (lstatSync(HISTORY_LINK, { throwIfNoEntry: false })?.isSymbolicLink()) unlinkSync(HISTORY_LINK);
-          // The next run's database starts from what the last suite leaves.
-          const harness = getHarness();
-          for (const id of [...Object.values(ID), 'system.adapter.history.0']) await harness.objects.delObjectAsync(id).catch(() => undefined);
-          if (systemConfig) await harness.objects.setObjectAsync('system.config', systemConfig);
-        });
 
         const provide = (instance = 'history.0', lines: string[] = []): HistoryProvider => {
           const add = (message: string): void => void lines.push(message);
