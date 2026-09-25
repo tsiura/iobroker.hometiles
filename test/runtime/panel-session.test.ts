@@ -427,23 +427,27 @@ describe('runtime/panel-session', () => {
       });
     });
 
-    it('publishes a whole map of exactly the limit', () => {
-      const { session, published, errors } = harness();
+    it('publishes a whole map of exactly the limit, and warns of nothing', () => {
+      const { session, published, errors, warnings } = harness();
       session.pushConfig(scenesWithIconMapOf(LIMIT));
       const icons = iconsOf(published)!;
       expect(bytes(icons.payload)).to.equal(LIMIT);
       expect(Object.values(JSON.parse(icons.payload))).to.satisfy((values: string[]) => values.every((value) => value === ''));
       expect(errors).to.deep.equal([]);
+      expect(warnings).to.deep.equal([]);
     });
 
-    it('drops the "" entries one byte over, counted in UTF-8 bytes', () => {
-      const { session, published } = harness();
-      session.pushConfig(scenesWithIconMapOf(LIMIT + 1));
+    it('drops the "" entries one byte over, counted in UTF-8 bytes, and says so', () => {
+      const { session, published, warnings } = harness();
+      const scenes = scenesWithIconMapOf(LIMIT + 1);
+      session.pushConfig(scenes);
       expect(iconsOf(published)!.payload).to.equal('{}');
+      expect(warnings).to.have.length(1);
+      expect(warnings[0]).to.include(`${scenes.length} entities without an MDI icon`);
     });
 
-    it('publishes the MDI icons of 940 long-id switches without their "" entries, where the apply still fits', () => {
-      const { session, published, errors } = harness();
+    it('publishes the MDI icons of 940 long-id switches without their "" entries, where the apply still fits, and says what that leaves (Task 21 round 2 C1)', () => {
+      const { session, published, errors, warnings } = harness();
       const sockets = Array.from({ length: 940 }, (_, i) => socket(i));
       // The premise: the apply fits, the whole map would not.
       expect(session.pushConfig(sockets)).to.equal(true);
@@ -457,21 +461,49 @@ describe('runtime/panel-session', () => {
         'switch.zwischenstecker_nr_0002': 'mdi:power-socket-de',
       });
       expect(errors).to.deep.equal([]);
+      // One English line: the 937 left without "" keep a stale icon until the panel restarts (Ruling 114).
+      expect(warnings).to.deep.equal([
+        `[Panel a1] Icons pushed without the entries that clear one: with them, bridge/icons is over the ${LIMIT} bytes a panel takes. ` +
+          'The 937 entities without an MDI icon keep any icon the panel holds for them until it restarts. ' +
+          'Pick fewer devices on the Devices tab of the adapter settings to send them again',
+      ]);
+    });
+
+    it('warns once per configuration whose icons go without their "" entries, as the refusals do, and anew once the map has fit', () => {
+      const { session, warnings } = harness();
+      const sockets = (count: number): VirtualEntity[] => Array.from({ length: count }, (_, i) => socket(i));
+      session.pushConfig(sockets(940));
+      // The same configuration again, as a panel's refresh request forces it: no second line.
+      session.pushConfig(sockets(940), true);
+      expect(warnings).to.have.length(1);
+      // The whole map fits: nothing to say; the same configuration as before, degraded again, is said again.
+      session.pushConfig(sockets(10));
+      expect(warnings).to.have.length(1);
+      session.pushConfig(sockets(940));
+      expect(warnings).to.have.length(2);
+      // Another configuration that degrades is named too, as each refused one is.
+      session.pushConfig(sockets(941));
+      expect(warnings).to.have.length(3);
+      expect(warnings[2]).to.include('The 938 entities');
     });
 
     it('publishes no icons when the MDI ones alone are over the limit, and says so once, with the byte count', () => {
       // Possible only past the 128 numbers, selects and datetimes the apply
       // takes: every other icon costs the apply more than the map.
-      const { session, published, errors } = harness();
+      const { session, published, errors, warnings } = harness();
       const setpoints = Array.from({ length: 700 }, (_, i) => setpoint(i));
       const size = bytes(JSON.stringify(Object.fromEntries(setpoints.map((s) => [s.entityId, 'mdi:thermostat']))));
-      expect(session.pushConfig(setpoints)).to.equal(true);
+      // And a switch with no icon, whose "" entry goes first.
+      const entities = [...setpoints, socket(9)];
+      expect(session.pushConfig(entities)).to.equal(true);
       expect(published.map((p) => p.topic)).to.deep.equal([APPLY]);
       expect(errors).to.have.length(1);
       expect(errors[0]).to.include('[Panel a1]').and.to.include(`${size} bytes`).and.to.include(`${LIMIT}`);
-      expect(session.pushConfig(setpoints, true)).to.equal(true);
+      expect(session.pushConfig(entities, true)).to.equal(true);
       expect(published.map((p) => p.topic)).to.deep.equal([APPLY, APPLY]);
       expect(errors).to.have.length(1);
+      // The error says it all: no map went out that a warning could describe.
+      expect(warnings).to.deep.equal([]);
     });
 
     it('publishes the icons again once they fit, and names the next refusal anew', () => {

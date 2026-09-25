@@ -141,6 +141,8 @@ export class PanelSession {
   private lastIconsPayload: string | null = null;
   /** The configuration whose icon map was last refused as too large, so each is named in one error only (Ruling 114). */
   private refusedIconsFor: string | null = null;
+  /** The configuration whose icon map last went out without its "" entries, so each is named in one warning only (Task 23). */
+  private degradedIconsFor: string | null = null;
   private started = false;
   /**
    * The entities pushed to this panel, as last pushed: what its requests are
@@ -298,7 +300,7 @@ export class PanelSession {
 
     // Ruling 114: an icon map a panel would cut is not published either;
     // buildIconsPayload has already left out the "" entries to make it fit.
-    const icons = buildIconsPayload(entities);
+    const { payload: icons, dropped } = buildIconsPayload(entities);
     const iconBytes = Buffer.byteLength(icons, 'utf8');
     if (iconBytes > MAX_ICONS_BYTES) {
       if (signature !== this.refusedIconsFor) {
@@ -311,6 +313,19 @@ export class PanelSession {
       }
     } else {
       this.refusedIconsFor = null;
+      // Without its "" entries, an icon the panel holds for such an entity is
+      // never cleared (Task 21 round 2, C1): said once per configuration, as
+      // the refusals are, and again once a whole map has gone out between.
+      if (dropped === 0) {
+        this.degradedIconsFor = null;
+      } else if (signature !== this.degradedIconsFor) {
+        this.degradedIconsFor = signature;
+        this.log.warn(
+          `[Panel ${this.deviceId}] Icons pushed without the entries that clear one: with them, bridge/icons is over the ` +
+            `${MAX_ICONS_BYTES} bytes a panel takes. The ${dropped} entities without an MDI icon keep any icon the panel ` +
+            'holds for them until it restarts. Pick fewer devices on the Devices tab of the adapter settings to send them again',
+        );
+      }
       if (icons !== this.lastIconsPayload) {
         this.lastIconsPayload = icons;
         this.transport.publish({ topic: iconsTopic(this.deviceId), payload: icons, retain: true });

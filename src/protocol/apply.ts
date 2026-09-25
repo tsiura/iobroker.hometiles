@@ -334,13 +334,15 @@ export function configSignature(payload: string): string {
  *
  * Over MAX_ICONS_BYTES the "" entries go first (Ruling 114): the MDI icons
  * still arrive, and an entity left out keeps whatever icon the panel holds
- * until it reboots. What is left can still be over the limit -- the icons
- * of the numbers, selects and datetimes past the 128th are in it, and not
- * in the apply -- and the session then publishes none.
+ * until it reboots; `dropped` counts them, for the session's warning. What is
+ * left can still be over the limit -- the icons of the numbers, selects and
+ * datetimes past the 128th are in it, and not in the apply -- and the session
+ * then publishes none.
  */
-export function buildIconsPayload(entities: VirtualEntity[]): string {
+export function buildIconsPayload(entities: VirtualEntity[]): { payload: string; dropped: number } {
   const icons = [...entities].sort(byEntityId).map((entity): [string, string] => [entity.entityId, mdiIcon(entity) ?? '']);
   const whole = JSON.stringify(Object.fromEntries(icons));
-  if (Buffer.byteLength(whole, 'utf8') <= MAX_ICONS_BYTES) return whole;
-  return JSON.stringify(Object.fromEntries(icons.filter(([, icon]) => icon)));
+  if (Buffer.byteLength(whole, 'utf8') <= MAX_ICONS_BYTES) return { payload: whole, dropped: 0 };
+  const kept = icons.filter(([, icon]) => icon);
+  return { payload: JSON.stringify(Object.fromEntries(kept)), dropped: icons.length - kept.length };
 }

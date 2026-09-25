@@ -163,9 +163,11 @@ describe('protocol/apply', () => {
     // applyIconUpdate takes each top-level pair as entity id and icon
     // (ha_bridge_config.cpp:743-771), as the Bridge sends it
     // (__init__.py:3529-3530); "" removes an icon the panel holds (:757-762).
-    expect(buildIconsPayload(ENTITIES)).to.equal(
-      '{"binary_sensor.tuer":"mdi:door","light.decke":"","scene.nacht":"","sensor.temp":"mdi:thermometer","switch.kaffee":""}',
-    );
+    // Whole, so nothing left out (Ruling 114).
+    expect(buildIconsPayload(ENTITIES)).to.deep.equal({
+      payload: '{"binary_sensor.tuer":"mdi:door","light.decke":"","scene.nacht":"","sensor.temp":"mdi:thermometer","switch.kaffee":""}',
+      dropped: 0,
+    });
   });
 });
 
@@ -317,14 +319,14 @@ describe('protocol/apply: what the panel can parse (Task 21 fix round 1)', () =>
         expect(JSON.parse(apply), apply).to.satisfy((parsed: Record<string, unknown[]>) =>
           Object.values(parsed).every((section) => !Array.isArray(section) || section.every((entry) => typeof entry !== 'object' || !('icon' in (entry as object)))),
         );
-        expect(Object.values(JSON.parse(buildIconsPayload(withIcon(icon))))).to.satisfy((icons: string[]) => icons.every((i) => i === ''));
+        expect(Object.values(JSON.parse(buildIconsPayload(withIcon(icon)).payload))).to.satisfy((icons: string[]) => icons.every((i) => i === ''));
       });
     }
 
     it('sends an MDI name in any case, which the panel lowercases (mdi_icons.cpp:7508-7521), in every section', () => {
       const apply = payload(withIcon('MDI:Lamp-Outline'));
       expect([...panelIconMap(apply, new Map()).entries()].sort()).to.deep.equal(DOMAINS.map((domain) => [`${domain}.x`, 'MDI:Lamp-Outline']).sort());
-      expect(Object.values(JSON.parse(buildIconsPayload(withIcon('mdi:lamp'))))).to.deep.equal(DOMAINS.map(() => 'mdi:lamp'));
+      expect(Object.values(JSON.parse(buildIconsPayload(withIcon('mdi:lamp')).payload))).to.deep.equal(DOMAINS.map(() => 'mdi:lamp'));
     });
   });
 
@@ -346,7 +348,7 @@ describe('protocol/apply: what the panel can parse (Task 21 fix round 1)', () =>
       expect(afterApply).to.deep.equal(held);
       // ... and an empty map clears nothing: only a pair per entity does.
       expect(panelIconUpdate(new Map(afterApply), '{}')).to.equal(false);
-      expect(panelIconUpdate(afterApply, buildIconsPayload(now))).to.equal(true);
+      expect(panelIconUpdate(afterApply, buildIconsPayload(now).payload)).to.equal(true);
       expect(afterApply).to.deep.equal(new Map());
     });
   });
