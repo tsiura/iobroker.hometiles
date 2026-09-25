@@ -2,11 +2,11 @@ import { expect } from 'chai';
 import sinon from 'sinon';
 import type { IoBrokerObject } from '../../src/registry/detector';
 import { EntityRegistry } from '../../src/registry/entity-registry';
-import type { DeviceInput } from '../../src/registry/types';
-import { aliasProblem, connectSources, missingTarget, SOURCE_CALL_MS, type SourceAccess } from '../../src/runtime/sources';
+import type { DeviceInput, SourceValue } from '../../src/registry/types';
+import { aliasProblem, connectSources, missingTarget, SOURCE_CALL_MS, subscribeBounded, type SourceAccess } from '../../src/runtime/sources';
 
 /** A value as js-controller hands it. */
-const state = (val: unknown): ioBroker.State => ({ val, ack: true, ts: 1_757_000_000_000, lc: 1_757_000_000_000, from: 'system.adapter.test.0', q: 0 }) as ioBroker.State;
+const state = (val: unknown): SourceValue => ({ val, ack: true, ts: 1_757_000_000_000, q: 0 });
 
 /** A temperature sensor whose one state is `objectId`. */
 const sensor = (root: string, name: string, objectId: string): DeviceInput => ({
@@ -43,13 +43,13 @@ function rebuild(...devices: DeviceInput[]): { registry: EntityRegistry; result:
 }
 
 /** js-controller as seen from the adapter: each call recorded; `hang` ids never answered, as 6.0.11-7.2.3 do an alias whose target id they refuse. */
-function controller(hang: { subscribe?: string[]; read?: string[] } = {}): SourceAccess & { calls: string[] } {
+function controller(hang: { subscribe?: string[]; unsubscribe?: string[]; read?: string[] } = {}): SourceAccess & { calls: string[] } {
   const calls: string[] = [];
   const never = new Promise<never>(() => undefined);
   return {
     calls,
     subscribe: (id) => (calls.push(`subscribe ${id}`), hang.subscribe?.includes(id) ? never : Promise.resolve()),
-    unsubscribe: (id) => (calls.push(`unsubscribe ${id}`), Promise.resolve()),
+    unsubscribe: (id) => (calls.push(`unsubscribe ${id}`), hang.unsubscribe?.includes(id) ? never : Promise.resolve()),
     read: (id) => (calls.push(`read ${id}`), hang.read?.includes(id) ? never : Promise.resolve(state(21.5))),
   };
 }
@@ -79,7 +79,7 @@ describe('runtime/sources: the calls a rebuild makes for its entities\' states (
 
   it('drops a read answered after its deadline, and names every call left unanswered in the one warning', async () => {
     const { registry, result } = rebuild(sensor('zigbee.0.t', 'Temp', TEMP), sensor('hm.0.h', 'Hang', HUNG));
-    let answer: (value: ioBroker.State) => void = () => undefined;
+    let answer: (value: SourceValue) => void = () => undefined;
     const js = controller({ subscribe: [HUNG] });
     js.read = (id) => (js.calls.push(`read ${id}`), new Promise((resolve) => (answer = resolve)));
     const warnings: string[] = [];
@@ -133,6 +133,48 @@ describe('runtime/sources: the calls a rebuild makes for its entities\' states (
     expect(registry.byId('sensor.temp')).to.include({ state: '21.5' });
     expect(registry.byId('sensor.hang')).to.include({ state: '21.5' });
     expect(warnings).to.deep.equal([]);
+    expect(clock.countTimers(), 'timers left').to.equal(0);
+  });
+
+  it('finishes when js-controller never answers an unsubscribe, reads the rest, and the warning names it (Ruling 151 n3)', async () => {
+    const values: string[] = [];
+    const js = controller({ unsubscribe: [HUNG] });
+    const warnings: string[] = [];
+    const done = connectSources({ subscribe: [TEMP], unsubscribe: [HUNG] }, OBJECTS, js, (id) => void values.push(id), { warn: (text) => void warnings.push(text) });
+    await clock.tickAsync(SOURCE_CALL_MS);
+    await done;
+    expect(values).to.deep.equal([TEMP]);
+    expect(warnings).to.have.lengthOf(1);
+    expect(warnings[0]).to.include(`unsubscribing ${HUNG}`);
+    expect(clock.countTimers(), 'timers left').to.equal(0);
+  });
+
+  it('subscribes one state at a time, never two at once: js-controller counts some with a read-modify-write (Ruling 151 n3)', async () => {
+    const { result } = rebuild(sensor('zigbee.0.t', 'Temp', TEMP), sensor('hm.0.h', 'Hang', HUNG), sensor('alias.0.c', 'Ok', 'alias.0.ok'));
+    let running = 0;
+    let most = 0;
+    const js = controller();
+    js.subscribe = () => {
+      most = Math.max(most, ++running);
+      return new Promise((resolve) => setTimeout(() => resolve(running--), 10));
+    };
+    const done = connectSources(result, OBJECTS, js, () => undefined, { warn: () => undefined });
+    await clock.tickAsync(100);
+    await done;
+    expect(most).to.equal(1);
+  });
+
+  it("gives up subscribing the adapter's own panels.* at SOURCE_CALL_MS, names it in one warning, and leaves no timer (Ruling 151 n3)", async () => {
+    const warnings: string[] = [];
+    const log = { warn: (text: string) => void warnings.push(text) };
+    await subscribeBounded(Promise.resolve(), 'hometiles.0.panels.*', log);
+    expect(warnings, 'answered in time').to.deep.equal([]);
+    let finished = false;
+    void subscribeBounded(new Promise<never>(() => undefined), 'hometiles.0.panels.*', log).then(() => (finished = true));
+    await clock.tickAsync(SOURCE_CALL_MS);
+    expect(finished).to.equal(true);
+    expect(warnings).to.have.lengthOf(1);
+    expect(warnings[0]).to.include('subscribing hometiles.0.panels.*').and.include(`${SOURCE_CALL_MS / 1000} s`);
     expect(clock.countTimers(), 'timers left').to.equal(0);
   });
 

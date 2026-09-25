@@ -13,6 +13,7 @@ import { promisify } from 'node:util';
 import { EnergySource, type EnergyNames } from '../src/runtime/energy-source';
 import { HistoryProvider, MAX_HISTORY_ROWS, type HistoryResult, type HistorySource } from '../src/runtime/history-provider';
 import { LOGIN_REFUSED_HINT } from '../src/runtime/mqtt-client';
+import { defaultBrokerPort } from './integration/broker-guard';
 
 /** Ports nothing listens on now, as the system hands them out: each held until all are known, so no two are one. */
 async function freePorts(count: number): Promise<number[]> {
@@ -27,12 +28,6 @@ async function freePorts(count: number): Promise<number[]> {
 async function noBroker(): Promise<{ brokerHost: string; brokerPort: number }> {
   return { brokerHost: '127.0.0.1', brokerPort: (await freePorts(1))[0]! };
 }
-
-/**
- * The ports io-package.json's broker defaults to, plain and TLS: a real broker may listen there,
- * and take a suite's retained applies to real panels (Ruling 145, I1).
- */
-const DEFAULT_BROKER_PORTS: readonly number[] = [1883, 8883];
 
 /**
  * Two free ports written into iobroker.json, where every process of a run reads its databases'
@@ -273,8 +268,9 @@ function refuseDefaultBroker({ AdapterSetup, TestHarness }: ReturnType<typeof ha
   };
   const refuse = async (harness: IntegrationTestHarness): Promise<void> => {
     const instance = (await harness.objects.getObjectAsync('system.adapter.hometiles.0')) as { native?: Record<string, unknown> } | null;
-    const port = Number(instance?.native?.brokerPort);
-    if (DEFAULT_BROKER_PORTS.includes(port)) {
+    // As the adapter computes it: no port at all is its default, 1883 (Ruling 151's nit).
+    const port = defaultBrokerPort(instance?.native);
+    if (port !== undefined) {
       throw new Error(
         `The adapter would connect to ${String(instance?.native?.brokerHost)}:${port}, where a real broker may take this suite's retained ` +
           'applies to real panels (Ruling 145, I1): give the suite a broker port of its own, its broker\'s or one taken and let go (freePorts)',

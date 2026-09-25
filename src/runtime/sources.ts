@@ -73,11 +73,23 @@ export function missingTarget(objectId: string, objects: Readonly<Record<string,
   return alias && 'read' in alias && objects[alias.read]?.type !== 'state' ? alias.read : undefined;
 }
 
+/**
+ * A subscribe of the adapter's own, `what`, bounded like the sources' calls
+ * (Ruling 150): the start goes on without it, and one warning names it.
+ */
+export async function subscribeBounded(call: Promise<unknown>, what: string, log: Pick<Logger, 'warn'>): Promise<void> {
+  if ((await within(call, SOURCE_CALL_MS)) !== UNANSWERED) return;
+  log.warn(
+    `[HomeTiles] js-controller gave no answer within ${SOURCE_CALL_MS / 1000} s to subscribing ${what}. ` +
+      "Carried on without it: writes to the panels' states may go unnoticed until the adapter restarts",
+  );
+}
+
 /** The js-controller calls a rebuild makes for the states its entities read. */
 export interface SourceAccess {
   subscribe(objectId: string): Promise<unknown>;
   unsubscribe(objectId: string): Promise<unknown>;
-  read(objectId: string): Promise<ioBroker.State | null | undefined>;
+  read(objectId: string): Promise<SourceValue | null | undefined>;
 }
 
 /**
