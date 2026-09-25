@@ -261,8 +261,11 @@ export function energyEntries(
  * once a device meter is set too: each slot of the consumption less the device
  * meters' values as measured, its total less their signed totals, as the
  * Bridge subtracts them (:2918, :2928; its dev_max is unused, the slots are the
- * consumption's). A total not known is skipped, as in a category total; the
- * unit is the first meter's where the Bridge writes kWh (review traps 6, 7).
+ * consumption's). A slot or total is known only where every grid, solar and
+ * battery meter has one (review N2): with the solar meter unknown, import less
+ * export would read as the house's, even below 0. A device not known counts 0,
+ * as in the Bridge. The unit is the first meter's where the Bridge writes kWh
+ * (review trap 7).
  * They go first in an answer: its size guard strips the last entries first,
  * and the house's consumption is the tile most likely bound (review trap 8).
  */
@@ -272,9 +275,11 @@ function consumptionEntries(entries: readonly EnergyEntry[], names: EnergyNames)
   const electric = own(['solar', 'grid', 'battery']);
   if (electric.length === 0) return [];
   const unit = electric[0]!.unit;
-  const house: EnergyEntry = { id: 'consumption_total', category: 'consumption', sign: 1, name: names.consumption, values: signedSlots(electric, 3), is_total: true };
+  const complete = (i: number): boolean => electric.every((entry) => (entry.values[i] ?? null) !== null);
+  const values = signedSlots(electric, 3).map((value, i) => (complete(i) ? value : null));
+  const house: EnergyEntry = { id: 'consumption_total', category: 'consumption', sign: 1, name: names.consumption, values, is_total: true };
   const houseTotal = knownTotal(electric, 3);
-  if (houseTotal !== undefined) house.total = houseTotal;
+  if (houseTotal !== undefined && electric.every((entry) => entry.total !== undefined)) house.total = houseTotal;
   if (unit) house.unit = unit;
   const devices = own(['device']);
   if (devices.length === 0) return [house];

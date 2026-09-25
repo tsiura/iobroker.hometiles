@@ -384,10 +384,10 @@ describe('runtime/energy-source', () => {
         meter({ id: 'energy.gas', category: 'gas', unit: 'm³' }),
       ];
       const data = series([
-        ['energy.bezug', { values: [1, null, 2], total: 3 }],
-        ['energy.einspeisung', { values: [0.5, null, null], total: 0.5 }],
+        ['energy.bezug', { values: [1, 0, 2], total: 3 }],
+        ['energy.einspeisung', { values: [0.5, 0, 0], total: 0.5 }],
         ['energy.pv', { values: [4, 4, 4], total: 12 }],
-        ['energy.akku_laden', { values: [1, null, null], total: 1 }],
+        ['energy.akku_laden', { values: [1, 0, 0], total: 1 }],
         ['energy.waschen', { values: [0.2, 0.3, null], total: 0.5 }],
         ['energy.gas', { values: [1, 1, 1], total: 3 }],
       ]);
@@ -427,19 +427,38 @@ describe('runtime/energy-source', () => {
       expect(energyEntries([meter({ id: 'energy.bezug' })], 'EUR', NAMES, data).map((e) => e.id)).to.deep.equal(['consumption_total', 'energy.bezug']);
     });
 
-    it('skips a total not known, and has none while no meter has one (review trap 6)', () => {
-      const meters = [meter({ id: 'energy.bezug' }), meter({ id: 'energy.pv', category: 'solar' }), meter({ id: 'energy.waschen', category: 'device' })];
-      const partly = series([
-        ['energy.bezug', { values: [null, 1], total: null }],
-        ['energy.pv', { values: [2, 2], total: 4 }],
-        ['energy.waschen', { values: [null, 0.5], total: null }],
-      ]);
-      const [house, untracked] = energyEntries(meters, 'EUR', NAMES, partly);
-      expect(house).to.deep.include({ values: [2, 3], total: 4 });
-      expect(untracked).to.deep.include({ values: [2, 2.5], total: 4 });
-      const unknown = series(['energy.bezug', 'energy.pv', 'energy.waschen'].map((id): [string, Consumption] => [id, { values: [null], total: null }]));
-      for (const entry of energyEntries(meters, 'EUR', NAMES, unknown).slice(0, 2)) {
-        expect(entry.values, entry.id).to.deep.equal([null]);
+    it("is known only where every grid, solar and battery meter is: a partial sum would read as the house's (review N2)", () => {
+      const meters = [
+        meter({ id: 'energy.bezug' }),
+        meter({ id: 'energy.einspeisung', sign: -1 }),
+        meter({ id: 'energy.pv', category: 'solar' }),
+        meter({ id: 'energy.waschen', category: 'device' }),
+      ];
+      const house = (pv: Consumption): EnergyEntry[] =>
+        energyEntries(
+          meters,
+          'EUR',
+          NAMES,
+          series([
+            ['energy.bezug', { values: [1, 1], total: 2 }],
+            ['energy.einspeisung', { values: [7, 8], total: 15 }],
+            ['energy.pv', pv],
+            // A device not known counts 0, as in the Bridge: only the electric meters must be complete.
+            ['energy.waschen', { values: [0.5, null], total: 0.5 }],
+          ]),
+        ).slice(0, 2);
+      // The review's probe: import 2 and export 15 with solar unknown read [-6, -7] and -13 as the house's.
+      for (const entry of house({ values: [null, null], total: null })) {
+        expect(entry.values, entry.id).to.deep.equal([null, null]);
+        expect(entry, entry.id).to.not.have.property('total');
+      }
+      // Complete: 2 - 15 + 20.
+      const [total, untracked] = house({ values: [10, 10], total: 20 });
+      expect(total).to.deep.include({ id: 'consumption_total', values: [4, 3], total: 7 });
+      expect(untracked).to.deep.include({ id: 'consumption_untracked', values: [3.5, 3], total: 6.5 });
+      // Slot by slot: the second slot, and the total, wait for the solar meter.
+      for (const entry of house({ values: [10, null], total: null })) {
+        expect(entry.values, entry.id).to.deep.equal(entry.id === 'consumption_total' ? [4, null] : [3.5, null]);
         expect(entry, entry.id).to.not.have.property('total');
       }
     });
