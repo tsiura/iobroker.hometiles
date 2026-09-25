@@ -424,6 +424,27 @@ panel:
 
 Until those are done, treat 0.2.0 as ready to test, not ready to rely on.
 
+## Development
+
+`npm run check` lints, builds and runs the unit tests. The integration tests
+run the adapter under a real js-controller, with a real iobroker.history,
+against in-process MQTT brokers. They are opt-in and need the network the
+first time:
+
+```sh
+npm run build
+HOMETILES_INTEGRATION=1 npm test
+```
+
+They install js-controller, the packed adapter and iobroker.history under
+`$TMPDIR/test-iobroker.hometiles` (about 200 MB) and reuse that directory on
+later runs. Every port they open is one the system hands out, but the
+directory holds one run's databases: **two integration runs at the same time
+need two different `TMPDIR`s**, for example `TMPDIR=/tmp/run-a` and
+`TMPDIR=/tmp/run-b`. An install that fails, a full disk or quota included,
+stops the run with npm's own error; only a missing network skips the suites
+that need iobroker.history.
+
 ## Protocol
 
 The wire contract this adapter implements is documented in
