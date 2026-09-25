@@ -93,7 +93,9 @@ function setLabelWritable(writable: Record<string, boolean>, role: string, chann
  * (neither the thermostat nor the airCondition pattern has one), so nothing
  * can back it.
  */
-const HVAC_MODE_NAMES = ['off', 'heat', 'cool', 'heat_cool', 'auto', 'dry', 'fan_only'] as const;
+export const HVAC_MODE_NAMES = ['off', 'heat', 'cool', 'heat_cool', 'auto', 'dry', 'fan_only'] as const;
+/** A firmware hvac name: what the Climate modes table maps a device's own mode to (Ruling 141). */
+export type HvacMode = (typeof HVAC_MODE_NAMES)[number];
 const FAN_MODE_NAMES = ['auto', 'low', 'medium', 'high', 'on', 'off', 'top', 'middle', 'focus', 'diffuse'] as const;
 const SWING_MODE_NAMES = ['off', 'on', 'vertical', 'horizontal', 'both'] as const;
 

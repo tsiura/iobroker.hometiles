@@ -3,11 +3,11 @@ import { readFileSync } from 'node:fs';
 import path from 'node:path';
 import { validateOptions, type AdapterOptions } from '../../src/config/options';
 import { parseAnnouncement } from '../../src/protocol/announce';
-import { parseLightCommand, parseMediaCommand, type ServiceCall } from '../../src/protocol/commands';
+import { parseClimateCommand, parseLightCommand, parseMediaCommand, type ServiceCall } from '../../src/protocol/commands';
 import { buildStatePublish } from '../../src/protocol/state-payload';
 import { createIoBrokerDetector, discoverDevices, type RootAnchors } from '../../src/registry/detector';
 import { EntityRegistry } from '../../src/registry/entity-registry';
-import { applyOverrides, detectedRows, mergeDetected, unbuiltForces } from '../../src/registry/overrides';
+import { applyClimateModes, applyOverrides, detectedRows, mergeDetected, unbuiltForces } from '../../src/registry/overrides';
 import { encodeChannelValue } from '../../src/registry/synth/common';
 import { synthDatetime, valueChannel } from '../../src/registry/synth/editable';
 import { lacks, synthesise } from '../../src/registry/synth/index';
@@ -2587,5 +2587,75 @@ describe('a forced type that makes no tile, and what the device lacks for it (Ru
       { objectId: GARDEN, domain: 'media_player', lack: 'player_state' },
     ]);
     expect(unbuiltForces(detected, picked)).to.have.lengthOf(2);
+  });
+});
+
+describe('a thermostat whose modes carry names of its own, mapped on the Climate modes table (Ruling 141)', () => {
+  // Homematic's own mode labels: none is a firmware hvac name, so Task 5b
+  // lists none of them and a panel shows no mode button (Ruling 26).
+  const TRV = 'hm-rpc.0.000A1BE9A2B3C4';
+  const ROOT = `${TRV}.1`;
+  const MODE = `${ROOT}.SET_POINT_MODE`;
+  const trv1 = (datapoint: string, common: Record<string, unknown>): IoObject =>
+    state(`${ROOT}.${datapoint}`, { name: `Heizung Bad:1.${datapoint}`, ...common });
+  const TRV_SET = objects(
+    device(TRV, 'Heizung Bad'),
+    channel(ROOT, 'Heizung Bad:1'),
+    trv1('ACTUAL_TEMPERATURE', { role: 'value.temperature', type: 'number', unit: '°C', write: false }),
+    trv1('SET_POINT_TEMPERATURE', { role: 'level.temperature', type: 'number', unit: '°C', min: 4.5, max: 30.5, write: true }),
+    trv1('SET_POINT_MODE', {
+      role: 'level.mode.thermostat',
+      type: 'number',
+      write: true,
+      states: { 0: 'AUTO-MODE', 1: 'MANU-MODE', 2: 'PARTY-MODE', 3: 'BOOST-MODE' },
+    }),
+  );
+  const ENTITY = 'climate.heizung_bad';
+  /** The table's rows as admin stores them: MANU as heat, AUTO as auto. */
+  const TABLE = [
+    { device: ROOT, deviceMode: 'MANU-MODE', panelMode: 'heat' },
+    { device: ROOT, deviceMode: 'AUTO-MODE', panelMode: 'auto' },
+  ];
+
+  /** What a start runs: detection, the pick, the table as the options take it, the synth and the payload. */
+  function thermostat(table: unknown[], mode = 1): { entity: VirtualEntity; payload: Record<string, unknown>; rejected: unknown[] } {
+    const picked = applyOverrides(detectDevices(TRV_SET), [{ objectId: ROOT, include: true, detectedDomain: 'climate' }]);
+    const { options } = validateOptions({ climateModes: table } as Partial<AdapterOptions>);
+    const { devices, rejected } = applyClimateModes(picked, options.climateModes);
+    const found = devices.find((candidate) => candidate.objectId === ROOT);
+    expect(found?.domain, 'one thermostat, at its channel').to.equal('climate');
+    const values = { [MODE]: value(mode), [`${ROOT}.SET_POINT_TEMPERATURE`]: value(21), [`${ROOT}.ACTUAL_TEMPERATURE`]: value(20.5) };
+    const entity = synthesise(found!, ENTITY, values)!;
+    return { entity, payload: JSON.parse(buildStatePublish('homeassistant', entity)!.payload) as Record<string, unknown>, rejected };
+  }
+  /** A mode button's command, as the panel sends it. */
+  const command = (mode: string): ServiceCall =>
+    parseClimateCommand(JSON.stringify({ entity_id: ENTITY, command: 'set_hvac_mode', hvac_mode: mode }));
+
+  it('has no mode button without a row, as Task 5b left it: no label of its mode state is a firmware name', () => {
+    const { payload } = thermostat([]);
+    expect(payload).to.include({ hvac_mode: 'MANU-MODE' }).and.not.have.property('hvac_modes');
+  });
+
+  it("lists MANU as heat and AUTO as auto, shows the current MANU as heat, and the panel's heat writes MANU's raw value", async () => {
+    const { entity, payload, rejected } = thermostat(TABLE);
+    expect(rejected).to.deep.equal([]);
+    expect(payload).to.include({ hvac_mode: 'heat' });
+    expect(payload.hvac_modes).to.deep.equal(['heat', 'auto']);
+    expect((await dispatch(entity, command('heat'))).writes).to.deep.equal([[MODE, 1]]);
+    expect((await dispatch(entity, command('auto'))).writes).to.deep.equal([[MODE, 0]]);
+    expect(thermostat(TABLE, 0).payload).to.include({ hvac_mode: 'auto' });
+  });
+
+  it('leaves a label no row maps as it was: shown by its own name, no button, and a command naming it writes what it wrote before', async () => {
+    const unmapped = thermostat([], 2);
+    const mapped = thermostat(TABLE, 2);
+    expect(mapped.payload).to.include({ hvac_mode: 'PARTY-MODE' });
+    expect(mapped.payload.hvac_modes).to.deep.equal(['heat', 'auto']);
+    for (const label of ['party-mode', 'boost-mode', 'eco', 'heat_cool']) {
+      expect((await dispatch(mapped.entity, command(label))).writes, label).to.deep.equal((await dispatch(unmapped.entity, command(label))).writes);
+    }
+    expect((await dispatch(mapped.entity, command('boost-mode'))).writes).to.deep.equal([[MODE, 3]]);
+    expect((await dispatch(mapped.entity, command('heat_cool'))).writes).to.deep.equal([]);
   });
 });

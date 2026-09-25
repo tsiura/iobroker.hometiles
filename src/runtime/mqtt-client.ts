@@ -194,3 +194,30 @@ export class HomeTilesMqttClient {
     }
   }
 }
+
+/**
+ * One connection attempt with these options, for the admin's Test broker
+ * (Ruling 140): whether it connected, else the broker's or the network's last
+ * error. mqtt.js gives up after its connect timeout (10 s) with "connack
+ * timeout", but a broker that hangs up on each connection without a word
+ * leaves it retrying for ever with no error at all: `deadlineMs` bounds the
+ * wait regardless (Ruling 143). The client is closed either way.
+ */
+export async function probeBroker(
+  options: AdapterOptions,
+  log: Logger,
+  deadlineMs: number,
+): Promise<{ connected: boolean; error: string | undefined; timedOut: boolean }> {
+  const client = new HomeTilesMqttClient(options, log);
+  let timer: NodeJS.Timeout | undefined;
+  const deadline = new Promise<true>((resolve) => {
+    timer = setTimeout(() => resolve(true), deadlineMs);
+  });
+  try {
+    const timedOut = await Promise.race([client.connect().then(() => false), deadline]);
+    return { connected: client.connected, error: client.lastError, timedOut: timedOut && !client.connected };
+  } finally {
+    clearTimeout(timer);
+    await client.disconnect();
+  }
+}

@@ -165,14 +165,20 @@ describe('runtime/energy-source', () => {
       expect(energyMeters(rows, objects, {}, 'hometiles.0', '').unloggedElectric).to.deep.equal([]);
     });
 
-    it("warns that an unlogged meter's tiles show nothing, and while it is electric the house's totals too (Task 23, energy round 2 C2)", () => {
+    it("warns that an unlogged meter's tiles show nothing, and while it is electric the house's totals show 0.000 (Task 23, energy round 2 C2, review m3)", () => {
       const enable = 'Enable history.0 in the settings of each of these states';
-      expect(unloggedWarning('history.0', ['x.0.gas', 'x.0.pump'], [])).to.equal(
+      expect(unloggedWarning('history.0', ['x.0.gas', 'x.0.pump'], [], true)).to.equal(
         `Not logged by history.0, so their energy tiles show no consumption: x.0.gas, x.0.pump. ${enable}`,
       );
-      expect(unloggedWarning('history.0', ['x.0.gas', 'x.0.pv', 'x.0.grid'], ['x.0.pv', 'x.0.grid'])).to.equal(
+      // An absent total reads 0.000 on a tile (global constraints); untracked consumption exists only beside a device meter.
+      expect(unloggedWarning('history.0', ['x.0.gas', 'x.0.pv', 'x.0.grid'], ['x.0.pv', 'x.0.grid'], false)).to.equal(
         'Not logged by history.0, so their energy tiles show no consumption: x.0.gas, x.0.pv, x.0.grid. ' +
-          "The house's total and untracked consumption stay blank as well while any grid, solar or battery meter is unknown: x.0.pv, x.0.grid. " +
+          "The house's total consumption shows 0.000 as well while any grid, solar or battery meter is unknown: x.0.pv, x.0.grid. " +
+          enable,
+      );
+      expect(unloggedWarning('history.0', ['x.0.grid'], ['x.0.grid'], true)).to.equal(
+        'Not logged by history.0, so their energy tiles show no consumption: x.0.grid. ' +
+          "The house's total and untracked consumption show 0.000 as well while any grid, solar or battery meter is unknown: x.0.grid. " +
           enable,
       );
     });

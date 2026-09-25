@@ -35,10 +35,13 @@
     "protocolTrace": false,
     "deviceOverrides": [],
     "manualEntities": [],
+    "climateModes": [],
     "historyInstance": "",
     "energyMeters": [],
     "currency": "EUR"
   },
+  "encryptedNative": ["brokerPassword"],
+  "protectedNative": ["brokerPassword"],
   "objects": [],
   "instanceObjects": [
     { "_id": "info", "type": "channel", "common": { "name": "Information" }, "native": {} },

@@ -1,10 +1,11 @@
 import { expect } from 'chai';
-import { validateOptions, type DeviceOverride } from '../../src/config/options';
+import { validateOptions, type ClimateModeRow, type DeviceOverride } from '../../src/config/options';
 import { discoverDevices, type IoBrokerObject } from '../../src/registry/detector';
 import { idsToStore } from '../../src/registry/entity-id';
 import { EntityRegistry } from '../../src/registry/entity-registry';
-import { applyOverrides, detectedRows, mergeDetected, type Detected } from '../../src/registry/overrides';
-import type { DeviceInput } from '../../src/registry/types';
+import { applyClimateModes, applyOverrides, detectedRows, mergeDetected, type Detected } from '../../src/registry/overrides';
+import type { HvacMode } from '../../src/registry/synth/climate';
+import type { ChannelInput, DeviceInput } from '../../src/registry/types';
 
 const DEVICES: DeviceInput[] = [
   { objectId: 'a', name: 'A', detectorType: 'socket', domain: 'switch', channels: { set: { objectId: 'a.set' } } },
@@ -88,6 +89,109 @@ describe('registry/overrides', () => {
     it('ignores an empty name override rather than blanking the device name', () => {
       const result = applyOverrides(DEVICES, [pick('a', { name: '   ' })]);
       expect(result[0]!.name).to.equal('A');
+    });
+  });
+
+  describe('climate modes the panel does not name (Ruling 141)', () => {
+    const MODES = { 0: 'AUTO-MODE', 1: 'MANU-MODE', 2: 'PARTY-MODE', 3: 'BOOST-MODE' };
+    const thermostat = (objectId: string, mode?: ChannelInput): DeviceInput => ({
+      objectId,
+      name: objectId,
+      detectorType: 'thermostat',
+      domain: 'climate',
+      channels: { set: { objectId: `${objectId}.SET`, type: 'number', write: true }, ...(mode ? { mode } : {}) },
+    });
+    const modeOf = (objectId: string, extra: Partial<ChannelInput> = {}): ChannelInput => ({
+      objectId: `${objectId}.MODE`,
+      type: 'number',
+      write: true,
+      states: MODES,
+      ...extra,
+    });
+    const row = (device: string, deviceMode: string, panelMode: HvacMode): ClimateModeRow => ({ device, deviceMode, panelMode });
+    const states = (devices: readonly DeviceInput[], objectId: string): Record<string, string> | undefined =>
+      devices.find((device) => device.objectId === objectId)?.channels.mode?.states;
+
+    it('relabels each mapped state with its panel mode, named by its value or by its label in any case, and leaves every other label and device as it was', () => {
+      const devices = [thermostat('t1', modeOf('t1')), DEVICES[0]!];
+      const { devices: mapped, rejected } = applyClimateModes(devices, [row('t1', ' manu-mode ', 'heat'), row('t1', '0', 'auto')]);
+      expect(rejected).to.deep.equal([]);
+      expect(states(mapped, 't1')).to.deep.equal({ 0: 'auto', 1: 'heat', 2: 'PARTY-MODE', 3: 'BOOST-MODE' });
+      expect(mapped[1]).to.equal(DEVICES[0]);
+      // Nothing it was given changes, and no row changes nothing.
+      expect(devices[0]!.channels.mode!.states).to.deep.equal(MODES);
+      expect(applyClimateModes(devices, [])).to.deep.equal({ devices, rejected: [] });
+    });
+
+    it('takes a mode state that has no states map by its raw value, as the state holds it', () => {
+      const devices = [thermostat('n', modeOf('n', { states: undefined })), thermostat('s', modeOf('s', { type: 'string', states: undefined }))];
+      const rows = [row('n', '1.0', 'heat'), row('n', 'MANU', 'auto'), row('s', 'MANU', 'heat')];
+      const { devices: mapped, rejected } = applyClimateModes(devices, rows);
+      expect(states(mapped, 'n')).to.deep.equal({ 1: 'heat' });
+      expect(states(mapped, 's')).to.deep.equal({ MANU: 'heat' });
+      expect(rejected).to.deep.equal([{ row: rows[1], reason: 'not exactly one value or label of n.MODE' }]);
+    });
+
+    it('leaves out, each with its reason, a row whose device is no picked climate device, whose device has no mode state, or whose device mode is not exactly one state', () => {
+      const devices = [thermostat('t1', modeOf('t1', { states: { ...MODES, 4: 'manu-mode' } })), thermostat('t2'), DEVICES[1]!];
+      const rows = [
+        row('nirgends', 'AUTO-MODE', 'auto'),
+        row('b', 'AUTO-MODE', 'auto'),
+        row('t2', 'AUTO-MODE', 'auto'),
+        row('t1', 'ECO', 'auto'),
+        // Two states have this label, case aside: the codec could not tell them apart either.
+        row('t1', 'MANU-MODE', 'heat'),
+        row('t1', 'AUTO-MODE', 'auto'),
+      ];
+      const { devices: mapped, rejected } = applyClimateModes(devices, rows);
+      expect(rejected).to.deep.equal([
+        { row: rows[0], reason: 'no climate device of this id is picked on the Devices tab' },
+        { row: rows[1], reason: 'no climate device of this id is picked on the Devices tab' },
+        { row: rows[2], reason: 'the device has no mode state' },
+        { row: rows[3], reason: 'not exactly one value or label of t1.MODE' },
+        { row: rows[4], reason: 'not exactly one value or label of t1.MODE' },
+      ]);
+      expect(states(mapped, 't1')).to.deep.equal({ ...MODES, 0: 'auto', 4: 'manu-mode' });
+    });
+
+    it('leaves out every row that maps one state twice, and every row whose panel mode would stand for more than one device mode, a label that is that name already included', () => {
+      const devices = [thermostat('t1', modeOf('t1', { states: { ...MODES, 4: 'Heat' } })), thermostat('t2', modeOf('t2'))];
+      const rows = [
+        // One state twice, by label and by value.
+        row('t1', 'AUTO-MODE', 'auto'),
+        row('t1', '0', 'auto'),
+        // Two states as heat: which one the panel's heat writes would be a guess.
+        row('t2', 'MANU-MODE', 'heat'),
+        row('t2', 'BOOST-MODE', 'heat'),
+        // Heat is the label of state 4 already, case aside, as the codec reads it.
+        row('t1', 'MANU-MODE', 'heat'),
+        row('t1', 'PARTY-MODE', 'fan_only'),
+        row('t2', 'AUTO-MODE', 'auto'),
+      ];
+      const { devices: mapped, rejected } = applyClimateModes(devices, rows);
+      expect(rejected).to.deep.equal([
+        { row: rows[0], reason: 'this device mode is mapped more than once' },
+        { row: rows[1], reason: 'this device mode is mapped more than once' },
+        { row: rows[2], reason: 'heat would stand for more than one device mode' },
+        { row: rows[3], reason: 'heat would stand for more than one device mode' },
+        { row: rows[4], reason: 'heat would stand for more than one device mode' },
+      ]);
+      expect(states(mapped, 't1')).to.deep.equal({ ...MODES, 2: 'fan_only', 4: 'Heat' });
+      expect(states(mapped, 't2')).to.deep.equal({ ...MODES, 0: 'auto' });
+    });
+
+    it('checks again once a row is left out: the state it would have renamed keeps its own label, which can clash in turn', () => {
+      // 0 and 2 both as cool clash; left out, state 0 is heat again, the panel mode row 3 gives state 1.
+      const own = { 0: 'heat', 1: 'MANU', 2: 'X' };
+      const devices = [thermostat('t1', modeOf('t1', { states: own }))];
+      const rows = [row('t1', '0', 'cool'), row('t1', '2', 'cool'), row('t1', '1', 'heat')];
+      const { devices: mapped, rejected } = applyClimateModes(devices, rows);
+      expect(rejected).to.deep.equal([
+        { row: rows[0], reason: 'cool would stand for more than one device mode' },
+        { row: rows[1], reason: 'cool would stand for more than one device mode' },
+        { row: rows[2], reason: 'heat would stand for more than one device mode' },
+      ]);
+      expect(states(mapped, 't1')).to.deep.equal(own);
     });
   });
 

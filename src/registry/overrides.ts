@@ -1,7 +1,7 @@
-import type { DeviceOverride } from '../config/options';
+import type { ClimateModeRow, DeviceOverride } from '../config/options';
 import { lastSegment, type IoBrokerObject } from './detector';
 import { lacks, type Lack } from './synth/index';
-import type { DeviceInput, Domain } from './types';
+import type { ChannelInput, DeviceInput, Domain } from './types';
 import { DOMAINS } from './types';
 
 function isDomain(value: string | undefined): value is Domain {
@@ -63,6 +63,100 @@ export function unbuiltForces(
     const lack = device.domain === found.get(device.objectId) ? undefined : lacks(device);
     return lack ? [{ objectId: device.objectId, domain: device.domain, lack }] : [];
   });
+}
+
+/** A Climate modes row left out, and why, in English (Ruling 141). */
+export interface RejectedClimateMode {
+  row: ClimateModeRow;
+  reason: string;
+}
+
+/**
+ * The key of the one state of a mode state that a device mode names: its
+ * value, or its label in any case, as encodeChannelValue reads labels. With no
+ * states map, the raw value itself, as readEnum looks it up (String(raw)).
+ */
+function modeKey(mode: ChannelInput, deviceMode: string): string | undefined {
+  const wanted = deviceMode.trim();
+  if (!wanted) return undefined;
+  const entries = Object.entries(mode.states ?? {});
+  if (entries.length === 0) {
+    if (mode.type !== 'number') return wanted;
+    const numeric = Number(wanted);
+    return Number.isFinite(numeric) ? String(numeric) : undefined;
+  }
+  const label = wanted.toLowerCase();
+  const keys = entries.filter(([key, own]) => key === wanted || own.trim().toLowerCase() === label).map(([key]) => key);
+  return new Set(keys).size === 1 ? keys[0] : undefined;
+}
+
+/**
+ * The Climate modes table (Ruling 141). Each row names a state of a picked
+ * climate device's mode state, and the firmware hvac name the panel shows
+ * for it. That state is relabelled with the name in the device's own states
+ * map, which readEnum decodes, enumModes lists and encodeChannelValue
+ * reverses: the one codec shows the device's MANU as heat, lists heat, and
+ * writes MANU's own raw value for the panel's heat. A label no row maps keeps
+ * what it had, a firmware name or not.
+ *
+ * A row is left out, with its reason, when its device is no picked climate
+ * device, has no mode state, or holds no one state its device mode names;
+ * when two rows map one state; and when its panel mode would stand for more
+ * than one state -- two rows' or a state already labelled so -- since the
+ * codec could then write neither. Leaving a row out gives its state its own
+ * label back, which can clash in turn, so the check runs until none does.
+ */
+export function applyClimateModes(
+  devices: readonly DeviceInput[],
+  rows: readonly ClimateModeRow[],
+): { devices: DeviceInput[]; rejected: RejectedClimateMode[] } {
+  const rejected: Array<RejectedClimateMode & { index: number }> = [];
+  const climate = new Map(devices.filter((device) => device.domain === 'climate').map((device) => [device.objectId, device]));
+  // Per device, each row it keeps and the state key the row names.
+  const mapped = new Map<string, Array<{ row: ClimateModeRow; index: number; key: string }>>();
+  rows.forEach((row, index) => {
+    const mode = climate.get(row.device)?.channels.mode;
+    const key = mode && modeKey(mode, row.deviceMode);
+    if (key !== undefined) mapped.set(row.device, [...(mapped.get(row.device) ?? []), { row, index, key }]);
+    else {
+      const reason = !climate.has(row.device)
+        ? 'no climate device of this id is picked on the Devices tab'
+        : !mode
+          ? 'the device has no mode state'
+          : `not exactly one value or label of ${mode.objectId}`;
+      rejected.push({ row, index, reason });
+    }
+  });
+
+  const relabelled = new Map<string, Record<string, string>>();
+  for (const [objectId, entries] of mapped) {
+    const own = climate.get(objectId)!.channels.mode!.states ?? {};
+    let kept = entries.filter((entry) => {
+      if (entries.filter((other) => other.key === entry.key).length === 1) return true;
+      rejected.push({ ...entry, reason: 'this device mode is mapped more than once' });
+      return false;
+    });
+    for (;;) {
+      const states = { ...own, ...Object.fromEntries(kept.map(({ key, row }) => [key, row.panelMode])) };
+      const clashing = kept.filter(({ key, row }) =>
+        Object.entries(states).some(([other, label]) => other !== key && label.trim().toLowerCase() === row.panelMode),
+      );
+      if (clashing.length === 0) {
+        if (kept.length > 0) relabelled.set(objectId, states);
+        break;
+      }
+      for (const entry of clashing) rejected.push({ ...entry, reason: `${entry.row.panelMode} would stand for more than one device mode` });
+      kept = kept.filter((entry) => !clashing.includes(entry));
+    }
+  }
+
+  return {
+    devices: devices.map((device) => {
+      const states = relabelled.get(device.objectId);
+      return states ? { ...device, channels: { ...device.channels, mode: { ...device.channels.mode!, states } } } : device;
+    }),
+    rejected: rejected.sort((a, b) => a.index - b.index).map(({ row, reason }) => ({ row, reason })),
+  };
 }
 
 /** What detection found of one device: the picker shows it read-only beside the user's choices. */

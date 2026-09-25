@@ -296,4 +296,44 @@ describe('config/options', () => {
       expect(validateOptions({ currency: '12345678' }).warnings).to.deep.equal([]);
     });
   });
+
+  describe('climate modes (Ruling 141)', () => {
+    const NAMES = 'off, heat, cool, heat_cool, auto, dry, fan_only';
+
+    it('keeps each well-formed row trimmed, a device mode typed as a number as its text, and drops the rest with a warning naming each one, an unknown panel mode among them', () => {
+      const { options, warnings } = validateOptions({
+        climateModes: [
+          { device: ' hm-rpc.0.A.1 ', deviceMode: ' MANU-MODE ', panelMode: 'heat' },
+          { device: 'hm-rpc.0.A.1', deviceMode: 0, panelMode: 'auto' },
+          null,
+          { deviceMode: 'AUTO', panelMode: 'auto' },
+          { device: '  ', deviceMode: 'AUTO', panelMode: 'auto' },
+          { device: 'hm-rpc.0.B.1', deviceMode: '  ', panelMode: 'heat' },
+          { device: 'hm-rpc.0.B.1', deviceMode: 'BOOST', panelMode: 'boost' },
+          { device: 'hm-rpc.0.B.1', deviceMode: 'BOOST', panelMode: 'Heat' },
+          { device: 'hm-rpc.0.B.1', deviceMode: 'BOOST' },
+        ],
+      } as unknown as Partial<AdapterOptions>);
+      expect(options.climateModes).to.deep.equal([
+        { device: 'hm-rpc.0.A.1', deviceMode: 'MANU-MODE', panelMode: 'heat' },
+        { device: 'hm-rpc.0.A.1', deviceMode: '0', panelMode: 'auto' },
+      ]);
+      expect(warnings).to.deep.equal([
+        'climateModes entry 3 names no device; ignoring it',
+        'climateModes entry 4 names no device; ignoring it',
+        'climateModes entry 5 names no device; ignoring it',
+        'climateModes entry 6 (hm-rpc.0.B.1) names no device mode; ignoring it',
+        `climateModes entry 7 (hm-rpc.0.B.1) has no panel mode of ${NAMES}; ignoring it`,
+        `climateModes entry 8 (hm-rpc.0.B.1) has no panel mode of ${NAMES}; ignoring it`,
+        `climateModes entry 9 (hm-rpc.0.B.1) has no panel mode of ${NAMES}; ignoring it`,
+      ]);
+    });
+
+    it('ignores every row, with one warning, when the list is no list, and has none by default', () => {
+      const { options, warnings } = validateOptions({ climateModes: { device: 'x' } } as unknown as Partial<AdapterOptions>);
+      expect(options.climateModes).to.deep.equal([]);
+      expect(warnings).to.deep.equal(['climateModes is not a list; ignoring every climate mode']);
+      expect(DEFAULTS.climateModes).to.deep.equal([]);
+    });
+  });
 });

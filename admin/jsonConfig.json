@@ -91,7 +91,7 @@
               "title": "column_preview",
               "label": "preview_entity",
               "command": "previewEntity",
-              "jsonData": "{\"objectId\": ${JSON.stringify(data.objectId ?? '')}, \"forcedDomain\": ${JSON.stringify(data.forcedDomain ?? '')}, \"name\": ${JSON.stringify(data.name ?? '')}}",
+              "jsonData": "{\"objectId\": ${JSON.stringify(data.objectId ?? '')}, \"forcedDomain\": ${JSON.stringify(data.forcedDomain ?? '')}, \"name\": ${JSON.stringify(data.name ?? '')}, \"rows\": ${JSON.stringify(globalData?.deviceOverrides ?? null)}, \"climateModes\": ${JSON.stringify(globalData?.climateModes ?? null)}}",
               "error": { "device_not_detected": "preview_not_detected", "no_usable_channel": "preview_no_entity" },
               "variant": "outlined",
               "width": "10%"
@@ -137,6 +137,42 @@
                 { "label": "kind_date", "value": "date" },
                 { "label": "kind_time", "value": "time" },
                 { "label": "kind_datetime", "value": "datetime" }
+              ]
+            }
+          ]
+        },
+        "_climateModesInfo": { "type": "staticText", "text": "climate_modes_info", "newLine": true, "sm": 12, "md": 12, "lg": 12 },
+        "climateModes": {
+          "type": "table",
+          "label": "climate_modes",
+          "newLine": true,
+          "sm": 12,
+          "md": 12,
+          "lg": 12,
+          "items": [
+            {
+              "type": "selectSendTo",
+              "attr": "device",
+              "title": "column_climate_device",
+              "width": "45%",
+              "command": "climateDevices",
+              "noTranslation": true,
+              "default": ""
+            },
+            { "type": "text", "attr": "deviceMode", "title": "column_device_mode", "width": "30%", "default": "" },
+            {
+              "type": "select",
+              "attr": "panelMode",
+              "title": "column_panel_mode",
+              "width": "25%",
+              "options": [
+                { "label": "hvac_off", "value": "off" },
+                { "label": "hvac_heat", "value": "heat" },
+                { "label": "hvac_cool", "value": "cool" },
+                { "label": "hvac_heat_cool", "value": "heat_cool" },
+                { "label": "hvac_auto", "value": "auto" },
+                { "label": "hvac_dry", "value": "dry" },
+                { "label": "hvac_fan_only", "value": "fan_only" }
               ]
             }
           ]

@@ -1,4 +1,5 @@
 import { ENERGY_CATEGORIES, type EnergyCategory } from '../protocol/energy';
+import { HVAC_MODE_NAMES, type HvacMode } from '../registry/synth/climate';
 import type { DatetimeKind } from '../registry/types';
 
 export interface AdapterOptions {
@@ -15,6 +16,8 @@ export interface AdapterOptions {
   protocolTrace: boolean;
   deviceOverrides: DeviceOverride[];
   manualEntities: ManualEntity[];
+  /** The Climate modes table (Ruling 141): a thermostat's own modes as the panel's hvac names. */
+  climateModes: ClimateModeRow[];
   /**
    * The saved form holds PICKER_VERSION under this key: its Refresh set it.
    * Until then nothing is published, whatever rows or manual entities an
@@ -78,6 +81,19 @@ export interface ManualEntity {
 
 const DATETIME_KINDS: readonly string[] = ['date', 'time', 'datetime'];
 
+/**
+ * One row of the Climate modes table (Ruling 141): a device mode of a
+ * climate device, by the value or the label its mode state holds, and the
+ * firmware hvac name the panel shows and sends for it. registry/overrides.ts
+ * applyClimateModes judges whether the device can take it.
+ */
+export interface ClimateModeRow {
+  /** The climate device's DeviceInput.objectId, as the table's device select stores it. */
+  device: string;
+  deviceMode: string;
+  panelMode: HvacMode;
+}
+
 export interface DeviceOverride {
   /**
    * The detected control's DeviceInput.objectId: its root (device or channel),
@@ -113,6 +129,7 @@ export const DEFAULTS: AdapterOptions = {
   protocolTrace: false,
   deviceOverrides: [],
   manualEntities: [],
+  climateModes: [],
   pickerArmed: false,
   historyInstance: '',
   energyMeters: [],
@@ -267,6 +284,42 @@ function energyMeters(value: unknown, warnings: string[]): EnergyMeterRow[] {
   return meters;
 }
 
+/**
+ * Climate modes as the table or a hand edit leaves them, the shape only
+ * (Ruling 141): a row without a device, a device mode or one of the
+ * firmware's hvac names as its panel mode is dropped. A device mode typed as
+ * a number by hand is its text, as a raw value is looked up (readEnum).
+ */
+function climateModes(value: unknown, warnings: string[]): ClimateModeRow[] {
+  if (value === undefined || value === null) return [];
+  if (!Array.isArray(value)) {
+    warnings.push('climateModes is not a list; ignoring every climate mode');
+    return [];
+  }
+  const rows: ClimateModeRow[] = [];
+  value.forEach((raw: unknown, index) => {
+    const row = raw as Partial<Record<keyof ClimateModeRow, unknown>> | null;
+    const device = typeof row?.device === 'string' ? row.device.trim() : '';
+    if (!device) {
+      warnings.push(`climateModes entry ${index + 1} names no device; ignoring it`);
+      return;
+    }
+    const where = `climateModes entry ${index + 1} (${device})`;
+    const mode = row!.deviceMode;
+    const deviceMode = typeof mode === 'string' ? mode.trim() : typeof mode === 'number' && Number.isFinite(mode) ? String(mode) : '';
+    if (!deviceMode) {
+      warnings.push(`${where} names no device mode; ignoring it`);
+      return;
+    }
+    if (!HVAC_MODE_NAMES.includes(row!.panelMode as HvacMode)) {
+      warnings.push(`${where} has no panel mode of ${HVAC_MODE_NAMES.join(', ')}; ignoring it`);
+      return;
+    }
+    rows.push({ device, deviceMode, panelMode: row!.panelMode as HvacMode });
+  });
+  return rows;
+}
+
 /** The admin's field allows 8 characters; the currency goes into every cost name and unit (review m4). */
 const CURRENCY_CHARS = 8;
 
@@ -324,6 +377,7 @@ export function validateOptions(raw: Partial<AdapterOptions>): {
     protocolTrace: raw.protocolTrace ?? DEFAULTS.protocolTrace,
     deviceOverrides: deviceOverrides(raw.deviceOverrides, warnings),
     manualEntities: manualEntities(raw.manualEntities, warnings),
+    climateModes: climateModes(raw.climateModes, warnings),
     // Only this picker's Refresh arms: not a hand edit's "2", nor 4cbb6d3's true.
     pickerArmed: (raw.pickerArmed as unknown) === PICKER_VERSION,
     historyInstance: historyInstance(raw.historyInstance, warnings),

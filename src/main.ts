@@ -18,13 +18,13 @@ import { discoverDevices, type Discovery, type RootAnchors } from './registry/de
 import { idsToStore, parseStringMap, resolveEntityIds } from './registry/entity-id';
 import { EntityRegistry } from './registry/entity-registry';
 import { listed, manualDevices } from './registry/manual';
-import { applyOverrides, detectedRows, mergeDetected, unbuiltForces } from './registry/overrides';
+import { applyClimateModes, applyOverrides, detectedRows, mergeDetected, unbuiltForces } from './registry/overrides';
 import { lacks, synthesise } from './registry/synth/index';
 import type { DeviceInput, SourceValue, VirtualEntity } from './registry/types';
 import { Dispatcher } from './runtime/dispatcher';
 import { energyMeters, EnergySource, unloggedWarning, type EnergyNames, type TotalNames } from './runtime/energy-source';
 import { HistoryProvider } from './runtime/history-provider';
-import { HomeTilesMqttClient, type Logger } from './runtime/mqtt-client';
+import { HomeTilesMqttClient, probeBroker, type Logger } from './runtime/mqtt-client';
 import { PanelManager } from './runtime/panel-manager';
 import { PanelObjects } from './runtime/panel-objects';
 import type { PanelSession } from './runtime/panel-session';
@@ -50,6 +50,8 @@ const DISCOVERY_RETRY_MAX_MS = 300_000;
 const I18N_DIR = path.join(__dirname, '..', 'admin', 'i18n');
 /** What the Connection tab's Test broker sends as typed (Ruling 140): the fields a broker connection is made of. */
 const BROKER_FIELDS = ['brokerHost', 'brokerPort', 'brokerTls', 'brokerUser', 'brokerPassword', 'clientId'] as const;
+/** How long Test broker waits at most (Ruling 143): past mqtt.js's own 10 s connect timeout, for what that never ends. */
+const TEST_BROKER_DEADLINE_MS = 12_000;
 
 /** One text of one admin translation file, or undefined. Only a language code names a file, never a path. */
 function i18nText(language: string, key: string): string | undefined {
@@ -476,7 +478,13 @@ class HomeTiles extends utils.Adapter {
     const armed = this.options.pickerArmed;
     this.detected = detected;
     const picked = armed ? applyOverrides(detected, this.options.deviceOverrides) : [];
-    this.devices = armed ? [...picked, ...manual.devices] : [];
+    // A picked thermostat's own modes under the panel's names, as the Climate modes table maps them (Ruling 141).
+    const climate = applyClimateModes(picked, armed ? this.options.climateModes : []);
+    if (climate.rejected.length > 0) {
+      const named = climate.rejected.map(({ row, reason }) => `${row.device}: ${row.deviceMode} as ${row.panelMode} (${reason})`);
+      this.log.warn(`[Registry] Climate modes left out: ${listed(named)}`);
+    }
+    this.devices = armed ? [...climate.devices, ...manual.devices] : [];
     // A forced type the device cannot serve stays no entity, as Task 13 pinned; the log names each such
     // override and what the device lacks, by the synths' own test, as the admin's preview does (Ruling 139).
     const unbuilt = unbuiltForces(detected, picked);
@@ -599,7 +607,8 @@ class HomeTiles extends utils.Adapter {
     if (meters.length > 0 && !instance) {
       this.log.warn('[Energy] No history instance is set on the Advanced tab and the system has no default one: energy tiles show no consumption');
     } else if (unlogged.length > 0) {
-      this.log.warn(`[Energy] ${unloggedWarning(instance, unlogged, unloggedElectric)}`);
+      const untracked = meters.some((meter) => meter.category === 'device');
+      this.log.warn(`[Energy] ${unloggedWarning(instance, unlogged, unloggedElectric, untracked)}`);
     }
     const language = (await this.getForeignObjectAsync('system.config'))?.common?.language ?? 'en';
     const names: EnergyNames = {
@@ -759,25 +768,39 @@ class HomeTiles extends utils.Adapter {
       case 'previewEntity': {
         // A row of the Detected devices table, as its button sends it
         // (jsonConfig _preview): the device as detected with the row's type
-        // and name, unsaved ones included -- what the panels get once the row
-        // is ticked and saved. A script may send the object id alone.
-        const request = (message.message ?? {}) as { objectId?: unknown; forcedDomain?: unknown; name?: unknown };
+        // and name, among the form's other rows and its Climate modes, unsaved
+        // ones included -- what the panels get once the form is saved with the
+        // row ticked. A script may send the object id alone: the saved rows
+        // and modes stand in for the form's.
+        const request = (message.message ?? {}) as { objectId?: unknown; forcedDomain?: unknown; name?: unknown; rows?: unknown; climateModes?: unknown };
         const text = (value: unknown): string => (typeof value === 'string' ? value : '');
         const objectId = text(request.objectId);
         const detected = this.detected.find((candidate) => candidate.objectId === objectId);
         if (!detected) return reply({ error: 'device_not_detected' });
+        // As a start takes them (validateOptions).
+        const form = validateOptions({
+          deviceOverrides: Array.isArray(request.rows) ? request.rows : this.options.deviceOverrides,
+          climateModes: Array.isArray(request.climateModes) ? request.climateModes : this.options.climateModes,
+        } as Partial<AdapterOptions>).options;
         const row = { objectId, include: true, detectedDomain: detected.domain, forcedDomain: text(request.forcedDomain), name: text(request.name) };
-        const device = applyOverrides([detected], [row])[0]!;
+        // Every device the save picks, in detection order, as the rebuild picks them; this row last, so that
+        // it is the one its device takes (applyOverrides keys rows by object id).
+        const picked = applyClimateModes(applyOverrides(this.detected, [...form.deviceOverrides, row]), form.climateModes).devices;
+        const device = picked.find((candidate) => candidate.objectId === objectId)!;
         const language = (await this.getForeignObjectAsync('system.config'))?.common?.language ?? 'en';
         // What the device lacks for the type chosen, by the synths' own test: the rebuild's warning names the same (Ruling 139).
         const lack = lacks(device);
         if (lack) return reply({ error: 'no_usable_channel', args: [adminText(`lack_${lack}`, language)] });
 
-        // The id picking it gives: a stored one only in the domain chosen (resolveEntityIds).
-        const entityId = resolveEntityIds([device], this.persistedIds)[objectId]!;
+        // The id the rebuild gives it, resolved over every device the save picks, as the registry resolves them:
+        // of two new ones of one name the earlier takes the plain slug (review m1). The manual entities come after
+        // them and take no id of theirs (resolveEntityIds reserves every stored id first).
+        const entityId = resolveEntityIds(picked, this.persistedIds)[objectId]!;
         const values: Record<string, SourceValue | null> = {};
         for (const channel of Object.values(device.channels)) {
-          const state = await this.getForeignStateAsync(channel.objectId);
+          // A value js-controller will not read -- an alias whose target id is malformed -- is none, as the
+          // rebuild's seed takes it: the entity shows unavailable, never an error (review m1 b).
+          const state = await this.getForeignStateAsync(channel.objectId).catch(() => null);
           values[channel.objectId] = state
             ? { val: state.val, ack: state.ack, q: state.q ?? 0, ts: state.ts }
             : null;
@@ -795,7 +818,7 @@ class HomeTiles extends utils.Adapter {
           ...(note ? { note } : {}),
         };
         // json-config's sendTo opens a copyDialog: its title, translated, over its text in an editor
-        // (ConfigSendto.renderCopyDialog, json-config 8.1.11 on); anything else it answers with "Ok" alone.
+        // (ConfigSendto.renderCopyDialog, json-config 8.1.10 on); anything else it answers with "Ok" alone.
         return reply({
           entity,
           publish,
@@ -820,18 +843,16 @@ class HomeTiles extends utils.Adapter {
           error: (text) => this.log.debug(text),
           debug: (text) => this.log.debug(text),
         };
-        const probe = new HomeTilesMqttClient(options, quiet);
-        await probe.connect();
-        const { connected, lastError } = probe;
-        await probe.disconnect();
+        const { connected, error, timedOut } = await probeBroker(options, quiet, TEST_BROKER_DEADLINE_MS);
         // Never a password: the broker, and what it or the network said.
-        this.log.info(`[Admin] Broker test of ${broker}: ${connected ? 'connected' : `no connection, ${lastError ?? 'no answer'}`}`);
+        this.log.info(`[Admin] Broker test of ${broker}: ${connected ? 'connected' : `no connection, ${error ?? 'no answer'}`}`);
         // Each answer as admin shows it (json-config ConfigSendto): a result text, the native branch
         // taken so that no raw code follows it, or an error text; never "Ok" alone.
         if (connected) return reply({ connected, result: 'connected', args: [broker], native: {} });
-        // mqtt.js gives up after the connect timeout, 10 s (mqtt-client.ts), with this error.
-        if (lastError === 'connack timeout') return reply({ connected, error: 'timeout', args: [broker] });
-        return reply({ connected, error: 'failed', args: [broker, lastError ?? ''] });
+        // mqtt.js gives up after the connect timeout, 10 s (mqtt-client.ts), with this error; the deadline ends what
+        // it retries for ever without one, a broker that hangs up on each connection (Ruling 143).
+        if (timedOut || error === 'connack timeout') return reply({ connected, error: 'timeout', args: [broker] });
+        return reply({ connected, error: 'failed', args: [broker, error ?? ''] });
       }
 
       case 'pairPanel': {
@@ -846,6 +867,15 @@ class HomeTiles extends utils.Adapter {
             ? { ...result, result: 'paired', args: [host], native: {} }
             : { ...result, error: result.reason, args: [host, String(result.status ?? '')] },
         );
+      }
+
+      case 'climateDevices': {
+        // The Climate modes table's device column (jsonConfig climateModes, Ruling 141), a selectSendTo: its
+        // options as [{label, value}] (json-config ConfigSelectSendTo). Every thermostat detected or picked as
+        // one, under the name it is picked with.
+        const picked = new Map(this.devices.map((device) => [device.objectId, device]));
+        const thermostats = this.detected.map((device) => picked.get(device.objectId) ?? device).filter((device) => device.domain === 'climate');
+        return reply(thermostats.map((device) => ({ label: `${device.name} (${device.objectId})`, value: device.objectId })));
       }
 
       default:

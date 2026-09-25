@@ -130,11 +130,19 @@ export function energyMeters(
  * The warning naming the meters the history instance does not log: their
  * tiles show no consumption, nor, while an electric one is among them, do
  * the house's totals, which are known only where every electric meter is
- * (energy round 2, C2).
+ * (energy round 2, C2). A tile shows an absent total as 0.000, and the
+ * untracked consumption exists only beside a device meter (consumptionEntries,
+ * review m3).
  */
-export function unloggedWarning(instance: string, unlogged: readonly string[], unloggedElectric: readonly string[]): string {
+export function unloggedWarning(
+  instance: string,
+  unlogged: readonly string[],
+  unloggedElectric: readonly string[],
+  untracked: boolean,
+): string {
+  const totals = untracked ? 'total and untracked consumption show' : 'total consumption shows';
   const house = unloggedElectric.length
-    ? `The house's total and untracked consumption stay blank as well while any grid, solar or battery meter is unknown: ${listed(unloggedElectric)}. `
+    ? `The house's ${totals} 0.000 as well while any grid, solar or battery meter is unknown: ${listed(unloggedElectric)}. `
     : '';
   return `Not logged by ${instance}, so their energy tiles show no consumption: ${listed(unlogged)}. ${house}Enable ${instance} in the settings of each of these states`;
 }

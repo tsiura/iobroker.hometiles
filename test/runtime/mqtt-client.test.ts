@@ -1,9 +1,9 @@
 import Aedes from 'aedes';
 import { expect } from 'chai';
 import mqtt from 'mqtt';
-import { createServer, type Server } from 'node:net';
+import { createServer, type AddressInfo, type Server } from 'node:net';
 import { DEFAULTS } from '../../src/config/options';
-import { HomeTilesMqttClient, type Logger } from '../../src/runtime/mqtt-client';
+import { HomeTilesMqttClient, probeBroker, type Logger } from '../../src/runtime/mqtt-client';
 
 function silentLogger(): Logger & { warnings: string[] } {
   const warnings: string[] = [];
@@ -170,5 +170,70 @@ describe('runtime/mqtt-client', () => {
     await client.disconnect();
     await client.disconnect();
     expect(client.connected).to.equal(false);
+  });
+});
+
+describe("runtime/mqtt-client probeBroker: the admin's Test broker (Rulings 140, 143)", () => {
+  const servers: Server[] = [];
+  /** A server on a port the system picks (Ruling 137). */
+  async function serve(server: Server): Promise<number> {
+    servers.push(server);
+    await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', resolve));
+    return (server.address() as AddressInfo).port;
+  }
+  afterEach(async () => {
+    for (const server of servers.splice(0)) await new Promise<void>((resolve) => server.close(() => resolve()));
+  });
+
+  it('connects to a broker that lets it in, and leaves again', async () => {
+    const broker = new Aedes();
+    const port = await serve(createServer(broker.handle));
+    try {
+      expect(await probeBroker({ ...DEFAULTS, brokerPort: port }, silentLogger(), 5000)).to.deep.equal({ connected: true, error: undefined, timedOut: false });
+      await waitUntil(() => broker.connectedClients === 0);
+    } finally {
+      await new Promise<void>((resolve) => broker.close(() => resolve()));
+    }
+  });
+
+  it('says what the network said about a port nobody listens on, at once', async () => {
+    // Taken, then let go.
+    const spare = createServer();
+    await new Promise<void>((resolve) => spare.listen(0, '127.0.0.1', resolve));
+    const { port } = spare.address() as AddressInfo;
+    await new Promise<void>((resolve) => spare.close(() => resolve()));
+    const result = await probeBroker({ ...DEFAULTS, brokerPort: port }, silentLogger(), 5000);
+    expect(result).to.include({ connected: false, timedOut: false });
+    expect(result.error).to.include('ECONNREFUSED');
+  });
+
+  it('gives up at its deadline on a broker that hangs up on each connection without a word, which mqtt.js retries for ever, and retries no more', async function () {
+    this.timeout(15000);
+    let accepted = 0;
+    // It reads the CONNECT and closes cleanly: mqtt.js sees a close, no error, and tries again.
+    const port = await serve(
+      createServer((socket) => {
+        accepted++;
+        socket.on('data', () => socket.end());
+      }),
+    );
+    const started = Date.now();
+    expect(await probeBroker({ ...DEFAULTS, brokerPort: port }, silentLogger(), 300)).to.deep.equal({ connected: false, error: undefined, timedOut: true });
+    expect(Date.now() - started).to.be.below(2000);
+    const tried = accepted;
+    expect(tried).to.be.greaterThan(0);
+    // mqtt.js tries again every 2 s (reconnectPeriod); a closed client does not.
+    await new Promise((resolve) => setTimeout(resolve, 2500));
+    expect(accepted).to.equal(tried);
+  });
+
+  it('gives up at its deadline on a broker that takes the connection and never answers, and closes that connection', async () => {
+    let closed = 0;
+    // Reading what arrives, as a broker does: a paused socket would never see the client's FIN.
+    const port = await serve(createServer((socket) => socket.resume().on('close', () => closed++)));
+    const started = Date.now();
+    expect(await probeBroker({ ...DEFAULTS, brokerPort: port }, silentLogger(), 300)).to.deep.equal({ connected: false, error: undefined, timedOut: true });
+    expect(Date.now() - started).to.be.below(2000);
+    await waitUntil(() => closed === 1);
   });
 });

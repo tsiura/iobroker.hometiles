@@ -5,6 +5,7 @@ import { PICKER_VERSION, validateOptions, type EnergyMeterRow, type ManualEntity
 import { ENERGY_CATEGORIES } from '../../src/protocol/energy';
 import { MANUAL_DOMAINS } from '../../src/registry/manual';
 import { mergeDetected } from '../../src/registry/overrides';
+import { HVAC_MODE_NAMES } from '../../src/registry/synth/climate';
 import { LACKS } from '../../src/registry/synth/index';
 import { DOMAINS } from '../../src/registry/types';
 import { PAIRING_FAILURES } from '../../src/runtime/pairing';
@@ -26,6 +27,8 @@ const handled = new Set([...MAIN.matchAll(/^\s*case '([A-Za-z]+)':/gm)].map((mat
 interface Column {
   type: string;
   attr: string;
+  title?: string;
+  noTranslation?: boolean;
   readOnly?: boolean;
   filter?: boolean;
   sort?: boolean;
@@ -42,10 +45,12 @@ const columns = (table: { items: Column[] }): Record<string, Column> =>
 
 /**
  * A pattern as the admin evaluates it: a JavaScript template literal over the
- * form's data (json-config ConfigGeneric.getPatternAsync, escapeString).
+ * form's data (json-config ConfigGeneric.getPatternAsync, escapeString). In a
+ * table's cell `data` is the row and `globalData` the whole form (ConfigTable
+ * itemTable, globalData: this.props.data).
  */
-function evaluatePattern(pattern: string, data: Record<string, unknown>): string {
-  return new Function('data', `return \`${pattern.replace(/`/g, '\\`')}\``)(data) as string;
+function evaluatePattern(pattern: string, data: Record<string, unknown>, globalData?: Record<string, unknown>): string {
+  return new Function('data', 'globalData', `return \`${pattern.replace(/`/g, '\\`')}\``)(data, globalData) as string;
 }
 
 /**
@@ -89,9 +94,23 @@ describe('admin/jsonConfig', () => {
     }
   });
 
-  it('stores the broker password as a password field so it is encrypted', () => {
+  it('stores the broker password as a password field that io-package.json declares encrypted and protected, as every password field (Ruling 143)', () => {
     const field = config.items.connection.items.brokerPassword;
     expect(field.type).to.equal('password');
+    // admin encrypts on save what the instance lists in encryptedNative (json-config JsonConfig.onSave), js-controller
+    // decrypts it into this.config on start (adapter.js), and hides what it lists in protectedNative from other adapters.
+    const passwords: string[] = [];
+    const walk = (node: unknown): void => {
+      if (!node || typeof node !== 'object') return;
+      for (const [key, value] of Object.entries(node as Record<string, unknown>)) {
+        if ((value as { type?: unknown } | null)?.type === 'password') passwords.push(key);
+        walk(value);
+      }
+    };
+    walk(config.items);
+    expect(passwords).to.deep.equal(['brokerPassword']);
+    expect(ioPackage.encryptedNative).to.deep.equal(passwords);
+    expect(ioPackage.protectedNative).to.deep.equal(passwords);
   });
 
   it('keys the device overrides table by objectId', () => {
@@ -167,11 +186,21 @@ describe('admin/jsonConfig', () => {
     // custom, data), and a sendTo evaluates jsonData over {_origin, _originIp, ...data}
     // (ConfigSendto._onClick). Text that would break a pattern or a JSON literal, were it spliced in raw:
     const row = { objectId: 'alias.0.Decke "oben" `1` ${data.x} \\ }', include: false, name: 'Licht "oben"', forcedDomain: 'datetime', detectedName: 'D', detectedDomain: 'light', room: '' };
-    expect(JSON.parse(evaluatePattern(preview.jsonData!, { _origin: 'http://x', _originIp: 'http://y', ...row }))).to.deep.equal({
+    // With it, every row of the form and its Climate modes, unsaved ones included: the entity id and the modes
+    // come out as saving them would give them, resolved over every picked device (review m1, Ruling 141).
+    const other = { objectId: 'hm-rpc.0.A', include: true, name: '', forcedDomain: '', detectedName: 'D', detectedDomain: 'light', room: '' };
+    const climateModes = [{ device: 'hm-rpc.0.T.1', deviceMode: 'MANU "1"', panelMode: 'heat' }];
+    const form = { brokerPassword: 'x', deviceOverrides: [other, row], climateModes };
+    expect(JSON.parse(evaluatePattern(preview.jsonData!, { _origin: 'http://x', _originIp: 'http://y', ...row }, form))).to.deep.equal({
       objectId: row.objectId,
       forcedDomain: 'datetime',
       name: 'Licht "oben"',
+      rows: [other, row],
+      climateModes,
     });
+    // A form that holds neither yet, and a json-config that passes no globalData: null, and the adapter takes the saved ones.
+    expect(JSON.parse(evaluatePattern(preview.jsonData!, row, {}))).to.include({ rows: null, climateModes: null });
+    expect(JSON.parse(evaluatePattern(preview.jsonData!, row))).to.include({ rows: null, climateModes: null });
     // A row the table's "+" added holds null in each column (ConfigTable.onAdd), and an earlier
     // version's row has no name or forced type at all: still JSON (JSON.stringify(undefined) is
     // no text), and text.
@@ -179,11 +208,15 @@ describe('admin/jsonConfig', () => {
       objectId: '',
       forcedDomain: '',
       name: '',
+      rows: null,
+      climateModes: null,
     });
     expect(JSON.parse(evaluatePattern(preview.jsonData!, { objectId: 'hue.0.a', include: true }))).to.deep.equal({
       objectId: 'hue.0.a',
       forcedDomain: '',
       name: '',
+      rows: null,
+      climateModes: null,
     });
     // Each error the adapter answers the preview with has a text of its own (ConfigSendto: schema.error[response.error]).
     const { errors } = answered('previewEntity');
@@ -332,17 +365,18 @@ describe('admin/jsonConfig', () => {
 
   it('wires each action button to a command the adapter implements', () => {
     // Read from main.ts itself, so a command it stops answering fails here.
-    expect([...handled]).to.include.members(['listDetected', 'refreshDetected', 'testBroker', 'previewEntity', 'pairPanel']);
+    expect([...handled]).to.include.members(['listDetected', 'refreshDetected', 'testBroker', 'previewEntity', 'pairPanel', 'climateDevices']);
     const commands = handled;
     const found = new Set<string>();
     const walk = (node: unknown): void => {
       if (!node || typeof node !== 'object') return;
       const record = node as Record<string, unknown>;
-      if (record.type === 'sendTo' && typeof record.command === 'string') found.add(record.command);
+      // A selectSendTo asks for its options the same way (json-config ConfigSelectSendTo.askInstance).
+      if ((record.type === 'sendTo' || record.type === 'selectSendTo') && typeof record.command === 'string') found.add(record.command);
       for (const value of Object.values(record)) walk(value);
     };
     walk(config.items);
-    expect(found.size).to.be.greaterThan(0);
+    expect(found).to.include('climateDevices');
     for (const command of found) expect(commands, `unknown command ${command}`).to.include(command);
   });
 
@@ -364,6 +398,42 @@ describe('admin/jsonConfig', () => {
     for (const [language, strings] of Object.entries(translations)) {
       expect(strings.devices_info, language).to.include(strings.tab_energy);
       expect(strings.refresh_result, language).to.include(strings.tab_energy);
+    }
+  });
+
+  it("maps a thermostat's own modes to the panel's on the Climate modes table: a detected thermostat, its mode as its state holds it, a panel mode by the panel's own names (Ruling 141)", () => {
+    const items = config.items.devices.items;
+    const table = items.climateModes;
+    expect(table).to.include({ type: 'table', label: 'climate_modes' });
+    // Explained right above it.
+    const keys = Object.keys(items);
+    expect(keys.indexOf('_climateModesInfo')).to.equal(keys.indexOf('climateModes') - 1);
+    expect(items._climateModesInfo).to.include({ type: 'staticText', text: 'climate_modes_info' });
+    const byAttr = columns(table);
+    // The row's fields are the ones validateOptions keeps, and no more.
+    const kept = validateOptions({ climateModes: [{ device: 'd', deviceMode: 'm', panelMode: 'heat' }] }).options.climateModes;
+    expect(Object.keys(byAttr)).to.deep.equal(Object.keys(kept[0]!));
+    // The thermostats the adapter detected, asked for as the list opens (json-config ConfigSelectSendTo: a list of
+    // {label, value}); a device's name is no translation key. Typed by hand while the adapter is not running.
+    expect(byAttr.device).to.include({ type: 'selectSendTo', command: 'climateDevices', noTranslation: true });
+    expect(handled).to.include('climateDevices');
+    expect(byAttr.deviceMode).to.include({ type: 'text' });
+    // Exactly the firmware's hvac names, each under a label of its own, none chosen for the user.
+    expect(byAttr.panelMode).to.include({ type: 'select' }).and.not.have.property('default');
+    expect(byAttr.panelMode!.options!.map((option) => option.value)).to.deep.equal([...HVAC_MODE_NAMES]);
+    expect(byAttr.panelMode!.options!.map((option) => option.label)).to.deep.equal(HVAC_MODE_NAMES.map((name) => `hvac_${name}`));
+    // Named as the panel names them (HomeTiles src/core/i18n/i18n.cpp:1331-1332, 1412-1413, read only).
+    expect(HVAC_MODE_NAMES.map((name) => translations.en![`hvac_${name}`])).to.deep.equal(['Off', 'Heat', 'Cool', 'Heat/Cool', 'Auto', 'Dry', 'Fan only']);
+    expect(HVAC_MODE_NAMES.map((name) => translations.de![`hvac_${name}`])).to.deep.equal(['Aus', 'Heizen', 'Kühlen', 'Heizen/Kühlen', 'Auto', 'Entfeuchten', 'Lüfter']);
+    for (const [language, strings] of Object.entries(translations)) {
+      for (const column of table.items as Column[]) expect(strings, `${language}: ${column.title}`).to.have.property(column.title!);
+      expect(strings.climate_modes_info, language).to.include(strings.column_panel_mode);
+    }
+  });
+
+  it("says on the Energy tab, in every language, to save and reopen the settings when Direction offers no export after a row's Category changed (review m4)", () => {
+    for (const [language, strings] of Object.entries(translations)) {
+      expect(strings.energy_info, language).to.include(strings.column_sign).and.include(strings.column_category);
     }
   });
 
@@ -418,6 +488,27 @@ describe('admin/jsonConfig', () => {
     for (const key of read) {
       for (const [language, strings] of Object.entries(translations)) expect(strings, `${language}.json is missing "${key}"`).to.have.property(key);
     }
+  });
+
+  it('uses every text it defines: in the form, as a text the adapter reads, or as the title of its preview dialog (review m5)', () => {
+    // Anywhere in jsonConfig.json: a label, a title, a text, an option, a sendTo's result or error text.
+    const inForm = new Set<string>();
+    const walk = (node: unknown): void => {
+      if (typeof node === 'string') inForm.add(node);
+      else if (node && typeof node === 'object') for (const value of Object.values(node)) walk(value);
+    };
+    walk(config);
+    // What main.ts reads with adminText/adminTexts, the keys it builds from a prefix among them.
+    const read = new Set([...MAIN.matchAll(/adminTexts?\('([a-z_]+)'/g)].map((match) => match[1]!));
+    expect(MAIN).to.include('adminText(`energy_total_${category}`');
+    for (const category of ENERGY_CATEGORIES) read.add(`energy_total_${category}`);
+    expect(MAIN).to.include('adminText(`lack_${');
+    for (const lack of LACKS) read.add(`lack_${lack}`);
+    // The preview's copyDialog title, which admin translates (ConfigSendto.renderCopyDialog).
+    expect(MAIN).to.include("copyDialog: { title: 'column_preview'");
+    read.add('column_preview');
+    const dead = Object.keys(translations.en!).filter((key) => !inForm.has(key) && !read.has(key));
+    expect(dead).to.deep.equal([]);
   });
 
   /** The codes one case of main.ts's onMessage answers with: `result: '…'` and `error: '…'`. */
