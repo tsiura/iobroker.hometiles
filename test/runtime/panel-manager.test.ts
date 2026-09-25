@@ -190,6 +190,16 @@ describe('runtime/panel-manager', () => {
     expect(manager.get('a1')!.baseTopic).to.equal('panel-a-renamed');
   });
 
+  it("gives a panel announcing again every entity's state, not only its configuration: the Bridge's per-connection snapshot", async () => {
+    // The firmware announces after every connection (mqtt_handlers.cpp:2707-2711), and a broker that restarted
+    // without persistence lost every retained state.
+    const { manager, published } = harness();
+    await manager.handleAnnouncement('a1', announcement('a1', 'panel-a'));
+    published.length = 0;
+    await manager.handleAnnouncement('a1', announcement('a1', 'panel-a'));
+    expect(published.map((p) => p.topic)).to.include('ha/statestream/switch/k/state');
+  });
+
   it('executes a shared-base-topic command exactly once, not once per panel', async () => {
     // base_topic defaults to "hometiles" when omitted, so two panels can end up
     // sharing one command channel. Executing per session would turn one tap

@@ -70,7 +70,12 @@ export class PanelManager {
     const existing = this.panels.get(deviceId);
     if (existing) {
       await existing.updateAnnouncement(announcement);
-      existing.pushConfig(this.deps.entities(), true);
+      // The firmware announces after every connection, as the adapter's retained replay does after its own
+      // reconnect: every state again, the Bridge's per-connection snapshot (a broker restarted without
+      // persistence has lost the retained ones).
+      const entities = this.deps.entities();
+      existing.pushConfig(entities, true);
+      for (const entity of entities ?? []) existing.pushEntityState(entity);
       await this.deps.onSessionsChanged();
       return;
     }
