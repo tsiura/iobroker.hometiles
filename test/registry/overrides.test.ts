@@ -1,11 +1,14 @@
 import { expect } from 'chai';
 import { validateOptions, type ClimateModeRow, type DeviceOverride } from '../../src/config/options';
+import { parseClimateCommand } from '../../src/protocol/commands';
 import { discoverDevices, type IoBrokerObject } from '../../src/registry/detector';
 import { idsToStore } from '../../src/registry/entity-id';
 import { EntityRegistry } from '../../src/registry/entity-registry';
 import { applyClimateModes, applyOverrides, detectedRows, mergeDetected, type Detected } from '../../src/registry/overrides';
 import type { HvacMode } from '../../src/registry/synth/climate';
+import { synthesise } from '../../src/registry/synth/index';
 import type { ChannelInput, DeviceInput } from '../../src/registry/types';
+import { Dispatcher } from '../../src/runtime/dispatcher';
 
 const DEVICES: DeviceInput[] = [
   { objectId: 'a', name: 'A', detectorType: 'socket', domain: 'switch', channels: { set: { objectId: 'a.set' } } },
@@ -123,13 +126,33 @@ describe('registry/overrides', () => {
       expect(applyClimateModes(devices, [])).to.deep.equal({ devices, rejected: [] });
     });
 
-    it('takes a mode state that has no states map by its raw value, as the state holds it', () => {
-      const devices = [thermostat('n', modeOf('n', { states: undefined })), thermostat('s', modeOf('s', { type: 'string', states: undefined }))];
-      const rows = [row('n', '1.0', 'heat'), row('n', 'MANU', 'auto'), row('s', 'MANU', 'heat')];
-      const { devices: mapped, rejected } = applyClimateModes(devices, rows);
-      expect(states(mapped, 'n')).to.deep.equal({ 1: 'heat' });
-      expect(states(mapped, 's')).to.deep.equal({ MANU: 'heat' });
-      expect(rejected).to.deep.equal([{ row: rows[1], reason: 'not exactly one value or label of n.MODE' }]);
+    it("leaves out a row for a mode state that lists no states: nothing tells what it holds, so the panel's heat would write what was typed (review n1's probe)", async () => {
+      /** What the panel's heat writes to a device holding `current`, through the real synth and dispatcher. */
+      async function heat(device: DeviceInput, current: unknown): Promise<unknown[]> {
+        const entity = synthesise(device, 'climate.t', { [device.channels.mode!.objectId]: { val: current, ack: true, q: 0, ts: 1 } })!;
+        const writes: unknown[] = [];
+        const silent = { info: () => undefined, warn: () => undefined, error: () => undefined, debug: () => undefined };
+        const dispatcher = new Dispatcher({ byId: () => entity, bySceneAlias: () => undefined }, async (_id, value) => void writes.push(value), silent);
+        await dispatcher.dispatch(parseClimateCommand('{"entity_id":"climate.t","command":"set_hvac_mode","hvac_mode":"heat"}'));
+        return writes;
+      }
+      // Typed in another case than the state holds it; the device's own "Heat" beside a "Manual" typed as heat;
+      // a number it may never hold; a mixed state, whose lone current option would write the text "1" for the number 1.
+      const probes: Array<[ChannelInput['type'], string, unknown]> = [
+        ['string', 'manual', 'Manual'],
+        ['string', 'Manual', 'Heat'],
+        ['number', '7', 1],
+        ['mixed', '1', 1],
+      ];
+      for (const [type, deviceMode, current] of probes) {
+        const device = thermostat('t', modeOf('t', { type, states: undefined }));
+        const { devices, rejected } = applyClimateModes([device], [row('t', deviceMode, 'heat')]);
+        expect(rejected, `${type} ${deviceMode}`).to.deep.equal([{ row: row('t', deviceMode, 'heat'), reason: 't.MODE lists no states to match a device mode against' }]);
+        // As before the row: no list to press, and heat writes nothing.
+        expect(devices[0], type).to.equal(device);
+        expect(synthesise(devices[0]!, 'climate.t', {})!.attributes, type).to.not.have.property('hvac_modes');
+        expect(await heat(devices[0]!, current), `${type} ${deviceMode}`).to.deep.equal([]);
+      }
     });
 
     it('leaves out, each with its reason, a row whose device is no picked climate device, whose device has no mode state, or whose device mode is not exactly one state', () => {

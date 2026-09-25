@@ -569,5 +569,15 @@ describe('admin/jsonConfig', () => {
     expect(results).to.deep.equal(['paired']);
     expect(Object.keys(button.result)).to.deep.equal(results);
     expect(Object.keys(button.error)).to.have.members([...PAIRING_FAILURES]);
+    // Among them a password that could not be decrypted, sent to no panel (Ruling 144): its text says where to enter it again.
+    expect(PAIRING_FAILURES).to.include('password_unreadable');
+    for (const [language, strings] of Object.entries(translations)) {
+      expect(strings[button.error.password_unreadable], language).to.include(strings.tab_connection);
+    }
+  });
+
+  it("says the broker did not complete the connection in time without naming a number of seconds: mqtt.js gives up after 10, the adapter's deadline after 12 (Ruling 143, review n2)", () => {
+    expect(MAIN).to.include('const TEST_BROKER_DEADLINE_MS = 12_000;');
+    for (const [language, strings] of Object.entries(translations)) expect(strings.broker_timeout, language).to.not.match(/\d/);
   });
 });

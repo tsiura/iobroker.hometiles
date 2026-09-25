@@ -1,5 +1,6 @@
 import { expect } from 'chai';
-import { DEFAULTS, normaliseTopic, PICKER_VERSION, validateOptions, type AdapterOptions } from '../../src/config/options';
+import { createCipheriv, createDecipheriv, randomBytes } from 'node:crypto';
+import { DEFAULTS, normaliseTopic, PICKER_VERSION, storedPassword, validateOptions, type AdapterOptions } from '../../src/config/options';
 
 describe('config/options', () => {
   it('strips leading and trailing slashes and collapses doubles', () => {
@@ -334,6 +335,69 @@ describe('config/options', () => {
       expect(options.climateModes).to.deep.equal([]);
       expect(warnings).to.deep.equal(['climateModes is not a list; ignoring every climate mode']);
       expect(DEFAULTS.climateModes).to.deep.equal([]);
+    });
+  });
+
+  describe('the broker password as stored (Ruling 144)', () => {
+    /**
+     * js-controller's tools.encrypt (js-controller-common-db tools.js:1733-1755), which cannot be
+     * loaded without a js-controller installed: AES-192-CBC under a 48-digit hex secret, marked by
+     * its prefix; under any other secret an XOR, marked by nothing. tools.decrypt is the inverse,
+     * and takes a value without the prefix for an XOR one (:1756-1766).
+     */
+    const AES = '$/aes-192-cbc:';
+    const xor = (key: string, value: string): string => {
+      let result = '';
+      for (let i = 0; i < value.length; i++) result += String.fromCharCode(key.charCodeAt(i % key.length) ^ value.charCodeAt(i));
+      return result;
+    };
+    const encrypt = (key: string, value: string): string => {
+      if (!/^[0-9a-f]{48}$/.test(key)) return xor(key, value);
+      const iv = randomBytes(16);
+      const cipher = createCipheriv('aes-192-cbc', Buffer.from(key, 'hex'), iv);
+      return `${AES}${iv.toString('hex')}:${Buffer.concat([cipher.update(value), cipher.final()]).toString('hex')}`;
+    };
+    /** The secret js-controller's setup makes (setupSetup.js:261-267), and the one an adapter falls back to without one (constants.js:37). */
+    const SECRET = '3f0a9c1b7d2e4f6a8b0c1d2e3f4a5b6c7d8e9f0a1b2c3d4e';
+    const LEGACY = 'Zgfr56gFe87jJOM';
+    const PASSWORD = 'geheim';
+
+    it("uses what js-controller decrypted from a value admin encrypted, and stores nothing", () => {
+      expect(storedPassword(encrypt(SECRET, PASSWORD), PASSWORD, (value) => encrypt(SECRET, value))).to.deep.equal({ password: PASSWORD });
+      // Under a secret AES does not take, admin encrypts by XOR: that decrypts as well.
+      expect(storedPassword(encrypt(LEGACY, PASSWORD), PASSWORD, (value) => encrypt(LEGACY, value))).to.deep.equal({ password: PASSWORD });
+    });
+
+    it('takes a value 0.1 stored plain as it stands, not as its XOR, and hands back its encryption to store, once', () => {
+      // js-controller decrypts a value without the prefix by XOR: garbage, never an error.
+      const upgraded = storedPassword(PASSWORD, xor(SECRET, PASSWORD), (value) => encrypt(SECRET, value));
+      expect(upgraded).to.include({ password: PASSWORD });
+      const store = upgraded!.store!;
+      expect(store.startsWith(AES)).to.equal(true);
+      // The value stored is one js-controller decrypts, and is not stored again: its prefix marks it.
+      const [, iv, text] = store.split(':');
+      const decipher = createDecipheriv('aes-192-cbc', Buffer.from(SECRET, 'hex'), Buffer.from(iv!, 'hex'));
+      expect(Buffer.concat([decipher.update(Buffer.from(text!, 'hex')), decipher.final()]).toString()).to.equal(PASSWORD);
+      expect(storedPassword(store, PASSWORD, (value) => encrypt(SECRET, value))).to.deep.equal({ password: PASSWORD });
+    });
+
+    it('refuses a value js-controller could not decrypt, which it leaves as stored, and a decryption holding a control character, which no typed password has', () => {
+      // Encrypted under another system's secret: js-controller logs that it cannot decrypt it and leaves it (adapter.js).
+      const foreign = encrypt('0'.repeat(48), PASSWORD);
+      expect(storedPassword(foreign, foreign, (value) => encrypt(SECRET, value))).to.equal(undefined);
+      // Under a secret AES does not take, a 0.1 value cannot be told from an encrypted one: its XOR is garbage.
+      expect([...xor(LEGACY, PASSWORD)].some((char) => char.charCodeAt(0) < 0x20)).to.equal(true);
+      expect(storedPassword(PASSWORD, xor(LEGACY, PASSWORD), (value) => encrypt(LEGACY, value))).to.equal(undefined);
+    });
+
+    it('has nothing to do while no password is stored', () => {
+      const never = (): string => {
+        throw new Error('nothing to encrypt');
+      };
+      expect(storedPassword('', '', never)).to.deep.equal({ password: '' });
+      expect(storedPassword(undefined, '', never)).to.deep.equal({ password: '' });
+      // Not text: validateOptions warned and uses none.
+      expect(storedPassword(5, '', never)).to.deep.equal({ password: '' });
     });
   });
 });

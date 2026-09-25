@@ -72,21 +72,16 @@ export interface RejectedClimateMode {
 }
 
 /**
- * The key of the one state of a mode state that a device mode names: its
- * value, or its label in any case, as encodeChannelValue reads labels. With no
- * states map, the raw value itself, as readEnum looks it up (String(raw)).
+ * The key of the one state of a mode state's states map that a device mode
+ * names: its value, or its label in any case, as encodeChannelValue reads
+ * labels.
  */
 function modeKey(mode: ChannelInput, deviceMode: string): string | undefined {
   const wanted = deviceMode.trim();
-  if (!wanted) return undefined;
-  const entries = Object.entries(mode.states ?? {});
-  if (entries.length === 0) {
-    if (mode.type !== 'number') return wanted;
-    const numeric = Number(wanted);
-    return Number.isFinite(numeric) ? String(numeric) : undefined;
-  }
   const label = wanted.toLowerCase();
-  const keys = entries.filter(([key, own]) => key === wanted || own.trim().toLowerCase() === label).map(([key]) => key);
+  const keys = Object.entries(mode.states ?? {})
+    .filter(([key, own]) => key === wanted || own.trim().toLowerCase() === label)
+    .map(([key]) => key);
   return new Set(keys).size === 1 ? keys[0] : undefined;
 }
 
@@ -105,6 +100,12 @@ function modeKey(mode: ChannelInput, deviceMode: string): string | undefined {
  * than one state -- two rows' or a state already labelled so -- since the
  * codec could then write neither. Leaving a row out gives its state its own
  * label back, which can clash in turn, so the check runs until none does.
+ *
+ * A mode state that lists no states is left alone (review n1): nothing tells
+ * which values it holds, so a typed device mode could only be taken on trust
+ * -- the panel's heat writing "manual" to a state that holds "Manual", or a
+ * value it never held -- and its own values, "Heat" among them, would pass
+ * every clash check unseen. Ruling 26: fewer buttons, never a wrong command.
  */
 export function applyClimateModes(
   devices: readonly DeviceInput[],
@@ -123,7 +124,9 @@ export function applyClimateModes(
         ? 'no climate device of this id is picked on the Devices tab'
         : !mode
           ? 'the device has no mode state'
-          : `not exactly one value or label of ${mode.objectId}`;
+          : Object.keys(mode.states ?? {}).length === 0
+            ? `${mode.objectId} lists no states to match a device mode against`
+            : `not exactly one value or label of ${mode.objectId}`;
       rejected.push({ row, index, reason });
     }
   });

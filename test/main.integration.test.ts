@@ -3,7 +3,7 @@ import { expect } from 'chai';
 import { tests, type IntegrationTestHarness } from '@iobroker/testing';
 import mqtt, { type MqttClient } from 'mqtt';
 import { execFile, execFileSync, spawn, type ChildProcess } from 'node:child_process';
-import { createCipheriv, randomBytes } from 'node:crypto';
+import { createCipheriv, createDecipheriv, randomBytes } from 'node:crypto';
 import { closeSync, mkdirSync, openSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { createServer as createHttpServer, type Server as HttpServer } from 'node:http';
 import { createServer, type AddressInfo, type Server } from 'node:net';
@@ -198,6 +198,28 @@ function encryptAsAdmin(secret: string, value: string): string {
   const iv = randomBytes(16);
   const cipher = createCipheriv('aes-192-cbc', Buffer.from(secret, 'hex'), iv);
   return `$/aes-192-cbc:${iv.toString('hex')}:${Buffer.concat([cipher.update(value), cipher.final()]).toString('hex')}`;
+}
+
+/** encryptAsAdmin's inverse, as js-controller decrypts (tools.decrypt): throws where the secret is not the one it was encrypted under, mostly. */
+function decryptAsAdmin(secret: string, stored: string): string {
+  const [, iv, text] = stored.split(':');
+  const decipher = createDecipheriv('aes-192-cbc', Buffer.from(secret, 'hex'), Buffer.from(iv!, 'hex'));
+  return Buffer.concat([decipher.update(Buffer.from(text!, 'hex')), decipher.final()]).toString();
+}
+
+/**
+ * A value as admin on another system stores it, which this one's secret cannot decrypt (Ruling 144): a
+ * wrong key fails AES's padding check, but in about 1 of 256 draws does not, so it draws until one fails.
+ */
+function undecryptable(secret: string, value: string): string {
+  for (;;) {
+    const stored = encryptAsAdmin(randomBytes(24).toString('hex'), value);
+    try {
+      decryptAsAdmin(secret, stored);
+    } catch {
+      return stored;
+    }
+  }
 }
 
 async function setObjects(harness: IntegrationTestHarness, objects: Record<string, object>): Promise<void> {
@@ -2058,6 +2080,123 @@ if (process.env.HOMETILES_INTEGRATION === '1') {
             ok: false,
             error: 'credentials_rejected',
             args: [`127.0.0.1:${panelPort}`, '401'],
+          });
+        });
+      });
+
+      describe('the broker password as an earlier version, or another system, stored it (Ruling 144)', () => {
+        const PASSWORD = 'gespeichert-9f2c41';
+        /** The passwords the broker was offered, in order: it lets in only this user with this password. */
+        const offered: Array<string | undefined> = [];
+        /** Each credentials form the panel's setup page received. */
+        const posted: string[] = [];
+        let broker: Aedes;
+        let brokerServer: Server;
+        let panelServer: HttpServer;
+        let brokerPort = 0;
+        let panelPort = 0;
+        /** A port the system picks (Ruling 137). */
+        const listen = (server: Server | HttpServer): Promise<number> =>
+          new Promise((resolve) => server.listen(0, '127.0.0.1', () => resolve((server.address() as AddressInfo).port)));
+        const MIGRATED = '[Config] The broker password was stored unencrypted by an earlier version; it is stored encrypted now';
+        const UNREADABLE =
+          '[Config] The broker password could not be decrypted, so the adapter connects to no broker and pairs no panel. ' +
+          'Passwords are stored encrypted since 0.2.0: enter it again on the Connection tab and save';
+
+        before(async () => {
+          broker = new Aedes({
+            authenticate: (_client, username, password, done) => {
+              offered.push(password?.toString());
+              if (username === 'gespeichert' && password?.toString() === PASSWORD) return done(null, true);
+              done(Object.assign(new Error('Bad username or password'), { returnCode: 4 as const }), false);
+            },
+          });
+          brokerServer = createServer(broker.handle);
+          brokerPort = await listen(brokerServer);
+          panelServer = createHttpServer((request, response) => {
+            let body = '';
+            request.on('data', (chunk: Buffer) => (body += chunk.toString()));
+            request.on('end', () => {
+              if (request.url === '/mqtt') posted.push(body);
+              response.writeHead(request.url === '/mqtt' ? 303 : 200);
+              response.end();
+            });
+          });
+          panelPort = await listen(panelServer);
+        });
+        after((done) => {
+          panelServer.close();
+          broker.close();
+          brokerServer.close(() => done());
+        });
+
+        /**
+         * Starts the adapter on the password `stored` gives for this system's secret, as an upgrade installs it
+         * (iobroker upload, as the Ruling 140 suite does); its logs, once onReady has finished. By then its
+         * first connection attempt, if it made one, has had its answer (mqtt-client.ts connect).
+         */
+        async function start(harness: IntegrationTestHarness, stored: (secret: string) => string): Promise<LogRecord[]> {
+          const logs = await captureLogs(harness);
+          await promisify(execFile)(process.execPath, ['iobroker.js', 'upload', 'hometiles'], { cwd: CONTROLLER_DIR, timeout: 120000 });
+          const secret = ((await harness.objects.getObjectAsync('system.config')) as { native: { secret: string } }).native.secret;
+          expect(secret, 'a secret AES-192 takes').to.match(/^[0-9a-f]{48}$/);
+          await harness.changeAdapterConfig('hometiles', {
+            native: { brokerHost: '127.0.0.1', brokerPort, brokerUser: 'gespeichert', brokerPassword: stored(secret), ...ARMED },
+          });
+          await harness.startAdapterAndWait();
+          await waitFor(harness, () => ready(logs), 'onReady to finish');
+          await harness.enableSendTo();
+          return logs;
+        }
+        async function pair(harness: IntegrationTestHarness): Promise<Record<string, unknown>> {
+          let answer: Record<string, unknown> | undefined;
+          harness.sendTo('hometiles.0', 'pairPanel', { host: `127.0.0.1:${panelPort}` }, (reply: unknown) => {
+            answer = reply as Record<string, unknown>;
+          });
+          return waitFor(harness, () => answer, 'the answer to pairPanel');
+        }
+        const said = (logs: LogRecord[]): string[][] =>
+          logs
+            .filter((log) => log.message.includes('[Config] The broker password'))
+            .map((log) => [log.severity, log.message.slice(log.message.indexOf('[Config]'))]);
+
+        suite('stored in plain text by 0.1', (getHarness) => {
+          withCleanFixtures(getHarness);
+
+          it('connects with it, stores it encrypted, says so once without it, and pairs with it', async function () {
+            this.timeout(180000);
+            const harness = getHarness();
+            const connection = valuesOf(harness, 'hometiles.0.info.connection');
+            const logs = await start(harness, () => PASSWORD);
+            expect(offered).to.deep.equal([PASSWORD]);
+            await waitFor(harness, () => (connection.includes(true) ? true : undefined), 'the broker connection');
+            // Stored as admin would store it now, which js-controller decrypts to the password.
+            const secret = ((await harness.objects.getObjectAsync('system.config')) as { native: { secret: string } }).native.secret;
+            const stored = ((await harness.objects.getObjectAsync('system.adapter.hometiles.0')) as { native: { brokerPassword: string } }).native.brokerPassword;
+            expect(stored).to.match(/^\$\/aes-192-cbc:/);
+            expect(decryptAsAdmin(secret, stored)).to.equal(PASSWORD);
+            expect(said(logs)).to.deep.equal([['info', MIGRATED]]);
+            expect(logs.filter((log) => log.message.includes(PASSWORD)).map((log) => log.message)).to.deep.equal([]);
+            expect(await pair(harness)).to.include({ ok: true });
+            expect(Object.fromEntries(new URLSearchParams(posted.at(-1)))).to.include({ mqtt_user: 'gespeichert', mqtt_pass: PASSWORD });
+          });
+        });
+
+        suite("stored encrypted under another system's secret", (getHarness) => {
+          withCleanFixtures(getHarness);
+
+          it('logs one error asking to enter it again, offers the broker nothing, and sends a panel nothing', async function () {
+            this.timeout(180000);
+            const harness = getHarness();
+            const [offeredBefore, postedBefore] = [offered.length, posted.length];
+            const logs = await start(harness, (secret) => undecryptable(secret, PASSWORD));
+            // js-controller says it could not decrypt it (adapter.js) and hands the adapter the value as stored.
+            expect(logs.some((log) => log.message.includes('Can not decrypt attribute brokerPassword'))).to.equal(true);
+            expect(said(logs)).to.deep.equal([['error', UNREADABLE]]);
+            expect(offered.length, 'connection attempts').to.equal(offeredBefore);
+            expect((await harness.states.getStateAsync('hometiles.0.info.connection'))?.val).to.equal(false);
+            expect(await pair(harness)).to.deep.include({ ok: false, error: 'password_unreadable', args: [`127.0.0.1:${panelPort}`, ''] });
+            expect(posted.length, 'forms posted').to.equal(postedBefore);
           });
         });
       });

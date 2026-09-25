@@ -1,7 +1,7 @@
 import * as utils from '@iobroker/adapter-core';
 import { readdirSync, readFileSync } from 'node:fs';
 import path from 'node:path';
-import { PICKER_VERSION, validateOptions, type AdapterOptions, type DeviceOverride } from './config/options';
+import { PICKER_VERSION, storedPassword, validateOptions, type AdapterOptions, type DeviceOverride } from './config/options';
 import { AnnounceError } from './protocol/announce';
 import { listsAnyEntity, MAX_EDITABLES, splitEditables } from './protocol/apply';
 import { ENTITY_ID_RE } from './protocol/commands';
@@ -28,7 +28,7 @@ import { HomeTilesMqttClient, probeBroker, type Logger } from './runtime/mqtt-cl
 import { PanelManager } from './runtime/panel-manager';
 import { PanelObjects } from './runtime/panel-objects';
 import type { PanelSession } from './runtime/panel-session';
-import { credentialsFromOptions, pushCredentials } from './runtime/pairing';
+import { credentialsFromOptions, pushCredentials, type PairingResult } from './runtime/pairing';
 import { mergeSceneAliases } from './runtime/scene-aliases';
 
 const ENTITY_ID_STATE = 'info.entityIds';
@@ -52,6 +52,10 @@ const I18N_DIR = path.join(__dirname, '..', 'admin', 'i18n');
 const BROKER_FIELDS = ['brokerHost', 'brokerPort', 'brokerTls', 'brokerUser', 'brokerPassword', 'clientId'] as const;
 /** How long Test broker waits at most (Ruling 143): past mqtt.js's own 10 s connect timeout, for what that never ends. */
 const TEST_BROKER_DEADLINE_MS = 12_000;
+/** Ruling 144, once per start that finds a broker password nothing may use. */
+const PASSWORD_UNREADABLE =
+  'The broker password could not be decrypted, so the adapter connects to no broker and pairs no panel. ' +
+  'Passwords are stored encrypted since 0.2.0: enter it again on the Connection tab and save';
 
 /** One text of one admin translation file, or undefined. Only a language code names a file, never a path. */
 function i18nText(language: string, key: string): string | undefined {
@@ -120,6 +124,8 @@ class HomeTiles extends utils.Adapter {
   /** Set first on unload: from then on nothing is published (Ruling 62 B). */
   private unloading = false;
   private discoveryRetry: ioBroker.Timeout | undefined;
+  /** The stored broker password decrypts to nothing usable: no connection, no pairing (Ruling 144). */
+  private passwordUnreadable = false;
 
   constructor(options: Partial<utils.AdapterOptions> = {}) {
     super({ ...options, name: 'hometiles' });
@@ -142,6 +148,26 @@ class HomeTiles extends utils.Adapter {
     const { options, errors, warnings } = validateOptions(this.config as unknown as Partial<AdapterOptions>);
     for (const error of errors) this.log.error(`[Config] ${error}`);
     for (const warning of warnings) this.log.warn(`[Config] ${warning}`);
+    // Never a password that could not be decrypted (Ruling 144). One 0.1 stored in plain text is used as
+    // stored and stored encrypted, once; storing it restarts the adapter (js-controller), which then finds it
+    // encrypted. Neither is ever logged.
+    const instance = `system.adapter.${this.namespace}`;
+    const password = storedPassword(
+      (await this.getForeignObjectAsync(instance))?.native?.brokerPassword,
+      options.brokerPassword,
+      (value) => this.encrypt(value),
+    );
+    this.passwordUnreadable = !password;
+    options.brokerPassword = password?.password ?? '';
+    if (!password) this.log.error(`[Config] ${PASSWORD_UNREADABLE}`);
+    else if (password.store !== undefined) {
+      try {
+        await this.extendForeignObjectAsync(instance, { native: { brokerPassword: password.store } });
+        this.log.info('[Config] The broker password was stored unencrypted by an earlier version; it is stored encrypted now');
+      } catch (error) {
+        this.log.warn(`[Config] The broker password, stored unencrypted by an earlier version, could not be stored encrypted: ${error instanceof Error ? error.message : String(error)}`);
+      }
+    }
     this.options = options;
 
     await this.setState('info.connection', false, true);
@@ -220,8 +246,9 @@ class HomeTiles extends utils.Adapter {
     await this.discover();
     await this.subscribeStatesAsync('panels.*');
 
-    // A broker that is down must not stop the adapter: the client reconnects.
-    await this.mqtt.connect();
+    // A broker that is down must not stop the adapter: the client reconnects. With a password that could
+    // not be decrypted it connects to none: the broker would only refuse it, every 2 s (Ruling 144).
+    if (!this.passwordUnreadable) await this.mqtt.connect();
     this.log.info(
       this.discovered ? `[HomeTiles] Ready. ${this.tally}` : '[HomeTiles] Ready. Devices are published once a discovery succeeds',
     );
@@ -439,13 +466,23 @@ class HomeTiles extends utils.Adapter {
       if (!host) {
         this.log.warn(`[Panel ${deviceId}] Pairing skipped: the panel has not reported an IP address`);
       } else {
-        await pushCredentials(host, credentialsFromOptions(this.options), this.log4);
+        await this.pair(host);
       }
       await this.setState(id, false, true);
       return;
     }
 
     this.panelObjects.handleControlWrite(session, path, state.val);
+  }
+
+  /**
+   * Sends a panel the credentials the adapter itself uses, as the Panels tab's button and a panel's
+   * control.pair ask for it; never a password that could not be decrypted (Ruling 144).
+   */
+  private async pair(host: string): Promise<PairingResult> {
+    if (!this.passwordUnreadable) return pushCredentials(host, credentialsFromOptions(this.options), this.log4);
+    this.log.warn('[Pairing] Nothing sent: the broker password could not be decrypted. Enter it again on the Connection tab and save');
+    return { ok: false, reason: 'password_unreadable' };
   }
 
   // ---- Registry ----
@@ -860,7 +897,7 @@ class HomeTiles extends utils.Adapter {
         // Connection tab saved, which the adapter itself uses.
         const request = typeof message.message === 'object' && message.message !== null ? (message.message as { host?: unknown }) : {};
         const host = typeof request.host === 'string' ? request.host.trim() : '';
-        const result = await pushCredentials(host, credentialsFromOptions(this.options), this.log4);
+        const result = await this.pair(host);
         // As admin shows it: a result text, or the failure's own text with the address and any HTTP status.
         return reply(
           result.ok

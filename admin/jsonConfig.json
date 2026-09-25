@@ -245,7 +245,8 @@
             "unreachable": "pair_unreachable",
             "credentials_rejected": "pair_credentials_rejected",
             "restart_unreachable": "pair_restart_unreachable",
-            "restart_failed": "pair_restart_failed"
+            "restart_failed": "pair_restart_failed",
+            "password_unreadable": "pair_password_unreadable"
           },
           "showProcess": true,
           "variant": "contained",

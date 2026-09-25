@@ -340,6 +340,38 @@ function historyInstance(value: unknown, warnings: string[]): string {
   return '';
 }
 
+/** What js-controller's tools.encrypt puts first in a value it encrypted with AES (js-controller-common-db tools.js:1747-1755). */
+const AES_PREFIX = '$/aes-192-cbc:';
+/** Nothing typed into a form's password field holds a control character: a decryption that yields one yielded garbage. */
+const hasControlCharacter = (text: string): boolean => [...text].some((char) => char.charCodeAt(0) < 0x20 || char.charCodeAt(0) === 0x7f);
+
+/**
+ * The broker password this run may use (Ruling 144), from the value the instance object stores (`raw`),
+ * what js-controller decrypted it to for this.config (`decrypted`), and the adapter's own encrypt.
+ *
+ * Under the secret js-controller's setup makes (48 hex digits), encrypt is AES and marks what it made
+ * with its prefix: a stored value without it was stored in plain text, by 0.1, and js-controller
+ * decrypts it by XOR, to garbage and without an error (tools.js:1756-1766). It is used as stored, and
+ * handed back encrypted, to be stored once: from then on its prefix marks it. Under any other secret
+ * encrypt is the same XOR and marks nothing, so plain and encrypted cannot be told apart.
+ *
+ * undefined: the value decrypts to nothing usable, and nothing may use it. js-controller leaves a
+ * value it cannot decrypt as stored, after logging so (adapter.js), and a decryption holding a
+ * control character is garbage.
+ */
+export function storedPassword(
+  raw: unknown,
+  decrypted: string,
+  encrypt: (value: string) => string,
+): { password: string; store?: string } | undefined {
+  if (typeof raw !== 'string' || raw === '') return { password: decrypted };
+  if (!raw.startsWith(AES_PREFIX)) {
+    const store = encrypt(raw);
+    if (store.startsWith(AES_PREFIX)) return { password: raw, store };
+  }
+  return decrypted.startsWith(AES_PREFIX) || hasControlCharacter(decrypted) ? undefined : { password: decrypted };
+}
+
 function clamp(value: number, min: number, max: number): number {
   if (!Number.isFinite(value)) return min;
   return Math.min(max, Math.max(min, Math.round(value)));
