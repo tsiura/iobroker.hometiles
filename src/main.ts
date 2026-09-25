@@ -30,6 +30,7 @@ import { PanelObjects } from './runtime/panel-objects';
 import type { PanelSession } from './runtime/panel-session';
 import { credentialsFromOptions, pushCredentials, type PairingResult } from './runtime/pairing';
 import { mergeSceneAliases } from './runtime/scene-aliases';
+import { connectSources, SOURCE_CALL_MS, UNANSWERED, within } from './runtime/sources';
 
 const ENTITY_ID_STATE = 'info.entityIds';
 const ROOT_ANCHOR_STATE = 'info.rootAnchors';
@@ -244,7 +245,13 @@ class HomeTiles extends utils.Adapter {
     this.mqtt.onMessage((topic, payload, retain) => void this.onMqttMessage(topic, payload, retain));
 
     await this.discover();
-    await this.subscribeStatesAsync('panels.*');
+    // Bounded like the sources' calls (Ruling 150): the start goes on without it.
+    if ((await within(this.subscribeStatesAsync('panels.*'), SOURCE_CALL_MS)) === UNANSWERED) {
+      this.log.warn(
+        `[HomeTiles] js-controller gave no answer within ${SOURCE_CALL_MS / 1000} s to subscribing ${this.namespace}.panels.*. ` +
+          'Carried on without it: writes to the panels\' states may go unnoticed until the adapter restarts',
+      );
+    }
 
     // A broker that is down must not stop the adapter: the client reconnects. With a password that could
     // not be decrypted it connects to none: the broker would only refuse it, every 2 s (Ruling 144).
@@ -552,33 +559,17 @@ class HomeTiles extends utils.Adapter {
     this.persistedIds = { ...idsToStore(this.persistedIds, [...detected, ...manual.devices], result.entityIds), ...energyIds };
     await this.saveJsonMap(ENTITY_ID_STATE, 'Persisted entity ids', this.persistedIds);
 
-    for (const objectId of result.unsubscribe) await this.unsubscribeForeignStatesAsync(objectId);
-    for (const objectId of result.subscribe) await this.subscribeForeignStatesAsync(objectId);
-
-    // Seed the registry with the values the sources already hold, so a panel
-    // that connects later finds retained state rather than an empty dashboard.
-    // A source whose value cannot be read -- js-controller refuses an alias
-    // whose target id is malformed (adapter.js _getForeignState) -- stays
-    // unavailable until it changes: one bad object must not hold back every
-    // other (Ruling 60(2)). Left unread, it is asked for again should this
-    // attempt fail later (RebuildResult.subscribe).
-    const unread: string[] = [];
-    for (const objectId of result.subscribe) {
-      let state: ioBroker.State | null | undefined;
-      try {
-        state = await this.getForeignStateAsync(objectId);
-      } catch (error) {
-        unread.push(`${objectId} (${error instanceof Error ? error.message : String(error)})`);
-        continue;
-      }
-      this.registry.applyStateChange(
-        objectId,
-        state ? { val: state.val, ack: state.ack, q: state.q ?? 0, ts: state.ts } : null,
-      );
-    }
-    if (unread.length > 0) {
-      this.log.warn(`[Registry] Could not read the value of ${unread.join(', ')}; unavailable until it changes`);
-    }
+    await connectSources(
+      result,
+      objects,
+      {
+        subscribe: (objectId) => this.subscribeForeignStatesAsync(objectId),
+        unsubscribe: (objectId) => this.unsubscribeForeignStatesAsync(objectId),
+        read: (objectId) => this.getForeignStateAsync(objectId),
+      },
+      (objectId, value) => this.registry.applyStateChange(objectId, value),
+      this.log,
+    );
     this.registry.flush();
 
     // A manual number, select or datetime the panel cannot edit, and what its
