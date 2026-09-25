@@ -4,7 +4,7 @@ import { tests, type IntegrationTestHarness } from '@iobroker/testing';
 import mqtt, { type MqttClient } from 'mqtt';
 import { execFile, execFileSync, spawn, type ChildProcess } from 'node:child_process';
 import { createCipheriv, randomBytes } from 'node:crypto';
-import { closeSync, lstatSync, mkdirSync, openSync, readFileSync, rmSync, symlinkSync, unlinkSync, writeFileSync } from 'node:fs';
+import { closeSync, mkdirSync, openSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { createServer as createHttpServer, type Server as HttpServer } from 'node:http';
 import { createServer, type AddressInfo, type Server } from 'node:net';
 import os from 'node:os';
@@ -12,6 +12,123 @@ import path from 'node:path';
 import { promisify } from 'node:util';
 import { EnergySource, type EnergyNames } from '../src/runtime/energy-source';
 import { HistoryProvider, MAX_HISTORY_ROWS, type HistoryResult, type HistorySource } from '../src/runtime/history-provider';
+
+/** Ports nothing listens on now, as the system hands them out: each held until all are known, so no two are one. */
+async function freePorts(count: number): Promise<number[]> {
+  const servers = Array.from({ length: count }, () => createServer());
+  for (const server of servers) await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', resolve));
+  const ports = servers.map((server) => (server.address() as AddressInfo).port);
+  for (const server of servers) await new Promise((resolve) => server.close(resolve));
+  return ports;
+}
+
+/** Two free ports written into iobroker.json, where every process of a run reads its databases' ports; none before an install made it. */
+async function freshDatabasePorts(dataDir: string): Promise<{ objects: number; states: number } | undefined> {
+  const file = path.join(dataDir, 'iobroker.json');
+  let config: { objects: { port: number }; states: { port: number } };
+  try {
+    config = JSON.parse(readFileSync(file, 'utf8'));
+  } catch {
+    return undefined;
+  }
+  [config.objects.port, config.states.port] = (await freePorts(2)) as [number, number];
+  writeFileSync(file, JSON.stringify(config, null, 2));
+  return { objects: config.objects.port, states: config.states.port };
+}
+
+/** What of @iobroker/testing's DBConnection (lib/dbConnection.js) the port fix reads and sets. */
+interface HarnessDb {
+  testDir: string;
+  testControllerDir: string;
+  testDataDir: string;
+  logger: unknown;
+  objectsType: string;
+  statesType: string;
+  _isRunning: boolean;
+  emit(event: string, ...args: unknown[]): boolean;
+  start(): Promise<void>;
+}
+
+/** lib/dbConnection.js createObjectsDB and createStatesDB, on the port given: the server, then a client of it that hears every change. */
+async function createDatabase(db: HarnessDb, kind: 'objects' | 'states', port: number): Promise<void> {
+  const type = kind === 'objects' ? db.objectsType : db.statesType;
+  const connection =
+    kind === 'objects'
+      ? { type, host: '127.0.0.1', port, user: '', pass: '', noFileCache: false, connectTimeout: 2000 }
+      : { type, host: '127.0.0.1', port, options: { auth_pass: null, retry_max_delay: 15000 } };
+  const settings = { connection, logger: db.logger };
+  const paths = [path.join(db.testDir, 'node_modules'), path.join(db.testControllerDir, 'node_modules')];
+  const { Server, Client } = require(require.resolve(`@iobroker/db-${kind}-${type}`, { paths }));
+  const fields = db as unknown as Record<string, { subscribe(pattern: string): void }>;
+  await new Promise<void>((resolve) => {
+    fields[`_${kind}Server`] = new Server({ ...settings, connected: () => resolve() });
+  });
+  await new Promise<void>((resolve) => {
+    fields[`_${kind}Client`] = new Client({
+      ...settings,
+      connected: () => {
+        fields[`_${kind}Client`]!.subscribe('*');
+        resolve();
+      },
+      change: db.emit.bind(db, kind === 'objects' ? 'objectChange' : 'stateChange'),
+    });
+  });
+}
+
+/**
+ * Ruling 137: no test takes a fixed port. @iobroker/testing 5 runs its databases on 19000 and
+ * 19001 (lib/dbConnection.js createObjectsDB, createStatesDB) and writes those into iobroker.json
+ * (lib/controllerSetup.js setupSystemConfig), where the adapter, js-controller's command line and
+ * iobroker.history read them: two runs at once shared one database, and a run whose ports another
+ * process held hung in `iobroker setup first` (Task 24). Each start of the databases now takes two
+ * ports the system hands out, written into iobroker.json first; so does each install, whose
+ * command line runs before any start. The servers take no port 0 (`port || 9000`): hence ports
+ * known to be free a moment before.
+ */
+function useFreeDatabasePorts(): void {
+  const { DBConnection } = require('@iobroker/testing/build/tests/integration/lib/dbConnection') as { DBConnection: { prototype: HarnessDb } };
+  const { ControllerSetup } = require('@iobroker/testing/build/tests/integration/lib/controllerSetup') as {
+    ControllerSetup: { prototype: { testDataDir: string; setupSystemConfig(): void; prepareTestDir(...args: unknown[]): Promise<void> } };
+  };
+  DBConnection.prototype.start = async function (this: HarnessDb): Promise<void> {
+    if (this._isRunning) return;
+    const ports = await freshDatabasePorts(this.testDataDir);
+    if (!ports) throw new Error(`No iobroker.json in ${this.testDataDir}: js-controller is not installed there`);
+    await createDatabase(this, 'objects', ports.objects);
+    await createDatabase(this, 'states', ports.states);
+    this._isRunning = true;
+  };
+  // Each start has written its ports; 19001 and 19000 written after one would send the command line elsewhere.
+  ControllerSetup.prototype.setupSystemConfig = (): void => undefined;
+  const prepare = ControllerSetup.prototype.prepareTestDir;
+  ControllerSetup.prototype.prepareTestDir = async function (this: { testDataDir: string }, ...args: unknown[]): Promise<void> {
+    await freshDatabasePorts(this.testDataDir);
+    return prepare.apply(this, args);
+  };
+}
+
+/**
+ * @iobroker/testing installs js-controller and the packed adapter with npm and never reads the
+ * outcome (lib/controllerSetup.js prepareTestDir, lib/adapterSetup.js installAdapterInTestDir):
+ * an install npm could not finish surfaced only as js-controller's "Unknown packet name
+ * hometiles", from the `iobroker add` that found the adapter's folder gone (Task 23 C3; npm could
+ * not write in a full temp quota, EDQUOT). A failed npm install or uninstall now fails the run
+ * where it happens, with npm's own last lines (Task 24).
+ */
+function failOnNpmErrors(): void {
+  type Run = (command: string, args?: unknown, options?: unknown) => Promise<{ exitCode?: number; signal?: string; stderr?: string }>;
+  const runner = require('@iobroker/testing/build/lib/executeCommand') as { executeCommand: Run };
+  const run = runner.executeCommand;
+  runner.executeCommand = async (command, args, options) => {
+    const result = await run(command, args, options);
+    const argv = Array.isArray(args) ? args.map(String) : [];
+    if (command === 'npm' && ['i', 'install', 'uninstall'].includes(argv[0] ?? '') && result.exitCode !== 0) {
+      const said = String(result.stderr ?? '').trim().split('\n').slice(-6).join('\n');
+      throw new Error(`npm ${argv.join(' ')} failed (${result.exitCode ?? result.signal}): ${said || 'nothing on stderr'}`);
+    }
+    return result;
+  };
+}
 
 /** A log line as js-controller forwards it (js-controller-common-db logger.js). */
 interface LogRecord {
@@ -279,6 +396,52 @@ const TRV_OBJECTS: Record<string, object> = {
 };
 
 /**
+ * For the round trips (Task 24), a device of each v0.2 domain the TRV above
+ * leaves, laid out as the adapters behind them lay them out: a KNX blind, a
+ * Squeezebox player, a weather station whose temperature sits in a channel
+ * (Ruling 46), a KNX ventilation level, and a heating programme and an alarm
+ * clock, readings the Devices tab forces into select and datetime, which no
+ * detector type yields.
+ */
+const BLIND = 'knx.0.Rollladen.Wohnzimmer';
+const PLAYER = 'squeezeboxrpc.0.Players.Kueche';
+const STATION = 'weather.0.station';
+const LEVEL = 'knx.0.Lueftung';
+const PROGRAM = 'mqtt.0.Heizung.Programm';
+const CLOCK = 'mqtt.0.Wecker';
+const readOnly = (name: string, role: string, type: string, extra: object = {}): object => ({
+  type: 'state',
+  common: { name, role, type, read: true, write: false, ...extra },
+});
+const writable = (name: string, role: string, type: string, extra: object = {}): object => ({
+  type: 'state',
+  common: { name, role, type, read: true, write: true, ...extra },
+});
+const button = (name: string, role: string): object => ({ type: 'state', common: { name, role, type: 'boolean', read: false, write: true } });
+const DOMAIN_OBJECTS: Record<string, object> = {
+  [BLIND]: { type: 'channel', common: { name: 'Rollladen Wohnzimmer' } },
+  [`${BLIND}.SET`]: writable('Position', 'level.blind', 'number', { min: 0, max: 100, unit: '%' }),
+  [`${BLIND}.ACTUAL`]: readOnly('Ist', 'value.blind', 'number', { min: 0, max: 100, unit: '%' }),
+  [`${BLIND}.STOP`]: button('Stop', 'button.stop.blind'),
+  [PLAYER]: { type: 'channel', common: { name: 'Kuechenradio' } },
+  [`${PLAYER}.state`]: writable('Status', 'media.state', 'number', { states: { 0: 'pause', 1: 'play', 2: 'stop' } }),
+  [`${PLAYER}.btnForward`]: button('Weiter', 'button.next'),
+  [`${PLAYER}.btnRewind`]: button('Zurueck', 'button.prev'),
+  [`${PLAYER}.Volume`]: writable('Lautstaerke', 'level.volume', 'number', { min: 0, max: 100 }),
+  [`${PLAYER}.Title`]: readOnly('Titel', 'media.title', 'string'),
+  [STATION]: { type: 'device', common: { name: 'Wetterstation' } },
+  [`${STATION}.icon`]: readOnly('Symbol', 'weather.icon', 'string'),
+  [`${STATION}.outside`]: { type: 'channel', common: { name: 'Aussen' } },
+  [`${STATION}.outside.temperature`]: readOnly('Temperatur', 'value.temperature', 'number', { unit: '°C' }),
+  [LEVEL]: { type: 'channel', common: { name: 'Lueftung' } },
+  [`${LEVEL}.Stufe`]: writable('Stufe', 'level', 'number', { min: 0, max: 4 }),
+  [PROGRAM]: { type: 'channel', common: { name: 'Heizprogramm' } },
+  [`${PROGRAM}.SET`]: writable('Programm', 'state', 'number', { states: { 0: 'Aus', 1: 'Eco', 2: 'Komfort' } }),
+  [CLOCK]: { type: 'channel', common: { name: 'Wecker' } },
+  [`${CLOCK}.Zeit`]: writable('Zeit', 'text', 'string'),
+};
+
+/**
  * Rows that pick devices, as the picker writes them (Task 21b): nothing
  * reaches a panel without one, and only a row carrying what Refresh found
  * counts (Ruling 118). The runtime reads the detected domain only as that
@@ -303,6 +466,7 @@ const FIXTURE_IDS = [
   ...Object.keys(SENDER_OBJECTS),
   ...Object.keys(TWIN_OBJECTS),
   ...Object.keys(TRV_OBJECTS),
+  ...Object.keys(DOMAIN_OBJECTS),
 ];
 
 /** A panel as the firmware announces itself: retained on the broker, like its last configuration. */
@@ -323,28 +487,48 @@ const ANNOUNCEMENT = JSON.stringify({
 });
 const LAST_GOOD_APPLY = '{"marker":"the last good configuration"}';
 
+/** A topic of the panel's own, for settled(). */
+const BARRIER_TOPIC = 'hometiles-test/barrier';
+
 /**
  * A broker, and a panel client on it that records every apply it receives.
- * Port 0 is one the system picks (Ruling 137), known once the suite starts.
+ * On a port the system hands out (Ruling 137), known once the suite starts.
  */
-function withBrokerAndPanel(port: number): { applies: string[]; panel: () => MqttClient; port: () => number } {
+function withBrokerAndPanel(): {
+  applies: string[];
+  panel: () => MqttClient;
+  port: () => number;
+  /**
+   * Resolves once the panel has received all the broker routed to it before
+   * now: a message the panel sends itself comes back after it. Called once the
+   * adapter has done what it would publish (a state it sets after, its log,
+   * its exit), it says the panel has seen all of that, and that anything not
+   * seen was not sent. No fixed sleep (Task 24).
+   */
+  settled: () => Promise<void>;
+  /** What the broker retains on these topics, from its own store: what a panel subscribing now is sent. */
+  retained: (...topics: string[]) => Promise<Record<string, string>>;
+} {
   const applies: string[] = [];
   let broker: Aedes;
   let server: Server;
   let panel: MqttClient;
-  let bound = port;
+  let bound = 0;
+  const marks = new Map<string, () => void>();
+  let sent = 0;
   // Created in the hook: a broker's timers would keep a --grep run that
   // skips this suite from ever exiting.
   before(async () => {
     broker = new Aedes();
     server = createServer(broker.handle);
-    await new Promise<void>((resolve) => server.listen(port, resolve));
+    await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', resolve));
     bound = (server.address() as AddressInfo).port;
     panel = await mqtt.connectAsync(`mqtt://127.0.0.1:${bound}`);
     panel.on('message', (topic, payload) => {
       if (topic === APPLY_TOPIC) applies.push(payload.toString());
+      if (topic === BARRIER_TOPIC) marks.get(payload.toString())?.();
     });
-    await panel.subscribeAsync(APPLY_TOPIC);
+    await panel.subscribeAsync([APPLY_TOPIC, BARRIER_TOPIC]);
     await panel.publishAsync(ANNOUNCE_TOPIC, ANNOUNCEMENT, { retain: true });
   });
   after((done) => {
@@ -352,7 +536,36 @@ function withBrokerAndPanel(port: number): { applies: string[]; panel: () => Mqt
     server.close(() => done());
     broker.close();
   });
-  return { applies, panel: () => panel, port: () => bound };
+  return {
+    applies,
+    panel: () => panel,
+    port: () => bound,
+    settled: () =>
+      new Promise<void>((resolve) => {
+        const mark = String(++sent);
+        marks.set(mark, () => {
+          marks.delete(mark);
+          resolve();
+        });
+        panel.publish(BARRIER_TOPIC, mark);
+      }),
+    retained: async (...topics) => {
+      const kept: Record<string, string> = {};
+      // aedes types its persistence as any; the memory store streams its retained packets.
+      const store = (broker as unknown as { persistence: { createRetainedStream(pattern: string): AsyncIterable<{ topic: string; payload: Buffer }> } }).persistence;
+      for (const topic of topics) for await (const packet of store.createRetainedStream(topic)) kept[packet.topic] = packet.payload.toString();
+      return kept;
+    },
+  };
+}
+
+/** An admin request as admin sends one (sendTo with a callback), and the adapter's answer; one at a time. */
+async function askAdapter(harness: IntegrationTestHarness, command: string, message: unknown): Promise<unknown> {
+  let answer: unknown;
+  harness.sendTo('hometiles.0', command, message, (reply: unknown) => {
+    answer = reply;
+  });
+  return waitFor(harness, () => answer, `the answer to ${command}`);
 }
 
 /**
@@ -411,8 +624,10 @@ async function breakDeviceView(harness: IntegrationTestHarness): Promise<DesignD
  * installed once under the harness's test directory but outside its
  * node_modules, which the harness's own `npm i` would prune; its adapter-core
  * finds the harness's js-controller further up. js-controller looks for an
- * adapter's directory beside itself only (js-controller-common-db tools.js
- * getAdapterDir), so the suite links it there while it runs.
+ * adapter's directory beside itself, or where require finds it
+ * (js-controller-common-db tools.js getAdapterDir): the suite starts it with
+ * NODE_PATH naming its node_modules. A link there instead changed the harness's
+ * node_modules after npm's last install, every run (Task 24).
  */
 const HISTORY_VERSION = '5.0.1';
 const HISTORY_DIR = path.join(os.tmpdir(), 'test-iobroker.hometiles', 'history-adapter');
@@ -421,7 +636,6 @@ const CONTROLLER_DIR = path.join(os.tmpdir(), 'test-iobroker.hometiles', 'node_m
 const HISTORY_STORE = path.join(HISTORY_DIR, 'store');
 const HISTORY_PACKAGE = path.join(HISTORY_DIR, 'node_modules', 'iobroker.history');
 const HISTORY_MAIN = path.join(HISTORY_PACKAGE, 'build', 'main.js');
-const HISTORY_LINK = path.join(os.tmpdir(), 'test-iobroker.hometiles', 'node_modules', 'iobroker.history');
 
 type HistoryRow = { ts: number; val: unknown; ack: boolean; q: number };
 
@@ -474,8 +688,8 @@ const meterRows = (until: number): HistoryRow[] => {
 /**
  * A real iobroker.history for the suite it is called in (Task 19). Installed
  * once, and again for another version; without the network the install
- * fails and the suite is skipped, saying why (M-7). Linked where js-controller
- * finds adapters while the suite runs. The `planted()` rows go into its store,
+ * fails and the suite is skipped, saying why (M-7). Run with NODE_PATH where
+ * js-controller finds it (HISTORY_DIR). The `planted()` rows go into its store,
  * each of those states and of `unlogged` gets its object, all but `unlogged`
  * logged by history.0, and it runs until it answers for the first planted
  * state. Afterwards it is stopped and all it added removed: the next run's
@@ -511,7 +725,6 @@ function withHistoryAdapter(
         this.skip();
       }
     }
-    if (!lstatSync(HISTORY_LINK, { throwIfNoEntry: false })) symlinkSync(HISTORY_PACKAGE, HISTORY_LINK, 'dir');
     rmSync(HISTORY_STORE, { recursive: true, force: true });
     const rows = planted();
     for (const [id, list] of Object.entries(rows)) plantHistory(id, list);
@@ -532,7 +745,11 @@ function withHistoryAdapter(
       native: { ...io.native, storeDir: HISTORY_STORE, writeNulls: false },
     });
     const log = openSync(path.join(HISTORY_DIR, 'history.0.log'), 'w');
-    adapter = spawn(process.execPath, [HISTORY_MAIN, '--force', '--console'], { cwd: HISTORY_DIR, stdio: ['ignore', log, log] });
+    adapter = spawn(process.execPath, [HISTORY_MAIN, '--force', '--console'], {
+      cwd: HISTORY_DIR,
+      stdio: ['ignore', log, log],
+      env: { ...process.env, NODE_PATH: path.join(HISTORY_DIR, 'node_modules') },
+    });
     closeSync(log);
 
     // Alive comes before its ready handler has set the store directory:
@@ -556,7 +773,6 @@ function withHistoryAdapter(
       await Promise.race([exited, pause(10000)]);
       if (adapter.exitCode === null) adapter.kill('SIGKILL');
     }
-    if (lstatSync(HISTORY_LINK, { throwIfNoEntry: false })?.isSymbolicLink()) unlinkSync(HISTORY_LINK);
     const harness = getHarness();
     for (const id of [...ids, 'system.adapter.history.0']) await harness.objects.delObjectAsync(id).catch(() => undefined);
     if (systemConfig) await harness.objects.setObjectAsync('system.config', systemConfig);
@@ -566,6 +782,8 @@ function withHistoryAdapter(
 // Opt-in: this downloads and runs a real js-controller, so it stays out of the
 // default suite. Run it with HOMETILES_INTEGRATION=1 npm test.
 if (process.env.HOMETILES_INTEGRATION === '1') {
+  useFreeDatabasePorts();
+  failOnNpmErrors();
   tests.integration(path.join(__dirname, '..'), {
     defineAdditionalTests({ suite }) {
       suite('startup', (getHarness) => {
@@ -611,7 +829,8 @@ if (process.env.HOMETILES_INTEGRATION === '1') {
 
       suite('a corrupt function enum (Ruling 58 D)', (getHarness) => {
         withCleanFixtures(getHarness);
-        const port = 18851;
+        /** One the system hands out (Ruling 137). */
+        let port = 0;
         // Created in the hook: a broker's timers would keep a --grep run
         // that skips this suite from ever exiting.
         let broker: Aedes;
@@ -619,7 +838,10 @@ if (process.env.HOMETILES_INTEGRATION === '1') {
         before((done) => {
           broker = new Aedes();
           server = createServer(broker.handle);
-          server.listen(port, done);
+          server.listen(0, '127.0.0.1', () => {
+            port = (server.address() as AddressInfo).port;
+            done();
+          });
         });
         after((done) => {
           server.close(() => done());
@@ -651,11 +873,7 @@ if (process.env.HOMETILES_INTEGRATION === '1') {
 
       suite('a discovery that fails, then recovers (Ruling 56)', (getHarness) => {
         withCleanFixtures(getHarness);
-        const port = 18852;
-        let broker: Aedes;
-        let server: Server;
-        let panel: MqttClient;
-        const applies: string[] = [];
+        const { applies, panel, port, settled } = withBrokerAndPanel();
         /** An entity the last run published and this run's selection leaves out (Task 21b). */
         const ALT_STATE = 'ha/e2e/sensor/alt/state';
         const altState: string[] = [];
@@ -666,23 +884,14 @@ if (process.env.HOMETILES_INTEGRATION === '1') {
           if (design) await getHarness().objects.setObjectAsync('_design/system', design);
         });
         before(async () => {
-          broker = new Aedes();
-          server = createServer(broker.handle);
-          await new Promise<void>((resolve) => server.listen(port, resolve));
-          panel = await mqtt.connectAsync(`mqtt://127.0.0.1:${port}`);
-          await panel.publishAsync(APPLY_TOPIC, LAST_GOOD_APPLY, { retain: true });
-          await panel.publishAsync(ANNOUNCE_TOPIC, ANNOUNCEMENT, { retain: true });
-          await panel.publishAsync(ALT_STATE, '7', { retain: true });
-          panel.on('message', (topic, payload) => {
-            if (topic === APPLY_TOPIC) applies.push(payload.toString());
+          // What the panel holds: its last good configuration, and a state it was given.
+          await panel().publishAsync(APPLY_TOPIC, LAST_GOOD_APPLY, { retain: true });
+          await panel().publishAsync(ALT_STATE, '7', { retain: true });
+          panel().on('message', (topic, payload) => {
             if (topic === ALT_STATE) altState.push(payload.toString());
           });
-          await panel.subscribeAsync([APPLY_TOPIC, ALT_STATE]);
-        });
-        after((done) => {
-          panel.end(true);
-          server.close(() => done());
-          broker.close();
+          await panel().subscribeAsync(ALT_STATE);
+          await settled();
         });
 
         it('publishes no apply while discovery fails, and says what failed and what happens next', async function () {
@@ -690,12 +899,13 @@ if (process.env.HOMETILES_INTEGRATION === '1') {
           const harness = getHarness();
           const logs = await captureLogs(harness);
           await harness.changeAdapterConfig('hometiles', {
-            native: { brokerHost: '127.0.0.1', brokerPort: port, ...ARMED, deviceOverrides: picked(SENSOR) },
+            native: { brokerHost: '127.0.0.1', brokerPort: port(), ...ARMED, deviceOverrides: picked(SENSOR) },
           });
           await setObjects(harness, SENSOR_OBJECTS);
           const lastRun = JSON.stringify({ 'zigbee.0.alt': 'sensor.alt' });
           await harness.states.setStateAsync('hometiles.0.info.publishedIds', { val: lastRun, ack: true });
           design = await breakDeviceView(harness);
+          const panels = valuesOf(harness, 'hometiles.0.info.panels');
           await harness.startAdapterAndWait(true);
           await waitFor(harness, () => logs.find((log) => log.message.includes(`[Panel ${PANEL}] Session started`)), 'the panel');
           const failure = await waitFor(
@@ -706,8 +916,11 @@ if (process.env.HOMETILES_INTEGRATION === '1') {
           expect(failure.message).to.include('"device"');
           expect(failure.message).to.include('Panels keep their last configuration; retrying in 5 s');
           // A retained apply with every list empty would make the firmware
-          // prune the panel's tile bindings and save that to flash.
-          await new Promise((resolve) => setTimeout(resolve, 1000));
+          // prune the panel's tile bindings and save that to flash. The
+          // session's first push is over once info.panels counts it
+          // (panel-manager.ts); what it sent, the panel then holds.
+          await waitFor(harness, () => (panels.includes(1) ? true : undefined), 'the panel session');
+          await settled();
           expect(applies).to.deep.equal([LAST_GOOD_APPLY]);
         });
 
@@ -715,13 +928,10 @@ if (process.env.HOMETILES_INTEGRATION === '1') {
           this.timeout(120000);
           const harness = getHarness();
           await harness.enableSendTo();
-          let answer: { error?: string } | undefined;
-          harness.sendTo('hometiles.0', 'listDetected', {}, (reply: unknown) => {
-            answer = reply as { error?: string };
-          });
-          await waitFor(harness, () => answer, 'the answer to listDetected');
-          expect(answer?.error).to.include('"device"');
-          await new Promise((resolve) => setTimeout(resolve, 1000));
+          expect(((await askAdapter(harness, 'listDetected', {})) as { error?: string }).error).to.include('"device"');
+          // Still running: the next request is answered too. A crash after the
+          // first answer would leave it unanswered, and waitFor names the stop.
+          expect(((await askAdapter(harness, 'listDetected', {})) as { error?: string }).error).to.include('"device"');
           expect(harness.didAdapterStop(), 'the adapter keeps running').to.equal(false);
         });
 
@@ -741,8 +951,7 @@ if (process.env.HOMETILES_INTEGRATION === '1') {
 
       suite('one bad object is left out, not the whole installation (Rulings 60, 62)', (getHarness) => {
         withCleanFixtures(getHarness);
-        const port = 18853;
-        const { applies, panel } = withBrokerAndPanel(port);
+        const { applies, panel, port } = withBrokerAndPanel();
         const balkonState: string[] = [];
         let logs: LogRecord[] = [];
 
@@ -753,7 +962,7 @@ if (process.env.HOMETILES_INTEGRATION === '1') {
           await harness.changeAdapterConfig('hometiles', {
             native: {
               brokerHost: '127.0.0.1',
-              brokerPort: port,
+              brokerPort: port(),
               // The alias picked too: only a picked device's values are read.
               ...ARMED,
               deviceOverrides: [...picked(SENSOR, BAD_ALIAS), { objectId: FORCED, include: true, detectedDomain: 'sensor', forcedDomain: 'number' }],
@@ -790,8 +999,7 @@ if (process.env.HOMETILES_INTEGRATION === '1') {
 
       suite('manual entities (Task 13b)', (getHarness) => {
         withCleanFixtures(getHarness);
-        const port = 18855;
-        const { applies, panel } = withBrokerAndPanel(port);
+        const { applies, panel, port } = withBrokerAndPanel();
         const helperState: string[] = [];
         /** topic -> the last /control payload on it */
         const controls = new Map<string, string>();
@@ -804,7 +1012,7 @@ if (process.env.HOMETILES_INTEGRATION === '1') {
           await harness.changeAdapterConfig('hometiles', {
             native: {
               brokerHost: '127.0.0.1',
-              brokerPort: port,
+              brokerPort: port(),
               ...ARMED,
               // Overrides are for detected devices: neither key removes it,
               // and a manual entity needs no row to be published (Task 21b).
@@ -886,7 +1094,7 @@ if (process.env.HOMETILES_INTEGRATION === '1') {
           expect(JSON.stringify(all)).to.not.match(/no min\/max|no states|no date or time/);
 
           // Retained: a panel that subscribes later gets it from the broker.
-          const late = await mqtt.connectAsync(`mqtt://127.0.0.1:${port}`);
+          const late = await mqtt.connectAsync(`mqtt://127.0.0.1:${port()}`);
           try {
             const retained = new Promise<string>((resolve) => {
               late.on('message', (_topic, payload, packet) => {
@@ -959,8 +1167,7 @@ if (process.env.HOMETILES_INTEGRATION === '1') {
       // One broker for both suites: what the panel and a client retained
       // survives the adapter's restart between them.
       describe('retained panel messages across an adapter restart (Task 15, Ruling 101)', () => {
-        const port = 18856;
-        const { applies, panel } = withBrokerAndPanel(port);
+        const { applies, panel, port } = withBrokerAndPanel();
         const commandWarnings = (logs: LogRecord[]): string[] =>
           logs
             .filter((log) => log.message.startsWith('hometiles.0 ') && log.severity === 'warn' && /command/i.test(log.message))
@@ -969,7 +1176,7 @@ if (process.env.HOMETILES_INTEGRATION === '1') {
         async function start(harness: IntegrationTestHarness): Promise<{ logs: LogRecord[]; written: unknown[] }> {
           const logs = await captureLogs(harness);
           await harness.changeAdapterConfig('hometiles', {
-            native: { brokerHost: '127.0.0.1', brokerPort: port, ...ARMED, deviceOverrides: picked(KAFFEE) },
+            native: { brokerHost: '127.0.0.1', brokerPort: port(), ...ARMED, deviceOverrides: picked(KAFFEE) },
           });
           await setObjects(harness, KAFFEE_OBJECTS);
           await harness.states.setStateAsync(KAFFEE_SWITCH, { val: false, ack: true });
@@ -1020,8 +1227,7 @@ if (process.env.HOMETILES_INTEGRATION === '1') {
 
       suite('stopping the adapter (Ruling 62 B)', (getHarness) => {
         withCleanFixtures(getHarness);
-        const port = 18854;
-        const { applies, panel } = withBrokerAndPanel(port);
+        const { applies, panel, port, settled } = withBrokerAndPanel();
         const ZAEHLER = '0_userdata.0.Energie.Zaehler';
         after(async () => {
           await getHarness().objects.delObjectAsync(ZAEHLER).catch(() => undefined);
@@ -1033,7 +1239,7 @@ if (process.env.HOMETILES_INTEGRATION === '1') {
           const harness = getHarness();
           const logs = await captureLogs(harness);
           await harness.changeAdapterConfig('hometiles', {
-            native: { brokerHost: '127.0.0.1', brokerPort: port, ...ARMED, deviceOverrides: picked(SENSOR) },
+            native: { brokerHost: '127.0.0.1', brokerPort: port(), ...ARMED, deviceOverrides: picked(SENSOR) },
           });
           // A meter alone is worth an apply (Ruling 131); an emptied registry beside it is not.
           await setEnergyMeters(harness, [{ stateId: ZAEHLER, category: 'grid', sign: 1 }]);
@@ -1053,7 +1259,8 @@ if (process.env.HOMETILES_INTEGRATION === '1') {
           } finally {
             clearInterval(flood);
           }
-          await new Promise((resolve) => setTimeout(resolve, 500));
+          // The process has exited: all it sent, the panel holds once its own message is back.
+          await settled();
           const empty = applies.filter((payload) => !payload.includes('sensor.balkon'));
           expect(empty, `${empty.length} of ${applies.length} applies without the sensor`).to.deep.equal([]);
           // Nor does the log claim one was pushed.
@@ -1064,8 +1271,7 @@ if (process.env.HOMETILES_INTEGRATION === '1') {
 
       suite('more numbers, selects and datetimes than a panel keeps (Ruling 111)', (getHarness) => {
         withCleanFixtures(getHarness);
-        const port = 18857;
-        const { applies } = withBrokerAndPanel(port);
+        const { applies, port } = withBrokerAndPanel();
         const removeRegler = async (): Promise<void> => {
           for (const id of REGLER) await getHarness().objects.delObjectAsync(id).catch(() => undefined);
         };
@@ -1079,7 +1285,7 @@ if (process.env.HOMETILES_INTEGRATION === '1') {
           this.timeout(120000);
           const harness = getHarness();
           const logs = await captureLogs(harness);
-          await harness.changeAdapterConfig('hometiles', { native: { brokerHost: '127.0.0.1', brokerPort: port, ...ARMED } });
+          await harness.changeAdapterConfig('hometiles', { native: { brokerHost: '127.0.0.1', brokerPort: port(), ...ARMED } });
           await setManualEntities(harness, REGLER.map((stateId) => ({ stateId, domain: 'number' })));
           await setObjects(harness, REGLER_OBJECTS);
           await harness.startAdapterAndWait(true);
@@ -1098,8 +1304,7 @@ if (process.env.HOMETILES_INTEGRATION === '1') {
 
       suite('energy meters in the apply (Task 20b)', (getHarness) => {
         withCleanFixtures(getHarness);
-        const port = 18859;
-        const { applies } = withBrokerAndPanel(port);
+        const { applies, port } = withBrokerAndPanel();
         const BEZUG = '0_userdata.0.Energie.Bezug';
         const EINSPEISUNG = '0_userdata.0.Energie.Einspeisung';
         /** Not electric: the house's consumption does not wait for it (Task 23). */
@@ -1127,7 +1332,7 @@ if (process.env.HOMETILES_INTEGRATION === '1') {
           system = (await harness.objects.getObjectAsync('system.config')) as typeof system;
           await harness.objects.setObjectAsync('system.config', { ...system!, common: { ...system!.common, language: 'de' } });
           await harness.changeAdapterConfig('hometiles', {
-            native: { brokerHost: '127.0.0.1', brokerPort: port, ...ARMED, deviceOverrides: picked(SENSOR), historyInstance: 'history.0', currency: 'EUR' },
+            native: { brokerHost: '127.0.0.1', brokerPort: port(), ...ARMED, deviceOverrides: picked(SENSOR), historyInstance: 'history.0', currency: 'EUR' },
           });
           await setEnergyMeters(harness, [
             { stateId: BEZUG, category: 'grid', sign: 1, name: 'Hausanschluss [Bezug]', price: 0.3 },
@@ -1166,13 +1371,10 @@ if (process.env.HOMETILES_INTEGRATION === '1') {
       });
 
       // Ruling 131: a meter is content for Ruling 116, once armed (Ruling 118).
-      for (const [armed, port] of [
-        [true, 18860],
-        [false, 18861],
-      ] as const) {
+      for (const armed of [true, false]) {
         suite(`energy meters, no entity in a list, ${armed ? 'armed' : 'before the Devices tab is used'} (Ruling 131)`, (getHarness) => {
           withCleanFixtures(getHarness);
-          const { applies, panel } = withBrokerAndPanel(port);
+          const { applies, panel, port, settled } = withBrokerAndPanel();
           const ZAEHLER = '0_userdata.0.Energie.Zaehler';
           const removeMeter = async (): Promise<void> => {
             await getHarness().objects.delObjectAsync(ZAEHLER).catch(() => undefined);
@@ -1181,11 +1383,12 @@ if (process.env.HOMETILES_INTEGRATION === '1') {
           after(async () => {
             await removeMeter();
             await setEnergyMeters(getHarness(), []);
+            await setManualEntities(getHarness(), []);
           });
 
           const title = armed
             ? 'publishes the apply for the meter beside a scene, which lands in no list: every entity list empty, no hint, the scene counted'
-            : 'publishes nothing, and names the meter among what waits';
+            : 'publishes nothing, answers no request, and names the meter and the manual sensor among what waits';
           it(title, async function () {
             this.timeout(120000);
             const harness = getHarness();
@@ -1193,39 +1396,50 @@ if (process.env.HOMETILES_INTEGRATION === '1') {
             // Only a scene picked: on its own it holds the apply back (M7).
             const scene = [{ objectId: KAFFEE, include: true, detectedDomain: 'switch', forcedDomain: 'scene' }];
             await harness.changeAdapterConfig('hometiles', {
-              native: { brokerHost: '127.0.0.1', brokerPort: port, ...(armed ? ARMED : {}), deviceOverrides: scene, historyInstance: 'history.0' },
+              native: { brokerHost: '127.0.0.1', brokerPort: port(), ...(armed ? ARMED : {}), deviceOverrides: scene, historyInstance: 'history.0' },
             });
             await setEnergyMeters(harness, [{ stateId: ZAEHLER, category: 'grid', sign: 1, name: 'Zähler' }]);
+            // Unarmed, a manual sensor waits as well (Ruling 118): armed, its graph is answered with its value.
+            if (!armed) await setManualEntities(harness, [{ stateId: ZAEHLER, domain: 'sensor', name: 'Fenster' }]);
             await setObjects(harness, {
               ...KAFFEE_OBJECTS,
               [ZAEHLER]: { type: 'state', common: { name: 'Zähler', role: 'value.energy.consumed', type: 'number', unit: 'kWh', read: true, write: false } },
             });
+            await harness.states.setStateAsync(ZAEHLER, { val: 1234.5, ack: true });
             const panels = valuesOf(harness, 'hometiles.0.info.panels');
             await harness.startAdapterAndWait(true);
             await waitFor(harness, () => ready(logs), 'onReady to finish');
+            // The session's first push is over once info.panels counts it; what it sent, the panel then holds.
             await waitFor(harness, () => (panels.includes(1) ? true : undefined), 'the panel session');
-            await pause(500);
-            const hints = logs
-              .map((log) => log.message)
-              .filter((message) => message.includes('No devices selected yet') || message.includes('Nothing picked shows in a panel list'));
+            await settled();
+            const hints = (): string[] =>
+              logs.map((log) => log.message).filter((message) => message.includes('No devices selected yet') || message.includes('Nothing picked shows in a panel list'));
             const published = async (): Promise<unknown> => JSON.parse(String((await harness.states.getStateAsync('hometiles.0.info.publishedIds'))?.val));
             if (!armed) {
-              expect(applies, 'no apply').to.deep.equal([]);
-              expect(hints).to.have.lengthOf(1);
-              expect(hints[0]).to.include('Held back until then: 1 device rows of an earlier version, 1 energy meters');
-              expect(await harness.states.getStateAsync('hometiles.0.info.entities')).to.include({ val: 0 });
-              expect(await published()).to.deep.equal({});
               // Nor is a history or an energy request answered (Task 22). The
-              // presence sent after them, which is read, marks both handled.
+              // graph asked for is the manual sensor's, under the id it gets once
+              // armed: were the sensor given to the panel, the graph would be
+              // answered with its value, as an armed run answers it (review m3,
+              // Ruling 138). The session says it ignored it; the presence sent
+              // after the energy request, which is read, marks that one handled.
               const answers: string[] = [];
               panel().on('message', (topic) => void (topic.endsWith('/response') && answers.push(topic)));
               await panel().subscribeAsync([`tab5_lvgl/config/${PANEL}/history/response`, `tab5_lvgl/config/${PANEL}/energy/response`]);
+              const ignored = (): boolean => logs.some((log) => log.message.includes('History request for sensor.fenster ignored'));
+              await panel().publishAsync(`tab5_lvgl/config/${PANEL}/history/request`, '{"entity_id":"sensor.fenster","hours":24,"period_minutes":5}');
+              await waitFor(harness, () => (ignored() || answers.length > 0 ? true : undefined), 'the graph request handled');
               const connected = valuesOf(harness, `hometiles.0.panels.${PANEL}.info.connected`);
-              await panel().publishAsync(`tab5_lvgl/config/${PANEL}/history/request`, '{"entity_id":"scene.kaffee","hours":24,"period_minutes":5}');
               await panel().publishAsync(`tab5_lvgl/config/${PANEL}/energy/request`, '{"period":"day"}');
               await panel().publishAsync('hometiles-e2e/stat/connected', 'online');
               await waitFor(harness, () => (connected.includes(true) ? true : undefined), 'the presence');
               expect(answers).to.deep.equal([]);
+              expect(ignored(), 'the graph request said to be ignored').to.equal(true);
+
+              expect(applies, 'no apply').to.deep.equal([]);
+              expect(hints()).to.have.lengthOf(1);
+              expect(hints()[0]).to.include('Held back until then: 1 manual entities, 1 device rows of an earlier version, 1 energy meters');
+              expect(await harness.states.getStateAsync('hometiles.0.info.entities')).to.include({ val: 0 });
+              expect(await published()).to.deep.equal({});
               return;
             }
             expect(applies, 'an apply').to.not.deep.equal([]);
@@ -1234,7 +1448,7 @@ if (process.env.HOMETILES_INTEGRATION === '1') {
               expect(apply[list], list).to.deep.equal([]);
             }
             expect((apply.energy as Array<{ id: string }>).map((entry) => entry.id)).to.include('energy.zahler');
-            expect(hints).to.deep.equal([]);
+            expect(hints()).to.deep.equal([]);
             // What went out is what the adapter reports and records (Ruling 119 M7).
             expect(ready(logs)!.message).to.include('1 picked (manual entities included), 1 entities published');
             expect(await harness.states.getStateAsync('hometiles.0.info.entities')).to.include({ val: 1 });
@@ -1249,8 +1463,7 @@ if (process.env.HOMETILES_INTEGRATION === '1') {
       // each suite, so the stores a run leaves are carried into the next, and
       // so is the form a suite "saves", as the admin writes it (JsonConfig.onSave).
       describe('opt-in selection (Task 21b)', () => {
-        const port = 18858;
-        const { applies, panel } = withBrokerAndPanel(port);
+        const { applies, panel, port, settled, retained } = withBrokerAndPanel();
         const UNARMED = 'No devices selected yet — open the Devices tab and click Refresh detected devices';
         const NOTHING = 'No devices selected yet — pick devices in the adapter settings (Devices tab)';
         const ICONS_TOPIC = `tab5_lvgl/config/${PANEL}/bridge/icons`;
@@ -1280,26 +1493,9 @@ if (process.env.HOMETILES_INTEGRATION === '1') {
           await panel().subscribeAsync([BALKON_STATE, ICONS_TOPIC]);
           await panel().publishAsync(APPLY_TOPIC, LAST_GOOD_APPLY, { retain: true });
           await panel().publishAsync(ICONS_TOPIC, OLD_ICONS, { retain: true });
-          for (let tries = 0; tries < 50 && !(applies.includes(LAST_GOOD_APPLY) && icons.includes(OLD_ICONS)); tries++) {
-            await new Promise((resolve) => setTimeout(resolve, 100));
-          }
+          await settled();
+          expect([applies, icons]).to.deep.equal([[LAST_GOOD_APPLY], [OLD_ICONS]]);
         });
-
-        /** What the broker retains on these topics, as a panel subscribing now would get it. */
-        async function retained(...topics: string[]): Promise<Record<string, string>> {
-          const late = await mqtt.connectAsync(`mqtt://127.0.0.1:${port}`);
-          try {
-            const got: Record<string, string> = {};
-            late.on('message', (topic, payload, packet) => {
-              if (packet.retain) got[topic] = payload.toString();
-            });
-            await late.subscribeAsync(topics);
-            await new Promise((resolve) => setTimeout(resolve, 500));
-            return got;
-          } finally {
-            late.end(true);
-          }
-        }
 
         /**
          * Starts a run on this instance config and these manual entities, from
@@ -1314,7 +1510,7 @@ if (process.env.HOMETILES_INTEGRATION === '1') {
           objects: Record<string, object> = SENSOR_OBJECTS,
         ): Promise<{ logs: LogRecord[]; apply: string | undefined }> {
           const logs = await captureLogs(harness);
-          await harness.changeAdapterConfig('hometiles', { native: { brokerHost: '127.0.0.1', brokerPort: port, ...native } });
+          await harness.changeAdapterConfig('hometiles', { native: { brokerHost: '127.0.0.1', brokerPort: port(), ...native } });
           await setManualEntities(harness, manual);
           await setObjects(harness, { ...objects, ...KAFFEE_OBJECTS, ...ROOM_OBJECTS, ...HELPER_OBJECTS });
           await harness.states.setStateAsync(`${SENSOR}.temperature`, { val: 21.5, ack: true });
@@ -1323,9 +1519,9 @@ if (process.env.HOMETILES_INTEGRATION === '1') {
           const seen = applies.length;
           await harness.startAdapterAndWait(true);
           await waitFor(harness, () => ready(logs), 'onReady to finish');
-          // info.panels counts the session once its first push is done (panel-manager.ts).
+          // info.panels counts the session once its first push is done (panel-manager.ts); what it sent, the panel then holds.
           await waitFor(harness, () => (panels.includes(1) ? true : undefined), 'the panel session');
-          await new Promise((resolve) => setTimeout(resolve, 500));
+          await settled();
           return { logs, apply: applies[seen] };
         }
 
@@ -1415,8 +1611,9 @@ if (process.env.HOMETILES_INTEGRATION === '1') {
               { objectId: KAFFEE, include: false, name: '', forcedDomain: '', detectedName: 'Kaffee', detectedDomain: 'switch', room: '' },
             ]);
             expect(reply.args).to.deep.equal(['2', '1']);
-            // A choice applies once saved, which restarts the adapter.
-            await new Promise((resolve) => setTimeout(resolve, 500));
+            // A choice applies once saved, which restarts the adapter: what the
+            // request made it send, it sent before its answer.
+            await settled();
             expect(applies.length).to.equal(seen);
           });
 
@@ -1429,7 +1626,7 @@ if (process.env.HOMETILES_INTEGRATION === '1') {
               [KAFFEE, ''],
             ]);
             // Nothing typed sent, as a script might ask: the saved broker, which this suite runs (Ruling 140).
-            expect(await ask(harness, 'testBroker', {})).to.deep.include({ connected: true, result: 'connected', args: [`127.0.0.1:${port}`] });
+            expect(await ask(harness, 'testBroker', {})).to.deep.include({ connected: true, result: 'connected', args: [`127.0.0.1:${port()}`] });
             // A script's request, the object id alone: the device as detected, under the id picking it would give (Task 23).
             const preview = (await ask(harness, 'previewEntity', { objectId: SENSOR })) as { entity: object; publish: object };
             expect(preview.entity).to.include({ entityId: 'sensor.balkon', state: '21.5' });
@@ -2058,7 +2255,7 @@ if (process.env.HOMETILES_INTEGRATION === '1') {
 
       suite('a thermostat whose modes carry names of its own, mapped on the Climate modes table (Ruling 141)', (getHarness) => {
         withCleanFixtures(getHarness);
-        const { applies, panel, port } = withBrokerAndPanel(0);
+        const { applies, panel, port } = withBrokerAndPanel();
         const STATE_TOPIC = 'ha/e2e/climate/heizung_bad/state';
         const NAMES = 'off, heat, cool, heat_cool, auto, dry, fan_only';
         /** The table as admin stores it: MANU as heat, AUTO as auto, and rows it must leave out. */
@@ -2155,9 +2352,341 @@ if (process.env.HOMETILES_INTEGRATION === '1') {
         });
       });
 
+      // Task 24: every v0.2 domain end to end, picked as a user picks it --
+      // Refresh on the Devices tab (the real sendTo), tick, Save -- with nothing
+      // published before. Saving restarts the adapter (js-controller restarts an
+      // instance whose object changes); the harness runs one adapter per suite,
+      // so the Refresh is one suite and the saved form the next, on one broker
+      // and panel. No fixed sleeps: each wait is on something the panel or the
+      // database shows.
+      describe('round trips per domain, picked on the Devices tab (Task 24)', () => {
+        const { applies, panel, port, settled } = withBrokerAndPanel();
+        const HOUR = 3_600_000;
+        /** A manual sensor's readings and an energy counter, in iobroker.history's store. */
+        const TEMPERATURE = '0_userdata.0.t24.temperature';
+        const METER = '0_userdata.0.t24.meter';
+        /** The form as the admin saves it after the Refresh (JsonConfig.onSave), for the next suite's start. */
+        let saved: Record<string, unknown> = {};
+
+        suite('Refresh, tick and Save on the Devices tab', (getHarness) => {
+          withCleanFixtures(getHarness);
+
+          it('publishes nothing until the form is saved, and Refresh lists each device unticked under its detected domain', async function () {
+            this.timeout(120000);
+            const harness = getHarness();
+            const logs = await captureLogs(harness);
+            await setNative(harness, { brokerHost: '127.0.0.1', brokerPort: port() });
+            await setObjects(harness, { ...TRV_OBJECTS, ...DOMAIN_OBJECTS });
+            const panels = valuesOf(harness, 'hometiles.0.info.panels');
+            await harness.startAdapterAndWait(true);
+            await waitFor(harness, () => ready(logs), 'onReady to finish');
+            await waitFor(harness, () => (panels.includes(1) ? true : undefined), 'the panel session');
+            await settled();
+            expect(applies, 'no apply before the Devices tab is used').to.deep.equal([]);
+
+            await harness.enableSendTo();
+            type Row = { objectId: string; include: boolean; detectedDomain: string };
+            const reply = (await askAdapter(harness, 'refreshDetected', { rows: [] })) as { native: { deviceOverrides: Row[]; pickerArmed: unknown } };
+            // No detector type yields select or datetime: the two readings are forced into them below (Task 13).
+            expect(Object.fromEntries(reply.native.deviceOverrides.map((row) => [row.objectId, `${row.detectedDomain}${row.include ? ', ticked' : ''}`]))).to.deep.equal({
+              [TRV_ROOT]: 'climate',
+              [BLIND]: 'cover',
+              [PLAYER]: 'media_player',
+              [STATION]: 'weather',
+              [`${STATION}.outside`]: 'sensor',
+              [LEVEL]: 'number',
+              [PROGRAM]: 'sensor',
+              [CLOCK]: 'sensor',
+            });
+            // A Refresh alone publishes nothing: saving the form does.
+            await settled();
+            expect(applies).to.deep.equal([]);
+
+            // One device of each domain ticked, the thermostat renamed, the readings forced, and the whole form saved
+            // with a helper and a sensor of 0_userdata, a meter, the thermostat's own modes and the history instance.
+            const choices: Record<string, object> = {
+              [TRV_ROOT]: { name: 'Heizung Bad' },
+              [BLIND]: {},
+              [PLAYER]: {},
+              [STATION]: {},
+              [LEVEL]: {},
+              [PROGRAM]: { forcedDomain: 'select' },
+              [CLOCK]: { forcedDomain: 'datetime' },
+            };
+            saved = {
+              ...reply.native,
+              deviceOverrides: reply.native.deviceOverrides.map((row) => (choices[row.objectId] ? { ...row, include: true, ...choices[row.objectId] } : row)),
+              manualEntities: [
+                { stateId: SOLL, domain: 'number' },
+                { stateId: TEMPERATURE, domain: 'sensor', name: 'Fenster' },
+              ],
+              energyMeters: [{ stateId: METER, category: 'grid', sign: 1, name: 'Zaehler' }],
+              climateModes: [
+                { device: TRV_ROOT, deviceMode: 'MANU-MODE', panelMode: 'heat' },
+                { device: TRV_ROOT, deviceMode: '0', panelMode: 'auto' },
+              ],
+              historyInstance: 'history.0',
+            };
+          });
+        });
+
+        suite('saved: a round trip each', (getHarness) => {
+          withCleanFixtures(getHarness);
+          const now = Date.now();
+          /** A reading two days old, then one every 30 minutes through the last day, the newest a quarter of an hour old. */
+          const READINGS = [row(now - 48 * HOUR, 18.5), ...Array.from({ length: 48 }, (_, i) => row(now - 24 * HOUR + HOUR / 4 + (i * HOUR) / 2, 20 + i / 10))];
+          /** Planted as the suite starts. */
+          let counter: HistoryRow[] = [];
+          withHistoryAdapter(getHarness, () => {
+            counter = meterRows(Date.now());
+            return { [TEMPERATURE]: READINGS, [METER]: counter };
+          });
+          /** What each state of the devices and the helper holds as the adapter starts. */
+          const VALUES: Record<string, unknown> = {
+            [`${TRV_ROOT}.ACTUAL_TEMPERATURE`]: 20.5,
+            [`${TRV_ROOT}.SET_POINT_TEMPERATURE`]: 21,
+            [TRV_MODE]: 0,
+            [`${BLIND}.SET`]: 60,
+            [`${BLIND}.ACTUAL`]: 60,
+            [`${PLAYER}.state`]: 1,
+            [`${PLAYER}.Volume`]: 25,
+            [`${PLAYER}.Title`]: 'Hotel California',
+            [`${STATION}.icon`]: 'rain',
+            [`${STATION}.outside.temperature`]: 7.5,
+            [`${LEVEL}.Stufe`]: 1,
+            [`${PROGRAM}.SET`]: 1,
+            [`${CLOCK}.Zeit`]: '2026-09-24 08:15:00',
+            [SOLL]: 20,
+          };
+          /** Every command written to one of those states (ack false), in order: what the panel's commands did. */
+          const writes: Array<[string, unknown]> = [];
+          /** Every payload the panel received, by topic, in order. */
+          const inbox = new Map<string, string[]>();
+          const got = (topic: string): string[] => inbox.get(topic) ?? [];
+          /** The newest payload the panel holds for an entity on this leaf, parsed. */
+          const shown = (entityId: string, leaf = 'state'): Record<string, unknown> | undefined => {
+            const last = got(`ha/e2e/${entityId.replace('.', '/')}/${leaf}`).at(-1);
+            return last === undefined ? undefined : (JSON.parse(last) as Record<string, unknown>);
+          };
+          /** A command as the panel sends it on cmnd/<leaf> (mqtt_topics.cpp). */
+          const send = (leaf: string, body: object): Promise<unknown> => panel().publishAsync(`hometiles-e2e/cmnd/${leaf}`, JSON.stringify(body));
+          let serial = 0;
+          /** A value command as the panel sends it (value_control.cpp:293-312), from the /control it holds; its answer. */
+          async function setValue(harness: IntegrationTestHarness, entityId: string, value: unknown): Promise<Record<string, unknown>> {
+            const { session, revision } = shown(entityId, 'control')!;
+            const id = `1a2b3c4d-00024000-${String(++serial).padStart(8, '0')}`;
+            await send('value', { entity_id: entityId, session, revision, value, id, deadline: Math.floor(Date.now() / 1000) + 10 });
+            const answer = await waitFor(harness, () => got('hometiles-e2e/stat/value').find((text) => (JSON.parse(text) as { id: string }).id === id), `the answer for ${entityId}`);
+            return JSON.parse(answer) as Record<string, unknown>;
+          }
+          /** The writes since `from`, once there is one: a command's writes follow one another at once. */
+          const written = async (harness: IntegrationTestHarness, from: number): Promise<Array<[string, unknown]>> => {
+            await waitFor(harness, () => (writes.length > from ? true : undefined), 'the write');
+            return writes.slice(from);
+          };
+          /** The entity's newest payload on this leaf once `key` no longer holds `was`: what the change it got sent. */
+          const changed = (harness: IntegrationTestHarness, entityId: string, key: string, was: unknown, leaf = 'state'): Promise<Record<string, unknown>> =>
+            waitFor(
+              harness,
+              () => {
+                const now = shown(entityId, leaf);
+                return now && now[key] !== was ? now : undefined;
+              },
+              `${entityId}'s ${key} to change on the panel`,
+            );
+          let reports = 0;
+          /**
+           * Resolves once the adapter has read every message the panel sent
+           * before: it mirrors an IP the panel reports into
+           * panels.<id>.info.ip (main.ts mirrorPanelStat), in the order they
+           * came. What it did in reply to one without awaiting anything, it has
+           * done by then.
+           */
+          async function heard(harness: IntegrationTestHarness): Promise<void> {
+            const ip = `192.0.2.${++reports}`;
+            const ips = valuesOf(harness, `hometiles.0.panels.${PANEL}.info.ip`);
+            await panel().publishAsync('hometiles-e2e/stat/ip', ip);
+            await waitFor(harness, () => (ips.includes(ip) ? true : undefined), 'the adapter reading the panel');
+          }
+          let apply: Record<string, unknown> = {};
+          /** The meter's live reading, just past the newest one stored. */
+          let live = 0;
+
+          before(async function () {
+            this.timeout(120000);
+            const harness = getHarness();
+            expect(saved, 'the form the Refresh suite saved').to.have.property('pickerArmed');
+            harness.on('stateChange', (id: string, state: Change) => {
+              if (state && !state.ack && id in VALUES) writes.push([id, state.val]);
+            });
+            panel().on('message', (topic, payload) => void inbox.set(topic, [...got(topic), payload.toString()]));
+            await panel().subscribeAsync(['ha/e2e/#', 'hometiles-e2e/stat/value', `tab5_lvgl/config/${PANEL}/+/response`]);
+            await setNative(harness, { brokerHost: '127.0.0.1', brokerPort: port(), ...saved });
+            await setObjects(harness, { ...TRV_OBJECTS, ...DOMAIN_OBJECTS, '0_userdata.0.Heizung': HELPER_OBJECTS['0_userdata.0.Heizung']!, [SOLL]: HELPER_OBJECTS[SOLL]! });
+            for (const [id, val] of Object.entries(VALUES)) await harness.states.setStateAsync(id, { val, ack: true });
+            live = (counter.at(-1)!.val as number) + 0.1;
+            await harness.states.setStateAsync(METER, { val: live, ack: true });
+            await harness.startAdapterAndWait(true);
+            apply = JSON.parse(await waitFor(harness, () => applies[0], 'the apply')) as Record<string, unknown>;
+            // Each entity's state goes out right after the apply (panel-manager.ts handleAnnouncement): all of them are in now.
+            await settled();
+          });
+
+          it('lists each picked device, the helper and the sensor under the ids their names give, and the meter, in bridge/apply', () => {
+            const lists = ['sensors', 'binary_sensors', 'lights', 'switches', 'media_players', 'climates', 'covers', 'weathers', 'numbers', 'selects', 'datetimes'];
+            expect(Object.fromEntries(lists.map((key) => [key, apply[key]]))).to.deep.equal({
+              sensors: ['sensor.fenster'],
+              binary_sensors: [],
+              lights: [],
+              switches: [],
+              media_players: ['media_player.kuechenradio'],
+              climates: ['climate.heizung_bad'],
+              covers: ['cover.rollladen_wohnzimmer'],
+              weathers: ['weather.wetterstation'],
+              numbers: ['number.lueftung', 'number.soll'],
+              selects: ['select.heizprogramm'],
+              datetimes: ['datetime.wecker'],
+            });
+            expect((apply.energy as Array<{ id: string }>).map((entry) => entry.id)).to.include('energy.zaehler');
+          });
+
+          it('climate: shows the thermostat, and the setpoint the panel sets lands on SET_POINT_TEMPERATURE and comes back', async function () {
+            this.timeout(60000);
+            const harness = getHarness();
+            expect(shown('climate.heizung_bad'), 'the thermostat on the panel').to.include({ current_temperature: 20.5, temperature: 21, hvac_mode: 'auto' });
+            const from = writes.length;
+            await send('climate', { entity_id: 'climate.heizung_bad', command: 'set_temperature', temperature: 22.5 });
+            expect(await written(harness, from)).to.deep.equal([[`${TRV_ROOT}.SET_POINT_TEMPERATURE`, 22.5]]);
+            expect((await changed(harness, 'climate.heizung_bad', 'temperature', 21)).temperature).to.equal(22.5);
+          });
+
+          it("climate modes: heat on the panel writes the thermostat's own MANU-MODE, 1, as the Climate modes table maps it (Ruling 141)", async function () {
+            this.timeout(60000);
+            const harness = getHarness();
+            expect(shown('climate.heizung_bad')).to.deep.include({ hvac_mode: 'auto', hvac_modes: ['heat', 'auto'] });
+            const from = writes.length;
+            await send('climate', { entity_id: 'climate.heizung_bad', command: 'set_hvac_mode', hvac_mode: 'heat' });
+            expect(await written(harness, from)).to.deep.equal([[TRV_MODE, 1]]);
+            expect((await changed(harness, 'climate.heizung_bad', 'hvac_mode', 'auto')).hvac_mode).to.equal('heat');
+          });
+
+          it('cover: shows the blind, and the position the panel sets lands on SET; once the blind reports it, the panel shows it', async function () {
+            this.timeout(60000);
+            const harness = getHarness();
+            expect(shown('cover.rollladen_wohnzimmer'), 'the blind on the panel').to.include({ state: 'open', current_position: 60 });
+            const from = writes.length;
+            await send('cover', { entity_id: 'cover.rollladen_wohnzimmer', command: 'set_cover_position', position: 40 });
+            expect(await written(harness, from)).to.deep.equal([[`${BLIND}.SET`, 40]]);
+            // The blind moves and says so, as its adapter would.
+            await harness.states.setStateAsync(`${BLIND}.ACTUAL`, { val: 40, ack: true });
+            expect((await changed(harness, 'cover.rollladen_wohnzimmer', 'current_position', 60)).current_position).to.equal(40);
+            expect(writes.slice(from), 'nothing written more').to.have.lengthOf(1);
+          });
+
+          it('media_player: shows the player, and the volume the panel sets lands on Volume, in percent, and comes back', async function () {
+            this.timeout(60000);
+            const harness = getHarness();
+            expect(shown('media_player.kuechenradio'), 'the player on the panel').to.include({ state: 'playing', volume_level: 0.25, media_title: 'Hotel California' });
+            const from = writes.length;
+            await send('media', { entity_id: 'media_player.kuechenradio', command: 'volume_set', volume_level: 0.3 });
+            expect(await written(harness, from)).to.deep.equal([[`${PLAYER}.Volume`, 30]]);
+            expect((await changed(harness, 'media_player.kuechenradio', 'volume_level', 0.25)).volume_level).to.equal(0.3);
+          });
+
+          it("weather: shows the station on its weather leaf, and answers the popup's request with it again, writing nothing", async function () {
+            this.timeout(60000);
+            const harness = getHarness();
+            const topic = 'ha/e2e/weather/wetterstation/weather';
+            expect(got(topic), 'the station on its weather leaf').to.not.deep.equal([]);
+            expect(JSON.parse(got(topic).at(-1)!)).to.include({ temperature: 7.5, name: 'Wetterstation' });
+            const seen = got(topic).length;
+            const from = writes.length;
+            await panel().publishAsync(`tab5_lvgl/config/${PANEL}/weather/request`, '{"entity_id":"weather.wetterstation"}');
+            // Answered as the adapter reads it (panel-session.ts answerWeatherRequest): by the next message, and on the panel with it.
+            await heard(harness);
+            await settled();
+            expect(got(topic).slice(seen), 'the same state again, once').to.deep.equal([got(topic)[seen - 1]]);
+            expect(writes.slice(from), 'a request is no command').to.deep.equal([]);
+          });
+
+          it('number: shows the level on its control leaf, and the value the panel sets lands on it, answered ok, and comes back', async function () {
+            this.timeout(60000);
+            const harness = getHarness();
+            expect(shown('number.lueftung', 'control'), "the level's /control").to.include({ kind: 'number', state: '1', min: 0, max: 4, step: 1, writable: true });
+            const from = writes.length;
+            expect(await setValue(harness, 'number.lueftung', 3)).to.include({ status: 'ok' });
+            expect(await written(harness, from)).to.deep.equal([[`${LEVEL}.Stufe`, 3]]);
+            expect((await changed(harness, 'number.lueftung', 'state', '1', 'control')).state).to.equal('3');
+          });
+
+          it("select: shows the programme's options, and the option the panel picks lands as the raw value behind it, answered ok", async function () {
+            this.timeout(60000);
+            const harness = getHarness();
+            expect(shown('select.heizprogramm', 'control'), "the programme's /control").to.deep.include({
+              kind: 'select',
+              state: 'Eco',
+              options: ['Aus', 'Eco', 'Komfort'],
+              options_complete: true,
+              writable: true,
+            });
+            const from = writes.length;
+            expect(await setValue(harness, 'select.heizprogramm', 'Komfort')).to.include({ status: 'ok' });
+            expect(await written(harness, from)).to.deep.equal([[`${PROGRAM}.SET`, 2]]);
+            expect((await changed(harness, 'select.heizprogramm', 'state', 'Eco', 'control')).state).to.equal('Komfort');
+          });
+
+          it('datetime: shows the alarm as its text holds it, and the time the panel sets lands in that same shape, answered ok', async function () {
+            this.timeout(60000);
+            const harness = getHarness();
+            expect(shown('datetime.wecker', 'control'), "the alarm's /control").to.include({ kind: 'datetime', state: '2026-09-24 08:15:00', writable: true });
+            const from = writes.length;
+            expect(await setValue(harness, 'datetime.wecker', '2026-09-25 06:30:00')).to.include({ status: 'ok' });
+            expect(await written(harness, from)).to.deep.equal([[`${CLOCK}.Zeit`, '2026-09-25 06:30:00']]);
+            expect((await changed(harness, 'datetime.wecker', 'state', '2026-09-24 08:15:00', 'control')).state).to.equal('2026-09-25 06:30:00');
+          });
+
+          it('a manual entity (Task 13b): the 0_userdata helper, published once the form is saved, takes the value the panel sets', async function () {
+            this.timeout(60000);
+            const harness = getHarness();
+            expect(shown('number.soll', 'control'), "the helper's /control").to.include({ kind: 'number', state: '20', min: 15, max: 28, writable: true });
+            const from = writes.length;
+            expect(await setValue(harness, 'number.soll', 21)).to.include({ status: 'ok' });
+            expect(await written(harness, from)).to.deep.equal([[SOLL, 21]]);
+            expect((await changed(harness, 'number.soll', 'state', '20', 'control')).state).to.equal('21');
+          });
+
+          it("an energy meter (Tasks 20, 20b): the panel's energy request is answered with the meter's day, read from the history instance", async function () {
+            this.timeout(60000);
+            const harness = getHarness();
+            await panel().publishAsync(`tab5_lvgl/config/${PANEL}/energy/request`, '{"period":"day"}');
+            const energy = JSON.parse(await waitFor(harness, () => got(`tab5_lvgl/config/${PANEL}/energy/response`)[0], 'the energy answer')) as {
+              period: string;
+              entries: Array<{ id: string; total?: number }>;
+            };
+            expect(energy.period).to.equal('day');
+            const midnight = new Date().setHours(0, 0, 0, 0);
+            const before = counter.filter((reading) => reading.ts < midnight).at(-1)!.val as number;
+            expect(energy.entries.find((entry) => entry.id === 'energy.zaehler')?.total).to.equal(Math.round((live - before) * 1000) / 1000);
+          });
+
+          it("a graph (the brief): the manual sensor's last 24 hours in quarter hours, 96 values read from the history instance", async function () {
+            this.timeout(60000);
+            const harness = getHarness();
+            await panel().publishAsync(`tab5_lvgl/config/${PANEL}/history/request`, '{"entity_id":"sensor.fenster","hours":24,"period_minutes":15}');
+            const history = JSON.parse(await waitFor(harness, () => got(`tab5_lvgl/config/${PANEL}/history/response`)[0], 'the graph')) as Record<string, unknown>;
+            expect(history).to.include({ entity_id: 'sensor.fenster', hours: 24, period_minutes: 15 });
+            const values = history.values as number[];
+            const planted = READINGS.map((reading) => reading.val as number);
+            expect(values).to.have.lengthOf(96);
+            expect(values.every((value) => planted.includes(value)), JSON.stringify(values)).to.equal(true);
+            expect(values).to.deep.equal([...values].sort((a, b) => a - b));
+            expect(values.at(-1)).to.equal(24.7);
+          });
+        });
+      });
+
       suite("a panel's history and energy requests, answered through the adapter (Task 22)", (getHarness) => {
-        const port = 18862;
-        const { applies, panel } = withBrokerAndPanel(port);
+        const { applies, panel, port } = withBrokerAndPanel();
         const HOUR = 3_600_000;
         const TEMPERATURE = '0_userdata.0.t22.temperature';
         const METER = '0_userdata.0.t22.meter';
@@ -2174,7 +2703,7 @@ if (process.env.HOMETILES_INTEGRATION === '1') {
         it('answers a numeric history request from the history instance and an energy request, each on its own response topic', async function () {
           this.timeout(120000);
           const harness = getHarness();
-          await harness.changeAdapterConfig('hometiles', { native: { brokerHost: '127.0.0.1', brokerPort: port, ...ARMED, historyInstance: 'history.0' } });
+          await harness.changeAdapterConfig('hometiles', { native: { brokerHost: '127.0.0.1', brokerPort: port(), ...ARMED, historyInstance: 'history.0' } });
           await setManualEntities(harness, [{ stateId: TEMPERATURE, domain: 'sensor', name: 'Fenster' }]);
           await setEnergyMeters(harness, [{ stateId: METER, category: 'grid', sign: 1, name: 'Zaehler' }]);
           // The running hour ends at the live reading.
