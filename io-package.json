@@ -19,6 +19,7 @@
     "type": "visualization",
     "tier": 3,
     "compact": true,
+    "nogit": true,
     "connectionType": "local",
     "dataSource": "push",
     "adminUI": { "config": "json" },

@@ -42,3 +42,15 @@ describe('release documentation and metadata (Task 25)', () => {
     expect(common.globalDependencies).to.deep.equal([{ admin: '>=7.6.17' }]);
   });
 });
+
+describe('packaging (Ruling 154)', () => {
+  it('marks the adapter nogit: build/ is not in git, so a GitHub install has nothing to run', () => {
+    const { common } = JSON.parse(read('io-package.json')) as { common: { nogit?: unknown } };
+    expect(common.nogit).to.equal(true);
+  });
+
+  it('pins type-detector to the 6.0 line detection was verified against: a later minor would change entity ids silently', () => {
+    const { dependencies } = JSON.parse(read('package.json')) as { dependencies: Record<string, string> };
+    expect(dependencies['@iobroker/type-detector']).to.equal('~6.0.1');
+  });
+});
