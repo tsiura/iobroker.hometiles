@@ -1489,7 +1489,8 @@ if (process.env.HOMETILES_INTEGRATION === '1') {
       suite('stopping the adapter before it is ready (final review I-4)', (getHarness) => {
         withCleanFixtures(getHarness);
         const { port, settled, connects } = withBrokerAndPanel();
-        // A discovery made slow, so that the stop lands in it, before the adapter connects.
+        // 2,000 extra states lengthen the first discovery (its object views and the detection), so that the
+        // stop, sent once the adapter is alive, lands in onReady before the adapter connects.
         const MANY = Object.fromEntries(
           Array.from({ length: 2000 }, (_, i) => `0_userdata.0.Viele.s${String(i).padStart(4, '0')}`).map((id) => [
             id,
@@ -1522,8 +1523,9 @@ if (process.env.HOMETILES_INTEGRATION === '1') {
           await harness.stopAdapter();
           // The process has exited: whatever it sent, the broker has seen once the panel's own mark is back.
           await settled();
-          const late = connects.filter(({ clientId, at }) => clientId.startsWith('iobroker-hometiles') && at >= stopping);
-          expect(late, 'CONNECTs from the adapter after the stop began').to.deep.equal([]);
+          const adapter = connects.filter(({ clientId }) => clientId.startsWith('iobroker-hometiles'));
+          expect(adapter.filter(({ at }) => at < stopping), 'CONNECTs before the stop: it came too late to test this').to.deep.equal([]);
+          expect(adapter.filter(({ at }) => at >= stopping), 'CONNECTs from the adapter after the stop began').to.deep.equal([]);
           expect(connection, 'the values info.connection took').to.not.include(true);
           expect((await harness.states.getStateAsync('hometiles.0.info.connection'))?.val).to.equal(false);
         });

@@ -74,8 +74,9 @@ export function missingTarget(objectId: string, objects: Readonly<Record<string,
 }
 
 /**
- * A subscribe of the adapter's own, `what`, bounded like the sources' calls
- * (Ruling 150): the start goes on without it, and one warning names it.
+ * The adapter's subscribe to its own panels' states, `what`, bounded like the
+ * sources' calls (Ruling 150): the start goes on without it, and one warning
+ * names it.
  */
 export async function subscribeBounded(call: Promise<unknown>, what: string, log: Pick<Logger, 'warn'>): Promise<void> {
   if ((await within(call, SOURCE_CALL_MS)) !== UNANSWERED) return;
