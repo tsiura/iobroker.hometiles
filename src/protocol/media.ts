@@ -64,7 +64,7 @@ const PANEL_KEYS: ReadonlySet<string> = new Set([
  * json_scan.h:41-55). So a title "volume" ahead of an artist "50" read as
  * volume 50 for a player whose volume is read-only, and a title
  * "entity_picture_data" had the artist decoded as cover pixels. A quote inside
- * a string is therefore written ", which makes every quote in the payload
+ * a string is therefore written \u0022, which makes every quote in the payload
  * a token's delimiter: a lookup can match only a whole token equal to the
  * name, and a string equal to a name has its first letter escaped. The panel
  * decodes \uXXXX (tile_renderer.cpp:998-1089) and shows the text unchanged.

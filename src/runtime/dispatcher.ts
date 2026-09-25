@@ -49,13 +49,12 @@ const ALLOWED_CALLS: Record<Domain, ReadonlySet<CallKind>> = {
   switch: new Set<CallKind>(['turn_on', 'turn_off', 'toggle']),
   light: new Set<CallKind>(['turn_on', 'turn_off', 'toggle', 'set_light']),
   scene: new Set<CallKind>(['activate_scene']),
+  // sensor, binary_sensor and weather take no command: their empty set sends a
+  // call for one into the existing, already-logged "call_not_allowed_for_domain"
+  // rejection below rather than throwing out of a static table — loud and
+  // explicit, not a silent fallthrough.
   sensor: new Set<CallKind>(),
   binary_sensor: new Set<CallKind>(),
-  // v0.2 domains without commands yet keep an empty set: a call for one of
-  // them goes into the existing, already-logged "call_not_allowed_for_domain"
-  // rejection below rather than throwing out of a static table — loud and
-  // explicit, not a silent fallthrough. Each task adds its domain's
-  // ServiceCall kinds here as it gains real commands.
   climate: new Set<CallKind>([
     'set_temperature',
     'set_humidity',
