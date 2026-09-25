@@ -219,11 +219,22 @@ describe('registry/entity-registry', () => {
       domain: 'binary_sensor',
       channels: { actual: { objectId: 'zigbee.0.door.opened', type: 'boolean' } },
     };
-    const { entityIds } = registry.rebuild([TEMP, DOOR], {});
+    // A room's reading beside its setpoint: the synth falls back to SET only while ACTUAL is unusable.
+    const ROOM: DeviceInput = {
+      objectId: 'hm.0.room',
+      name: 'Raum',
+      detectorType: 'temperature',
+      domain: 'sensor',
+      channels: { actual: { objectId: 'hm.0.room.ACTUAL', type: 'number' }, set: { objectId: 'hm.0.room.SET', type: 'number' } },
+    };
+    const { entityIds } = registry.rebuild([TEMP, DOOR, ROOM], {});
     const doorId = entityIds['zigbee.0.door']!;
     const door = (row: SourceValue): string | undefined => registry.stateOf(doorId, 'zigbee.0.door.opened', row);
     expect([door(value(true)), door(value(false)), door({ ...value(true), q: 0x42 }), door(value(null))]).to.deep.equal(['on', 'off', 'unavailable', 'unavailable']);
     expect(registry.stateOf('sensor.wohnzimmer', 'zigbee.0.temp.value', value(21.5))).to.equal('21.5');
+    // The row alone: a bad reading is unavailable, whatever the setpoint holds now.
+    registry.applyStateChange('hm.0.room.SET', value(19));
+    expect(registry.stateOf(entityIds['hm.0.room']!, 'hm.0.room.ACTUAL', { ...value(21), q: 0x42 })).to.equal('unavailable');
     // The live entity does not move.
     expect(registry.byId(doorId)!.state).to.equal('unavailable');
     expect(registry.stateOf('sensor.elsewhere', 'zigbee.0.temp.value', value(21.5))).to.equal(undefined);

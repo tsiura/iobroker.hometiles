@@ -459,7 +459,7 @@ export class PanelSession {
    * A history or energy request (Task 22), answered on its response topic,
    * never retained. A retained one is ignored: it would be answered again at
    * every (re)subscription, and the panel retains none (mqtt_handlers.cpp:
-   * 2424, :2488, :2555; value_control.cpp:187). Nothing thrown reaches the
+   * 2424, :2488, :2555; value_control.cpp:188). Nothing thrown reaches the
    * MQTT handler.
    */
   private async answerRequest(topic: string, payload: string, retain: boolean): Promise<void> {

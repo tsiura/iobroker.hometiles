@@ -907,6 +907,23 @@ describe('runtime/panel-session', () => {
         },
       },
       'switch.k': { objectId: 'shelly.0.k', name: 'K', detectorType: 'socket', domain: 'switch', channels: { set: { objectId: 'shelly.0.k.on', type: 'boolean', write: true } } },
+      // A reading beside a setpoint, listed first; and the two readings not named ACTUAL.
+      'sensor.room': {
+        objectId: 'hm.0.room',
+        name: 'Room',
+        detectorType: 'temperature',
+        domain: 'sensor',
+        channels: { set: { objectId: 'hm.0.room.SET', type: 'number' }, actual: { objectId: 'hm.0.room.ACTUAL', type: 'number' } },
+      },
+      'sensor.air': { objectId: 'hm.0.air', name: 'Air', detectorType: 'pressure', domain: 'sensor', channels: { pressure: { objectId: 'hm.0.air.PRESSURE', type: 'number' } } },
+      'binary_sensor.window': {
+        objectId: 'hm.0.window',
+        name: 'Window',
+        detectorType: 'window',
+        domain: 'binary_sensor',
+        channels: { set: { objectId: 'hm.0.window.SET', type: 'boolean' }, actual: { objectId: 'hm.0.window.ACTUAL', type: 'boolean' } },
+      },
+      'binary_sensor.alarm': { objectId: 'hm.0.alarm', name: 'Alarm', detectorType: 'warning', domain: 'binary_sensor', channels: { level: { objectId: 'hm.0.alarm.LEVEL', type: 'number' } } },
     };
     const row = (ts: number, val: unknown, q = 0): SourceValue => ({ ts, val, ack: true, q });
     /** The entity its synth makes of `val` on every channel, changed an hour ago. */
@@ -961,11 +978,15 @@ describe('runtime/panel-session', () => {
     };
 
     it('subscribes to its own history and energy requests under the config root, never under the base topic', async () => {
-      const { session, subscribed } = harness();
+      const { session, subscribed, published, warnings } = harness();
       await session.start();
       expect(session.commandTopics()).to.include.members([HISTORY, ENERGY]);
       // The base topic is hometiles: nothing of history or energy there.
       expect(subscribed.filter((topic) => /history|energy/.test(topic))).to.deep.equal([HISTORY, ENERGY]);
+      // With nothing wired to answer, a request is a wiring error, and says so.
+      expect(await session.handleMessage(HISTORY, NUMERIC, false)).to.equal(true);
+      expect(published).to.deep.equal([]);
+      expect(warnings).to.deep.equal([`[Panel a1] Request on ${HISTORY} ignored: nothing answers it here, a wiring error`]);
     });
 
     it("answers each kind on history/response, not retained, from the state the entity's synth reads, by a deadline 7 s on", async () => {
@@ -1002,6 +1023,19 @@ describe('runtime/panel-session', () => {
       expect(Object.keys(editable!).slice(0, 4)).to.deep.equal(['kind', 'entity_id', 'hours', 'request_id']);
       expect(editable).to.include({ kind: 'number', request_id: '1a2b3c4d-0002b1c8-00000001' });
       expect((editable!.activity as Array<{ state: string }>).map(({ state }) => state)).to.deep.equal(['unknown', 'unavailable', '22']);
+    });
+
+    it("reads a sensor's history from its reading as its synth does: never from a setpoint beside it, and from PRESSURE or LEVEL without ACTUAL", async () => {
+      const run = wired();
+      run.session.pushEntityState(live('sensor.room', 21));
+      run.session.pushEntityState(live('sensor.air', 1013));
+      run.session.pushEntityState(live('binary_sensor.window', false));
+      run.session.pushEntityState(live('binary_sensor.alarm', 0));
+      await run.session.handleMessage(HISTORY, NUMERIC.replace('sensor.t', 'sensor.room'), false);
+      await run.session.handleMessage(HISTORY, NUMERIC.replace('sensor.t', 'sensor.air'), false);
+      await run.session.handleMessage(HISTORY, BINARY.replace('binary_sensor.door', 'binary_sensor.window'), false);
+      await run.session.handleMessage(HISTORY, BINARY.replace('binary_sensor.door', 'binary_sensor.alarm'), false);
+      expect(run.queries.map(({ id }) => id)).to.deep.equal(['hm.0.room.ACTUAL', 'hm.0.air.PRESSURE', 'hm.0.window.ACTUAL', 'hm.0.alarm.LEVEL']);
     });
 
     it('ignores a retained request, which would replay at every reconnect: no query, no answer', async () => {

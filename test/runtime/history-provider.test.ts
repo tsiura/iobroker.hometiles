@@ -286,9 +286,10 @@ describe('runtime/history-provider', () => {
     });
 
     it('looks back past the week once for the reading in effect of a window of about MAX_HISTORY_ROWS rows, unless it already has (N2)', async () => {
-      // 4997 rows in the window, so the question before it asks for 5000; the
+      // A whole window, so the question before it asks for 5003 (M-1); the
       // week before holds only bad rows, the reading is ten days old.
-      const window = series(START + MINUTE, 10_000, MAX_HISTORY_ROWS - 3);
+      const window = series(START + MINUTE, 10_000, MAX_HISTORY_ROWS);
+      const count = MAX_HISTORY_ROWS + 3;
       const bad = series(START - DAY, MINUTE, 3, () => 1).map((row) => ({ ...row, q: 0x42 }));
       const good: Stored = { ts: START - 10 * DAY, val: 7, ack: true, q: 0 };
       const fake = sqlFake([good, ...bad, ...window]);
@@ -296,16 +297,17 @@ describe('runtime/history-provider', () => {
       expect(result.rows[0]).to.include({ ts: good.ts, val: 7 });
       expect(fake.calls.map(({ options }) => [options.start, options.end, options.count])).to.deep.equal([
         [START, undefined, MAX_HISTORY_ROWS + 1],
-        [START - PRIOR_LOOKBACK_MS, START, MAX_HISTORY_ROWS],
-        [undefined, START, MAX_HISTORY_ROWS],
+        [START - PRIOR_LOOKBACK_MS, START, count],
+        // However old, and as many as the window's rows need: a day file counts them first.
+        [undefined, START, count],
       ]);
       // An empty week: the question with no start has looked back as far already.
       const quiet = sqlFake([...bad.map((row) => ({ ...row, ts: row.ts - 9 * DAY })), ...window]);
       expect((await ask(provide(quiet))).rows[0]).to.include({ ts: window[0]!.ts });
       expect(quiet.calls.map(({ options }) => [options.start, options.count])).to.deep.equal([
         [START, MAX_HISTORY_ROWS + 1],
-        [START - PRIOR_LOOKBACK_MS, MAX_HISTORY_ROWS],
-        [undefined, MAX_HISTORY_ROWS],
+        [START - PRIOR_LOOKBACK_MS, count],
+        [undefined, count],
       ]);
     });
 
