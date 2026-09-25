@@ -199,6 +199,22 @@ const ROOM_OBJECTS: Record<string, object> = {
 };
 
 /**
+ * A list of 64 choices, detected as a reading, that a user would force into a
+ * select (Task 23). A panel takes 64 options (more make it read-only, no list
+ * sent), each at most 255 bytes; only labels that JSON escapes, such as these
+ * backslashes, can take its /control payload over the 24576 bytes it takes,
+ * so it goes without them (Ruling 98). Not under alias.0: js-controller reads
+ * an alias state through its target, and this one has none.
+ */
+const SENDER = 'mqtt.0.Radio.Sender';
+const SENDER_SET = `${SENDER}.SET`;
+const STATIONS = Object.fromEntries(Array.from({ length: 64 }, (_, i) => [`s${i}`, `Sender ${i} ${'\\'.repeat(240)}`]));
+const SENDER_OBJECTS: Record<string, object> = {
+  [SENDER]: { type: 'channel', common: { name: 'Sender' } },
+  [SENDER_SET]: { type: 'state', common: { name: 'Sender', role: 'state', type: 'string', read: true, write: true, states: STATIONS } },
+};
+
+/**
  * Rows that pick devices, as the picker writes them (Task 21b): nothing
  * reaches a panel without one, and only a row carrying what Refresh found
  * counts (Ruling 118). The runtime reads the detected domain only as that
@@ -220,6 +236,7 @@ const FIXTURE_IDS = [
   ...Object.keys(HELPER_OBJECTS),
   ...Object.keys(KAFFEE_OBJECTS),
   ...Object.keys(ROOM_OBJECTS),
+  ...Object.keys(SENDER_OBJECTS),
 ];
 
 /** A panel as the firmware announces itself: retained on the broker, like its last configuration. */
@@ -1010,11 +1027,13 @@ if (process.env.HOMETILES_INTEGRATION === '1') {
         const { applies } = withBrokerAndPanel(port);
         const BEZUG = '0_userdata.0.Energie.Bezug';
         const EINSPEISUNG = '0_userdata.0.Energie.Einspeisung';
-        const counter = (name: string): object => ({
+        /** Not electric: the house's consumption does not wait for it (Task 23). */
+        const GAS = '0_userdata.0.Energie.Gas';
+        const counter = (name: string, unit = 'kWh'): object => ({
           type: 'state',
-          common: { name, role: 'value.energy.consumed', type: 'number', unit: 'kWh', read: true, write: false },
+          common: { name, role: 'value.energy.consumed', type: 'number', unit, read: true, write: false },
         });
-        const METER_OBJECTS = { [BEZUG]: counter('Bezug'), [EINSPEISUNG]: counter('Einspeisung') };
+        const METER_OBJECTS = { [BEZUG]: counter('Bezug'), [EINSPEISUNG]: counter('Einspeisung'), [GAS]: counter('Gas', 'm³') };
         let system: ({ common: Record<string, unknown> } & Record<string, unknown>) | undefined;
         const removeMeters = async (): Promise<void> => {
           for (const id of Object.keys(METER_OBJECTS)) await getHarness().objects.delObjectAsync(id).catch(() => undefined);
@@ -1039,6 +1058,7 @@ if (process.env.HOMETILES_INTEGRATION === '1') {
             { stateId: BEZUG, category: 'grid', sign: 1, name: 'Hausanschluss [Bezug]', price: 0.3 },
             { stateId: EINSPEISUNG, category: 'grid', sign: -1 },
             { stateId: '0_userdata.0.Energie.Fehlt', category: 'solar', sign: 1 },
+            { stateId: GAS, category: 'gas', sign: 1 },
           ]);
           await setObjects(harness, { ...SENSOR_OBJECTS, ...METER_OBJECTS });
           await harness.startAdapterAndWait(true);
@@ -1051,6 +1071,7 @@ if (process.env.HOMETILES_INTEGRATION === '1') {
             { id: 'energy.hausanschluss_bezug', name: 'Hausanschluss (Bezug)', unit: 'kWh', category: 'grid' },
             { id: 'energy.hausanschluss_bezug_cost', name: 'Hausanschluss (Bezug) (EUR)', unit: 'EUR', category: 'grid' },
             { id: 'energy.einspeisung', name: 'Einspeisung', unit: 'kWh', category: 'grid' },
+            { id: 'energy.gas', name: 'Gas', unit: 'm³', category: 'gas' },
             { id: 'grid_total', name: 'Netz gesamt', unit: 'kWh', category: 'grid' },
           ]);
           const stored = JSON.parse(String((await harness.states.getStateAsync('hometiles.0.info.entityIds'))?.val)) as Record<string, string>;
@@ -1058,7 +1079,13 @@ if (process.env.HOMETILES_INTEGRATION === '1') {
           const energy = logs.filter((log) => log.message.includes('[Energy]'));
           expect(energy.map((log) => log.severity), energy.map((log) => log.message).join('\n')).to.deep.equal(['warn', 'warn']);
           expect(energy[0]!.message).to.include('0_userdata.0.Energie.Fehlt (no such object)');
-          expect(energy[1]!.message).to.include('history.0').and.include(BEZUG).and.include(EINSPEISUNG);
+          expect(energy[1]!.message).to.include('history.0').and.include(BEZUG).and.include(EINSPEISUNG).and.include(GAS);
+          // The grid meters unknown, the house's totals are too (energy round 2 C2); the gas meter is no part of them.
+          const house = energy[1]!.message.slice(energy[1]!.message.indexOf("The house's"));
+          expect(house).to.equal(
+            `The house's total and untracked consumption stay blank as well while any grid, solar or battery meter is unknown: ${BEZUG}, ${EINSPEISUNG}. ` +
+              'Enable history.0 in the settings of each of these states',
+          );
         });
       });
 
@@ -1326,9 +1353,10 @@ if (process.env.HOMETILES_INTEGRATION === '1') {
               [KAFFEE, ''],
             ]);
             expect(await ask(harness, 'testBroker', {})).to.deep.equal({ connected: true });
+            // A script's request, the object id alone: the device as detected, under the id picking it would give (Task 23).
             const preview = (await ask(harness, 'previewEntity', { objectId: SENSOR })) as { entity: object; publish: object };
-            expect(preview.entity).to.include({ entityId: 'sensor.preview', state: '21.5' });
-            expect(preview.publish).to.include({ topic: 'ha/statestream/sensor/preview/state', payload: '21.5' });
+            expect(preview.entity).to.include({ entityId: 'sensor.balkon', state: '21.5' });
+            expect(preview.publish).to.include({ topic: 'ha/statestream/sensor/balkon/state', payload: '21.5' });
           });
         });
 
@@ -1517,6 +1545,99 @@ if (process.env.HOMETILES_INTEGRATION === '1') {
             expect(ready(logs)!.message).to.include('1 picked (manual entities included), 0 entities published');
             expect(await reported(harness)).to.equal(0);
           });
+        });
+      });
+
+      suite("the preview of a Detected devices row, as its button asks for it (Task 23)", (getHarness) => {
+        withCleanFixtures(getHarness);
+        /** The adapter's own English texts: what its answers carry, in the system language. */
+        const en = JSON.parse(readFileSync(path.join(__dirname, '../admin/i18n/en.json'), 'utf8')) as Record<string, string>;
+        type Preview = {
+          entity?: { entityId: string };
+          publish?: { topic: string; payload: string; retain: boolean } | null;
+          note?: string;
+          copyDialog?: { title: string; type: string; text: string };
+          error?: string;
+        };
+        /** A previewEntity request as a row's button sends it (jsonConfig, _preview), and the answer; one at a time. */
+        async function preview(message: unknown): Promise<Preview> {
+          const harness = getHarness();
+          let answer: Preview | undefined;
+          harness.sendTo('hometiles.0', 'previewEntity', message, (reply: unknown) => {
+            answer = reply as Preview;
+          });
+          return waitFor(harness, () => answer, 'the preview');
+        }
+        const row = (objectId: string, forcedDomain = '', name = ''): object => ({ objectId, forcedDomain, name });
+
+        before(async function () {
+          this.timeout(120000);
+          const harness = getHarness();
+          const logs = await captureLogs(harness);
+          // Armed, nothing picked: a row is previewed as it would publish, ticked or not. No broker is needed.
+          await harness.changeAdapterConfig('hometiles', { native: { ...ARMED } });
+          await setObjects(harness, { ...SENSOR_OBJECTS, ...KAFFEE_OBJECTS, ...SENDER_OBJECTS });
+          await harness.states.setStateAsync(`${SENSOR}.temperature`, { val: 21.5, ack: true });
+          await harness.states.setStateAsync(SENDER_SET, { val: 's1', ack: true });
+          // The sensor was once picked as a thermostat: its id is kept for it (Task 21b rule 6).
+          await harness.states.setStateAsync('hometiles.0.info.entityIds', { val: JSON.stringify({ [SENSOR]: 'climate.balkon' }), ack: true });
+          await harness.startAdapterAndWait();
+          await waitFor(harness, () => ready(logs), 'onReady to finish');
+          await harness.enableSendTo();
+        });
+
+        it('shows what a row publishes as it stands: its topic, retained payload and the id picking it gives, in the dialog admin opens', async function () {
+          this.timeout(60000);
+          const answer = await preview(row(SENSOR));
+          const publish = { topic: 'ha/statestream/sensor/balkon/state', payload: '21.5', retain: true };
+          expect(answer.publish).to.deep.equal(publish);
+          expect(answer).to.not.have.property('note');
+          // json-config's sendTo shows a copyDialog as a titled text in an editor (ConfigSendto.renderCopyDialog).
+          expect(answer.copyDialog).to.deep.include({ title: 'column_preview', type: 'json' });
+          expect(JSON.parse(answer.copyDialog!.text)).to.deep.equal({ entity_id: 'sensor.balkon', ...publish });
+        });
+
+        it("shows the row's unsaved type and name as saving them would publish: another id, its topic and its payload", async function () {
+          this.timeout(60000);
+          const answer = await preview(row(SENSOR, 'number', 'Terrasse'));
+          expect(answer.entity).to.include({ entityId: 'number.terrasse' });
+          expect(answer.publish).to.include({ topic: 'ha/statestream/number/terrasse/control', retain: true });
+          expect(JSON.parse(answer.publish!.payload)).to.include({ kind: 'number', state: '21.5' });
+          expect(JSON.parse(answer.copyDialog!.text).payload).to.include({ kind: 'number', state: '21.5' });
+          // Forced back into the type its stored id has, it gets that id again, as picking it would (resolveEntityIds).
+          const climate = await preview(row(SENSOR, 'climate'));
+          expect(climate.entity).to.include({ entityId: 'climate.balkon' });
+          expect(climate.publish).to.include({ topic: 'ha/statestream/climate/balkon/state' });
+          expect(JSON.parse(climate.publish!.payload)).to.include({ current_temperature: 21.5 });
+        });
+
+        it("turns the internal degraded flag into a note: the list of choices, over the panel's limit, goes without its options (Task 14 N1)", async function () {
+          this.timeout(60000);
+          const answer = await preview(row(SENDER, 'select'));
+          expect(Object.keys(answer.publish!).sort()).to.deep.equal(['payload', 'retain', 'topic']);
+          expect(answer.publish!.topic).to.equal('ha/statestream/select/sender/control');
+          expect(JSON.parse(answer.publish!.payload)).to.include({ kind: 'select', writable: false, state: STATIONS.s1 }).and.not.have.property('options');
+          expect(answer.note).to.equal(en.preview_degraded);
+          expect(JSON.parse(answer.copyDialog!.text)).to.include({ note: en.preview_degraded });
+          expect(JSON.stringify(answer)).to.not.include('degraded');
+        });
+
+        it('says a scene publishes no state, where its payload would be', async function () {
+          this.timeout(60000);
+          const answer = await preview(row(KAFFEE, 'scene'));
+          expect(answer.entity).to.include({ entityId: 'scene.kaffee' });
+          expect(answer.publish).to.equal(null);
+          expect(answer.note).to.equal(en.preview_no_state);
+          expect(JSON.parse(answer.copyDialog!.text)).to.deep.equal({ entity_id: 'scene.kaffee', note: en.preview_no_state });
+        });
+
+        it('answers with an error, which the button shows in words, for a type the device cannot serve and for a device it did not detect', async function () {
+          this.timeout(60000);
+          // A temperature reading has no player state (synthMediaPlayer).
+          expect(await preview(row(SENSOR, 'media_player'))).to.deep.equal({ error: 'no_usable_channel' });
+          expect(await preview(row('zigbee.0.nirgends'))).to.deep.equal({ error: 'device_not_detected' });
+          // The message the old button sent: none at all (Task 21b C5).
+          expect(await preview(null)).to.deep.equal({ error: 'device_not_detected' });
         });
       });
 

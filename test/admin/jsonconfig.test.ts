@@ -5,6 +5,7 @@ import { PICKER_VERSION, validateOptions, type EnergyMeterRow, type ManualEntity
 import { ENERGY_CATEGORIES } from '../../src/protocol/energy';
 import { MANUAL_DOMAINS } from '../../src/registry/manual';
 import { mergeDetected } from '../../src/registry/overrides';
+import { DOMAINS } from '../../src/registry/types';
 
 const config = JSON.parse(readFileSync(path.join(__dirname, '../../admin/jsonConfig.json'), 'utf8'));
 const ioPackage = JSON.parse(readFileSync(path.join(__dirname, '../../io-package.json'), 'utf8'));
@@ -16,10 +17,9 @@ const translations: Record<string, Record<string, string>> = Object.fromEntries(
     .map((file) => [file.slice(0, -'.json'.length), JSON.parse(readFileSync(path.join(I18N, file), 'utf8'))]),
 );
 
+const MAIN = readFileSync(path.join(__dirname, '../../src/main.ts'), 'utf8');
 /** The admin commands main.ts answers: the cases of its onMessage switch. */
-const handled = new Set(
-  [...readFileSync(path.join(__dirname, '../../src/main.ts'), 'utf8').matchAll(/^\s*case '([A-Za-z]+)':/gm)].map((match) => match[1]),
-);
+const handled = new Set([...MAIN.matchAll(/^\s*case '([A-Za-z]+)':/gm)].map((match) => match[1]));
 
 interface Column {
   type: string;
@@ -30,7 +30,10 @@ interface Column {
   types?: string[];
   default?: unknown;
   disabled?: string;
-  options?: Array<{ label: string; value: string }>;
+  options?: Array<{ label: string; value: string; hidden?: string }>;
+  command?: string;
+  jsonData?: string;
+  error?: Record<string, string>;
 }
 const columns = (table: { items: Column[] }): Record<string, Column> =>
   Object.fromEntries(table.items.map((column) => [column.attr, column]));
@@ -95,11 +98,17 @@ describe('admin/jsonConfig', () => {
     expect(table.items.map((column: { attr: string }) => column.attr)).to.include('objectId');
   });
 
-  it('offers only the v0.1 domains in the forced-domain column', () => {
-    const table = config.items.devices.items.deviceOverrides;
-    const column = table.items.find((item: { attr: string }) => item.attr === 'forcedDomain');
-    const values = column.options.map((option: { value: string }) => option.value);
-    expect(values).to.deep.equal(['', 'sensor', 'binary_sensor', 'switch', 'light', 'scene']);
+  it('offers every domain the adapter publishes as a forced type, Auto first, each under its own label, never camera (Task 23)', () => {
+    const column = columns(config.items.devices.items.deviceOverrides).forcedDomain!;
+    // '' is Auto: validateOptions keeps it, applyOverrides takes the detected domain for it (overrides.ts isDomain).
+    const values = column.options!.map((option) => option.value);
+    expect(values).to.deep.equal(['', ...DOMAINS]);
+    expect(values).to.not.include('camera');
+    expect(column.options!.map((option) => option.label)).to.deep.equal(['domain_auto', ...DOMAINS.map((domain) => `domain_${domain}`)]);
+    // Saved as the admin stores a row, each one is kept as it is.
+    const rows = values.map((forcedDomain, i) => ({ objectId: `x.0.${i}`, include: true, forcedDomain, detectedDomain: 'sensor' }));
+    const { options, warnings } = validateOptions({ deviceOverrides: rows });
+    expect([options.deviceOverrides, warnings]).to.deep.equal([rows, []]);
   });
 
   it('fills the detected devices table through the form, sending the rows the form holds, unsaved choices included (Task 21b)', () => {
@@ -133,9 +142,9 @@ describe('admin/jsonConfig', () => {
     // The adapter marks a row whose device is detected no more in the
     // system's language (Ruling 117): every language has the text.
     for (const [language, strings] of Object.entries(translations)) expect(strings, language).to.have.property('not_detected');
-    // Exactly the fields a refreshed row holds.
+    // Exactly the fields a refreshed row holds, beside the preview button (_preview), which is no field.
     const [row] = mergeDetected([], [{ objectId: 'hue.0.a', detectedName: 'A', detectedDomain: 'light', room: 'Flur' }]);
-    expect(Object.keys(byAttr)).to.have.members(Object.keys(row!));
+    expect(Object.keys(byAttr).filter((attr) => !attr.startsWith('_'))).to.have.members(Object.keys(row!));
     expect(byAttr.include).to.include({ type: 'checkbox' });
     for (const attr of ['include', 'name', 'forcedDomain']) expect(byAttr[attr]!.readOnly, attr).to.not.equal(true);
     for (const attr of ['detectedName', 'detectedDomain', 'room', 'objectId']) {
@@ -147,6 +156,49 @@ describe('admin/jsonConfig', () => {
     // (ConfigSelect._getValue): after a Refresh a sorted table would show one
     // device's forced type beside another (Ruling 119, M2).
     for (const column of table.items) expect(column.sort, column.attr).to.not.equal(true);
+  });
+
+  it("previews each row of the Detected devices table from the row itself, its unsaved type and name included (Task 23, Task 21b C5)", () => {
+    const preview = columns(config.items.devices.items.deviceOverrides)._preview!;
+    expect(preview).to.include({ type: 'sendTo', command: 'previewEntity' });
+    // A table renders each cell with its row as `data` (json-config ConfigTable.itemTable:
+    // custom, data), and a sendTo evaluates jsonData over {_origin, _originIp, ...data}
+    // (ConfigSendto._onClick). Text that would break a pattern or a JSON literal, were it spliced in raw:
+    const row = { objectId: 'alias.0.Decke "oben" `1` ${data.x} \\ }', include: false, name: 'Licht "oben"', forcedDomain: 'datetime', detectedName: 'D', detectedDomain: 'light', room: '' };
+    expect(JSON.parse(evaluatePattern(preview.jsonData!, { _origin: 'http://x', _originIp: 'http://y', ...row }))).to.deep.equal({
+      objectId: row.objectId,
+      forcedDomain: 'datetime',
+      name: 'Licht "oben"',
+    });
+    // A row the table's "+" added holds null in each column (ConfigTable.onAdd), and an earlier
+    // version's row has no name or forced type at all: still JSON (JSON.stringify(undefined) is
+    // no text), and text.
+    expect(JSON.parse(evaluatePattern(preview.jsonData!, { objectId: null, include: false, name: null, forcedDomain: null }))).to.deep.equal({
+      objectId: '',
+      forcedDomain: '',
+      name: '',
+    });
+    expect(JSON.parse(evaluatePattern(preview.jsonData!, { objectId: 'hue.0.a', include: true }))).to.deep.equal({
+      objectId: 'hue.0.a',
+      forcedDomain: '',
+      name: '',
+    });
+    // Each error the adapter answers the preview with has a text of its own (ConfigSendto: schema.error[response.error]).
+    const start = MAIN.indexOf("case 'previewEntity'");
+    const previewCase = MAIN.slice(start, MAIN.indexOf("case '", start + 1));
+    const answered = [...previewCase.matchAll(/error: '([a-z_]+)'/g)].map((match) => match[1]);
+    expect(answered.length, 'the preview answers errors').to.be.greaterThan(1);
+    expect(Object.keys(preview.error!)).to.have.members(answered);
+    // No button anywhere asks for a preview without naming the object: the one below the tables did (Task 21b C5).
+    const previews: Array<Record<string, unknown>> = [];
+    const walk = (node: unknown): void => {
+      if (!node || typeof node !== 'object') return;
+      const record = node as Record<string, unknown>;
+      if (record.type === 'sendTo' && record.command === 'previewEntity') previews.push(record);
+      for (const value of Object.values(record)) walk(value);
+    };
+    walk(config.items);
+    expect(previews).to.deep.equal([preview]);
   });
 
   it('lets the user add manual entities: a state picker, the domains one state can serve, a name and a datetime kind (Task 21b)', () => {
@@ -213,6 +265,28 @@ describe('admin/jsonConfig', () => {
     expect(options.energyMeters).to.deep.equal([{ stateId: 'shelly.0.em.total', category: 'grid', sign: 1 }]);
     expect(warnings).to.deep.equal([]);
     expect(ioPackage.native.energyMeters).to.deep.equal([]);
+  });
+
+  it('offers a device row no export sign: the adapter takes a device as consumption only (Task 23, energy round 2 C1)', () => {
+    const sign = columns(config.items.energy.items.energyMeters).sign!;
+    // json-config hides an option whose `hidden` formula holds, evaluated over the row
+    // (ConfigSelect.isHidden: executeCustom(item.hidden, data); a table cell's data is its row).
+    const shown = (category: string): unknown[] =>
+      sign
+        .options!.filter((option) => {
+          if (!option.hidden) return true;
+          return !new Function('data', option.hidden.includes('return') ? option.hidden : `return ${option.hidden}`)({ stateId: 'x.0.m', category, sign: 1 });
+        })
+        .map((option) => option.value);
+    for (const category of ENERGY_CATEGORIES) {
+      const expected = category === 'device' || category === 'device_water' ? [1] : [1, -1];
+      expect(shown(category), category).to.deep.equal(expected);
+      // What it offers, validateOptions keeps as it is.
+      for (const value of expected) {
+        const { options, warnings } = validateOptions({ energyMeters: [{ stateId: 'x.0.m', category, sign: value }] as EnergyMeterRow[] });
+        expect([options.energyMeters[0]?.sign, warnings], `${category} ${String(value)}`).to.deep.equal([value, []]);
+      }
+    }
   });
 
   it('asks for the currency the prices are in, EUR by default (Task 20b)', () => {
@@ -286,6 +360,13 @@ describe('admin/jsonConfig', () => {
     }
   });
 
+  it("says on the Devices tab too, in every language, that saving after Refresh publishes the Energy tab's meters, ticked rows or not (Task 23, Ruling 131)", () => {
+    for (const [language, strings] of Object.entries(translations)) {
+      expect(strings.devices_info, language).to.include(strings.tab_energy);
+      expect(strings.refresh_result, language).to.include(strings.tab_energy);
+    }
+  });
+
   it('ships every translation file with the key set of the English source', () => {
     const en = JSON.parse(readFileSync(path.join(__dirname, '../../admin/i18n/en.json'), 'utf8'));
     expect(Object.keys(translations).sort()).to.include.members(['de', 'en']);
@@ -306,9 +387,12 @@ describe('admin/jsonConfig', () => {
         const value = record[prop];
         if (typeof value === 'string' && value) referenced.add(value);
       }
-      // A sendTo's result texts are translations too (json-config types.d.ts, ConfigItemSendTo).
-      if (record.type === 'sendTo' && record.result) {
-        for (const value of Object.values(record.result as Record<string, unknown>)) if (typeof value === 'string') referenced.add(value);
+      // A sendTo's result and error texts are translations too (json-config types.d.ts,
+      // ConfigItemSendTo; ConfigSendto._onClick passes each through getText).
+      if (record.type === 'sendTo') {
+        for (const texts of [record.result, record.error]) {
+          for (const value of Object.values((texts ?? {}) as Record<string, unknown>)) if (typeof value === 'string') referenced.add(value);
+        }
       }
       for (const value of Object.values(record)) walk(value);
     };
@@ -316,10 +400,20 @@ describe('admin/jsonConfig', () => {
 
     expect(referenced.size, 'the walk must actually find identifiers').to.be.greaterThan(20);
     expect(referenced, 'the result text').to.include('refresh_result');
+    expect(referenced, 'an error text').to.include('preview_no_entity');
     for (const key of referenced) {
       for (const [language, strings] of Object.entries(translations)) {
         expect(strings, `${language}.json is missing "${key}"`).to.have.property(key);
       }
+    }
+  });
+
+  it('defines in every language each text the adapter itself reads from admin/i18n (Task 23)', () => {
+    // main.ts writes these into the admin form or its replies (adminText, adminTexts), in the system language.
+    const read = new Set([...MAIN.matchAll(/adminTexts?\('([a-z_]+)'/g)].map((match) => match[1]!));
+    expect([...read]).to.include.members(['not_detected', 'energy_consumption_total', 'preview_degraded', 'preview_no_state']);
+    for (const key of read) {
+      for (const [language, strings] of Object.entries(translations)) expect(strings, `${language}.json is missing "${key}"`).to.have.property(key);
     }
   });
 });

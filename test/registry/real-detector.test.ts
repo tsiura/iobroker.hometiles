@@ -1,14 +1,17 @@
 import { expect } from 'chai';
+import { readFileSync } from 'node:fs';
+import path from 'node:path';
+import { validateOptions, type AdapterOptions } from '../../src/config/options';
 import { parseAnnouncement } from '../../src/protocol/announce';
 import { parseLightCommand, parseMediaCommand, type ServiceCall } from '../../src/protocol/commands';
 import { buildStatePublish } from '../../src/protocol/state-payload';
 import { createIoBrokerDetector, discoverDevices, type RootAnchors } from '../../src/registry/detector';
 import { EntityRegistry } from '../../src/registry/entity-registry';
-import { applyOverrides } from '../../src/registry/overrides';
+import { applyOverrides, detectedRows, mergeDetected } from '../../src/registry/overrides';
 import { encodeChannelValue } from '../../src/registry/synth/common';
 import { synthDatetime, valueChannel } from '../../src/registry/synth/editable';
 import { synthesise } from '../../src/registry/synth/index';
-import type { DeviceInput, SourceValue, VirtualEntity } from '../../src/registry/types';
+import type { DeviceInput, Domain, SourceValue, VirtualEntity } from '../../src/registry/types';
 import { Dispatcher } from '../../src/runtime/dispatcher';
 import type { PublishRequest } from '../../src/runtime/mqtt-client';
 import { PanelSession } from '../../src/runtime/panel-session';
@@ -2329,5 +2332,186 @@ describe('bridge/apply from real detections (Task 21)', () => {
       'weather.wetterstation': 'mdi:weather-partly-cloudy',
       'select.heizmodus': 'mdi:tune',
     });
+  });
+});
+
+describe('each type the Devices tab can force, end to end (Task 23)', () => {
+  /** The forced types the admin offers, read from its own form: one offered with no case below fails. */
+  const OFFERED: string[] = (
+    JSON.parse(readFileSync(path.join(__dirname, '../../admin/jsonConfig.json'), 'utf8')).items.devices.items.deviceOverrides.items as Array<{
+      attr: string;
+      options?: Array<{ value: string }>;
+    }>
+  )
+    .find((column) => column.attr === 'forcedDomain')!
+    .options!.map((option) => option.value);
+
+  // What a user forces: a heating flow setpoint (a slider, so a number) as a
+  // thermostat, a garage door's relay (a socket) as a cover, a garden
+  // thermometer as the weather outside, a writable setpoint whose role says
+  // nothing (so a reading) as a number, a text mode and a text time (readings)
+  // as a select and a time. Only a player makes a media player (below).
+  const WW = 'modbus.0.heizung.warmwasser';
+  const WW_SET = objects(channel(WW, 'Warmwasser Soll'), state(`${WW}.soll`, { role: 'value', type: 'number', unit: '°C', min: 40, max: 60, write: true }));
+  const MODE = 'alias.0.Heizung.Betriebsart';
+  const MODE_SET = objects(
+    channel(MODE, 'Betriebsart'),
+    state(`${MODE}.SET`, { role: 'state', type: 'string', write: true, states: { off: 'Aus', eco: 'Eco', comfort: 'Komfort' } }),
+  );
+  const WECKER = 'alias.0.Schlafzimmer.Wecker';
+  const WECKER_SET = objects(channel(WECKER, 'Weckzeit'), state(`${WECKER}.SET`, { role: 'state', type: 'string', write: true }));
+  const RELAY = `${SHELLY}.Relay0`;
+
+  interface Case {
+    domain: Domain;
+    all: IoObjects;
+    objectId: string;
+    detectedAs: Domain;
+    values: Record<string, SourceValue>;
+    entityId: string;
+    /** The apply's list the panel reads it from. */
+    list: string;
+    /** Its state topic, under the prefix the panel announced ("ha"), and what that payload holds. */
+    topic: string;
+    payload: Record<string, unknown>;
+  }
+  const CASES: Case[] = [
+    {
+      domain: 'climate',
+      all: FLOW_SET,
+      objectId: FLOW,
+      detectedAs: 'number',
+      values: { [`${FLOW}.SET`]: value(45) },
+      entityId: 'climate.vorlauf_soll',
+      list: 'climates',
+      topic: 'ha/climate/vorlauf_soll/state',
+      payload: { temperature: 45, min_temp: 20, max_temp: 60, available: true },
+    },
+    {
+      domain: 'cover',
+      all: SHELLY_SET,
+      objectId: RELAY,
+      detectedAs: 'switch',
+      values: { [`${RELAY}.Switch`]: value(true) },
+      entityId: 'cover.kaffeemaschine',
+      list: 'covers',
+      topic: 'ha/cover/kaffeemaschine/state',
+      payload: { state: 'open', available: true },
+    },
+    {
+      domain: 'media_player',
+      all: SQUEEZE_SET,
+      objectId: SQUEEZE,
+      detectedAs: 'media_player',
+      values: { [`${SQUEEZE}.state`]: value(1), [`${SQUEEZE}.Title`]: value('Radio') },
+      entityId: 'media_player.kuche',
+      list: 'media_players',
+      topic: 'ha/media_player/kuche/state',
+      payload: { state: 'playing', media_title: 'Radio' },
+    },
+    {
+      domain: 'weather',
+      all: GARDEN_SET,
+      objectId: GARDEN,
+      detectedAs: 'sensor',
+      values: { [`${GARDEN}.ACTUAL`]: value(18.5) },
+      entityId: 'weather.garten',
+      list: 'weathers',
+      // Weather's leaf is the word weather (global constraints).
+      topic: 'ha/weather/garten/weather',
+      payload: { temperature: 18.5, temperature_unit: '°C' },
+    },
+    {
+      domain: 'number',
+      all: WW_SET,
+      objectId: WW,
+      detectedAs: 'sensor',
+      values: { [`${WW}.soll`]: value(52) },
+      entityId: 'number.warmwasser_soll',
+      list: 'numbers',
+      topic: 'ha/number/warmwasser_soll/control',
+      payload: { kind: 'number', available: true, writable: true, min: 40, max: 60, state: '52' },
+    },
+    {
+      domain: 'select',
+      all: MODE_SET,
+      objectId: MODE,
+      detectedAs: 'sensor',
+      values: { [`${MODE}.SET`]: value('eco') },
+      entityId: 'select.betriebsart',
+      list: 'selects',
+      topic: 'ha/select/betriebsart/control',
+      payload: { kind: 'select', available: true, writable: true, options_complete: true, options: ['Aus', 'Eco', 'Komfort'], state: 'Eco' },
+    },
+    {
+      // No detector type is one: an override or a manual entity is its only way in.
+      domain: 'datetime',
+      all: WECKER_SET,
+      objectId: WECKER,
+      detectedAs: 'sensor',
+      values: { [`${WECKER}.SET`]: value('06:45') },
+      entityId: 'datetime.weckzeit',
+      list: 'datetimes',
+      topic: 'ha/datetime/weckzeit/control',
+      payload: { kind: 'time', available: true, writable: true, state: '06:45' },
+    },
+  ];
+
+  /**
+   * The chain main.ts runs: the rows Refresh writes (detectedRows,
+   * mergeDetected), the case's row ticked and forced as the user does, saved
+   * and validated at start (validateOptions), picked (applyOverrides), made
+   * entities (EntityRegistry) and pushed by a panel session: its apply and
+   * each entity's state.
+   */
+  function run(c: Case, forcedDomain: string = c.domain) {
+    const devices = detectDevices(c.all);
+    const rows = mergeDetected([], detectedRows(devices, c.all, 'en')).map((row) =>
+      row.objectId === c.objectId ? { ...row, include: true, forcedDomain } : row,
+    );
+    const { options, warnings } = validateOptions({ deviceOverrides: rows } as Partial<AdapterOptions>);
+    expect(warnings).to.deep.equal([]);
+    const registry = new EntityRegistry({ onEntityChanged: () => undefined, onMembershipChanged: () => undefined }, 0);
+    const { entityIds } = registry.rebuild(applyOverrides(devices, options.deviceOverrides), {});
+    for (const [id, state] of Object.entries(c.values)) registry.applyStateChange(id, state);
+    registry.flush();
+    const published: PublishRequest[] = [];
+    const session = new PanelSession(
+      parseAnnouncement('p1', '{"base_topic":"ht","ha_prefix":"ha"}'),
+      { publish: (request) => void published.push(request), subscribe: async () => undefined, unsubscribe: async () => undefined },
+      new Dispatcher({ byId: () => undefined, bySceneAlias: () => undefined }, async () => undefined, silentLog),
+      silentLog,
+    );
+    session.pushConfig(registry.all(), true);
+    for (const entity of registry.all()) session.pushEntityState(entity);
+    const apply = published.find((p) => p.topic === 'tab5_lvgl/config/p1/bridge/apply')!.payload;
+    return { devices, entityIds, entities: registry.all(), apply, published };
+  }
+
+  it('has a case for each type the admin offers beyond Auto and the v0.1 ones', () => {
+    // Those are forced elsewhere: overrides.test.ts, main.integration.test.ts.
+    const v01 = ['', 'sensor', 'binary_sensor', 'switch', 'light', 'scene'];
+    expect(OFFERED.filter((option) => !v01.includes(option))).to.deep.equal(CASES.map((c) => c.domain));
+  });
+
+  for (const c of CASES) {
+    it(`${c.domain}: a device detected as ${c.detectedAs}, ticked and forced in its picker row, is listed and published as one`, () => {
+      const { devices, entityIds, apply, published } = run(c);
+      expect(devices.find((device) => device.objectId === c.objectId)?.domain).to.equal(c.detectedAs);
+      expect(entityIds).to.deep.equal({ [c.objectId]: c.entityId });
+      expect(panelList(apply, c.list)).to.deep.equal([c.entityId]);
+      const publish = published.find((p) => p.topic === c.topic);
+      expect(publish, `a state on ${c.topic}, among ${published.map((p) => p.topic).join(', ')}`).to.not.equal(undefined);
+      expect(JSON.parse(publish!.payload)).to.deep.include(c.payload);
+    });
+  }
+
+  it('media_player: a socket forced into one is no tile at all, and no switch either -- a player has the state one needs, a socket has none', () => {
+    const relay = CASES.find((c) => c.objectId === RELAY)!;
+    const { entityIds, entities, apply } = run(relay, 'media_player');
+    // The force took: the id is a media player's (resolveEntityIds), and synthMediaPlayer finds no STATE.
+    expect(entityIds).to.deep.equal({ [RELAY]: 'media_player.kaffeemaschine' });
+    expect(entities).to.deep.equal([]);
+    for (const list of ['switches', 'media_players']) expect(panelList(apply, list), list).to.deep.equal([]);
   });
 });

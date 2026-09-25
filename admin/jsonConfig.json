@@ -54,10 +54,10 @@
           "md": 12,
           "lg": 12,
           "items": [
-            { "type": "checkbox", "attr": "include", "title": "column_include", "width": "8%", "default": false },
-            { "type": "text", "attr": "detectedName", "title": "column_detected_name", "width": "18%", "readOnly": true, "filter": true },
-            { "type": "text", "attr": "name", "title": "column_name", "width": "15%" },
-            { "type": "text", "attr": "detectedDomain", "title": "column_domain", "width": "10%", "readOnly": true, "filter": true },
+            { "type": "checkbox", "attr": "include", "title": "column_include", "width": "7%", "default": false },
+            { "type": "text", "attr": "detectedName", "title": "column_detected_name", "width": "16%", "readOnly": true, "filter": true },
+            { "type": "text", "attr": "name", "title": "column_name", "width": "14%" },
+            { "type": "text", "attr": "detectedDomain", "title": "column_domain", "width": "9%", "readOnly": true, "filter": true },
             {
               "type": "select",
               "attr": "forcedDomain",
@@ -69,11 +69,29 @@
                 { "label": "domain_binary_sensor", "value": "binary_sensor" },
                 { "label": "domain_switch", "value": "switch" },
                 { "label": "domain_light", "value": "light" },
-                { "label": "domain_scene", "value": "scene" }
+                { "label": "domain_scene", "value": "scene" },
+                { "label": "domain_climate", "value": "climate" },
+                { "label": "domain_cover", "value": "cover" },
+                { "label": "domain_media_player", "value": "media_player" },
+                { "label": "domain_weather", "value": "weather" },
+                { "label": "domain_number", "value": "number" },
+                { "label": "domain_select", "value": "select" },
+                { "label": "domain_datetime", "value": "datetime" }
               ]
             },
-            { "type": "text", "attr": "room", "title": "column_room", "width": "15%", "readOnly": true, "filter": true },
-            { "type": "text", "attr": "objectId", "title": "column_object_id", "width": "22%", "readOnly": true, "filter": true, "default": "" }
+            { "type": "text", "attr": "room", "title": "column_room", "width": "14%", "readOnly": true, "filter": true },
+            { "type": "text", "attr": "objectId", "title": "column_object_id", "width": "18%", "readOnly": true, "filter": true, "default": "" },
+            {
+              "type": "sendTo",
+              "attr": "_preview",
+              "title": "column_preview",
+              "label": "preview_entity",
+              "command": "previewEntity",
+              "jsonData": "{\"objectId\": ${JSON.stringify(data.objectId ?? '')}, \"forcedDomain\": ${JSON.stringify(data.forcedDomain ?? '')}, \"name\": ${JSON.stringify(data.name ?? '')}}",
+              "error": { "device_not_detected": "preview_not_detected", "no_usable_channel": "preview_no_entity" },
+              "variant": "outlined",
+              "width": "10%"
+            }
           ]
         },
         "_manualInfo": { "type": "staticText", "text": "manual_info", "newLine": true, "sm": 12, "md": 12, "lg": 12 },
@@ -118,18 +136,6 @@
               ]
             }
           ]
-        },
-        "_preview": {
-          "type": "sendTo",
-          "label": "preview_entity",
-          "command": "previewEntity",
-          "newLine": true,
-          "variant": "outlined",
-          "useNative": true,
-          "sm": 12,
-          "md": 4,
-          "lg": 3,
-          "help": "preview_entity_help"
         }
       }
     },
@@ -172,7 +178,7 @@
               "default": 1,
               "options": [
                 { "label": "sign_import", "value": 1 },
-                { "label": "sign_export", "value": -1 }
+                { "label": "sign_export", "value": -1, "hidden": "data.category === 'device' || data.category === 'device_water'" }
               ]
             },
             { "type": "text", "attr": "name", "title": "column_name", "width": "20%", "default": "" },

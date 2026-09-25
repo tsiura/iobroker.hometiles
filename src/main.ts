@@ -15,14 +15,14 @@ import {
   stateTopic,
 } from './protocol/topics';
 import { discoverDevices, type Discovery, type RootAnchors } from './registry/detector';
-import { idsToStore, parseStringMap } from './registry/entity-id';
+import { idsToStore, parseStringMap, resolveEntityIds } from './registry/entity-id';
 import { EntityRegistry } from './registry/entity-registry';
 import { listed, manualDevices } from './registry/manual';
 import { applyOverrides, detectedRows, mergeDetected } from './registry/overrides';
 import { synthesise } from './registry/synth/index';
 import type { DeviceInput, SourceValue, VirtualEntity } from './registry/types';
 import { Dispatcher } from './runtime/dispatcher';
-import { energyMeters, EnergySource, type EnergyNames, type TotalNames } from './runtime/energy-source';
+import { energyMeters, EnergySource, unloggedWarning, type EnergyNames, type TotalNames } from './runtime/energy-source';
 import { HistoryProvider } from './runtime/history-provider';
 import { HomeTilesMqttClient, type Logger } from './runtime/mqtt-client';
 import { PanelManager } from './runtime/panel-manager';
@@ -78,6 +78,16 @@ function adminTexts(key: string): string[] {
     // No translations installed: no mark to take off.
   }
   return files.flatMap((file) => i18nText(file.slice(0, -'.json'.length), key) ?? []);
+}
+
+/** A payload as the admin's preview shows it (Task 23): a JSON object as one, anything else as the text it is. */
+function readable(payload: string): unknown {
+  try {
+    const parsed: unknown = JSON.parse(payload);
+    return parsed !== null && typeof parsed === 'object' ? parsed : payload;
+  } catch {
+    return payload;
+  }
 }
 
 class HomeTiles extends utils.Adapter {
@@ -572,17 +582,14 @@ class HomeTiles extends utils.Adapter {
   private async configureEnergy(objects: Record<string, ioBroker.Object>, armed: boolean): Promise<Record<string, string>> {
     const rows = this.options.energyMeters;
     const instance = rows.length > 0 ? await this.history.instanceName().catch(() => '') : '';
-    const { meters, ids, rejected, unlogged } = energyMeters(rows, objects, this.persistedIds, this.namespace, instance);
+    const { meters, ids, rejected, unlogged, unloggedElectric } = energyMeters(rows, objects, this.persistedIds, this.namespace, instance);
     if (rejected.length > 0) {
       this.log.warn(`[Energy] Meters left out: ${listed(rejected.map(({ stateId, reason }) => `${stateId} (${reason})`))}`);
     }
     if (meters.length > 0 && !instance) {
       this.log.warn('[Energy] No history instance is set on the Advanced tab and the system has no default one: energy tiles show no consumption');
     } else if (unlogged.length > 0) {
-      this.log.warn(
-        `[Energy] Not logged by ${instance}, so their energy tiles show no consumption: ${listed(unlogged)}. ` +
-          `Enable ${instance} in the settings of each of these states`,
-      );
+      this.log.warn(`[Energy] ${unloggedWarning(instance, unlogged, unloggedElectric)}`);
     }
     const language = (await this.getForeignObjectAsync('system.config'))?.common?.language ?? 'en';
     const names: EnergyNames = {
@@ -740,12 +747,20 @@ class HomeTiles extends utils.Adapter {
       }
 
       case 'previewEntity': {
-        const objectId = String((message.message as { objectId?: string })?.objectId ?? '');
-        // A detected device can be previewed before it is picked.
-        const device = [...this.devices, ...this.detected].find((candidate) => candidate.objectId === objectId);
-        if (!device) return reply({ error: 'device_not_detected' });
+        // A row of the Detected devices table, as its button sends it
+        // (jsonConfig _preview): the device as detected with the row's type
+        // and name, unsaved ones included -- what the panels get once the row
+        // is ticked and saved. A script may send the object id alone.
+        const request = (message.message ?? {}) as { objectId?: unknown; forcedDomain?: unknown; name?: unknown };
+        const text = (value: unknown): string => (typeof value === 'string' ? value : '');
+        const objectId = text(request.objectId);
+        const detected = this.detected.find((candidate) => candidate.objectId === objectId);
+        if (!detected) return reply({ error: 'device_not_detected' });
+        const row = { objectId, include: true, detectedDomain: detected.domain, forcedDomain: text(request.forcedDomain), name: text(request.name) };
+        const device = applyOverrides([detected], [row])[0]!;
 
-        const entityId = this.persistedIds[objectId] ?? `${device.domain}.preview`;
+        // The id picking it gives: a stored one only in the domain chosen (resolveEntityIds).
+        const entityId = resolveEntityIds([device], this.persistedIds)[objectId]!;
         const values: Record<string, SourceValue | null> = {};
         for (const channel of Object.values(device.channels)) {
           const state = await this.getForeignStateAsync(channel.objectId);
@@ -755,8 +770,24 @@ class HomeTiles extends utils.Adapter {
         }
         const entity = synthesise(device, entityId, values);
         if (!entity) return reply({ error: 'no_usable_channel' });
-        const publish = buildStatePublish(this.options.haPrefix, entity);
-        return reply({ entity, publish: publish ?? { note: 'this domain publishes no state' } });
+        const built = buildStatePublish(this.options.haPrefix, entity);
+        // What goes on the wire, never the internal degraded flag (Task 14 re-review N1): a note says what it means.
+        const publish = built && { topic: built.topic, payload: built.payload, retain: built.retain };
+        const language = (await this.getForeignObjectAsync('system.config'))?.common?.language ?? 'en';
+        const note = !built ? adminText('preview_no_state', language) : built.degraded ? adminText('preview_degraded', language) : undefined;
+        const shown = {
+          entity_id: entity.entityId,
+          ...(publish ? { topic: publish.topic, retain: publish.retain, payload: readable(publish.payload) } : {}),
+          ...(note ? { note } : {}),
+        };
+        // json-config's sendTo opens a copyDialog: its title, translated, over its text in an editor
+        // (ConfigSendto.renderCopyDialog, json-config 8.1.11 on); anything else it answers with "Ok" alone.
+        return reply({
+          entity,
+          publish,
+          ...(note ? { note } : {}),
+          copyDialog: { title: 'column_preview', type: 'json', text: JSON.stringify(shown, null, 2) },
+        });
       }
 
       case 'testBroker': {
