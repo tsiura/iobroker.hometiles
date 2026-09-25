@@ -571,8 +571,11 @@ describe('admin/jsonConfig', () => {
     expect(Object.keys(button.error)).to.have.members([...PAIRING_FAILURES]);
     // Among them a password that could not be decrypted, sent to no panel (Ruling 144): its text says where to enter it again.
     expect(PAIRING_FAILURES).to.include('password_unreadable');
+    // And an adapter not connected to its broker (Ruling 149): its credentials may not work, so none go out.
+    expect(PAIRING_FAILURES).to.include('broker_not_connected');
     for (const [language, strings] of Object.entries(translations)) {
       expect(strings[button.error.password_unreadable], language).to.include(strings.tab_connection);
+      expect(strings[button.error.broker_not_connected], language).to.include(strings.tab_connection);
     }
   });
 

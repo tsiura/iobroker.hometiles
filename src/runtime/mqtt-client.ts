@@ -17,6 +17,21 @@ export interface PublishRequest {
 
 const DROP_WARN_INTERVAL_MS = 10_000;
 
+/** The broker refused the user name or password: MQTT 3.1.1 connack 4 and 5, MQTT 5 134 and 135 (mqtt.js ErrorWithReasonCode). */
+const LOGIN_REFUSALS: ReadonlySet<unknown> = new Set([4, 5, 134, 135]);
+/** How often the hint on a refused login may repeat while the broker goes on refusing it (Ruling 149). */
+export const LOGIN_HINT_INTERVAL_MS = 3_600_000;
+/**
+ * Ruling 149: a password a settings page saved before 0.2.0 had migrated it is AES-encrypted garbage, which
+ * the adapter can refuse only when its decryption holds a control character; otherwise it is used, and all
+ * the log would show is the broker's refusal. mqtt.js 5.16 and later then try no more (handlers/connack.js),
+ * earlier versions try again every 2 s.
+ */
+export const LOGIN_REFUSED_HINT =
+  '[MQTT] The broker refused the user name or password. If this began after an upgrade to 0.2.0, a settings ' +
+  'page opened before the adapter had stored the password encrypted may have saved an unusable value over it: enter ' +
+  'the password again on the Connection tab and save. No panel is paired while the adapter is not connected';
+
 export class HomeTilesMqttClient {
   private client: MqttClient | null = null;
   private queue: PublishRequest[] = [];
@@ -26,6 +41,7 @@ export class HomeTilesMqttClient {
   private dropped = 0;
   private lastDropWarnMs = 0;
   private stopping = false;
+  private loginHintAt = -Infinity;
   /** The broker's or the connection's last error, as mqtt.js words it: the admin's Test broker shows it (Ruling 140). */
   lastError: string | undefined;
 
@@ -109,6 +125,7 @@ export class HomeTilesMqttClient {
     client.on('error', (error) => {
       this.lastError = error.message;
       this.log.error(`[MQTT] ${error.message}`);
+      if (LOGIN_REFUSALS.has((error as { code?: unknown }).code)) this.loginRefused();
     });
 
     await new Promise<void>((resolve) => {
@@ -133,6 +150,17 @@ export class HomeTilesMqttClient {
       this.isConnected = false;
       this.notifyConnection(false);
     }
+  }
+
+  /**
+   * The hint (Ruling 149) at a refused login, and again at most once an hour while the broker goes on
+   * refusing it. The admin's Test broker logs it at debug level, as all it logs (main.ts testBroker).
+   */
+  private loginRefused(): void {
+    const now = Date.now();
+    if (now - this.loginHintAt < LOGIN_HINT_INTERVAL_MS) return;
+    this.loginHintAt = now;
+    this.log.error(LOGIN_REFUSED_HINT);
   }
 
   /** Same isolation as the message path: a throwing consumer must not crash us. */

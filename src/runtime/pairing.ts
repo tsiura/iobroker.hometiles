@@ -12,9 +12,18 @@ export interface PairingCredentials {
 
 /**
  * Why a pairing failed: each has a text of its own in the admin (Ruling 140). A password that could not
- * be decrypted is sent to no panel (main.ts pair, Ruling 144).
+ * be decrypted, or credentials the adapter is not connected with, are sent to no panel (main.ts pair,
+ * Rulings 144 and 149).
  */
-export const PAIRING_FAILURES = ['invalid_host', 'unreachable', 'credentials_rejected', 'restart_unreachable', 'restart_failed', 'password_unreadable'] as const;
+export const PAIRING_FAILURES = [
+  'invalid_host',
+  'unreachable',
+  'credentials_rejected',
+  'restart_unreachable',
+  'restart_failed',
+  'password_unreadable',
+  'broker_not_connected',
+] as const;
 export type PairingFailure = (typeof PAIRING_FAILURES)[number];
 
 /** A failure the panel answered with an HTTP status carries it apart, for that text to name. */

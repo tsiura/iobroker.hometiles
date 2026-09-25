@@ -12,6 +12,7 @@ import path from 'node:path';
 import { promisify } from 'node:util';
 import { EnergySource, type EnergyNames } from '../src/runtime/energy-source';
 import { HistoryProvider, MAX_HISTORY_ROWS, type HistoryResult, type HistorySource } from '../src/runtime/history-provider';
+import { LOGIN_REFUSED_HINT } from '../src/runtime/mqtt-client';
 
 /** Ports nothing listens on now, as the system hands them out: each held until all are known, so no two are one. */
 async function freePorts(count: number): Promise<number[]> {
@@ -2098,17 +2099,21 @@ if (process.env.HOMETILES_INTEGRATION === '1') {
         let dropping: Server;
         let droppingPort = 0;
         let logs: LogRecord[] = [];
+        /** Every value info.connection takes once the adapter starts. */
+        let connection: unknown[] = [];
         /** A port the system picks (Ruling 137). */
         const listen = (server: Server | HttpServer): Promise<number> =>
           new Promise((resolve) => server.listen(0, '127.0.0.1', () => resolve((server.address() as AddressInfo).port)));
 
         before(async function () {
           this.timeout(120000);
-          // A broker that lets one user in.
+          // A broker that lets in the typed user, and the saved one the adapter itself connects with: Pair
+          // sends credentials only while the adapter is connected with them (Ruling 149).
           broker = new Aedes({
             authenticate: (_client, username, password, done) => {
               seen.push({ user: username, password: password?.toString() });
               if (username === 'panel' && password?.toString() === TYPED_PASSWORD) return done(null, true);
+              if (username === 'gespeichert' && password?.toString() === SAVED_PASSWORD) return done(null, true);
               done(Object.assign(new Error('Bad username or password'), { returnCode: 4 as const }), false);
             },
           });
@@ -2136,17 +2141,18 @@ if (process.env.HOMETILES_INTEGRATION === '1') {
 
           const harness = getHarness();
           logs = await captureLogs(harness);
+          connection = valuesOf(harness, 'hometiles.0.info.connection');
           // As installing or upgrading does (iobroker upload: js-controller-cli setupUpload.js upgradeAdapterObjects),
           // encryptedNative and protectedNative go from io-package.json onto the adapter and its instance. The
           // harness's database keeps the adapter object of the run that first installed it, lists and all. Not
           // execFileSync: the database runs in this process, and a blocked one would never answer the upload.
           await promisify(execFile)(process.execPath, ['iobroker.js', 'upload', 'hometiles'], { cwd: CONTROLLER_DIR, timeout: 120000 });
-          // Saved: a broker that is not there, under other credentials, the password encrypted as admin saves it.
+          // Saved: the same broker under other credentials, the password encrypted as admin saves it.
           const secret = ((await harness.objects.getObjectAsync('system.config')) as { native: { secret: string } }).native.secret;
           expect(secret, 'a secret AES-192 takes').to.match(/^[0-9a-f]{48}$/);
           stored = encryptAsAdmin(secret, SAVED_PASSWORD);
           await harness.changeAdapterConfig('hometiles', {
-            native: { brokerHost: '127.0.0.1', brokerPort: closedPort, brokerUser: 'gespeichert', brokerPassword: stored, ...ARMED },
+            native: { brokerHost: '127.0.0.1', brokerPort, brokerUser: 'gespeichert', brokerPassword: stored, ...ARMED },
           });
           await harness.startAdapterAndWait();
           await waitFor(harness, () => ready(logs), 'onReady to finish');
@@ -2227,7 +2233,7 @@ if (process.env.HOMETILES_INTEGRATION === '1') {
         it('saves nothing it tested, and logs no password, typed or saved', async function () {
           this.timeout(120000);
           const instance = (await getHarness().objects.getObjectAsync('system.adapter.hometiles.0')) as { native: Record<string, unknown> };
-          expect(instance.native).to.include({ brokerPort: closedPort, brokerUser: 'gespeichert', brokerPassword: stored });
+          expect(instance.native).to.include({ brokerPort, brokerUser: 'gespeichert', brokerPassword: stored });
           const tested = logs.filter((log) => log.message.includes('[Admin] Broker test'));
           expect(tested.map((log) => log.severity)).to.deep.equal(['info', 'info', 'info', 'info', 'info']);
           const leaked = logs.filter((log) => [TYPED_PASSWORD, 'falsch', SAVED_PASSWORD].some((secret) => log.message.includes(secret)));
@@ -2244,12 +2250,14 @@ if (process.env.HOMETILES_INTEGRATION === '1') {
 
         it('pairs the panel at the typed address with the saved credentials, the password as saved before admin encrypted it, and says so', async function () {
           this.timeout(120000);
+          // Pair sends only credentials the adapter itself is connected with (Ruling 149).
+          await waitFor(getHarness(), () => (connection.includes(true) ? true : undefined), "the adapter's broker connection");
           const host = `127.0.0.1:${panelPort}`;
           expect(await ask('pairPanel', { host: ` ${host} ` })).to.deep.equal({ ok: true, result: 'paired', args: [host], native: {} });
           // js-controller hands the adapter its config decrypted (adapter.js, encryptedNative): the panel gets the password itself.
           expect(Object.fromEntries(new URLSearchParams(posted.at(-1)))).to.include({
             mqtt_host: '127.0.0.1',
-            mqtt_port: String(closedPort),
+            mqtt_port: String(brokerPort),
             mqtt_user: 'gespeichert',
             mqtt_pass: SAVED_PASSWORD,
           });
@@ -2386,6 +2394,51 @@ if (process.env.HOMETILES_INTEGRATION === '1') {
             expect(offered.length, 'connection attempts').to.equal(offeredBefore);
             expect((await harness.states.getStateAsync('hometiles.0.info.connection'))?.val).to.equal(false);
             expect(await pair(harness)).to.deep.include({ ok: false, error: 'password_unreadable', args: [`127.0.0.1:${panelPort}`, ''] });
+            expect(posted.length, 'forms posted').to.equal(postedBefore);
+          });
+        });
+
+        suite('stored in plain text by 0.1, beside an admin older than 6.2.3 (Ruling 149)', (getHarness) => {
+          withCleanFixtures(getHarness);
+          const ADMIN = 'system.adapter.admin.0';
+          after(async () => {
+            await getHarness().objects.delObjectAsync(ADMIN).catch(() => undefined);
+          });
+
+          it('migrates nothing, never takes the stored value for the password, and says why once', async function () {
+            this.timeout(180000);
+            const harness = getHarness();
+            // Such an admin encrypts by XOR with no prefix, so this value may as well be its encryption.
+            await setObjects(harness, {
+              [ADMIN]: { type: 'instance', common: { name: 'admin', version: '6.2.2', enabled: false, host: os.hostname(), mode: 'daemon' } },
+            });
+            const offeredBefore = offered.length;
+            const logs = await start(harness, () => PASSWORD);
+            const stored = ((await harness.objects.getObjectAsync('system.adapter.hometiles.0')) as { native: { brokerPassword: string } }).native.brokerPassword;
+            expect(stored, 'left as stored').to.equal(PASSWORD);
+            expect(logs.some((log) => log.message.includes(MIGRATED)), 'migrated').to.equal(false);
+            const outdated = logs.filter((log) => log.message.includes('An ioBroker admin older than 6.2.3 is installed'));
+            expect(outdated.map((log) => log.severity)).to.deep.equal(['error']);
+            expect(outdated[0]!.message).to.include('(admin.0 6.2.2)').and.include('Connection tab');
+            expect(offered.slice(offeredBefore), 'the stored value offered as the password').to.not.include(PASSWORD);
+          });
+        });
+
+        suite('a broker that refuses the saved login (Ruling 149)', (getHarness) => {
+          withCleanFixtures(getHarness);
+
+          it('says once why the broker refuses it, and sends no panel credentials the adapter cannot use', async function () {
+            this.timeout(180000);
+            const harness = getHarness();
+            const [offeredBefore, postedBefore] = [offered.length, posted.length];
+            // What a settings page saved before the migration looks like to the broker: a wrong password.
+            const logs = await start(harness, (secret) => encryptAsAdmin(secret, 'falsch'));
+            expect(offered.slice(offeredBefore)[0], 'the password offered').to.equal('falsch');
+            await waitFor(harness, () => (logs.some((log) => log.message.includes(LOGIN_REFUSED_HINT)) ? true : undefined), 'the hint');
+            const hints = logs.filter((log) => log.message.includes(LOGIN_REFUSED_HINT));
+            expect(hints.map((log) => log.severity)).to.deep.equal(['error']);
+            expect((await harness.states.getStateAsync('hometiles.0.info.connection'))?.val).to.equal(false);
+            expect(await pair(harness)).to.deep.include({ ok: false, error: 'broker_not_connected', args: [`127.0.0.1:${panelPort}`, ''] });
             expect(posted.length, 'forms posted').to.equal(postedBefore);
           });
         });

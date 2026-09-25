@@ -246,7 +246,8 @@
             "credentials_rejected": "pair_credentials_rejected",
             "restart_unreachable": "pair_restart_unreachable",
             "restart_failed": "pair_restart_failed",
-            "password_unreadable": "pair_password_unreadable"
+            "password_unreadable": "pair_password_unreadable",
+            "broker_not_connected": "pair_broker_not_connected"
           },
           "showProcess": true,
           "variant": "contained",

@@ -1,7 +1,7 @@
 import * as utils from '@iobroker/adapter-core';
 import { readdirSync, readFileSync } from 'node:fs';
 import path from 'node:path';
-import { PICKER_VERSION, storedPassword, validateOptions, type AdapterOptions, type DeviceOverride } from './config/options';
+import { outdatedAdmins, PICKER_VERSION, storedInPlainText, storedPassword, validateOptions, type AdapterOptions, type DeviceOverride } from './config/options';
 import { AnnounceError } from './protocol/announce';
 import { listsAnyEntity, MAX_EDITABLES, splitEditables } from './protocol/apply';
 import { ENTITY_ID_RE } from './protocol/commands';
@@ -57,6 +57,11 @@ const TEST_BROKER_DEADLINE_MS = 12_000;
 const PASSWORD_UNREADABLE =
   'The broker password could not be decrypted, so the adapter connects to no broker and pairs no panel. ' +
   'Passwords are stored encrypted since 0.2.0: enter it again on the Connection tab and save';
+/** Ruling 149, once per start that finds a password to migrate beside an admin older than 6.2.3. */
+const OUTDATED_ADMIN = (admins: readonly string[]): string =>
+  `An ioBroker admin older than 6.2.3 is installed (${admins.join(', ')}). It stores passwords in a form the adapter cannot ` +
+  'tell from the plain text of 0.1, so the broker password is left as stored and not migrated. Update admin to 6.2.3 or ' +
+  'newer; if the broker refuses the password meanwhile, enter it again on the Connection tab and save';
 
 /** One text of one admin translation file, or undefined. Only a language code names a file, never a path. */
 function i18nText(language: string, key: string): string | undefined {
@@ -151,13 +156,15 @@ class HomeTiles extends utils.Adapter {
     for (const warning of warnings) this.log.warn(`[Config] ${warning}`);
     // Never a password that could not be decrypted (Ruling 144). One 0.1 stored in plain text is used as
     // stored and stored encrypted, once; storing it restarts the adapter (js-controller), which then finds it
-    // encrypted. Neither is ever logged.
+    // encrypted. Neither is ever logged. Beside an admin older than 6.2.3 a value without the AES prefix may
+    // be that admin's own encryption, so nothing is migrated (Ruling 149): js-controller's globalDependencies
+    // check does not run on a URL install or upgrade.
     const instance = `system.adapter.${this.namespace}`;
-    const password = storedPassword(
-      (await this.getForeignObjectAsync(instance))?.native?.brokerPassword,
-      options.brokerPassword,
-      (value) => this.encrypt(value),
-    );
+    const stored: unknown = (await this.getForeignObjectAsync(instance))?.native?.brokerPassword;
+    const encrypt = (value: string): string => this.encrypt(value);
+    const outdated = storedInPlainText(stored, encrypt) ? outdatedAdmins(await this.objectsOfType('instance', 'system.adapter.admin.')) : [];
+    if (outdated.length > 0) this.log.error(`[Config] ${OUTDATED_ADMIN(outdated)}`);
+    const password = storedPassword(stored, options.brokerPassword, encrypt, outdated.length === 0);
     this.passwordUnreadable = !password;
     options.brokerPassword = password?.password ?? '';
     if (!password) this.log.error(`[Config] ${PASSWORD_UNREADABLE}`);
@@ -484,12 +491,19 @@ class HomeTiles extends utils.Adapter {
 
   /**
    * Sends a panel the credentials the adapter itself uses, as the Panels tab's button and a panel's
-   * control.pair ask for it; never a password that could not be decrypted (Ruling 144).
+   * control.pair ask for it, and only while the adapter is connected with them: never a password that could
+   * not be decrypted (Ruling 144) or one the broker refuses (Ruling 149).
    */
   private async pair(host: string): Promise<PairingResult> {
-    if (!this.passwordUnreadable) return pushCredentials(host, credentialsFromOptions(this.options), this.log4);
-    this.log.warn('[Pairing] Nothing sent: the broker password could not be decrypted. Enter it again on the Connection tab and save');
-    return { ok: false, reason: 'password_unreadable' };
+    if (this.passwordUnreadable) {
+      this.log.warn('[Pairing] Nothing sent: the broker password could not be decrypted. Enter it again on the Connection tab and save');
+      return { ok: false, reason: 'password_unreadable' };
+    }
+    if (!this.mqtt?.connected) {
+      this.log.warn(`[Pairing] Nothing sent to ${host}: the adapter is not connected to the broker, so its credentials are not known to work`);
+      return { ok: false, reason: 'broker_not_connected' };
+    }
+    return pushCredentials(host, credentialsFromOptions(this.options), this.log4);
   }
 
   // ---- Registry ----
@@ -668,7 +682,7 @@ class HomeTiles extends utils.Adapter {
    * (Ruling 58 D).
    */
   private async objectsOfType(
-    type: 'state' | 'channel' | 'device' | 'enum',
+    type: 'state' | 'channel' | 'device' | 'enum' | 'instance',
     prefix?: string,
   ): Promise<Record<string, ioBroker.Object>> {
     const range = prefix ? { startkey: prefix, endkey: `${prefix}\u9999` } : {};

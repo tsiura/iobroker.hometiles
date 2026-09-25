@@ -1,6 +1,6 @@
 import { expect } from 'chai';
 import { createCipheriv, createDecipheriv, randomBytes } from 'node:crypto';
-import { DEFAULTS, normaliseTopic, PICKER_VERSION, storedPassword, validateOptions, type AdapterOptions } from '../../src/config/options';
+import { DEFAULTS, normaliseTopic, outdatedAdmins, PICKER_VERSION, storedInPlainText, storedPassword, validateOptions, type AdapterOptions } from '../../src/config/options';
 
 describe('config/options', () => {
   it('strips leading and trailing slashes and collapses doubles', () => {
@@ -398,6 +398,39 @@ describe('config/options', () => {
       expect(storedPassword(undefined, '', never)).to.deep.equal({ password: '' });
       // Not text: validateOptions warned and uses none.
       expect(storedPassword(5, '', never)).to.deep.equal({ password: '' });
+    });
+
+    describe('beside an admin older than 6.2.3 (Ruling 149)', () => {
+      it('names each admin instance whose version is below 6.2.3, compared by number, and none whose version it cannot read', () => {
+        const admins = {
+          'system.adapter.admin.0': { common: { version: '6.2.2' } },
+          'system.adapter.admin.1': { common: { version: '6.10.0' } },
+          'system.adapter.admin.2': { common: { version: '6.2.3' } },
+          'system.adapter.admin.3': { common: { version: '5.4.9' } },
+          'system.adapter.admin.4': { common: { version: '7.6.17-beta.1' } },
+          'system.adapter.admin.5': { common: {} },
+          'system.adapter.admin.6': { common: { version: 'latest' } },
+          'system.adapter.admin.7': null,
+        };
+        expect(outdatedAdmins(admins)).to.deep.equal(['admin.0 6.2.2', 'admin.3 5.4.9']);
+        expect(outdatedAdmins({})).to.deep.equal([]);
+      });
+
+      it("uses what js-controller decrypted from a value such an admin encrypted, by XOR with no prefix, and stores nothing, where the migration would take the XOR for 0.1's plain text", () => {
+        // Admin up to 6.2.2 encrypts by XOR under any secret, so its value carries no prefix; js-controller
+        // decrypts a value without one by XOR (tools.js:1756-1766), back to the password.
+        const byOldAdmin = xor(SECRET, PASSWORD);
+        const enc = (value: string): string => encrypt(SECRET, value);
+        expect(storedPassword(byOldAdmin, PASSWORD, enc, false)).to.deep.equal({ password: PASSWORD });
+        // The hazard the guard exists for: taken for plain text, the XOR itself would be used and stored encrypted.
+        expect(storedPassword(byOldAdmin, PASSWORD, enc)).to.include({ password: byOldAdmin });
+        expect(storedInPlainText(byOldAdmin, enc)).to.equal(true);
+        // An AES value, or nothing stored, is no migration to skip.
+        expect(storedInPlainText(encrypt(SECRET, PASSWORD), enc)).to.equal(false);
+        expect(storedInPlainText('', enc)).to.equal(false);
+        // Not migrated, a value whose decryption is garbage is refused as before.
+        expect(storedPassword(PASSWORD, xor(LEGACY, PASSWORD), enc, false)).to.equal(undefined);
+      });
     });
   });
 });

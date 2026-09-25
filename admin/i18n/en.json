@@ -84,6 +84,7 @@
   "pair_restart_unreachable": "The panel at %s took the credentials but did not answer the restart. Restart it by hand.",
   "pair_restart_failed": "The panel at %s took the credentials but refused the restart (HTTP %s). Restart it by hand.",
   "pair_password_unreadable": "The broker password could not be decrypted, so nothing was sent to the panel at %s. Enter the password again on the Connection tab and save.",
+  "pair_broker_not_connected": "The adapter is not connected to the broker, so nothing was sent to the panel at %s. Pair once the adapter is connected. If the broker refuses its login, enter the password again on the Connection tab and save.",
   "history_instance": "History instance",
   "history_instance_help": "The history, SQL or InfluxDB instance the panels read graphs and timelines from. With none chosen, the system's default history instance is used, if one is set.",
   "tab_energy": "Energy",

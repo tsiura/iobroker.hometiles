@@ -358,18 +358,44 @@ const hasControlCharacter = (text: string): boolean => [...text].some((char) => 
  * undefined: the value decrypts to nothing usable, and nothing may use it. js-controller leaves a
  * value it cannot decrypt as stored, after logging so (adapter.js), and a decryption holding a
  * control character is garbage.
+ *
+ * `migrate` false (Ruling 149): an admin older than 6.2.3 encrypts by XOR with no prefix under any
+ * secret, so a value without the prefix may be its encryption as well as 0.1's plain text. Nothing is
+ * migrated then, and what js-controller decrypted is used, as for any other stored value.
  */
 export function storedPassword(
   raw: unknown,
   decrypted: string,
   encrypt: (value: string) => string,
+  migrate = true,
 ): { password: string; store?: string } | undefined {
   if (typeof raw !== 'string' || raw === '') return { password: decrypted };
-  if (!raw.startsWith(AES_PREFIX)) {
-    const store = encrypt(raw);
-    if (store.startsWith(AES_PREFIX)) return { password: raw, store };
-  }
+  if (migrate && storedInPlainText(raw, encrypt)) return { password: raw, store: encrypt(raw) };
   return decrypted.startsWith(AES_PREFIX) || hasControlCharacter(decrypted) ? undefined : { password: decrypted };
+}
+
+/** Whether a stored value reads as 0.1's plain text: no AES prefix, under a secret that makes one (storedPassword). */
+export function storedInPlainText(raw: unknown, encrypt: (value: string) => string): boolean {
+  return typeof raw === 'string' && raw !== '' && !raw.startsWith(AES_PREFIX) && encrypt(raw).startsWith(AES_PREFIX);
+}
+
+/** Where admin encrypts with AES and its prefix: 6.2.3 on (Task 23 round-3 re-review, R3-m1). */
+const AES_ADMIN: readonly number[] = [6, 2, 3];
+
+/**
+ * The admin instances among `instances` (system.adapter.admin.* by id) that report a version below
+ * 6.2.3 (Ruling 149), as "admin.0 6.2.2": such an admin encrypts a password by XOR with no prefix. A
+ * version that does not start with x.y.z is none; a prerelease counts as its release.
+ */
+export function outdatedAdmins(instances: Readonly<Record<string, unknown>>): string[] {
+  return Object.entries(instances).flatMap(([id, object]) => {
+    const version = (object as { common?: { version?: unknown } } | null)?.common?.version;
+    const parts = typeof version === 'string' ? /^(\d+)\.(\d+)\.(\d+)/.exec(version) : null;
+    if (!parts) return [];
+    const numbers = parts.slice(1).map(Number);
+    const differs = numbers.findIndex((part, i) => part !== AES_ADMIN[i]);
+    return differs >= 0 && numbers[differs]! < AES_ADMIN[differs]! ? [`${id.replace(/^system\.adapter\./, '')} ${version}`] : [];
+  });
 }
 
 function clamp(value: number, min: number, max: number): number {
