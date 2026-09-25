@@ -227,6 +227,11 @@ describe('admin/jsonConfig', () => {
     expect(translations.de!.energy_info).to.include('nie ein Zähler, der täglich zurückgesetzt wird');
   });
 
+  it("gives the signs the house's consumption depends on: solar and discharge import, charging export (review N3)", () => {
+    expect(translations.en!.energy_info).to.include('Solar and battery discharge count as import; battery charging, like grid feed-in, as export.');
+    expect(translations.de!.energy_info).to.include('PV und Batterieentladung zählen als Bezug; das Laden der Batterie, wie die Netzeinspeisung, als Abgabe.');
+  });
+
   it('warns on the Energy tab too that meters alone prune the panels once Refresh is saved, to export their layout first (Ruling 131)', () => {
     for (const [language, strings] of Object.entries(translations)) {
       expect(strings.energy_info, language).to.include(strings.refresh_detected);
