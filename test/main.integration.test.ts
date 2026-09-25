@@ -978,6 +978,14 @@ function withHistoryAdapter(
   });
 }
 
+/**
+ * The js-controller the harness installs and every run tests against (m6). Unpinned,
+ * @iobroker/testing takes 7.2.2 on Node 20 and below and the moving `dev` tag above
+ * (lib/controllerSetup.js prepareTestDir), resolved again each run: a new alpha overnight, with
+ * the database libraries createDatabase copies. 7.2.2 is js-controller's stable release.
+ */
+const CONTROLLER_VERSION = '7.2.2';
+
 // Opt-in: this downloads and runs a real js-controller, so it stays out of the
 // default suite. Run it with HOMETILES_INTEGRATION=1 npm test.
 if (process.env.HOMETILES_INTEGRATION === '1') {
@@ -986,6 +994,7 @@ if (process.env.HOMETILES_INTEGRATION === '1') {
   failOnNpmErrors(internals);
   refuseDefaultBroker(internals);
   tests.integration(path.join(__dirname, '..'), {
+    controllerVersion: CONTROLLER_VERSION,
     defineAdditionalTests({ suite }) {
       suite('startup', (getHarness) => {
         it('starts with no reachable broker and reports info.connection false', async function () {
