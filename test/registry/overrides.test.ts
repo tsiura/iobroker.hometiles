@@ -4,7 +4,7 @@ import { parseClimateCommand } from '../../src/protocol/commands';
 import { discoverDevices, type IoBrokerObject } from '../../src/registry/detector';
 import { idsToStore } from '../../src/registry/entity-id';
 import { EntityRegistry } from '../../src/registry/entity-registry';
-import { applyClimateModes, applyOverrides, detectedRows, mergeDetected, type Detected } from '../../src/registry/overrides';
+import { applyClimateModes, applyOverrides, detectedRows, mergeDetected, unbuiltForces, unbuiltPicks, type Detected } from '../../src/registry/overrides';
 import type { HvacMode } from '../../src/registry/synth/climate';
 import { synthesise } from '../../src/registry/synth/index';
 import type { ChannelInput, DeviceInput } from '../../src/registry/types';
@@ -92,6 +92,17 @@ describe('registry/overrides', () => {
     it('ignores an empty name override rather than blanking the device name', () => {
       const result = applyOverrides(DEVICES, [pick('a', { name: '   ' })]);
       expect(result[0]!.name).to.equal('A');
+    });
+  });
+
+  describe('a picked device that makes no tile', () => {
+    it("names a picked device whose own detected type makes no entity, with what it lacks; a forced type stays unbuiltForces' (T9)", () => {
+      // A media player whose play state discovery set aside: a Chromecast whose detection bound its …paused.
+      const player: DeviceInput = { objectId: 'cast', name: 'Cast', detectorType: 'media', domain: 'media_player', channels: { volume: { objectId: 'cast.volume' } } };
+      const detected = [...DEVICES, player];
+      const picked = applyOverrides(detected, [pick('cast', { detectedDomain: 'media_player' }), pick('b', { detectedDomain: 'sensor', forcedDomain: 'media_player' })]);
+      expect(unbuiltPicks(detected, picked)).to.deep.equal([{ objectId: 'cast', domain: 'media_player', lack: 'player_state' }]);
+      expect(unbuiltForces(detected, picked)).to.deep.equal([{ objectId: 'b', domain: 'media_player', lack: 'player_state' }]);
     });
   });
 

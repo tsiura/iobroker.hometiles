@@ -249,9 +249,10 @@ const IGNORED_CHANNELS = new Set([
   'WINDOW',
   'PARTY',
   // mediaPlayer's, each unique to that pattern: IGNORE is how it sets
-  // Chromecast's …paused/…playerState aside; the panel has no shuffle or
-  // repeat control (mqtt_handlers.cpp:2020-2122 sends only transport, seek,
-  // volume and mute) and shows no track, episode, season or player metadata.
+  // Chromecast's …paused/…playerState aside (channelName keeps …paused out of
+  // STATE as well); the panel has no shuffle or repeat control
+  // (mqtt_handlers.cpp:2020-2122 sends only transport, seek, volume and mute)
+  // and shows no track, episode, season or player metadata.
   'IGNORE',
   'SHUFFLE',
   'REPEAT',
@@ -330,11 +331,14 @@ function channelName(controlType: string, state: DetectedChannel): string | null
   }
 
   // mediaPlayer sets Chromecast's …paused and …playerState aside by name
-  // (its IGNORE, /\.(paused|playerState)$/), yet its STATE can still take one:
-  // two media.state objects tie on role and the later id wins, so an
-  // isPlaying is replaced by paused -- and paused: true read as "playing".
-  // Neither is the play state; without one there is no media player.
-  if (upper === 'STATE' && controlType === 'media' && /\.(paused|playerState)$/.test(state.id ?? '')) return null;
+  // (its IGNORE, /\.(paused|playerState)$/), yet its STATE can still take the
+  // boolean …paused: two media.state objects tie on role and the later id
+  // wins, so an isPlaying is replaced by paused -- and paused: true read as
+  // "playing". It is no play state; without one there is no media player.
+  // STATE takes a boolean or a number only (typePatterns.js:453), so
+  // Chromecast's string …playerState never reaches it, and another adapter's
+  // numeric …playerState is that player's play state (T9).
+  if (upper === 'STATE' && controlType === 'media' && /\.paused$/.test(state.id ?? '')) return null;
 
   return upper.toLowerCase();
 }

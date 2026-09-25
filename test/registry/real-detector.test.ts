@@ -1226,6 +1226,18 @@ describe('real type-detector end to end (Task 5c)', () => {
       expect(result.entity, 'no media player without its play state').to.equal(null);
     });
 
+    it("T9: another adapter's numeric …playerState is its play state: STATE takes no Chromecast string, so only …paused is set aside", () => {
+      const player = 'alias.0.Bad.Radio';
+      const all = objects(
+        channel(player, 'Badradio'),
+        state(`${player}.playerState`, { role: 'media.state', type: 'number', write: false, states: { 0: 'stop', 1: 'play', 2: 'pause' } }),
+        state(`${player}.volume`, { role: 'level.volume', type: 'number', min: 0, max: 100, write: true }),
+      );
+      const result = runFor(run(all, { [`${player}.playerState`]: value(1), [`${player}.volume`]: value(30) }), player);
+      expect(result.device.channels.state?.objectId).to.equal(`${player}.playerState`);
+      expect(result.entity).to.include({ domain: 'media_player' });
+    });
+
     // Task 10: the panel's own commands, through the real detector, synth,
     // parser and dispatcher.
     describe('Task 10: media commands', () => {

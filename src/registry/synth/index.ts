@@ -57,8 +57,9 @@ export type Lack = (typeof LACKS)[number];
 /**
  * What `device` lacks to be made an entity of its domain, or undefined: the
  * very test each synth returns null by, so synthesise makes none exactly
- * when this names a lack (Ruling 139). Only a forced type can meet one:
- * each detector type brings what its domain needs.
+ * when this names a lack (Ruling 139). Mostly a forced type meets one: each
+ * detector type brings what its domain needs, but for a media player whose
+ * play state discovery set aside (detector.ts channelName; unbuiltPicks).
  */
 export function lacks(device: DeviceInput): Lack | undefined {
   switch (device.domain) {

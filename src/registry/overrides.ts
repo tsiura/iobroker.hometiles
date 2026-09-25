@@ -65,6 +65,23 @@ export function unbuiltForces(
   });
 }
 
+/**
+ * The picked devices whose own detected type makes no entity (T9), with what
+ * each lacks for it (lacks): a media player whose play state discovery set
+ * aside, a Chromecast whose detection bound its …paused. A forced type is
+ * unbuiltForces'; main.ts names both.
+ */
+export function unbuiltPicks(
+  detected: readonly DeviceInput[],
+  picked: readonly DeviceInput[],
+): Array<{ objectId: string; domain: Domain; lack: Lack }> {
+  const found = new Map(detected.map((device) => [device.objectId, device.domain]));
+  return picked.flatMap((device) => {
+    const lack = device.domain === found.get(device.objectId) ? lacks(device) : undefined;
+    return lack ? [{ objectId: device.objectId, domain: device.domain, lack }] : [];
+  });
+}
+
 /** A Climate modes row left out, and why, in English (Ruling 141). */
 export interface RejectedClimateMode {
   row: ClimateModeRow;

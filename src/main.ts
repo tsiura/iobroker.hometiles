@@ -29,7 +29,7 @@ import { discoverDevices, type Discovery, type RootAnchors } from './registry/de
 import { idsToStore, parseStringMap, resolveEntityIds } from './registry/entity-id';
 import { EntityRegistry } from './registry/entity-registry';
 import { listed, manualDevices } from './registry/manual';
-import { applyClimateModes, applyOverrides, detectedRows, mergeDetected, unbuiltForces } from './registry/overrides';
+import { applyClimateModes, applyOverrides, detectedRows, mergeDetected, unbuiltForces, unbuiltPicks } from './registry/overrides';
 import { lacks, synthesise } from './registry/synth/index';
 import type { DeviceInput, SourceValue, VirtualEntity } from './registry/types';
 import { Dispatcher } from './runtime/dispatcher';
@@ -589,6 +589,13 @@ class HomeTiles extends utils.Adapter {
     if (unbuilt.length > 0) {
       const named = unbuilt.map(({ objectId, domain, lack }) => `${domain} on ${objectId} (${adminText(`lack_${lack}`, 'en')})`);
       this.log.warn(`[Registry] Forced types that produced no tile: ${listed(named)}. Choose Auto or another type for them on the Devices tab`);
+    }
+    // A picked device whose own detected type makes no entity, such as a media player whose play state
+    // discovery set aside, is no tile either, and would otherwise be named nowhere (T9).
+    const unbuiltPicked = unbuiltPicks(detected, picked);
+    if (unbuiltPicked.length > 0) {
+      const named = unbuiltPicked.map(({ objectId, domain, lack }) => `${domain} on ${objectId} (${adminText(`lack_${lack}`, 'en')})`);
+      this.log.warn(`[Registry] Picked devices that produced no tile: ${listed(named)}`);
     }
     this.rootAnchors = anchors;
     await this.saveJsonMap(ROOT_ANCHOR_STATE, 'Root anchors: the state each root id stays with', anchors);
