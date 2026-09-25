@@ -171,9 +171,10 @@ describe('registry/entity-id', () => {
     it("never gives a meter another meter's id or its cost entry's id, <id>_cost", () => {
       const ids = resolveEnergyIds([meter('a.0.grid', 'Grid'), meter('a.0.cost', 'Grid cost'), meter('a.0.again', 'Grid')], {});
       expect(ids).to.deep.equal({ 'energy:a.0.grid': 'energy.grid', 'energy:a.0.cost': 'energy.grid_cost_meter', 'energy:a.0.again': 'energy.grid_2' });
-      // Nor, the other way round, one whose own cost id is a meter's.
-      const reverse = resolveEnergyIds([meter('a.0.again', 'Grid'), meter('a.0.grid', 'Grid')], { 'energy:a.0.grid': 'energy.grid_2' });
-      expect(reverse).to.deep.equal({ 'energy:a.0.again': 'energy.grid', 'energy:a.0.grid': 'energy.grid_2' });
+      // Nor, the other way round, one whose own cost id is a meter's: a hand-edited
+      // stored id ending in _cost is refused (review m4, N5), so Grid's cost id stays free.
+      const reverse = resolveEnergyIds([meter('a.0.grid', 'Grid'), meter('a.0.cost', 'Grid cost')], { 'energy:a.0.cost': 'energy.grid_cost' });
+      expect(reverse).to.deep.equal({ 'energy:a.0.grid': 'energy.grid', 'energy:a.0.cost': 'energy.grid_cost_meter' });
       for (const all of [ids, reverse]) {
         const taken = Object.values(all).flatMap((id) => [id, `${id}_cost`]);
         expect(new Set(taken).size).to.equal(taken.length);
