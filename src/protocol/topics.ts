@@ -13,13 +13,20 @@ export const PANEL_SETTING_LEAVES = [
 
 export type PanelSettingLeaf = (typeof PANEL_SETTING_LEAVES)[number];
 
+/**
+ * The firmware's device id is 12 hex digits. It becomes panels.<deviceId>
+ * object ids, which a "." would misparent (M-11): letters, digits, "_" and
+ * "-", 64 at most, or no device.
+ */
+const DEVICE_ID_RE = /^[A-Za-z0-9_-]{1,64}$/;
+
 export function deviceIdFromAnnounceTopic(topic: string): string | null {
   const parts = topic.split('/');
   if (parts.length !== 4) return null;
   if (`${parts[0]}/${parts[1]}` !== CONFIG_TOPIC_ROOT) return null;
   if (parts[3] !== 'bridge') return null;
   const deviceId = parts[2];
-  return deviceId ? deviceId : null;
+  return deviceId && DEVICE_ID_RE.test(deviceId) ? deviceId : null;
 }
 
 export function applyTopic(deviceId: string): string {

@@ -31,6 +31,14 @@ describe('protocol/topics', () => {
     expect(deviceIdFromAnnounceTopic('something/else')).to.equal(null);
   });
 
+  it('returns null for a device id that is no id: it becomes panels.<deviceId> object ids, which a "." misparents (M-11)', () => {
+    // The firmware's id is 12 hex digits; letters, digits, "_" and "-" up to 64 are taken.
+    expect(deviceIdFromAnnounceTopic('tab5_lvgl/config/a.b/bridge')).to.equal(null);
+    expect(deviceIdFromAnnounceTopic(`tab5_lvgl/config/${'a'.repeat(65)}/bridge`)).to.equal(null);
+    expect(deviceIdFromAnnounceTopic('tab5_lvgl/config/a1b2c3d4e5f6/bridge')).to.equal('a1b2c3d4e5f6');
+    expect(deviceIdFromAnnounceTopic(`tab5_lvgl/config/Panel_1-${'a'.repeat(56)}/bridge`)).to.equal(`Panel_1-${'a'.repeat(56)}`);
+  });
+
   it('builds the per-device config topics', () => {
     expect(applyTopic('a1')).to.equal('tab5_lvgl/config/a1/bridge/apply');
     expect(iconsTopic('a1')).to.equal('tab5_lvgl/config/a1/bridge/icons');
