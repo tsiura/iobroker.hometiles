@@ -8,6 +8,25 @@ Bridge integration. This adapter replaces that backend. The firmware is
 **not modified and not forked**: the adapter speaks the same MQTT contract, so
 stock HomeTiles firmware works against ioBroker with no reflash.
 
+**New to all this?** Follow
+[Step by step: from zero to a working panel](#step-by-step-from-zero-to-a-working-panel).
+It assumes no MQTT or HomeTiles knowledge.
+
+## Contents
+
+- [Status: read this first](#status-read-this-first)
+- [Step by step: from zero to a working panel](#step-by-step-from-zero-to-a-working-panel)
+  - [Troubleshooting for beginners](#troubleshooting-for-beginners)
+- [What 0.2.0 covers](#what-020-covers) and
+  [what it does not cover](#what-020-does-not-cover)
+- [Requirements](#requirements)
+- [Setup: every settings tab in detail](#setup)
+- [Upgrading from 0.1.0](#upgrading-from-010)
+- [Limits and requirements](#limits-and-requirements)
+- [Objects](#objects)
+- [Hardware checks still outstanding](#hardware-checks-still-outstanding)
+- [Development](#development), [Changelog](#changelog), [License](#license)
+
 ## Status: read this first
 
 **No physical panel has ever run this adapter.**
@@ -24,6 +43,393 @@ behaviour on a device. The checks that still need a real panel are listed under
 on any installation with ordinary detected devices: it subscribed to every
 state in the installation, then stopped with an error before connecting to
 MQTT, and js-controller restarted it in a loop.
+
+## Step by step: from zero to a working panel
+
+This guide takes you from nothing to a panel on your wall that shows and
+switches your ioBroker devices. You need no MQTT or HomeTiles knowledge. Plan
+about an hour. Every step ends with a **Check**: do not go on until it passes.
+
+> **You are an early tester.** 0.2.0 has not yet run on a physical panel (see
+> [Status](#status-read-this-first)). If a step does not do what it says, note
+> what you saw and what the log says, and report it at
+> <https://github.com/tsiura/iobroker.hometiles/issues>.
+
+### How the parts fit together
+
+```text
+ your devices ──► ioBroker ──► HomeTiles adapter ──► MQTT broker ◄── network ──► HomeTiles panel
+ (lamps, plugs,   (objects,    (this adapter, the    (passes the                  (the touch screen
+  sensors, …)      states)      translator)           messages)                    on your wall)
+```
+
+- The **panel** runs the HomeTiles firmware. It never talks to ioBroker
+  directly. It sends and receives short messages through an **MQTT broker**, a
+  small program that passes messages between devices, like a post office.
+- The **HomeTiles adapter** is the translator. It tells the panel which devices
+  exist, keeps their values up to date, and turns a tap on the panel into a
+  command for ioBroker.
+- You choose which devices the panel may use in the adapter's settings. Then
+  you place tiles in the panel's own web page, the **Web Admin**.
+
+### Step 1: Check what you need
+
+**Hardware**
+
+- A touch panel that HomeTiles supports. Find your **exact** model, including
+  its revision, in the
+  [HomeTiles device list](https://galusperes.github.io/#device-support), for
+  example the M5Stack Tab5 or a Waveshare ESP32-P4 panel.
+- A USB **data** cable for the panel. A charge-only cable cannot flash it.
+- A computer with desktop **Chrome** or **Edge**, to install the firmware once.
+- A **2.4 GHz** Wi-Fi network (the panels' Wi-Fi does not use 5 GHz), or a
+  network cable on a panel that has Ethernet. The panel and the ioBroker
+  computer must be on the same home network, not a guest network.
+
+**Software**
+
+- ioBroker with **js-controller 6.0.11** or newer, **admin 7.6.17** or newer
+  and **Node.js 20** or newer.
+- HomeTiles firmware **v0.6.12**, which you install in Step 5. This adapter
+  was built against v0.6.12. A newer firmware release probably works, but it
+  has not been checked.
+
+**Check your ioBroker versions**
+
+1. Open the ioBroker Admin page in your browser, usually
+   `http://<ioBroker-IP>:8081`.
+2. Click **Hosts** in the left menu. The row of your computer shows the
+   js-controller and Node.js versions.
+3. Click **Adapters** and search for `admin`. Its card shows the installed
+   version.
+
+If something is too old, update ioBroker first. On Linux the usual way to
+update js-controller is `iob stop`, `iob update`, `iob upgrade self` and
+`iob start` in a terminal. Update admin from the **Adapters** page. For
+Node.js, follow the ioBroker documentation for your kind of installation.
+
+**Keep notes.** You will need these values in the later steps:
+
+| What | Example | Yours |
+| --- | --- | --- |
+| IP address of the ioBroker computer | `192.168.1.10` | |
+| MQTT user name | `hometiles` | |
+| MQTT password | a password you choose | |
+| IP address of the panel (Step 6) | `192.168.1.50` | |
+
+The ioBroker computer's IP address is the part before `:8081` in the address
+you use to open Admin. If you open Admin by a name, such as
+`iobroker.local`, run `hostname -I` in a terminal on the ioBroker computer, or
+look it up in your router's list of devices.
+
+### Step 2: Set up an MQTT broker
+
+The panel and the adapter meet at the broker.
+
+**If you already run an MQTT broker**, such as Mosquitto, that both the
+ioBroker computer and the panel can reach, create a user for HomeTiles on it,
+write down the user name and password, and go to Step 3.
+
+**Otherwise, let ioBroker be the broker** with its MQTT adapter:
+
+1. In Admin, open **Adapters**, search for `mqtt` and install
+   **MQTT Broker/Client**.
+2. Open its settings (**Instances**, then the wrench icon of `mqtt.0`) and set
+   **Type** to **Server/broker**.
+3. Leave **Port** at `1883`.
+4. Under **Authentication**, enter a user name, such as `hometiles`, and a
+   password. Write both down.
+5. Leave the other settings as they are, then click **Save and close**.
+
+The ioBroker MQTT broker keeps each message it receives as a state under
+`mqtt.0`, so HomeTiles topics will show up there. That is normal.
+
+**Check:** In **Instances**, `mqtt.0` (or your own broker) is running.
+
+### Step 3: Install the HomeTiles adapter
+
+The adapter is not in the ioBroker repository yet, so you install it from its
+file, named like `iobroker.hometiles-0.2.0.tgz`. **Keep the file name as you
+got it.** ioBroker reads the adapter's name from it.
+
+1. Copy the file to the ioBroker computer, for example into `/tmp`. On Windows
+   use a tool such as WinSCP. On macOS or Linux run
+   `scp iobroker.hometiles-0.2.0.tgz <user>@192.168.1.10:/tmp/`.
+2. Open a terminal on the ioBroker computer (for example over SSH) and run
+   these two lines, with your file's exact name:
+
+   ```sh
+   chmod a+r /tmp/iobroker.hometiles-0.2.0.tgz
+   iobroker url /tmp/iobroker.hometiles-0.2.0.tgz
+   ```
+
+   The second command installs the adapter together with its settings page.
+   Wait until it finishes without an error.
+   - **ioBroker in Docker:** copy the file into the container with
+     `docker cp`, then run the same command inside it, for example
+     `docker exec -it iobroker iobroker url /tmp/iobroker.hometiles-0.2.0.tgz`.
+     Your container's name may differ.
+3. In Admin, open **Adapters**, find **HomeTiles** and click **+** to add an
+   instance. Alternatively, run `iobroker add hometiles` in the terminal.
+
+**Check:** **Instances** lists `hometiles.0`.
+
+### Step 4: Connect the adapter to the broker
+
+Open the settings of `hometiles.0` (**Instances**, then its wrench icon). On
+the **Connection** tab:
+
+1. **MQTT broker host:** the broker's IP address, such as `192.168.1.10`. Use
+   the real network address even when the broker runs on the ioBroker computer
+   itself. **Never enter `127.0.0.1` or `localhost`.** The adapter hands this
+   address to the panel when it pairs, and for the panel `127.0.0.1` means the
+   panel itself.
+2. **Port:** `1883`.
+3. **Username** and **Password:** the MQTT user from Step 2.
+4. Leave **Use TLS** off. Leave **MQTT client id**, **Panel base topic**
+   (`hometiles`) and **Entity state prefix** (`ha/statestream`) as they are.
+5. Click **Test broker connection**. It must answer "Connected to the MQTT
+   broker at …". If it does not, see
+   [Troubleshooting](#troubleshooting-for-beginners).
+6. Click **Save and close**. Saving restarts the adapter, which is normal and
+   happens at every save.
+
+**Check:**
+- `hometiles.0` turns green in **Instances**.
+- In **Objects**, `hometiles.0.info.connection` is `true`.
+
+### Step 5: Install the HomeTiles firmware on the panel
+
+Skip this step if your panel already runs HomeTiles v0.6.12. The panel shows
+its version under **Settings → System**.
+
+1. Connect the panel to your computer with the USB data cable.
+2. Open the HomeTiles online flasher in Chrome or Edge:
+   <https://galusperes.github.io/installer/>.
+3. Fill in the flasher's sections:
+   - **1. Firmware:** keep the published release.
+   - **2. Device:** select the exact model printed on the device or on its rear
+     label.
+   - **3. Flash mode:** choose **First install / factory reset** for a new
+     panel. This erases everything on it. Choose **Update** only for a panel
+     that already runs HomeTiles and should keep its settings.
+   - **4. Confirm:** tick the confirmations.
+   - **5. Connect and flash:** click **Connect and flash** and choose the
+     panel's port in the browser's pop-up.
+4. Keep the cable plugged in and the browser tab open until the flasher says
+   it has finished.
+5. Restart the panel.
+
+If the browser shows no port, try another cable or USB port and close other
+programs that use the port. Some panels need their **BOOT** button held down
+while you connect. The flasher page has more help.
+
+**Check:** the panel starts and shows the HomeTiles screen.
+
+### Step 6: Connect the panel to Wi-Fi
+
+1. On the panel, open **Settings → WiFi**, choose your network and enter its
+   password.
+   - **Typing on the panel is awkward?** Tap **Enable AP** instead. Connect
+     your phone to the panel's own Wi-Fi hotspot (password `12345678`) and
+     enter your Wi-Fi details on the page that opens. The hotspot switches off
+     after 10 minutes.
+2. Write down the panel's IP address. **Settings → WiFi** on the panel shows
+   it.
+
+**Tip:** in your router, give the panel a fixed IP address, often called a
+"DHCP reservation", so that it never changes.
+
+**Check:** on your computer, open `http://<panel-IP>/`. The panel's Web Admin
+page appears.
+
+### Step 7: Pair the panel with ioBroker
+
+Pairing hands the panel the broker's address and login.
+
+1. Open the settings of `hometiles.0` and go to the **Panels** tab.
+2. **Panel address:** the panel's IP address from Step 6.
+3. Click **Pair a panel by address**. The answer should be "Credentials sent to
+   the panel at … It restarts now and then connects to the broker."
+4. Wait about a minute while the panel restarts.
+
+**Check:**
+- In **Objects**, `hometiles.0.panels` now holds your panel, under an id of
+  12 letters and digits.
+- Its `info.connected` is `true`.
+
+The adapter pairs only while it is connected to the broker itself, which is
+the check of Step 4. For any other message, see
+[Troubleshooting](#troubleshooting-for-beginners).
+
+**If pairing keeps failing, enter the settings by hand:**
+
+1. Open `http://<panel-IP>/`, go to the **Settings** tab and find **MQTT**.
+2. Enter these values, then select **Save**. The panel reconnects.
+   - **Host:** the broker's IP address.
+   - **Port:** `1883`.
+   - **Username / Password:** the MQTT user from Step 2.
+   - **Device topic base:** `hometiles`.
+   - **Home Assistant prefix:** `ha/statestream`. The panel keeps its Home
+     Assistant name for this field; with ioBroker it means the same.
+
+**A second panel needs its own base topic.**
+
+1. Before pairing it, open the **Connection** tab.
+2. Change **Panel base topic** to a new value, such as `hometiles2`, and save.
+3. Pair the second panel.
+
+When entering the settings by hand, use that value as its **Device topic
+base**. The first panel keeps working, because the adapter uses the topic
+each panel reports for itself.
+
+### Step 8: Choose what the panel may show
+
+Nothing reaches the panel until you choose devices.
+
+1. Open the settings of `hometiles.0` and go to the **Devices** tab.
+2. Click **Refresh detected devices**. A table lists every device ioBroker
+   could recognise, with its **Type** (Light, Switch, Sensor, …) and its room.
+3. Tick **Show on panels** for each device the panel should get. Start with a
+   few, such as a lamp and a thermometer.
+   - Optionally, give a device a friendlier **Name override**.
+   - **Preview** shows exactly what the adapter sends to the panel for that
+     device.
+4. Click **Save and close**. The adapter restarts and sends your choice to the
+   panel.
+
+> **Warning:** from the first save on, each panel removes its tiles for
+> everything it is not given. A new panel has nothing to lose. For a panel that
+> already has a layout, for example from Home Assistant, save it first: open
+> the panel's Web Admin, go to **Import / Export** and click **Export**.
+
+**Your device is not in the table?** ioBroker recognises a device by the roles
+of its states. There are two ways to add one:
+
+- **A single state,** such as a helper in `0_userdata.0`: add it under
+  **Manual entities** on the same tab. Pick the **State**, choose its **Type**,
+  and save.
+- **A whole device:** ioBroker's **Devices** adapter can create a properly
+  typed alias for it, which the next **Refresh detected devices** finds.
+
+**Check:**
+- In **Objects**, `hometiles.0.info.entities` shows how many entities were
+  published.
+- The log (Admin, **Log**, filter `hometiles`) has a line such as
+  "Configuration pushed, 12 entities, 2310 of 32767 bytes".
+
+### Step 9: Put tiles on the panel
+
+1. Open the panel's Web Admin at `http://<panel-IP>/`.
+2. Click an empty cell in the grid.
+3. Choose the tile **Type** that fits the device:
+
+   | Device in ioBroker | Tile type on the panel |
+   | --- | --- |
+   | Lamp, dimmer, colour light, plug, switch | **Switch**. A lamp's tile also opens brightness and colour controls. |
+   | Thermometer, humidity, light level, a value or text | **Sensor** |
+   | Window or door contact, motion, smoke, water leak | **Binary Sensor** |
+   | Blind, shutter, gate | **Cover** |
+   | Thermostat, air conditioner | **Climate** |
+   | Media player | **Media** |
+   | Weather adapter | **Weather** |
+   | Button or scene | **Scene** |
+   | Adjustable number, options list, date or time | **Number**, **Select**, **Date/Time** |
+   | Energy meter (Step 10) | **Energy** |
+
+4. Choose the device in the entity list. The list shows the devices of that
+   type that you ticked in Step 8.
+5. Optionally, set a **Title**, an **Icon** and a **Color**. The icon is a
+   Material Design Icons name, such as `mdi:lamp`.
+
+Changes save automatically and appear on the panel at once.
+
+**Check:**
+- Tap the tile on the panel: the lamp switches, and its state changes in
+  ioBroker's **Objects**.
+- Switch the lamp from ioBroker: the tile follows.
+
+**Your panel works.**
+
+### Step 10 (optional): graphs, energy and thermostat modes
+
+- **Graphs and timelines** (tap a sensor tile) need a history instance:
+  1. Install the **History** adapter if you have none. SQL and InfluxDB work
+     too.
+  2. In **Objects**, open the settings of each chosen state (the gear icon)
+     and enable logging in that instance.
+  3. On the adapter's **Advanced** tab, select it as the **History instance**.
+
+  Details: [Advanced tab](#6-advanced-tab-the-history-instance).
+- **Energy tiles:** add your meters that count up, such as kWh totals, on the
+  **Energy** tab, and log each of them in the history instance. Details:
+  [Energy tab](#5-energy-tab-energy-meters).
+- **Thermostat mode buttons**, for thermostats whose modes have their own
+  names such as MANU or AUTO: map the modes under **Climate modes** on the
+  Devices tab. Details: [Climate modes](#4-climate-modes).
+
+### Everyday use
+
+- **After a settings save:** the adapter restarts, and the panel reconnects by
+  itself within seconds.
+- **When ioBroker or the broker is down:** the panel keeps showing the last
+  values and reconnects when they are back.
+- **More devices later:** on the **Devices** tab, click **Refresh detected
+  devices**, tick the new devices and save. Then add their tiles in the Web
+  Admin.
+- **Updating the adapter:**
+  1. Read [Upgrading from 0.1.0](#upgrading-from-010) and the
+     [Changelog](#changelog) first.
+  2. Run `iobroker url` with the new file.
+  3. Run `iobroker restart hometiles`.
+- **Updating the panel's firmware:** on the panel, use **Settings → System →
+  Check for updates**, or use **Firmware** in the Web Admin. First check which
+  firmware version this adapter supports, under
+  [Requirements](#requirements).
+- **Brightness, screensaver, rotation and sleep** of each panel can be set
+  from ioBroker, in `hometiles.0.panels.<id>.control.*`. See
+  [Objects](#objects).
+
+### Troubleshooting for beginners
+
+**Look at the log first.** Open Admin, go to **Log** and filter for
+`hometiles`. The messages are in English and name the problem.
+
+| What you see | What to do |
+| --- | --- |
+| **Test broker connection** says "No connection" or "did not complete the connection in time" | Check the host (an IP address), the port (`1883`) and that the broker runs (`mqtt.0` green). A firewall on the ioBroker computer must allow port 1883. |
+| The log says "Connection refused", or the broker refuses the login | The user name or password is wrong. Enter the password again on the **Connection** tab and save. |
+| `hometiles.0` stays yellow | The adapter is not connected to the broker. Do the same checks as above. |
+| Pairing says the panel "did not answer" | Check the panel's IP address. Check that the panel is on and has finished Step 6: its hotspot mode has no Web Admin. A computer and a panel in different networks, such as a guest Wi-Fi, cannot reach each other. |
+| Pairing says "not connected to the broker, so nothing was sent" | Finish Step 4 first, then pair again once `hometiles.0` is green. |
+| The panel does not appear under `hometiles.0.panels` | Open `http://<panel-IP>/`, go to **Settings**, then **MQTT**. The host must be the broker's IP address, not `127.0.0.1`, and the port, user name and password must be right. On the panel, **Settings → System → Pairing** announces the panel again. |
+| The entity list in the Web Admin is empty | Step 8 is not done yet (**Refresh**, tick, **Save**), or nothing of that tile's type is ticked. |
+| A tile shows `--` or "unavailable" | The ioBroker state has no value yet, or its device is offline. For an alias, the log names aliases whose target is missing. |
+| A graph shows only the current value, or a popup says "History unavailable" | Logging is not enabled for that state. See Step 10. |
+| Changing a number, select or date/time fails as "expired" | The clocks of the panel and of the ioBroker computer differ. On the panel, set the time zone under **Settings → Localization**, and let both get their time from the internet (NTP). |
+| The log says the installation is incomplete and names `iobroker upload hometiles` | Run `iobroker upload hometiles`, then `iobroker restart hometiles`. |
+| The log says the broker password "could not be decrypted" | Enter the password again on the **Connection** tab and save. |
+| The log says the configuration is over 32767 bytes | Too many devices are ticked. Untick some or shorten long names. See [Limits](#limits-and-requirements). |
+
+For problems on the panel itself, such as the display, Wi-Fi or updates, see
+the [HomeTiles troubleshooting page](https://galusperes.github.io/faq/). To
+read the panel's own log over USB, use
+[HomeTiles device logs](https://galusperes.github.io/device-logs/).
+
+### Words used in this guide
+
+- **MQTT:** a simple way of sending messages that many smart-home devices use.
+- **Broker:** the program that passes MQTT messages between devices.
+- **Topic:** the address an MQTT message is sent to.
+- **Base topic:** a panel's own MQTT address. Every panel needs a different one.
+- **Entity:** one thing a panel can show or control, such as a lamp or a
+  sensor, as the adapter describes it to the panel.
+- **Tile:** a square on the panel's screen, showing one entity or something of
+  the panel's own, such as a clock or a folder.
+- **Instance:** one running copy of an adapter, such as `hometiles.0`.
+- **Object and state:** an object is ioBroker's description of a value, such
+  as a lamp's on/off; the state is the value itself.
+- **Web Admin:** the panel's own settings page, at `http://<panel-IP>/`.
 
 ## What 0.2.0 covers
 
@@ -134,6 +540,10 @@ adapter shows the provider's own values, as its own widgets do.
     documentation does not describe.
 
 ## Setup
+
+Every settings tab in detail. For a first installation, follow
+[Step by step](#step-by-step-from-zero-to-a-working-panel) instead; it links
+back here where the details matter.
 
 ### 1. Connection tab: the broker
 
